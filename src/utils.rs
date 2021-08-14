@@ -1,6 +1,5 @@
-use std::iter::once;
-use std::result::Result;
+use crate::types::ResultVec;
 
-pub fn echo<S: Into<String>>(input: S) -> Result<impl Iterator<Item = String>, String> {
-    Ok(once(input.into()))
+pub fn echo(text: String) -> impl Fn(String) -> ResultVec {
+    move |_| Ok(vec![text.clone()])
 }
