@@ -2,7 +2,7 @@ mod types;
 pub mod utils;
 use crate::types::ResultVec;
 
-pub fn pipe(fns: Vec<impl Fn(String) -> ResultVec>) -> ResultVec {
+pub fn pipe(fns: Vec<Box<dyn Fn(String) -> ResultVec>>) -> ResultVec {
     fns.iter().fold(Ok(vec!["".to_string()]), |in_acc, f| {
         in_acc?
             .iter()

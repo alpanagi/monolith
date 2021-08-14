@@ -4,7 +4,6 @@ version = "0.1.0"
 authors = ["Alexandros Panagiotakis <dev@alpanagi.com>"]
 edition = "2018"
 repository = "https://github.com/alpanagi/monolith/"
-license = " GPL-3.0-only"
 license-file = "LICENSE"
 
 [dependencies]
