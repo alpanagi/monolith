@@ -2,7 +2,7 @@
 
 Shell scripting replacement for Rust
 
-## Rational
+## Rationale
 
 TBD
 
