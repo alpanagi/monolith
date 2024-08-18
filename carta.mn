@@ -1,0 +1,66 @@
+# Variables are declared when used.
+foo1 = 42
+
+# They can optionally be given a type. If no type is given the type is infered by the right hand side of the assignment.
+foo2: int = 42
+
+# You are allowed to redeclare the variable with a different type at any point. This also happens automatically if you reassign a variable with a value of a different type. Even if it looks like dynamic typing, these values are checked on compile time.
+a1: int = 1
+b1: float = 1.0
+c1 = "test"
+
+# Available primitive types
+a2: int = -1
+b2: uint = 1
+c2: long = 1
+d2: ulong = 1
+e2: float = 1.0
+f2: bool = true
+g2: string = "Here"
+h2: char = 'a' # always utf-8
+i2: byte = 0
+# j2: complex = 1 + 3i
+# Complex types would be added in the future
+
+# The numberic types from above also have their sized versions
+a3: i8 = 1
+b3: i16 = 1
+c3: i32 = 1
+d3: i64 = 1
+# e3: i128 = 1
+# Numbers bigger than 64bits will be implemented later
+
+a4: u8 = 1 # byte is an alias to this
+b4: u16 = 1
+c4: u32 = 1
+d4: u64 = 1
+# e4: u128 = 1
+# Numbers bigger than 64bits will be implemented later
+
+a5: f32 = 1.0
+b5: f64 = 1.0
+
+# a6: complex64 = 1 + 1i
+# b6: complex128 = 1 + 1i
+# Complex types would be added in the future
+
+# printing to the console
+print("Hello fellow developer")
+
+# printing without passing an argument prints an empty line
+print()
+
+# `print` accepts a set of arguments to modify how it prints.
+# Note that end is a string and not a character
+print("Adjusted printing", end="", output=stderr)
+
+# Monolith is an indentation based language similar to python.
+# You can use both tabs and spaces. Mixing tabs and spaces, while discouraged, will work as long as a block of code uses the same type of indentation
+if true:
+    print("Space based")
+if true:
+	print("Tab based")
+
+# Logical expressions are combined with `and`/`or`:
+if (a == 3 and b == 5) or c === "This is a test":
+    print("Success")
