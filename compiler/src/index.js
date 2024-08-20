@@ -18,6 +18,8 @@ const processedText = text.split("\n")
     .join("\n");
 
 const tokens = tokenize(processedText);
+
 const ast = parse(tokens);
+
 const output = generate(ast);
 console.log(output);

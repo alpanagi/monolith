@@ -7,7 +7,8 @@ export function tokenize(text) {
     let state = {
         text,
         position: 0,
-        tokens: []
+        tokens: [],
+        string: ""
     }
 
     while (state.position < text.length) {
@@ -28,7 +29,7 @@ export function tokenize(text) {
     state.tokens.push({
         kind: 'eof'
     });
-    return state.tokens;
+    return { tokens: state.tokens, string: state.string };
 }
 
 function comment(state) {
@@ -161,9 +162,13 @@ function string(state) {
         state.position += 1;
     }
 
+    const text = state.text.slice(startPosition, state.position);
+    const idx = state.string.length;
+    state.string += text;
     state.tokens.push({
         kind: 'string',
-        value: state.text.slice(startPosition, state.position)
+        idx,
+        length: text.length,
     });
     state.position += 1;
 

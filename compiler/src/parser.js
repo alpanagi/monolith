@@ -1,19 +1,21 @@
-export function parse(tokens) {
+export function parse({ tokens, string }) {
     let ast = {
         root: { kind: 'root', children: [] },
         tokens: tokens,
+        string
     };
 
     while (ast.tokens.length > 0) {
         const currentTokenLength = ast.tokens.length;
 
         ast = variableDeclaration(ast);
+        ast = callExpression(ast);
 
         if (ast.tokens.length === currentTokenLength) {
             return ast.root;
         }
     }
-    return ast.root;
+    return { nodes: ast.root.children, string: ast.string };
 }
 
 function variableDeclaration(ast) {
@@ -129,6 +131,24 @@ function variableDeclaration(ast) {
             value: ast.tokens[4].value
         })
         ast.tokens = ast.tokens.slice(6);
+    }
+
+    return ast;
+}
+
+function callExpression(ast) {
+    if (ast.tokens[0].kind === 'identifier'
+        && ast.tokens[1].kind === 'left_parenthesis'
+        && (ast.tokens[2].kind === 'number' || ast.tokens[2].kind === 'string')
+        && ast.tokens[3].kind === 'right_parenthesis'
+        && (ast.tokens[4].kind === 'newline' || ast.tokens[4].kind === 'eof')) {
+        ast.root.children.push({
+            kind: 'call_expression',
+            identifier: 'print',
+            idx: ast.tokens[2].idx,
+            length: ast.tokens[2].length
+        })
+        ast.tokens = ast.tokens.slice(5);
     }
 
     return ast;
