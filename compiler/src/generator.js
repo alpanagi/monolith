@@ -4,7 +4,8 @@ import { generateEnvironment } from "./environment.js";
 export function generate({ nodes, string }) {
     let output = {
         nodes,
-        output: ""
+        output: "",
+        currentIdx: string.length,
     };
 
     output.output += `(module\n`;
@@ -98,12 +99,14 @@ function print(output) {
     if (output.nodes[0].kind === "call_expression") {
         const idx = output.nodes[0].idx;
         const length = output.nodes[0].length;
+        const name = output.nodes[0].identifier;
 
         output.output += `
-        (i32.store(i32.const 100)(i32.const ${idx}))
-        (i32.store(i32.const 104)(i32.const ${length}))
-        i32.const 100
-        call $print\n`;
+        (i32.store(i32.const ${output.currentIdx})(i32.const ${idx}))
+        (i32.store(i32.const ${output.currentIdx + 4})(i32.const ${length}))
+        i32.const ${output.currentIdx}
+        call $${name}\n`;
+        output.currentIdx += 8;
         output.nodes = output.nodes.slice(1);
     }
 
