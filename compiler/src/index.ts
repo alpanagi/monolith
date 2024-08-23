@@ -1,7 +1,7 @@
 import fs from "fs"
-import { tokenize } from "./tokenizer"
-import { parse } from "./parser"
-import { generate } from "./generator"
+import { tokenize } from "./tokenizers/tokenize"
+import { parse } from "./parsers/parse"
+import { generate } from "./generators/generate"
 
 void main()
 function main() {
@@ -17,7 +17,10 @@ function main() {
     const text = fs.readFileSync(filepath, "utf-8").trim()
 
     const tokenState = tokenize(text)
+
     const astState = parse(tokenState.tokens, tokenState.strings.length)
+    console.warn(JSON.stringify(astState, null, 2))
+
     const output = generate(astState.nodes, tokenState.strings)
     console.log(output)
 }

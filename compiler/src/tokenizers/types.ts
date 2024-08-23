@@ -19,25 +19,11 @@ export type Token = Location &
         | { kind: "equals" }
     )
 
-export type Node =
-    | {
-          kind: "call_expression"
-          value: {
-              parameter: Type
-          }
-      }
-    | {
-          kind: "variable_assignment"
-          value: Variable
-      }
-
-export type Variable = { name: string } & Type
-
-type Pointer = {
-    kind: "string"
-    memoryIdx: number
-    targetIdx: number
-    length: number
+export interface TokenizerState {
+    currentLine: number
+    currentColumn: number
+    currentIdx: number
+    input: string
+    tokens: Token[]
+    strings: string
 }
-
-type Type = Pointer
