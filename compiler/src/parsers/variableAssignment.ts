@@ -9,7 +9,6 @@ export function variableAssignment(state: ParserState) {
         const variable: Variable = {
             kind: "string_pointer",
             name: state.tokens[0].value.name,
-            memoryIdx: state.memoryIdx,
             targetIdx: state.tokens[2]?.value.memoryIdx,
             length: state.tokens[2]?.value.length,
         }

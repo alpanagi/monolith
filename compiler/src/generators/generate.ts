@@ -2,9 +2,8 @@ import { callExpression } from "./callExpression"
 import { generatePrelude } from "./prelude"
 import { GeneratorState } from "./types"
 import { Node } from "../parsers/types"
-import { variableDeclaration } from "./variableDeclaration"
 
-const generators = [variableDeclaration, callExpression]
+const generators = [callExpression]
 
 export function generate(nodes: Node[], strings: string) {
     const state: GeneratorState = {

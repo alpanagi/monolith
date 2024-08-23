@@ -11,7 +11,7 @@ export function functionCall(state: ParserState) {
             kind: "call_expression",
             value: {
                 parameter: {
-                    kind: "string_constant",
+                    kind: "string_pointer",
                     targetIdx: state.tokens[2]?.value.memoryIdx,
                     length: state.tokens[2]?.value.length,
                 },

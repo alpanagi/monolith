@@ -21,17 +21,10 @@ export type Node =
 
 export type Variable = { name: string } & Type
 
-type Pointer =
-    | {
-          kind: "string_pointer"
-          memoryIdx: number
-          targetIdx: number
-          length: number
-      }
-    | {
-          kind: "string_constant"
-          targetIdx: number
-          length: number
-      }
+type Pointer = {
+    kind: "string_pointer"
+    targetIdx: number
+    length: number
+}
 
 type Type = Pointer
