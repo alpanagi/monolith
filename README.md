@@ -6,4 +6,4 @@
 
 `carta.mn` is the file where the language is defined. It serves both as a tutorial and a code sample that the compiler should be able to compile to WebAssembly.
 
-The current bootstrap compiler is written in JavaScript.
+The current bootstrap compiler is written in TypeScript.
