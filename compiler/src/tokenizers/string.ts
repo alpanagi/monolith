@@ -24,11 +24,11 @@ export function string(state: TokenizerState) {
             line: startLine,
             column: startColumn,
             value: {
-                memoryIdx: state.strings.length,
+                arrayIdx: state.strings.length,
                 length,
             },
         })
-        state.strings += state.input.slice(startIdx, startIdx + length)
+        state.strings.push(state.input.slice(startIdx, startIdx + length))
 
         state.currentIdx += 1
         state.currentColumn += length + 2

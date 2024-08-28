@@ -19,7 +19,6 @@ function main() {
     const tokenState = tokenize(text)
 
     const astState = parse(tokenState.tokens, tokenState.strings.length)
-    console.warn(JSON.stringify(astState, null, 2))
 
     const output = generate(astState.nodes, tokenState.strings)
     console.log(output)

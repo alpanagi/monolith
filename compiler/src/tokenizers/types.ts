@@ -8,7 +8,7 @@ export type Token = Location &
         | {
               kind: "string"
               value: {
-                  memoryIdx: number
+                  arrayIdx: number
                   length: number
               }
           }
@@ -25,5 +25,5 @@ export interface TokenizerState {
     currentIdx: number
     input: string
     tokens: Token[]
-    strings: string
+    strings: string[]
 }

@@ -23,7 +23,7 @@ export type Variable = { name: string } & Type
 
 type Pointer = {
     kind: "string_pointer"
-    targetIdx: number
+    arrayIdx: number
     length: number
 }
 

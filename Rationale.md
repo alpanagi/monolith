@@ -12,6 +12,8 @@ The ability to implement functionality for a type without affecting that type's 
 
 Rust allows you to use `let` with a previously defined variable name and reuse the variable with different types. This is a significant boost in ergonomics.
 
+### Pattern Matching
+
 ## Inspiration from Typescript
 
 ### Module System

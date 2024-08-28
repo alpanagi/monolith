@@ -14,7 +14,7 @@ export function tokenize(input: string) {
         currentColumn: 0,
         currentIdx: 0,
         tokens: [],
-        strings: "",
+        strings: [],
     }
 
     while (state.currentIdx < state.input.length) {

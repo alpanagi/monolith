@@ -12,7 +12,7 @@ export function functionCall(state: ParserState) {
             value: {
                 parameter: {
                     kind: "string_pointer",
-                    targetIdx: state.tokens[2]?.value.memoryIdx,
+                    arrayIdx: state.tokens[2]?.value.arrayIdx,
                     length: state.tokens[2]?.value.length,
                 },
             },
