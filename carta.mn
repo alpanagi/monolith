@@ -23,22 +23,22 @@ let i2: byte = 0
 # Complex types would be added in the future
 
 # The numberic types from above also have their sized versions
-a3: i8 = 1
-b3: i16 = 1
-c3: i32 = 1
-d3: i64 = 1
+let a3: i8 = 1
+let b3: i16 = 1
+let c3: i32 = 1
+let d3: i64 = 1
 # e3: i128 = 1
 # Numbers bigger than 64bits will be implemented later
 
-a4: u8 = 1 # byte is an alias to this
-b4: u16 = 1
-c4: u32 = 1
-d4: u64 = 1
+let a4: u8 = 1 # byte is an alias to this
+let b4: u16 = 1
+let c4: u32 = 1
+let d4: u64 = 1
 # e4: u128 = 1
 # Numbers bigger than 64bits will be implemented later
 
-a5: f32 = 1.0
-b5: f64 = 1.0
+let a5: f32 = 1.0
+let b5: f64 = 1.0
 
 # a6: complex64 = 1 + 1i
 # b6: complex128 = 1 + 1i
