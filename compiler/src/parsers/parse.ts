@@ -2,9 +2,9 @@ import { Token } from "../tokenizers/types"
 import { functionCall } from "./functionCall"
 import { ignoreNewLine } from "./ignoreNewLine"
 import { ParserState } from "./types"
-import { variableAssignment } from "./variableAssignment"
+import { variableDeclaration } from "./variableDeclaration"
 
-const parsers = [ignoreNewLine, functionCall, variableAssignment]
+const parsers = [ignoreNewLine, variableDeclaration, functionCall]
 
 export function parse(tokens: Token[], memoryStartIdx: number) {
     const state: ParserState = {

@@ -10,21 +10,27 @@ export interface ParserState {
 export type Node =
     | {
           kind: "call_expression"
-          value: {
-              parameter: Type
-          }
+          parameter: Type
       }
     | {
           kind: "variable_assignment"
-          value: Variable
+          variable: Variable
       }
 
-export type Variable = { name: string } & Type
+type Type = StringConstant | Variable
 
-type Pointer = {
-    kind: "string_pointer"
+type StringConstant = {
+    kind: "string_constant"
     arrayIdx: number
     length: number
 }
 
-type Type = Pointer
+export type Variable = { kind: "variable"; name: string; pointer: Pointer }
+
+type Pointer = {
+    kind: "string_pointer"
+    value: {
+        stringArrayIdx: number
+        length: number
+    }
+}

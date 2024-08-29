@@ -4,8 +4,18 @@ import { identifier } from "./identifier"
 import { string } from "./string"
 import { symbols } from "./symbols"
 import { whitespace } from "./whitespace"
+import { keywords } from "./keywords"
+import { number } from "./number"
 
-const tokenizers = [comments, string, whitespace, symbols, identifier]
+const tokenizers = [
+    comments,
+    string,
+    whitespace,
+    symbols,
+    keywords,
+    identifier,
+    number,
+]
 
 export function tokenize(input: string) {
     const state: TokenizerState = {

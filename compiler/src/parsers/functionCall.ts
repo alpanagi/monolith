@@ -9,12 +9,10 @@ export function functionCall(state: ParserState) {
     ) {
         state.nodes.push({
             kind: "call_expression",
-            value: {
-                parameter: {
-                    kind: "string_pointer",
-                    arrayIdx: state.tokens[2]?.value.arrayIdx,
-                    length: state.tokens[2]?.value.length,
-                },
+            parameter: {
+                kind: "string_constant",
+                arrayIdx: state.tokens[2]?.value.arrayIdx,
+                length: state.tokens[2]?.value.length,
             },
         })
 
@@ -41,9 +39,7 @@ export function functionCall(state: ParserState) {
 
         state.nodes.push({
             kind: "call_expression",
-            value: {
-                parameter: variable,
-            },
+            parameter: variable,
         })
 
         state.memoryIdx += 8
