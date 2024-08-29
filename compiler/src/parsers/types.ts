@@ -25,12 +25,19 @@ type StringConstant = {
     length: number
 }
 
-export type Variable = { kind: "variable"; name: string; pointer: Pointer }
+export type Variable = { kind: "variable"; name: string; value: Value }
 
-type Pointer = {
+type Value = Pointer | Constant
+
+export type Pointer = {
     kind: "string_pointer"
     value: {
         stringArrayIdx: number
         length: number
     }
+}
+
+export type Constant = {
+    kind: "integer_constant"
+    value: string
 }

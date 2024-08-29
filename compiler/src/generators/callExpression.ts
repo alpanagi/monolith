@@ -13,7 +13,7 @@ export function callExpression(state: GeneratorState, node: Node) {
     if (node.kind === "call_expression" && node.parameter.kind === "variable") {
         const variable = node.parameter
         state.output += `  %${state.currentRegisterIdx} = load ptr, ptr %${variable.name}\n`
-        state.output += `  call void @print(ptr %${state.currentRegisterIdx}, i64 ${variable.pointer.value.length})\n`
+        state.output += `  call void @print(ptr %${state.currentRegisterIdx}, i64 ${variable.value.value.length})\n`
         state.currentRegisterIdx += 1
     }
 }
