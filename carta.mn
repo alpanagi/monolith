@@ -1,24 +1,24 @@
-# Variables are declared when used.
-foo1 = 42
+# Variable declaration
+let foo1
+let bar1 = 42
 
 # They can optionally be given a type. If no type is given the type is infered by the right hand side of the assignment.
-foo2: int = 42
+let foo2: int = 42
 
-# You are allowed to redeclare the variable with a different type at any point. This also happens automatically if you reassign a variable with a value of a different type. Even if it looks like dynamic typing, these values are checked on compile time.
-a1: int = 1
-b1: float = 1.0
-c1 = "test"
+# You are allowed to redeclare the variable with a different type at any point.
+let a1: int = 1
+let a1: float = 1.0
 
 # Available primitive types
-a2: int = -1
-b2: uint = 1
-c2: long = 1
-d2: ulong = 1
-e2: float = 1.0
-f2: bool = true
-g2: string = "Here"
-h2: char = 'a' # always utf-8
-i2: byte = 0
+let a2: int = -1
+let b2: uint = 1
+let c2: long = 1
+let d2: ulong = 1
+let e2: float = 1.0
+let f2: bool = true
+let g2: string = "Here"
+let h2: char = 'a' # always utf-8
+let i2: byte = 0
 # j2: complex = 1 + 3i
 # Complex types would be added in the future
 
