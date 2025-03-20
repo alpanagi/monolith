@@ -1,0 +1,14 @@
+{
+    "extends": [
+        "@tsconfig/strictest/tsconfig.json",
+        "@tsconfig/node23/tsconfig.json"
+    ],
+    "compilerOptions": {
+        "target": "esnext",
+        "rootDir": "./src",
+        "outDir": "./dist",
+        "types": [
+            "node"
+        ]
+    }
+}
