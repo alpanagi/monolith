@@ -1,16 +1,13 @@
-type TokenType = "left_parenthesis" | "right_parenthesis";
+type TokenType =
+    | "identifier"
+    | "string"
+    | "left_parenthesis"
+    | "right_parenthesis";
 
-type Token =
-    | {
-          type: "identifier";
-          value: string;
-      }
-    | {
-          type: "string";
-          value: string;
-      }
-    | { type: "left_parenthesis" }
-    | { type: "right_parenthesis" };
+export type Token = {
+    type: TokenType;
+    value?: string;
+};
 
 interface TokenizerState {
     text: string;

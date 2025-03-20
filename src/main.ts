@@ -1,5 +1,6 @@
 import fs from "fs";
 import { tokenize } from "./tokenize.js";
+import { generateAst } from "./ast.js";
 
 if (process.argv.length !== 3) {
     console.log("Usage: monolith <FILENAME>");
@@ -9,4 +10,5 @@ if (process.argv.length !== 3) {
 const filepath: string = process.argv[2] ?? "";
 const text = fs.readFileSync(filepath, "utf-8");
 const tokens = tokenize(text);
-console.log(tokens);
+const ast = generateAst(tokens);
+console.log(JSON.stringify(ast, null, 2));
