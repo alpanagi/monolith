@@ -1,3 +1,5 @@
+type TokenType = "left_parenthesis" | "right_parenthesis";
+
 type Token =
     | {
           type: "identifier";
@@ -45,18 +47,18 @@ function identiferTokenizer(prevState: TokenizerState): TokenizerState {
 }
 
 function symbolTokenizer(prevState: TokenizerState): TokenizerState {
-    if (prevState.text[0] === "(") {
-        return {
-            text: prevState.text.slice(1),
-            tokens: [...prevState.tokens, { type: "left_parenthesis" }],
-        };
-    }
+    const tokenMap: Record<string, TokenType> = {
+        "(": "left_parenthesis",
+        ")": "right_parenthesis",
+    };
 
-    if (prevState.text[0] === ")") {
-        return {
-            text: prevState.text.slice(1),
-            tokens: [...prevState.tokens, { type: "right_parenthesis" }],
-        };
+    for (const key of Object.keys(tokenMap)) {
+        if (prevState.text[0] === key) {
+            return {
+                text: prevState.text.slice(1),
+                tokens: [...prevState.tokens, { type: tokenMap[key]! }],
+            };
+        }
     }
 
     return prevState;
