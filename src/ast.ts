@@ -5,7 +5,7 @@ interface StringLiteral {
     value: string;
 }
 
-type Node =
+export type Node =
     | { type: "program"; statements: Node[] }
     | { type: "function_call"; name: string; arguments: StringLiteral[] }
     | StringLiteral;
