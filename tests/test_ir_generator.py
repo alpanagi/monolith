@@ -16,6 +16,7 @@ declare void @printf(i8* %str)
 
 
 def test_print_statement():
+    string_map = {"HERE": 0}
     ast = FunctionCall("print", [StringConstant("HERE", 0)])
-    ir = generate_ir(ast)
+    ir = generate_ir(string_map, ast)
     assert ir == ir1

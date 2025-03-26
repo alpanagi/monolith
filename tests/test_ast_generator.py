@@ -3,7 +3,7 @@ from token_generator import Keyword, StringLiteral, Symbol
 
 
 def test_print_statement():
-    ast = generate_ast(
+    (string_map, ast) = generate_ast(
         [
             Keyword("print"),
             Symbol("("),
@@ -12,6 +12,7 @@ def test_print_statement():
         ]
     )
 
+    assert string_map["HERE"] == 0
     assert isinstance(ast, Program)
 
     call = ast.statements[0]
