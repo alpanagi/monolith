@@ -20,8 +20,9 @@ class FunctionCall:
 
 
 class StringConstant:
-    def __init__(self, string, id):
+    def __init__(self, string, size, id):
         self.string = string
+        self.size = size
         self.id = id
 
 
@@ -57,14 +58,18 @@ def function_call_generator(prev_state):
         and tokens[3].symbol == ")"
     ):
         if tokens[2].string not in string_map:
-            string_map[tokens[2].string] = len(string_map)
-        id = string_map[tokens[2].string]
+            string_constant = StringConstant(
+                tokens[2].string, tokens[2].size, len(string_map)
+            )
+            string_map[tokens[2].string] = string_constant
+        else:
+            string_constant = string_map[tokens[2].string]
 
         return AstGeneratorState(
             prev_state.tokens[4:],
             FunctionCall(
                 prev_state.tokens[0].keyword,
-                [StringConstant(prev_state.tokens[2].string, id)],
+                [string_constant],
             ),
             string_map,
         )

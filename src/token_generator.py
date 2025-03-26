@@ -18,8 +18,9 @@ class Symbol:
 
 
 class StringLiteral:
-    def __init__(self, text):
+    def __init__(self, text, size):
         self.string = text
+        self.size = size
 
 
 def generate_tokens(text):
@@ -71,8 +72,12 @@ def tokenize_string(prev_state):
 
     if match:
         text = match.group(1)
+        new_line_count = text.count("\\n")
+        size = len(text) - new_line_count
+        escaped_text = text.replace("\\n", "\\0A")
         return TokenGeneratorState(
-            prev_state.text[len(text) + 2 :], prev_state.tokens + [StringLiteral(text)]
+            prev_state.text[len(text) + 2 :],
+            prev_state.tokens + [StringLiteral(escaped_text, size)],
         )
 
     return prev_state

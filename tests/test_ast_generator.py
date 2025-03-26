@@ -7,12 +7,17 @@ def test_print_statement():
         [
             Keyword("print"),
             Symbol("("),
-            StringLiteral("HERE"),
+            StringLiteral("HERE", 4),
             Symbol(")"),
         ]
     )
 
-    assert string_map["HERE"] == 0
+    string_constant = string_map["HERE"]
+    assert isinstance(string_constant, StringConstant)
+    assert string_constant.string == "HERE"
+    assert string_constant.size == 4
+    assert string_constant.id == 0
+
     assert isinstance(ast, Program)
 
     call = ast.statements[0]
@@ -22,3 +27,5 @@ def test_print_statement():
     argument = call.arguments[0]
     assert isinstance(argument, StringConstant)
     assert argument.string == "HERE"
+    assert argument.size == 4
+    assert argument.id == 0

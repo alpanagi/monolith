@@ -12,12 +12,12 @@ def generate_ir(string_map, ast):
     state = IrGeneratorState(ast, [])
     state = generate_ir_(state)
     irs = []
-    for key, value in string_map.items():
+    for key, string_constant in string_map.items():
         irs += [
             "@.str"
-            + str(value)
+            + str(string_constant.id)
             + " = constant ["
-            + str(len(key) + 1)
+            + str(string_constant.size + 1)
             + ' x i8] c"'
             + key
             + '\\00"'

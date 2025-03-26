@@ -12,6 +12,15 @@ def test_print_statement():
 
     assert isinstance(tokens[2], StringLiteral)
     assert tokens[2].string == "HERE"
+    assert tokens[2].size == 4
 
     assert isinstance(tokens[3], Symbol)
     assert tokens[3].symbol == ")"
+
+
+def test_escape_new_line():
+    tokens = generate_tokens('"HERE\\n"')
+
+    assert isinstance(tokens[0], StringLiteral)
+    assert tokens[0].size == 5
+    assert tokens[0].string == "HERE\\0A"
