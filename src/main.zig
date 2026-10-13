@@ -53,6 +53,25 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
 
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    switch (target) {
+        .javascript => {
+            var generator = javascript.Generator.init(module);
+            generator.generate(&output.writer) catch |generate_error| switch (generate_error) {
+                error.WriteFailed => return error.WriteFailed,
+                error.UnsupportedType => {
+                    const message = "type is not supported on the javascript target";
+                    try report(stderr, path, generator.failure.?, message);
+                    return 1;
+                },
+            };
+        },
+        .c => {
+            var generator = c.Generator.init(module);
+            try generator.generate(&output.writer);
+        },
+    }
+
     const extension = switch (target) {
         .javascript => "js",
         .c => "c",
@@ -61,22 +80,7 @@ pub fn main(init: std.process.Init) !u8 {
     const directory_path = try std.fs.path.join(allocator, &.{ "build", @tagName(target) });
     const directory = try std.Io.Dir.cwd().createDirPathOpen(io, directory_path, .{});
     defer directory.close(io);
-    const output = try directory.createFile(io, output_name, .{});
-    defer output.close(io);
-
-    var output_buffer: [4096]u8 = undefined;
-    var output_writer = output.writer(io, &output_buffer);
-    switch (target) {
-        .javascript => {
-            var generator = javascript.Generator.init(module);
-            try generator.generate(&output_writer.interface);
-        },
-        .c => {
-            var generator = c.Generator.init(module);
-            try generator.generate(&output_writer.interface);
-        },
-    }
-    try output_writer.interface.flush();
+    try directory.writeFile(io, .{ .sub_path = output_name, .data = output.written() });
     return 0;
 }
 

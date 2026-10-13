@@ -143,6 +143,10 @@ pub const Generator = struct {
                     text = text[2..];
                 }
                 for (text) |byte| try writer.writeByte(if (byte == '_') '\'' else byte);
+                switch (expression.primitive_type.?) {
+                    .u8, .u16, .u32, .u64 => try writer.writeByte('u'),
+                    else => {},
+                }
             },
             .boolean => |value| try writer.writeAll(if (value) "true" else "false"),
         }
@@ -155,7 +159,10 @@ test "Generator.generate: separates functions with a blank line" {
     var lexer = @import("lexer.zig").Lexer.init("fn main(): noop\nfn two():\n    noop\n");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    var generator = Generator.init(try parser.parse(&arena));
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try generator.generate(&output.writer);
@@ -169,7 +176,10 @@ test "Generator.generate: includes stdint" {
     var lexer = @import("lexer.zig").Lexer.init("fn answer() i32: return 42");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    var generator = Generator.init(try parser.parse(&arena));
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try generator.generate(&output.writer);
@@ -183,7 +193,10 @@ test "generateFunction: generates main as the entry point" {
     var lexer = @import("lexer.zig").Lexer.init("fn main(): noop");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    var generator = Generator.init(try parser.parse(&arena));
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try generator.generate(&output.writer);
@@ -197,7 +210,10 @@ test "generateFunction: generates other functions as static" {
     var lexer = @import("lexer.zig").Lexer.init("fn one(): noop");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    var generator = Generator.init(try parser.parse(&arena));
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try generator.generate(&output.writer);
@@ -211,7 +227,10 @@ test "generateType: maps floating point types" {
     var lexer = @import("lexer.zig").Lexer.init("fn half() f32: return 0.5\nfn whole() f64: return 1.0");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    var generator = Generator.init(try parser.parse(&arena));
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try generator.generate(&output.writer);
@@ -225,7 +244,10 @@ test "generateIdentifier: appends an underscore to reserved words" {
     var lexer = @import("lexer.zig").Lexer.init("fn int(): noop");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    var generator = Generator.init(try parser.parse(&arena));
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try generator.generate(&output.writer);
@@ -239,7 +261,10 @@ test "generateBlock: writes statements on separate lines" {
     var lexer = @import("lexer.zig").Lexer.init("fn stop():\n    noop\n    return\n");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    var generator = Generator.init(try parser.parse(&arena));
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try generator.generate(&output.writer);
@@ -253,7 +278,10 @@ test "generateStatement: returns zero from main" {
     var lexer = @import("lexer.zig").Lexer.init("fn main(): return");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    var generator = Generator.init(try parser.parse(&arena));
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try generator.generate(&output.writer);
@@ -267,10 +295,47 @@ test "generateExpression: converts separators and octal" {
     var lexer = @import("lexer.zig").Lexer.init("fn mode() u16: return 0o7_5_5\nfn big() u32: return 1_000");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    var generator = Generator.init(try parser.parse(&arena));
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("#include <stdint.h>\n\nstatic uint16_t mode() {\n    return 07'5'5;\n}\n\nstatic uint32_t big() {\n    return 1'000;\n}\n", output.written());
+    try std.testing.expectEqualStrings("#include <stdint.h>\n\nstatic uint16_t mode() {\n    return 07'5'5u;\n}\n\nstatic uint32_t big() {\n    return 1'000u;\n}\n", output.written());
+}
+
+test "generateExpression: marks unsigned literals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn mask() u8: return 0xff\nfn big() u64: return 18446744073709551615");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try generator.generate(&output.writer);
+
+    try std.testing.expectEqualStrings("#include <stdint.h>\n\nstatic uint8_t mask() {\n    return 0xffu;\n}\n\nstatic uint64_t big() {\n    return 18446744073709551615u;\n}\n", output.written());
+}
+
+test "generateExpression: leaves signed literals unmarked" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn big() i64: return 9223372036854775807");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try generator.generate(&output.writer);
+
+    try std.testing.expectEqualStrings("#include <stdint.h>\n\nstatic int64_t big() {\n    return 9223372036854775807;\n}\n", output.written());
 }

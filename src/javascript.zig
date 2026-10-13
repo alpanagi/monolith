@@ -1,15 +1,17 @@
 const std = @import("std");
 const ast = @import("ast.zig");
+const token = @import("token.zig");
 
 pub const Generator = struct {
     module: ast.Module,
     depth: usize = 0,
+    failure: ?token.Location = null,
 
     pub fn init(module: ast.Module) Generator {
         return .{ .module = module };
     }
 
-    pub fn generate(self: *Generator, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    pub fn generate(self: *Generator, writer: *std.Io.Writer) GenerateError!void {
         for (self.module.functions, 0..) |function, index| {
             if (index > 0) try writer.writeByte('\n');
             try self.generateFunction(writer, function);
@@ -20,7 +22,13 @@ pub const Generator = struct {
         self: *Generator,
         writer: *std.Io.Writer,
         function: ast.Function,
-    ) std.Io.Writer.Error!void {
+    ) GenerateError!void {
+        const return_type = function.return_type;
+        switch (return_type.primitive_type) {
+            .i64, .u64 => return self.fail(return_type.location, error.UnsupportedType),
+            else => {},
+        }
+
         try writer.writeAll("function ");
         try self.generateIdentifier(writer, function.name);
         try writer.writeAll("() ");
@@ -101,7 +109,18 @@ pub const Generator = struct {
             .boolean => |value| try writer.writeAll(if (value) "true" else "false"),
         }
     }
+
+    fn fail(
+        self: *Generator,
+        location: token.Location,
+        generate_error: GenerateError,
+    ) GenerateError {
+        self.failure = location;
+        return generate_error;
+    }
 };
+
+pub const GenerateError = std.Io.Writer.Error || error{UnsupportedType};
 
 test "Generator.generate: separates functions with a blank line" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -109,7 +128,10 @@ test "Generator.generate: separates functions with a blank line" {
     var lexer = @import("lexer.zig").Lexer.init("fn one(): noop\nfn two():\n    noop\n");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    var generator = Generator.init(try parser.parse(&arena));
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try generator.generate(&output.writer);
@@ -123,12 +145,49 @@ test "generateFunction: generates an empty function" {
     var lexer = @import("lexer.zig").Lexer.init("fn main(): noop");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    var generator = Generator.init(try parser.parse(&arena));
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try generator.generate(&output.writer);
 
     try std.testing.expectEqualStrings("function main() {}\n", output.written());
+}
+
+test "generateFunction: rejects i64" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn big() i64: return 1");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectError(error.UnsupportedType, generator.generate(&output.writer));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 10 }, generator.failure.?);
+}
+
+test "generateFunction: rejects u64" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn big() u64: return 1");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectError(error.UnsupportedType, generator.generate(&output.writer));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 10 }, generator.failure.?);
 }
 
 test "generateIdentifier: appends an underscore to reserved words" {
@@ -137,7 +196,10 @@ test "generateIdentifier: appends an underscore to reserved words" {
     var lexer = @import("lexer.zig").Lexer.init("fn delete(): noop");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    var generator = Generator.init(try parser.parse(&arena));
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try generator.generate(&output.writer);
@@ -151,7 +213,10 @@ test "generateBlock: writes statements on separate lines" {
     var lexer = @import("lexer.zig").Lexer.init("fn answer() i32:\n    noop\n    return 42\n");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    var generator = Generator.init(try parser.parse(&arena));
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try generator.generate(&output.writer);
@@ -165,7 +230,10 @@ test "generateStatement: writes return without a value" {
     var lexer = @import("lexer.zig").Lexer.init("fn stop(): return");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    var generator = Generator.init(try parser.parse(&arena));
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try generator.generate(&output.writer);
@@ -179,7 +247,10 @@ test "generateExpression: keeps the base and drops the suffix" {
     var lexer = @import("lexer.zig").Lexer.init("fn mask() u32: return 0xff_FF_u32");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    var generator = Generator.init(try parser.parse(&arena));
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try generator.generate(&output.writer);
@@ -193,7 +264,10 @@ test "generateExpression: writes booleans" {
     var lexer = @import("lexer.zig").Lexer.init("fn ready() bool: return false");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    var generator = Generator.init(try parser.parse(&arena));
+    const module = try parser.parse(&arena);
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try generator.generate(&output.writer);
