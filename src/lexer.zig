@@ -11,11 +11,9 @@ pub const Lexer = struct {
         return .{ .source = source };
     }
 
-    pub fn deinit(self: *Lexer, allocator: std.mem.Allocator) void {
-        self.tokens.deinit(allocator);
-    }
+    pub fn lex(self: *Lexer, arena: *std.heap.ArenaAllocator) LexError!void {
+        const allocator = arena.allocator();
 
-    pub fn lex(self: *Lexer, allocator: std.mem.Allocator) LexError!void {
         if (self.peek(0) == ' ') return error.UnexpectedCharacter;
         try self.tokens.append(allocator, .{
             .kind = token.TokenKind{ .indent = 0 },
@@ -136,9 +134,10 @@ fn lexSymbols(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
 }
 
 test "Lexer.lex: lexes a function signature" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var lexer = Lexer.init("fn main(): noop");
-    defer lexer.deinit(std.testing.allocator);
-    try lexer.lex(std.testing.allocator);
+    try lexer.lex(&arena);
 
     try std.testing.expectEqual(8, lexer.tokens.items.len);
     try std.testing.expect(lexer.tokens.items[0].kind == .indent);
@@ -152,9 +151,10 @@ test "Lexer.lex: lexes a function signature" {
 }
 
 test "Lexer.lex: emits indentation and eof for empty source" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var lexer = Lexer.init("");
-    defer lexer.deinit(std.testing.allocator);
-    try lexer.lex(std.testing.allocator);
+    try lexer.lex(&arena);
 
     try std.testing.expectEqual(2, lexer.tokens.items.len);
     try std.testing.expect(lexer.tokens.items[0].kind == .indent);
@@ -163,17 +163,19 @@ test "Lexer.lex: emits indentation and eof for empty source" {
 }
 
 test "Lexer.lex: rejects indentation on the first line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var lexer = Lexer.init("  noop");
-    defer lexer.deinit(std.testing.allocator);
 
-    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(std.testing.allocator));
+    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
     try std.testing.expectEqual(0, lexer.offset);
 }
 
 test "Lexer.lex: tracks row and column of each token" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var lexer = Lexer.init("fn main():\n  noop\n");
-    defer lexer.deinit(std.testing.allocator);
-    try lexer.lex(std.testing.allocator);
+    try lexer.lex(&arena);
 
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, lexer.tokens.items[1].location);
     try std.testing.expect(lexer.tokens.items[1].kind == .keyword_fn);
@@ -186,36 +188,40 @@ test "Lexer.lex: tracks row and column of each token" {
 }
 
 test "Lexer.lex: rejects tab characters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var lexer = Lexer.init("fn main():\n\tnoop\n");
-    defer lexer.deinit(std.testing.allocator);
 
-    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(std.testing.allocator));
+    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
     try std.testing.expectEqual(11, lexer.offset);
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, lexer.location);
 }
 
 test "Lexer.lex: rejects lone carriage return" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var lexer = Lexer.init("\r");
-    defer lexer.deinit(std.testing.allocator);
 
-    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(std.testing.allocator));
+    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
     try std.testing.expectEqual(0, lexer.offset);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, lexer.location);
 }
 
 test "Lexer.lex: tracks position on unexpected character" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var lexer = Lexer.init("fn main():\r\n  @");
-    defer lexer.deinit(std.testing.allocator);
 
-    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(std.testing.allocator));
+    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
     try std.testing.expectEqual(14, lexer.offset);
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 3 }, lexer.location);
 }
 
 test "lexIndentation: recognizes indented noop body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var lexer = Lexer.init("fn main():\n    noop\n");
-    defer lexer.deinit(std.testing.allocator);
-    try lexer.lex(std.testing.allocator);
+    try lexer.lex(&arena);
 
     try std.testing.expectEqual(10, lexer.tokens.items.len);
     try std.testing.expect(lexer.tokens.items[1].kind == .keyword_fn);
@@ -230,9 +236,10 @@ test "lexIndentation: recognizes indented noop body" {
 }
 
 test "lexIndentation: handles carriage return line feed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var lexer = Lexer.init("fn main():\r\n  noop\r\n");
-    defer lexer.deinit(std.testing.allocator);
-    try lexer.lex(std.testing.allocator);
+    try lexer.lex(&arena);
 
     try std.testing.expectEqual(10, lexer.tokens.items.len);
     try std.testing.expect(lexer.tokens.items[1].kind == .keyword_fn);
@@ -248,9 +255,10 @@ test "lexIndentation: handles carriage return line feed" {
 }
 
 test "lexIndentation: recognizes blank line indentation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var lexer = Lexer.init("noop\n\nnoop");
-    defer lexer.deinit(std.testing.allocator);
-    try lexer.lex(std.testing.allocator);
+    try lexer.lex(&arena);
 
     try std.testing.expectEqual(6, lexer.tokens.items.len);
     try std.testing.expect(lexer.tokens.items[1].kind == .keyword_noop);
@@ -266,9 +274,10 @@ test "lexIndentation: recognizes blank line indentation" {
 }
 
 test "lexIndentation: preserves leading spaces per line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var lexer = Lexer.init("fn main():\n    noop\n  noop\n");
-    defer lexer.deinit(std.testing.allocator);
-    try lexer.lex(std.testing.allocator);
+    try lexer.lex(&arena);
 
     try std.testing.expectEqual(12, lexer.tokens.items.len);
     try std.testing.expect(lexer.tokens.items[6].kind == .indent);
@@ -279,9 +288,10 @@ test "lexIndentation: preserves leading spaces per line" {
 }
 
 test "lexIndentation: handles pure indentation stream" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var lexer = Lexer.init("\n    \n  \n");
-    defer lexer.deinit(std.testing.allocator);
-    try lexer.lex(std.testing.allocator);
+    try lexer.lex(&arena);
 
     try std.testing.expectEqual(5, lexer.tokens.items.len);
     try std.testing.expect(lexer.tokens.items[0].kind == .indent);
@@ -291,9 +301,10 @@ test "lexIndentation: handles pure indentation stream" {
 }
 
 test "lexWord: distinguishes keyword from identifier" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var lexer = Lexer.init("fn noop fnx noop2 _fn noop_name");
-    defer lexer.deinit(std.testing.allocator);
-    try lexer.lex(std.testing.allocator);
+    try lexer.lex(&arena);
 
     try std.testing.expectEqual(8, lexer.tokens.items.len);
     try std.testing.expect(lexer.tokens.items[1].kind == .keyword_fn);
@@ -310,17 +321,19 @@ test "lexWord: distinguishes keyword from identifier" {
 }
 
 test "lexWord: rejects leading digit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var lexer = Lexer.init("2fast");
-    defer lexer.deinit(std.testing.allocator);
 
-    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(std.testing.allocator));
+    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
     try std.testing.expectEqual(0, lexer.offset);
 }
 
 test "lexSymbols: lexes adjacent symbols" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var lexer = Lexer.init(":(");
-    defer lexer.deinit(std.testing.allocator);
-    try lexer.lex(std.testing.allocator);
+    try lexer.lex(&arena);
 
     try std.testing.expectEqual(4, lexer.tokens.items.len);
     try std.testing.expect(lexer.tokens.items[1].kind == .colon);
