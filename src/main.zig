@@ -1,4 +1,5 @@
 const std = @import("std");
+const c = @import("c.zig");
 const javascript = @import("javascript.zig");
 const token = @import("token.zig");
 
@@ -15,12 +16,10 @@ pub fn main(init: std.process.Init) !u8 {
     const stderr = &stderr_writer.interface;
 
     const arguments = try init.minimal.args.toSlice(allocator);
-    if (arguments.len != 2 or !std.mem.endsWith(u8, arguments[1], ".mn")) {
-        try stderr.writeAll("usage: monolith <file.mn>\n");
-        try stderr.flush();
-        return 1;
-    }
-    const path = arguments[1];
+    if (arguments.len != 4 or !std.mem.eql(u8, arguments[1], "--target")) return printUsage(stderr);
+    const target = std.meta.stringToEnum(Target, arguments[2]) orelse return printUsage(stderr);
+    const path = arguments[3];
+    if (!std.mem.endsWith(u8, path, ".mn")) return printUsage(stderr);
 
     const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch |read_error| {
         try stderr.print("error: cannot read '{s}': {t}\n", .{ path, read_error });
@@ -46,19 +45,43 @@ pub fn main(init: std.process.Init) !u8 {
         },
     };
 
-    const output_name = try std.fmt.allocPrint(allocator, "{s}.js", .{std.fs.path.stem(path)});
-    const build_directory = try std.Io.Dir.cwd().createDirPathOpen(io, "build", .{});
-    defer build_directory.close(io);
-    const output = try build_directory.createFile(io, output_name, .{});
+    const extension = switch (target) {
+        .javascript => "js",
+        .c => "c",
+    };
+    const output_name = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ std.fs.path.stem(path), extension });
+    const directory_path = try std.fs.path.join(allocator, &.{ "build", @tagName(target) });
+    const directory = try std.Io.Dir.cwd().createDirPathOpen(io, directory_path, .{});
+    defer directory.close(io);
+    const output = try directory.createFile(io, output_name, .{});
     defer output.close(io);
 
     var output_buffer: [4096]u8 = undefined;
     var output_writer = output.writer(io, &output_buffer);
-    var generator = javascript.Generator.init(module);
-    try generator.generate(&output_writer.interface);
+    switch (target) {
+        .javascript => {
+            var generator = javascript.Generator.init(module);
+            try generator.generate(&output_writer.interface);
+        },
+        .c => {
+            var generator = c.Generator.init(module);
+            try generator.generate(&output_writer.interface);
+        },
+    }
     try output_writer.interface.flush();
     return 0;
 }
+
+fn printUsage(stderr: *std.Io.Writer) std.Io.Writer.Error!u8 {
+    try stderr.writeAll("usage: monolith --target <javascript|c> <file.mn>\n");
+    try stderr.flush();
+    return 1;
+}
+
+const Target = enum {
+    javascript,
+    c,
+};
 
 fn report(
     stderr: *std.Io.Writer,
@@ -88,4 +111,5 @@ test {
     _ = @import("lexer.zig");
     _ = @import("parser.zig");
     _ = @import("javascript.zig");
+    _ = @import("c.zig");
 }
