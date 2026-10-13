@@ -37,6 +37,7 @@ pub const PrimitiveType = enum {
     f32,
     f64,
     bool,
+    void,
 };
 
 pub const Location = struct {

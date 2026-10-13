@@ -6,7 +6,13 @@ pub const Module = struct {
 
 pub const Function = struct {
     name: []const u8,
+    return_type: Type,
     body: []const Statement,
+    location: token.Location,
+};
+
+pub const Type = struct {
+    primitive_type: token.PrimitiveType,
     location: token.Location,
 };
 
@@ -17,4 +23,16 @@ pub const Statement = struct {
 
 pub const StatementKind = union(enum) {
     noop,
+    @"return": ?Expression,
+};
+
+pub const Expression = struct {
+    kind: ExpressionKind,
+    location: token.Location,
+};
+
+pub const ExpressionKind = union(enum) {
+    integer: token.NumberLiteral,
+    float: token.NumberLiteral,
+    boolean: bool,
 };

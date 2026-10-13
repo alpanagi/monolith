@@ -140,7 +140,11 @@ fn lexNumber(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
     var position = state.offset;
     var base: u8 = 10;
     if (state.source[position] == '0') {
-        base = switch (state.peek(position + 1) orelse ' ') {
+        const next = state.peek(position + 1);
+        if (isDigit(next, 10) or next == '_') {
+            return state.fail(position + 1, error.UnexpectedCharacter);
+        }
+        base = switch (next orelse ' ') {
             'x' => 16,
             'o' => 8,
             'b' => 2,
@@ -235,8 +239,9 @@ fn consumeSuffix(state: *Lexer, offset: *usize, is_float: bool) LexError!?token.
 
     const name = state.source[offset.*..][0..length];
     const suffix = std.meta.stringToEnum(token.PrimitiveType, name);
+    const is_number_type = suffix != null and suffix != .bool and suffix != .void;
     const is_float_type = suffix == .f32 or suffix == .f64;
-    const valid = suffix != null and suffix != .bool and (!is_float or is_float_type);
+    const valid = is_number_type and (!is_float or is_float_type);
     if (!valid) return state.fail(offset.*, error.UnexpectedCharacter);
     offset.* += length;
     return suffix;
@@ -452,17 +457,15 @@ test "lexNumber: lexes an integer literal" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 10 }, lexer.tokens.items[3].location);
 }
 
-test "lexNumber: keeps leading zeros and separators" {
+test "lexNumber: keeps separators" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("007 1_000_000");
+    var lexer = Lexer.init("1_000_000");
     try lexer.lex(&arena);
 
-    try std.testing.expectEqual(4, lexer.tokens.items.len);
+    try std.testing.expectEqual(3, lexer.tokens.items.len);
     try std.testing.expect(lexer.tokens.items[1].kind == .integer);
-    try std.testing.expectEqualStrings("007", lexer.tokens.items[1].kind.integer.text);
-    try std.testing.expect(lexer.tokens.items[2].kind == .integer);
-    try std.testing.expectEqualStrings("1_000_000", lexer.tokens.items[2].kind.integer.text);
+    try std.testing.expectEqualStrings("1_000_000", lexer.tokens.items[1].kind.integer.text);
 }
 
 test "lexNumber: lexes base prefixes" {
@@ -483,10 +486,10 @@ test "lexNumber: lexes base prefixes" {
 test "lexNumber: lexes float literals" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("5. 5.0 1e10 2.5e-3 3E+2");
+    var lexer = Lexer.init("5. 5.0 1e10 2.5e-3 3E+2 0.5");
     try lexer.lex(&arena);
 
-    try std.testing.expectEqual(7, lexer.tokens.items.len);
+    try std.testing.expectEqual(8, lexer.tokens.items.len);
     try std.testing.expect(lexer.tokens.items[1].kind == .float);
     try std.testing.expectEqualStrings("5.", lexer.tokens.items[1].kind.float.text);
     try std.testing.expect(lexer.tokens.items[2].kind == .float);
@@ -497,6 +500,8 @@ test "lexNumber: lexes float literals" {
     try std.testing.expectEqualStrings("2.5e-3", lexer.tokens.items[4].kind.float.text);
     try std.testing.expect(lexer.tokens.items[5].kind == .float);
     try std.testing.expectEqualStrings("3E+2", lexer.tokens.items[5].kind.float.text);
+    try std.testing.expect(lexer.tokens.items[6].kind == .float);
+    try std.testing.expectEqualStrings("0.5", lexer.tokens.items[6].kind.float.text);
 }
 
 test "lexNumber: lexes type suffixes" {
@@ -520,6 +525,35 @@ test "lexNumber: does not read a point followed by a letter as a float" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = Lexer.init("5.a");
+
+    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.failure.?);
+}
+
+test "lexNumber: accepts a zero on its own" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("0");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(3, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[1].kind == .integer);
+    try std.testing.expectEqualStrings("0", lexer.tokens.items[1].kind.integer.text);
+}
+
+test "lexNumber: rejects leading zero" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("007");
+
+    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.failure.?);
+}
+
+test "lexNumber: rejects separator after leading zero" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("0_1");
 
     try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.failure.?);
@@ -592,6 +626,15 @@ test "lexNumber: rejects bool suffix" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = Lexer.init("5bool");
+
+    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.failure.?);
+}
+
+test "lexNumber: rejects void suffix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("5void");
 
     try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.failure.?);

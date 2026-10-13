@@ -102,6 +102,7 @@ fn describeParseError(parse_error: ParseError) []const u8 {
         error.ExpectedRightParenthesis => "expected ')'",
         error.ExpectedColon => "expected ':'",
         error.ExpectedStatement => "expected a statement",
+        error.ExpectedExpression => "expected an expression",
         error.ExpectedBlock => "expected an indented block",
         error.UnexpectedIndentation => "unexpected indentation",
     };
