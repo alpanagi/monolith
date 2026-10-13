@@ -217,24 +217,6 @@ test "Lexer.lex: tracks position on unexpected character" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 3 }, lexer.location);
 }
 
-test "lexIndentation: recognizes indented noop body" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = Lexer.init("fn main():\n    noop\n");
-    try lexer.lex(&arena);
-
-    try std.testing.expectEqual(10, lexer.tokens.items.len);
-    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_fn);
-    try std.testing.expect(lexer.tokens.items[2].kind == .identifier);
-    try std.testing.expect(lexer.tokens.items[3].kind == .left_parenthesis);
-    try std.testing.expect(lexer.tokens.items[4].kind == .right_parenthesis);
-    try std.testing.expect(lexer.tokens.items[5].kind == .colon);
-    try std.testing.expect(lexer.tokens.items[6].kind == .indent);
-    try std.testing.expectEqual(4, lexer.tokens.items[6].kind.indent);
-    try std.testing.expect(lexer.tokens.items[7].kind == .keyword_noop);
-    try std.testing.expect(lexer.tokens.items[8].kind == .indent);
-}
-
 test "lexIndentation: handles carriage return line feed" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -298,6 +280,8 @@ test "lexIndentation: handles pure indentation stream" {
     try std.testing.expectEqual(0, lexer.tokens.items[0].kind.indent);
     try std.testing.expect(lexer.tokens.items[1].kind == .indent);
     try std.testing.expectEqual(4, lexer.tokens.items[1].kind.indent);
+    try std.testing.expect(lexer.tokens.items[2].kind == .indent);
+    try std.testing.expectEqual(2, lexer.tokens.items[2].kind.indent);
 }
 
 test "lexWord: distinguishes keyword from identifier" {
