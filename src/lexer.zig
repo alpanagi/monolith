@@ -7,6 +7,14 @@ pub const Lexer = struct {
     tokens: std.ArrayList(token.Token) = .empty,
     location: token.Location = .{ .row = 1, .column = 1 },
 
+    pub fn init(source: []const u8) Lexer {
+        return .{ .source = source };
+    }
+
+    pub fn deinit(self: *Lexer, allocator: std.mem.Allocator) void {
+        self.tokens.deinit(allocator);
+    }
+
     pub fn lex(self: *Lexer, allocator: std.mem.Allocator) LexError!void {
         if (self.peek(0) == ' ') return error.UnexpectedCharacter;
         try self.tokens.append(allocator, .{
@@ -128,8 +136,8 @@ fn lexSymbols(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
 }
 
 test "Lexer.lex: lexes a function signature" {
-    var lexer: Lexer = .{ .source = "fn main(): noop" };
-    defer lexer.tokens.deinit(std.testing.allocator);
+    var lexer = Lexer.init("fn main(): noop");
+    defer lexer.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
     try std.testing.expectEqual(8, lexer.tokens.items.len);
@@ -144,8 +152,8 @@ test "Lexer.lex: lexes a function signature" {
 }
 
 test "Lexer.lex: emits indentation and eof for empty source" {
-    var lexer: Lexer = .{ .source = "" };
-    defer lexer.tokens.deinit(std.testing.allocator);
+    var lexer = Lexer.init("");
+    defer lexer.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
     try std.testing.expectEqual(2, lexer.tokens.items.len);
@@ -155,16 +163,16 @@ test "Lexer.lex: emits indentation and eof for empty source" {
 }
 
 test "Lexer.lex: rejects indentation on the first line" {
-    var lexer: Lexer = .{ .source = "  noop" };
-    defer lexer.tokens.deinit(std.testing.allocator);
+    var lexer = Lexer.init("  noop");
+    defer lexer.deinit(std.testing.allocator);
 
     try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(std.testing.allocator));
     try std.testing.expectEqual(0, lexer.offset);
 }
 
 test "Lexer.lex: tracks row and column of each token" {
-    var lexer: Lexer = .{ .source = "fn main():\n  noop\n" };
-    defer lexer.tokens.deinit(std.testing.allocator);
+    var lexer = Lexer.init("fn main():\n  noop\n");
+    defer lexer.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, lexer.tokens.items[1].location);
@@ -178,8 +186,8 @@ test "Lexer.lex: tracks row and column of each token" {
 }
 
 test "Lexer.lex: rejects tab characters" {
-    var lexer: Lexer = .{ .source = "fn main():\n\tnoop\n" };
-    defer lexer.tokens.deinit(std.testing.allocator);
+    var lexer = Lexer.init("fn main():\n\tnoop\n");
+    defer lexer.deinit(std.testing.allocator);
 
     try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(std.testing.allocator));
     try std.testing.expectEqual(11, lexer.offset);
@@ -187,8 +195,8 @@ test "Lexer.lex: rejects tab characters" {
 }
 
 test "Lexer.lex: rejects lone carriage return" {
-    var lexer: Lexer = .{ .source = "\r" };
-    defer lexer.tokens.deinit(std.testing.allocator);
+    var lexer = Lexer.init("\r");
+    defer lexer.deinit(std.testing.allocator);
 
     try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(std.testing.allocator));
     try std.testing.expectEqual(0, lexer.offset);
@@ -196,8 +204,8 @@ test "Lexer.lex: rejects lone carriage return" {
 }
 
 test "Lexer.lex: tracks position on unexpected character" {
-    var lexer: Lexer = .{ .source = "fn main():\r\n  @" };
-    defer lexer.tokens.deinit(std.testing.allocator);
+    var lexer = Lexer.init("fn main():\r\n  @");
+    defer lexer.deinit(std.testing.allocator);
 
     try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(std.testing.allocator));
     try std.testing.expectEqual(14, lexer.offset);
@@ -205,8 +213,8 @@ test "Lexer.lex: tracks position on unexpected character" {
 }
 
 test "lexIndentation: recognizes indented noop body" {
-    var lexer: Lexer = .{ .source = "fn main():\n    noop\n" };
-    defer lexer.tokens.deinit(std.testing.allocator);
+    var lexer = Lexer.init("fn main():\n    noop\n");
+    defer lexer.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
     try std.testing.expectEqual(10, lexer.tokens.items.len);
@@ -222,8 +230,8 @@ test "lexIndentation: recognizes indented noop body" {
 }
 
 test "lexIndentation: handles carriage return line feed" {
-    var lexer: Lexer = .{ .source = "fn main():\r\n  noop\r\n" };
-    defer lexer.tokens.deinit(std.testing.allocator);
+    var lexer = Lexer.init("fn main():\r\n  noop\r\n");
+    defer lexer.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
     try std.testing.expectEqual(10, lexer.tokens.items.len);
@@ -240,8 +248,8 @@ test "lexIndentation: handles carriage return line feed" {
 }
 
 test "lexIndentation: recognizes blank line indentation" {
-    var lexer: Lexer = .{ .source = "noop\n\nnoop" };
-    defer lexer.tokens.deinit(std.testing.allocator);
+    var lexer = Lexer.init("noop\n\nnoop");
+    defer lexer.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
     try std.testing.expectEqual(6, lexer.tokens.items.len);
@@ -258,8 +266,8 @@ test "lexIndentation: recognizes blank line indentation" {
 }
 
 test "lexIndentation: preserves leading spaces per line" {
-    var lexer: Lexer = .{ .source = "fn main():\n    noop\n  noop\n" };
-    defer lexer.tokens.deinit(std.testing.allocator);
+    var lexer = Lexer.init("fn main():\n    noop\n  noop\n");
+    defer lexer.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
     try std.testing.expectEqual(12, lexer.tokens.items.len);
@@ -271,8 +279,8 @@ test "lexIndentation: preserves leading spaces per line" {
 }
 
 test "lexIndentation: handles pure indentation stream" {
-    var lexer: Lexer = .{ .source = "\n    \n  \n" };
-    defer lexer.tokens.deinit(std.testing.allocator);
+    var lexer = Lexer.init("\n    \n  \n");
+    defer lexer.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
     try std.testing.expectEqual(5, lexer.tokens.items.len);
@@ -283,8 +291,8 @@ test "lexIndentation: handles pure indentation stream" {
 }
 
 test "lexWord: distinguishes keyword from identifier" {
-    var lexer: Lexer = .{ .source = "fn noop fnx noop2 _fn noop_name" };
-    defer lexer.tokens.deinit(std.testing.allocator);
+    var lexer = Lexer.init("fn noop fnx noop2 _fn noop_name");
+    defer lexer.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
     try std.testing.expectEqual(8, lexer.tokens.items.len);
@@ -302,16 +310,16 @@ test "lexWord: distinguishes keyword from identifier" {
 }
 
 test "lexWord: rejects leading digit" {
-    var lexer: Lexer = .{ .source = "2fast" };
-    defer lexer.tokens.deinit(std.testing.allocator);
+    var lexer = Lexer.init("2fast");
+    defer lexer.deinit(std.testing.allocator);
 
     try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(std.testing.allocator));
     try std.testing.expectEqual(0, lexer.offset);
 }
 
 test "lexSymbols: lexes adjacent symbols" {
-    var lexer: Lexer = .{ .source = ":(" };
-    defer lexer.tokens.deinit(std.testing.allocator);
+    var lexer = Lexer.init(":(");
+    defer lexer.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
     try std.testing.expectEqual(4, lexer.tokens.items.len);
