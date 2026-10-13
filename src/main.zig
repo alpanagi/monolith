@@ -31,7 +31,7 @@ pub fn main(init: std.process.Init) !u8 {
     lexer.lex(init.arena) catch |lex_error| switch (lex_error) {
         error.OutOfMemory => return error.OutOfMemory,
         error.UnexpectedCharacter => {
-            try report(stderr, path, lexer.location, "unexpected character");
+            try report(stderr, path, lexer.failure.?, "unexpected character");
             return 1;
         },
     };

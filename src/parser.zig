@@ -16,113 +16,136 @@ pub const Parser = struct {
         const allocator = arena.allocator();
 
         while (true) {
-            self.skipBlankLines();
+            self.skipBlankLines(&self.offset);
             if (self.tokens[self.offset].kind == .eof) break;
-            if (try self.parseTopLevelFunction(allocator)) continue;
-            return self.fail(error.UnexpectedToken);
+            if (try self.parseTopLevelFunction(allocator, &self.offset)) continue;
+            return self.fail(self.offset, error.UnexpectedToken);
         }
 
         return .{ .functions = self.functions.items };
     }
 
-    fn skipBlankLines(self: *Parser) void {
-        while (self.tokens[self.offset].kind == .indent) {
-            switch (self.tokens[self.offset + 1].kind) {
-                .indent, .eof => self.offset += 1,
+    fn skipBlankLines(self: *Parser, offset: *usize) void {
+        while (self.tokens[offset.*].kind == .indent) {
+            switch (self.tokens[offset.* + 1].kind) {
+                .indent, .eof => offset.* += 1,
                 else => return,
             }
         }
     }
 
-    fn parseTopLevelFunction(self: *Parser, allocator: std.mem.Allocator) ParseError!bool {
-        const start = self.offset;
-        const indentation = self.match(.indent) orelse return false;
-        if (indentation.kind.indent == 0) {
-            if (try self.parseFunction(allocator)) |function| {
-                try self.functions.append(allocator, function);
-                return true;
-            }
-        }
-        self.offset = start;
-        return false;
+    fn parseTopLevelFunction(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!bool {
+        var position = offset.*;
+        const indentation = self.match(&position, .indent) orelse return false;
+        if (indentation.kind.indent != 0) return false;
+        const function = (try self.parseFunction(allocator, &position)) orelse return false;
+        try self.functions.append(allocator, function);
+        offset.* = position;
+        return true;
     }
 
-    fn parseFunction(self: *Parser, allocator: std.mem.Allocator) ParseError!?ast.Function {
-        const keyword = self.match(.keyword_fn) orelse return null;
-        const name = try self.expect(.identifier, error.ExpectedIdentifier);
-        _ = try self.expect(.left_parenthesis, error.ExpectedLeftParenthesis);
-        _ = try self.expect(.right_parenthesis, error.ExpectedRightParenthesis);
-        _ = try self.expect(.colon, error.ExpectedColon);
+    fn parseFunction(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.Function {
+        var position = offset.*;
+        const keyword = self.match(&position, .keyword_fn) orelse return null;
+        const name = try self.expect(&position, .identifier, error.ExpectedIdentifier);
+        _ = try self.expect(&position, .left_parenthesis, error.ExpectedLeftParenthesis);
+        _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
+        _ = try self.expect(&position, .colon, error.ExpectedColon);
+        const body = try self.parseBlock(allocator, &position);
 
+        offset.* = position;
         return .{
             .name = name.kind.identifier,
-            .body = try self.parseBlock(allocator),
+            .body = body,
             .location = keyword.location,
         };
     }
 
-    fn parseBlock(self: *Parser, allocator: std.mem.Allocator) ParseError![]const ast.Statement {
-        if (self.tokens[self.offset].kind == .indent) return self.parseIndentedBlock(allocator);
-        return self.parseInlineBlock(allocator);
+    fn parseBlock(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError![]const ast.Statement {
+        if (self.tokens[offset.*].kind == .indent) {
+            return self.parseIndentedBlock(allocator, offset);
+        }
+        return self.parseInlineBlock(allocator, offset);
     }
 
     fn parseIndentedBlock(
         self: *Parser,
         allocator: std.mem.Allocator,
+        offset: *usize,
     ) ParseError![]const ast.Statement {
-        self.skipBlankLines();
-        const first = self.tokens[self.offset];
-        if (first.kind != .indent or first.kind.indent == 0) return self.fail(error.ExpectedBlock);
+        var position = offset.*;
+        self.skipBlankLines(&position);
+        const first = self.tokens[position];
+        if (first.kind != .indent or first.kind.indent == 0) {
+            return self.fail(position, error.ExpectedBlock);
+        }
         const depth = first.kind.indent;
 
         var statements: std.ArrayList(ast.Statement) = .empty;
         while (true) {
-            self.skipBlankLines();
-            const current = self.tokens[self.offset];
+            self.skipBlankLines(&position);
+            const current = self.tokens[position];
             if (current.kind != .indent or current.kind.indent < depth) break;
-            if (current.kind.indent > depth) return self.fail(error.UnexpectedIndentation);
-            self.offset += 1;
-            const statement = self.parseStatement() orelse {
-                return self.fail(error.ExpectedStatement);
+            if (current.kind.indent > depth) {
+                return self.fail(position, error.UnexpectedIndentation);
+            }
+            position += 1;
+            const statement = self.parseStatement(&position) orelse {
+                return self.fail(position, error.ExpectedStatement);
             };
             try statements.append(allocator, statement);
         }
 
+        offset.* = position;
         return statements.items;
     }
 
     fn parseInlineBlock(
         self: *Parser,
         allocator: std.mem.Allocator,
+        offset: *usize,
     ) ParseError![]const ast.Statement {
-        const statement = self.parseStatement() orelse {
-            return self.fail(error.ExpectedStatement);
+        const statement = self.parseStatement(offset) orelse {
+            return self.fail(offset.*, error.ExpectedStatement);
         };
         return allocator.dupe(ast.Statement, &.{statement});
     }
 
-    fn parseStatement(self: *Parser) ?ast.Statement {
-        const keyword = self.match(.keyword_noop) orelse return null;
+    fn parseStatement(self: *Parser, offset: *usize) ?ast.Statement {
+        const keyword = self.match(offset, .keyword_noop) orelse return null;
         return .{ .kind = .noop, .location = keyword.location };
     }
 
     fn expect(
         self: *Parser,
+        offset: *usize,
         tag: std.meta.Tag(token.TokenKind),
         parse_error: ParseError,
     ) ParseError!token.Token {
-        return self.match(tag) orelse self.fail(parse_error);
+        return self.match(offset, tag) orelse self.fail(offset.*, parse_error);
     }
 
-    fn match(self: *Parser, tag: std.meta.Tag(token.TokenKind)) ?token.Token {
-        const current = self.tokens[self.offset];
+    fn match(self: *Parser, offset: *usize, tag: std.meta.Tag(token.TokenKind)) ?token.Token {
+        const current = self.tokens[offset.*];
         if (std.meta.activeTag(current.kind) != tag) return null;
-        self.offset += 1;
+        offset.* += 1;
         return current;
     }
 
-    fn fail(self: *Parser, parse_error: ParseError) ParseError {
-        self.failure = self.tokens[self.offset];
+    fn fail(self: *Parser, offset: usize, parse_error: ParseError) ParseError {
+        self.failure = self.tokens[offset];
         return parse_error;
     }
 };
