@@ -241,7 +241,7 @@ fn consumeSuffix(state: *Lexer, offset: *usize, is_float: bool) LexError!?token.
     const suffix = std.meta.stringToEnum(token.PrimitiveType, name);
     const is_number_type = suffix != null and suffix != .bool and suffix != .void;
     const is_float_type = suffix == .f32 or suffix == .f64;
-    const valid = is_number_type and (!is_float or is_float_type);
+    const valid = is_number_type and is_float == is_float_type;
     if (!valid) return state.fail(offset.*, error.UnexpectedCharacter);
     offset.* += length;
     return suffix;
@@ -507,7 +507,7 @@ test "lexNumber: lexes float literals" {
 test "lexNumber: lexes type suffixes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("5u8 1_000_u32 2.5f32 1f64");
+    var lexer = Lexer.init("5u8 1_000_u32 2.5f32 1.0_f64");
     try lexer.lex(&arena);
 
     try std.testing.expectEqual(6, lexer.tokens.items.len);
@@ -517,8 +517,8 @@ test "lexNumber: lexes type suffixes" {
     try std.testing.expectEqual(.u32, lexer.tokens.items[2].kind.integer.suffix);
     try std.testing.expectEqualStrings("2.5", lexer.tokens.items[3].kind.float.text);
     try std.testing.expectEqual(.f32, lexer.tokens.items[3].kind.float.suffix);
-    try std.testing.expectEqualStrings("1", lexer.tokens.items[4].kind.integer.text);
-    try std.testing.expectEqual(.f64, lexer.tokens.items[4].kind.integer.suffix);
+    try std.testing.expectEqualStrings("1.0", lexer.tokens.items[4].kind.float.text);
+    try std.testing.expectEqual(.f64, lexer.tokens.items[4].kind.float.suffix);
 }
 
 test "lexNumber: does not read a point followed by a letter as a float" {
@@ -620,6 +620,24 @@ test "lexNumber: rejects integer suffix on float" {
 
     try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 4 }, lexer.failure.?);
+}
+
+test "lexNumber: rejects float suffix on integer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("1f64");
+
+    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.failure.?);
+}
+
+test "lexNumber: rejects float suffix on binary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("0b1_f64");
+
+    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 5 }, lexer.failure.?);
 }
 
 test "lexNumber: rejects bool suffix" {
