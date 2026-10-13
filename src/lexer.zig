@@ -8,6 +8,12 @@ pub const Lexer = struct {
     location: token.Location = .{ .row = 1, .column = 1 },
 
     pub fn lex(self: *Lexer, allocator: std.mem.Allocator) LexError!void {
+        if (self.peek(0) == ' ') return error.UnexpectedCharacter;
+        try self.tokens.append(allocator, .{
+            .kind = token.TokenKind{ .indent = 0 },
+            .location = self.location,
+        });
+
         const lexers = [_]*const fn (*Lexer, std.mem.Allocator) LexError!bool{
             lexIndentation,
             lexWhitespace,
@@ -126,23 +132,34 @@ test "Lexer.lex: lexes a function signature" {
     defer lexer.tokens.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
-    try std.testing.expectEqual(7, lexer.tokens.items.len);
-    try std.testing.expect(lexer.tokens.items[0].kind == .keyword_fn);
-    try std.testing.expect(lexer.tokens.items[1].kind == .identifier);
-    try std.testing.expect(lexer.tokens.items[2].kind == .left_parenthesis);
-    try std.testing.expect(lexer.tokens.items[3].kind == .right_parenthesis);
-    try std.testing.expect(lexer.tokens.items[4].kind == .colon);
-    try std.testing.expect(lexer.tokens.items[5].kind == .keyword_noop);
-    try std.testing.expect(lexer.tokens.items[6].kind == .eof);
+    try std.testing.expectEqual(8, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[0].kind == .indent);
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_fn);
+    try std.testing.expect(lexer.tokens.items[2].kind == .identifier);
+    try std.testing.expect(lexer.tokens.items[3].kind == .left_parenthesis);
+    try std.testing.expect(lexer.tokens.items[4].kind == .right_parenthesis);
+    try std.testing.expect(lexer.tokens.items[5].kind == .colon);
+    try std.testing.expect(lexer.tokens.items[6].kind == .keyword_noop);
+    try std.testing.expect(lexer.tokens.items[7].kind == .eof);
 }
 
-test "Lexer.lex: emits only eof for empty source" {
+test "Lexer.lex: emits indentation and eof for empty source" {
     var lexer: Lexer = .{ .source = "" };
     defer lexer.tokens.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
-    try std.testing.expectEqual(1, lexer.tokens.items.len);
-    try std.testing.expect(lexer.tokens.items[0].kind == .eof);
+    try std.testing.expectEqual(2, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[0].kind == .indent);
+    try std.testing.expectEqual(0, lexer.tokens.items[0].kind.indent);
+    try std.testing.expect(lexer.tokens.items[1].kind == .eof);
+}
+
+test "Lexer.lex: rejects indentation on the first line" {
+    var lexer: Lexer = .{ .source = "  noop" };
+    defer lexer.tokens.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(std.testing.allocator));
+    try std.testing.expectEqual(0, lexer.offset);
 }
 
 test "Lexer.lex: tracks row and column of each token" {
@@ -150,14 +167,14 @@ test "Lexer.lex: tracks row and column of each token" {
     defer lexer.tokens.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, lexer.tokens.items[0].location);
-    try std.testing.expect(lexer.tokens.items[0].kind == .keyword_fn);
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, lexer.tokens.items[5].location);
-    try std.testing.expect(lexer.tokens.items[5].kind == .indent);
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 3 }, lexer.tokens.items[6].location);
-    try std.testing.expect(lexer.tokens.items[6].kind == .keyword_noop);
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 1 }, lexer.tokens.items[7].location);
-    try std.testing.expect(lexer.tokens.items[7].kind == .indent);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, lexer.tokens.items[1].location);
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_fn);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, lexer.tokens.items[6].location);
+    try std.testing.expect(lexer.tokens.items[6].kind == .indent);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 3 }, lexer.tokens.items[7].location);
+    try std.testing.expect(lexer.tokens.items[7].kind == .keyword_noop);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 1 }, lexer.tokens.items[8].location);
+    try std.testing.expect(lexer.tokens.items[8].kind == .indent);
 }
 
 test "Lexer.lex: rejects tab characters" {
@@ -192,16 +209,16 @@ test "lexIndentation: recognizes indented noop body" {
     defer lexer.tokens.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
-    try std.testing.expectEqual(9, lexer.tokens.items.len);
-    try std.testing.expect(lexer.tokens.items[0].kind == .keyword_fn);
-    try std.testing.expect(lexer.tokens.items[1].kind == .identifier);
-    try std.testing.expect(lexer.tokens.items[2].kind == .left_parenthesis);
-    try std.testing.expect(lexer.tokens.items[3].kind == .right_parenthesis);
-    try std.testing.expect(lexer.tokens.items[4].kind == .colon);
-    try std.testing.expect(lexer.tokens.items[5].kind == .indent);
-    try std.testing.expectEqual(4, lexer.tokens.items[5].kind.indent);
-    try std.testing.expect(lexer.tokens.items[6].kind == .keyword_noop);
-    try std.testing.expect(lexer.tokens.items[7].kind == .indent);
+    try std.testing.expectEqual(10, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_fn);
+    try std.testing.expect(lexer.tokens.items[2].kind == .identifier);
+    try std.testing.expect(lexer.tokens.items[3].kind == .left_parenthesis);
+    try std.testing.expect(lexer.tokens.items[4].kind == .right_parenthesis);
+    try std.testing.expect(lexer.tokens.items[5].kind == .colon);
+    try std.testing.expect(lexer.tokens.items[6].kind == .indent);
+    try std.testing.expectEqual(4, lexer.tokens.items[6].kind.indent);
+    try std.testing.expect(lexer.tokens.items[7].kind == .keyword_noop);
+    try std.testing.expect(lexer.tokens.items[8].kind == .indent);
 }
 
 test "lexIndentation: handles carriage return line feed" {
@@ -209,17 +226,17 @@ test "lexIndentation: handles carriage return line feed" {
     defer lexer.tokens.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
-    try std.testing.expectEqual(9, lexer.tokens.items.len);
-    try std.testing.expect(lexer.tokens.items[0].kind == .keyword_fn);
-    try std.testing.expect(lexer.tokens.items[1].kind == .identifier);
-    try std.testing.expect(lexer.tokens.items[2].kind == .left_parenthesis);
-    try std.testing.expect(lexer.tokens.items[3].kind == .right_parenthesis);
-    try std.testing.expect(lexer.tokens.items[4].kind == .colon);
-    try std.testing.expect(lexer.tokens.items[5].kind == .indent);
-    try std.testing.expectEqual(2, lexer.tokens.items[5].kind.indent);
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, lexer.tokens.items[5].location);
-    try std.testing.expect(lexer.tokens.items[6].kind == .keyword_noop);
-    try std.testing.expect(lexer.tokens.items[7].kind == .indent);
+    try std.testing.expectEqual(10, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_fn);
+    try std.testing.expect(lexer.tokens.items[2].kind == .identifier);
+    try std.testing.expect(lexer.tokens.items[3].kind == .left_parenthesis);
+    try std.testing.expect(lexer.tokens.items[4].kind == .right_parenthesis);
+    try std.testing.expect(lexer.tokens.items[5].kind == .colon);
+    try std.testing.expect(lexer.tokens.items[6].kind == .indent);
+    try std.testing.expectEqual(2, lexer.tokens.items[6].kind.indent);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, lexer.tokens.items[6].location);
+    try std.testing.expect(lexer.tokens.items[7].kind == .keyword_noop);
+    try std.testing.expect(lexer.tokens.items[8].kind == .indent);
 }
 
 test "lexIndentation: recognizes blank line indentation" {
@@ -227,17 +244,17 @@ test "lexIndentation: recognizes blank line indentation" {
     defer lexer.tokens.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
-    try std.testing.expectEqual(5, lexer.tokens.items.len);
-    try std.testing.expect(lexer.tokens.items[0].kind == .keyword_noop);
-    try std.testing.expect(lexer.tokens.items[1].kind == .indent);
-    try std.testing.expectEqual(0, lexer.tokens.items[1].kind.indent);
+    try std.testing.expectEqual(6, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_noop);
     try std.testing.expect(lexer.tokens.items[2].kind == .indent);
     try std.testing.expectEqual(0, lexer.tokens.items[2].kind.indent);
-    try std.testing.expect(lexer.tokens.items[3].kind == .keyword_noop);
+    try std.testing.expect(lexer.tokens.items[3].kind == .indent);
+    try std.testing.expectEqual(0, lexer.tokens.items[3].kind.indent);
+    try std.testing.expect(lexer.tokens.items[4].kind == .keyword_noop);
 
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, lexer.tokens.items[0].location);
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, lexer.tokens.items[1].location);
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 1 }, lexer.tokens.items[2].location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, lexer.tokens.items[1].location);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, lexer.tokens.items[2].location);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 1 }, lexer.tokens.items[3].location);
 }
 
 test "lexIndentation: preserves leading spaces per line" {
@@ -245,12 +262,12 @@ test "lexIndentation: preserves leading spaces per line" {
     defer lexer.tokens.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
-    try std.testing.expectEqual(11, lexer.tokens.items.len);
-    try std.testing.expect(lexer.tokens.items[5].kind == .indent);
-    try std.testing.expectEqual(4, lexer.tokens.items[5].kind.indent);
-    try std.testing.expect(lexer.tokens.items[6].kind == .keyword_noop);
-    try std.testing.expect(lexer.tokens.items[7].kind == .indent);
-    try std.testing.expectEqual(2, lexer.tokens.items[7].kind.indent);
+    try std.testing.expectEqual(12, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[6].kind == .indent);
+    try std.testing.expectEqual(4, lexer.tokens.items[6].kind.indent);
+    try std.testing.expect(lexer.tokens.items[7].kind == .keyword_noop);
+    try std.testing.expect(lexer.tokens.items[8].kind == .indent);
+    try std.testing.expectEqual(2, lexer.tokens.items[8].kind.indent);
 }
 
 test "lexIndentation: handles pure indentation stream" {
@@ -258,7 +275,7 @@ test "lexIndentation: handles pure indentation stream" {
     defer lexer.tokens.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
-    try std.testing.expectEqual(4, lexer.tokens.items.len);
+    try std.testing.expectEqual(5, lexer.tokens.items.len);
     try std.testing.expect(lexer.tokens.items[0].kind == .indent);
     try std.testing.expectEqual(0, lexer.tokens.items[0].kind.indent);
     try std.testing.expect(lexer.tokens.items[1].kind == .indent);
@@ -270,18 +287,18 @@ test "lexWord: distinguishes keyword from identifier" {
     defer lexer.tokens.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
-    try std.testing.expectEqual(7, lexer.tokens.items.len);
-    try std.testing.expect(lexer.tokens.items[0].kind == .keyword_fn);
-    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_noop);
-    try std.testing.expect(lexer.tokens.items[2].kind == .identifier);
-    try std.testing.expectEqualStrings("fnx", lexer.tokens.items[2].kind.identifier);
+    try std.testing.expectEqual(8, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_fn);
+    try std.testing.expect(lexer.tokens.items[2].kind == .keyword_noop);
     try std.testing.expect(lexer.tokens.items[3].kind == .identifier);
-    try std.testing.expectEqualStrings("noop2", lexer.tokens.items[3].kind.identifier);
+    try std.testing.expectEqualStrings("fnx", lexer.tokens.items[3].kind.identifier);
     try std.testing.expect(lexer.tokens.items[4].kind == .identifier);
-    try std.testing.expectEqualStrings("_fn", lexer.tokens.items[4].kind.identifier);
+    try std.testing.expectEqualStrings("noop2", lexer.tokens.items[4].kind.identifier);
     try std.testing.expect(lexer.tokens.items[5].kind == .identifier);
-    try std.testing.expectEqualStrings("noop_name", lexer.tokens.items[5].kind.identifier);
-    try std.testing.expect(lexer.tokens.items[6].kind == .eof);
+    try std.testing.expectEqualStrings("_fn", lexer.tokens.items[5].kind.identifier);
+    try std.testing.expect(lexer.tokens.items[6].kind == .identifier);
+    try std.testing.expectEqualStrings("noop_name", lexer.tokens.items[6].kind.identifier);
+    try std.testing.expect(lexer.tokens.items[7].kind == .eof);
 }
 
 test "lexWord: rejects leading digit" {
@@ -297,7 +314,7 @@ test "lexSymbols: lexes adjacent symbols" {
     defer lexer.tokens.deinit(std.testing.allocator);
     try lexer.lex(std.testing.allocator);
 
-    try std.testing.expectEqual(3, lexer.tokens.items.len);
-    try std.testing.expect(lexer.tokens.items[0].kind == .colon);
-    try std.testing.expect(lexer.tokens.items[1].kind == .left_parenthesis);
+    try std.testing.expectEqual(4, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[1].kind == .colon);
+    try std.testing.expect(lexer.tokens.items[2].kind == .left_parenthesis);
 }
