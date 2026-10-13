@@ -23,17 +23,26 @@ pub const Generator = struct {
         writer: *std.Io.Writer,
         function: ast.Function,
     ) GenerateError!void {
-        const return_type = function.return_type;
-        switch (return_type.primitive_type) {
-            .i64, .u64 => return self.fail(return_type.location, error.UnsupportedType),
-            else => {},
-        }
+        for (function.parameters) |parameter| try self.checkSupported(parameter.parameter_type);
+        try self.checkSupported(function.return_type);
 
         try writer.writeAll("function ");
         try self.generateIdentifier(writer, function.name);
-        try writer.writeAll("() ");
+        try writer.writeByte('(');
+        for (function.parameters, 0..) |parameter, index| {
+            if (index > 0) try writer.writeAll(", ");
+            try self.generateIdentifier(writer, parameter.name);
+        }
+        try writer.writeAll(") ");
         try self.generateBlock(writer, function.body);
         try writer.writeByte('\n');
+    }
+
+    fn checkSupported(self: *Generator, written_type: ast.Type) GenerateError!void {
+        switch (written_type.primitive_type) {
+            .i64, .u64 => return self.fail(written_type.location, error.UnsupportedType),
+            else => {},
+        }
     }
 
     fn generateIdentifier(
@@ -55,7 +64,7 @@ pub const Generator = struct {
         });
 
         try writer.writeAll(name);
-        if (reserved_words.has(name)) try writer.writeByte('_');
+        if (reserved_words.has(name) or std.mem.endsWith(u8, name, "_")) try writer.writeByte('_');
     }
 
     fn generateBlock(
@@ -92,6 +101,11 @@ pub const Generator = struct {
                 }
                 try writer.writeAll(";\n");
             },
+            .discard, .expression => |expression| {
+                try self.generateIndentation(writer);
+                try self.generateExpression(writer, expression);
+                try writer.writeAll(";\n");
+            },
         }
     }
 
@@ -100,13 +114,23 @@ pub const Generator = struct {
     }
 
     fn generateExpression(
-        _: *Generator,
+        self: *Generator,
         writer: *std.Io.Writer,
         expression: ast.Expression,
     ) std.Io.Writer.Error!void {
         switch (expression.kind) {
             .integer, .float => |literal| try writer.writeAll(literal.text),
             .boolean => |value| try writer.writeAll(if (value) "true" else "false"),
+            .identifier => |identifier| try self.generateIdentifier(writer, identifier.name),
+            .call => |call| {
+                try self.generateIdentifier(writer, call.name);
+                try writer.writeByte('(');
+                for (call.arguments, 0..) |argument, index| {
+                    if (index > 0) try writer.writeAll(", ");
+                    try self.generateExpression(writer, argument);
+                }
+                try writer.writeByte(')');
+            },
         }
     }
 
@@ -129,6 +153,8 @@ test "Generator.generate: separates functions with a blank line" {
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
     var type_checker = @import("type_checker.zig").TypeChecker.init(module);
     try type_checker.check();
     var generator = Generator.init(module);
@@ -146,6 +172,8 @@ test "generateFunction: generates an empty function" {
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
     var type_checker = @import("type_checker.zig").TypeChecker.init(module);
     try type_checker.check();
     var generator = Generator.init(module);
@@ -156,6 +184,25 @@ test "generateFunction: generates an empty function" {
     try std.testing.expectEqualStrings("function main() {}\n", output.written());
 }
 
+test "generateFunction: writes parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn add(left: i32, right: i32) i32: return left");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try generator.generate(&output.writer);
+
+    try std.testing.expectEqualStrings("function add(left, right) {\n    return left;\n}\n", output.written());
+}
+
 test "generateFunction: rejects i64" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -163,6 +210,8 @@ test "generateFunction: rejects i64" {
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
     var type_checker = @import("type_checker.zig").TypeChecker.init(module);
     try type_checker.check();
     var generator = Generator.init(module);
@@ -180,6 +229,8 @@ test "generateFunction: rejects u64" {
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
     var type_checker = @import("type_checker.zig").TypeChecker.init(module);
     try type_checker.check();
     var generator = Generator.init(module);
@@ -190,6 +241,25 @@ test "generateFunction: rejects u64" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 10 }, generator.failure.?);
 }
 
+test "generateFunction: rejects an i64 parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn take(value: i64): noop");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectError(error.UnsupportedType, generator.generate(&output.writer));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, generator.failure.?);
+}
+
 test "generateIdentifier: appends an underscore to reserved words" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -197,6 +267,8 @@ test "generateIdentifier: appends an underscore to reserved words" {
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
     var type_checker = @import("type_checker.zig").TypeChecker.init(module);
     try type_checker.check();
     var generator = Generator.init(module);
@@ -207,6 +279,25 @@ test "generateIdentifier: appends an underscore to reserved words" {
     try std.testing.expectEqualStrings("function delete_() {}\n", output.written());
 }
 
+test "generateIdentifier: keeps escaped names apart" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn delete(): noop\nfn delete_(): noop");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try generator.generate(&output.writer);
+
+    try std.testing.expectEqualStrings("function delete_() {}\n\nfunction delete__() {}\n", output.written());
+}
+
 test "generateBlock: writes statements on separate lines" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -214,6 +305,8 @@ test "generateBlock: writes statements on separate lines" {
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
     var type_checker = @import("type_checker.zig").TypeChecker.init(module);
     try type_checker.check();
     var generator = Generator.init(module);
@@ -231,6 +324,8 @@ test "generateStatement: writes return without a value" {
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
     var type_checker = @import("type_checker.zig").TypeChecker.init(module);
     try type_checker.check();
     var generator = Generator.init(module);
@@ -241,6 +336,25 @@ test "generateStatement: writes return without a value" {
     try std.testing.expectEqualStrings("function stop() {\n    return;\n}\n", output.written());
 }
 
+test "generateStatement: writes calls and discards" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn log(value: i32): noop\nfn one() i32: return 1\nfn main():\n    log(one())\n    _ = one()\n");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try generator.generate(&output.writer);
+
+    try std.testing.expectEqualStrings("function log(value) {}\n\nfunction one() {\n    return 1;\n}\n\nfunction main() {\n    log(one());\n    one();\n}\n", output.written());
+}
+
 test "generateExpression: keeps the base and drops the suffix" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -248,6 +362,8 @@ test "generateExpression: keeps the base and drops the suffix" {
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
     var type_checker = @import("type_checker.zig").TypeChecker.init(module);
     try type_checker.check();
     var generator = Generator.init(module);
@@ -265,6 +381,8 @@ test "generateExpression: writes booleans" {
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
     var type_checker = @import("type_checker.zig").TypeChecker.init(module);
     try type_checker.check();
     var generator = Generator.init(module);

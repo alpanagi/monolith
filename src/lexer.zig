@@ -26,6 +26,7 @@ pub const Lexer = struct {
         const lexers = [_]*const fn (*Lexer, std.mem.Allocator) LexError!bool{
             lexIndentation,
             lexWhitespace,
+            lexTab,
             lexWord,
             lexNumber,
             lexSymbols,
@@ -58,7 +59,7 @@ pub const Lexer = struct {
     }
 };
 
-pub const LexError = error{ OutOfMemory, UnexpectedCharacter };
+pub const LexError = error{ OutOfMemory, UnexpectedCharacter, UnexpectedTab };
 
 fn lexIndentation(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
     var position = state.offset;
@@ -91,6 +92,11 @@ fn lexWhitespace(state: *Lexer, _: std.mem.Allocator) LexError!bool {
     return true;
 }
 
+fn lexTab(state: *Lexer, _: std.mem.Allocator) LexError!bool {
+    if (state.source[state.offset] != '\t') return false;
+    return state.fail(state.offset, error.UnexpectedTab);
+}
+
 fn lexWord(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
     const first = state.source[state.offset];
     if (!std.ascii.isAlphabetic(first) and first != '_') return false;
@@ -108,6 +114,7 @@ fn lexWord(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
         .{ .text = "return", .kind = .keyword_return },
         .{ .text = "true", .kind = .keyword_true },
         .{ .text = "false", .kind = .keyword_false },
+        .{ .text = "_", .kind = .underscore },
         .{ .text = "i8", .kind = .{ .primitive_type = .i8 } },
         .{ .text = "i16", .kind = .{ .primitive_type = .i16 } },
         .{ .text = "i32", .kind = .{ .primitive_type = .i32 } },
@@ -195,6 +202,8 @@ fn lexSymbols(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
         ':' => .colon,
         '(' => .left_parenthesis,
         ')' => .right_parenthesis,
+        ',' => .comma,
+        '=' => .equals,
         else => return false,
     };
 
@@ -301,15 +310,6 @@ test "Lexer.lex: tracks row and column of each token" {
     try std.testing.expect(lexer.tokens.items[8].kind == .indent);
 }
 
-test "Lexer.lex: rejects tab characters" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = Lexer.init("fn main():\n\tnoop\n");
-
-    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, lexer.failure.?);
-}
-
 test "Lexer.lex: rejects lone carriage return" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -395,6 +395,15 @@ test "lexIndentation: handles pure indentation stream" {
     try std.testing.expectEqual(2, lexer.tokens.items[2].kind.indent);
 }
 
+test "lexTab: rejects tab characters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("fn main():\n\tnoop\n");
+
+    try std.testing.expectError(error.UnexpectedTab, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, lexer.failure.?);
+}
+
 test "lexWord: distinguishes keyword from identifier" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -427,6 +436,18 @@ test "lexWord: recognizes return and boolean keywords" {
     try std.testing.expect(lexer.tokens.items[1].kind == .keyword_return);
     try std.testing.expect(lexer.tokens.items[2].kind == .keyword_true);
     try std.testing.expect(lexer.tokens.items[3].kind == .keyword_false);
+}
+
+test "lexWord: recognizes a lone underscore" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("_ _value");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(4, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[1].kind == .underscore);
+    try std.testing.expect(lexer.tokens.items[2].kind == .identifier);
+    try std.testing.expectEqualStrings("_value", lexer.tokens.items[2].kind.identifier);
 }
 
 test "lexWord: recognizes primitive types" {
@@ -672,10 +693,13 @@ test "lexNumber: leaves the position untouched on failure" {
 test "lexSymbols: lexes adjacent symbols" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init(":(");
+    var lexer = Lexer.init(":(,=)");
     try lexer.lex(&arena);
 
-    try std.testing.expectEqual(4, lexer.tokens.items.len);
+    try std.testing.expectEqual(7, lexer.tokens.items.len);
     try std.testing.expect(lexer.tokens.items[1].kind == .colon);
     try std.testing.expect(lexer.tokens.items[2].kind == .left_parenthesis);
+    try std.testing.expect(lexer.tokens.items[3].kind == .comma);
+    try std.testing.expect(lexer.tokens.items[4].kind == .equals);
+    try std.testing.expect(lexer.tokens.items[5].kind == .right_parenthesis);
 }

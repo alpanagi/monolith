@@ -6,6 +6,8 @@ const token = @import("token.zig");
 const Lexer = @import("lexer.zig").Lexer;
 const Parser = @import("parser.zig").Parser;
 const ParseError = @import("parser.zig").ParseError;
+const NameResolver = @import("name_resolver.zig").NameResolver;
+const NameError = @import("name_resolver.zig").NameError;
 const TypeChecker = @import("type_checker.zig").TypeChecker;
 const TypeError = @import("type_checker.zig").TypeError;
 
@@ -21,7 +23,11 @@ pub fn main(init: std.process.Init) !u8 {
     if (arguments.len != 4 or !std.mem.eql(u8, arguments[1], "--target")) return printUsage(stderr);
     const target = std.meta.stringToEnum(Target, arguments[2]) orelse return printUsage(stderr);
     const path = arguments[3];
-    if (!std.mem.endsWith(u8, path, ".mn")) return printUsage(stderr);
+    const file_name = std.fs.path.basename(path);
+    const source_extension = ".mn";
+    const has_extension = std.mem.endsWith(u8, file_name, source_extension);
+    if (!has_extension or file_name.len == source_extension.len) return printUsage(stderr);
+    const module_name = file_name[0 .. file_name.len - source_extension.len];
 
     const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch |read_error| {
         try stderr.print("error: cannot read '{s}': {t}\n", .{ path, read_error });
@@ -36,6 +42,10 @@ pub fn main(init: std.process.Init) !u8 {
             try report(stderr, path, lexer.failure.?, "unexpected character");
             return 1;
         },
+        error.UnexpectedTab => {
+            try report(stderr, path, lexer.failure.?, "tabs are not allowed, use spaces");
+            return 1;
+        },
     };
 
     var parser = Parser.init(lexer.tokens.items);
@@ -45,6 +55,12 @@ pub fn main(init: std.process.Init) !u8 {
             try report(stderr, path, parser.failure.?.location, describeParseError(parse_error));
             return 1;
         },
+    };
+
+    var name_resolver = NameResolver.init(module);
+    name_resolver.resolve() catch |name_error| {
+        try report(stderr, path, name_resolver.failure.?, describeNameError(name_error));
+        return 1;
     };
 
     var type_checker = TypeChecker.init(module);
@@ -72,11 +88,15 @@ pub fn main(init: std.process.Init) !u8 {
         },
     }
 
-    const extension = switch (target) {
+    const output_extension = switch (target) {
         .javascript => "js",
         .c => "c",
     };
-    const output_name = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ std.fs.path.stem(path), extension });
+    const output_name = try std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}",
+        .{ module_name, output_extension },
+    );
     const directory_path = try std.fs.path.join(allocator, &.{ "build", @tagName(target) });
     const directory = try std.Io.Dir.cwd().createDirPathOpen(io, directory_path, .{});
     defer directory.close(io);
@@ -113,10 +133,24 @@ fn describeParseError(parse_error: ParseError) []const u8 {
         error.ExpectedLeftParenthesis => "expected '('",
         error.ExpectedRightParenthesis => "expected ')'",
         error.ExpectedColon => "expected ':'",
+        error.ExpectedType => "expected a type",
+        error.ExpectedEquals => "expected '='",
         error.ExpectedStatement => "expected a statement",
         error.ExpectedExpression => "expected an expression",
+        error.ExpectedCall => "expected a call",
         error.ExpectedBlock => "expected an indented block",
         error.UnexpectedIndentation => "unexpected indentation",
+        error.InconsistentIndentation => "indentation does not match any outer level",
+    };
+}
+
+fn describeNameError(name_error: NameError) []const u8 {
+    return switch (name_error) {
+        error.DuplicateFunction => "function is already defined",
+        error.DuplicateParameter => "parameter is already defined",
+        error.UnknownName => "unknown name",
+        error.NotAFunction => "name is not a function",
+        error.FunctionUsedAsValue => "functions cannot be used as values",
     };
 }
 
@@ -128,12 +162,18 @@ fn describeTypeError(type_error: TypeError) []const u8 {
         error.UnexpectedReturnValue => "void function cannot return a value",
         error.MissingReturn => "function must end with a return",
         error.MainHasReturnType => "main cannot have a return type",
+        error.MainHasParameters => "main cannot have parameters",
+        error.MainCalled => "main cannot be called",
+        error.ArgumentCountMismatch => "wrong number of arguments",
+        error.UnusedResult => "call result is unused, discard it with _ =",
+        error.DiscardedVoid => "call returns no value to discard",
     };
 }
 
 test {
     _ = @import("lexer.zig");
     _ = @import("parser.zig");
+    _ = @import("name_resolver.zig");
     _ = @import("type_checker.zig");
     _ = @import("javascript.zig");
     _ = @import("c.zig");
