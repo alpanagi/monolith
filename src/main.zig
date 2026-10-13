@@ -6,6 +6,8 @@ const token = @import("token.zig");
 const Lexer = @import("lexer.zig").Lexer;
 const Parser = @import("parser.zig").Parser;
 const ParseError = @import("parser.zig").ParseError;
+const TypeChecker = @import("type_checker.zig").TypeChecker;
+const TypeError = @import("type_checker.zig").TypeError;
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
@@ -43,6 +45,12 @@ pub fn main(init: std.process.Init) !u8 {
             try report(stderr, path, parser.failure.?.location, describeParseError(parse_error));
             return 1;
         },
+    };
+
+    var type_checker = TypeChecker.init(module);
+    type_checker.check() catch |type_error| {
+        try report(stderr, path, type_checker.failure.?, describeTypeError(type_error));
+        return 1;
     };
 
     const extension = switch (target) {
@@ -108,9 +116,21 @@ fn describeParseError(parse_error: ParseError) []const u8 {
     };
 }
 
+fn describeTypeError(type_error: TypeError) []const u8 {
+    return switch (type_error) {
+        error.TypeMismatch => "value does not match the expected type",
+        error.LiteralOutOfRange => "literal out of range for its type",
+        error.MissingReturnValue => "missing return value",
+        error.UnexpectedReturnValue => "void function cannot return a value",
+        error.MissingReturn => "function must end with a return",
+        error.MainHasReturnType => "main cannot have a return type",
+    };
+}
+
 test {
     _ = @import("lexer.zig");
     _ = @import("parser.zig");
+    _ = @import("type_checker.zig");
     _ = @import("javascript.zig");
     _ = @import("c.zig");
 }

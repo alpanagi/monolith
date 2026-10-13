@@ -85,7 +85,7 @@ pub const Parser = struct {
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
-    ) ParseError![]const ast.Statement {
+    ) ParseError![]ast.Statement {
         if (self.tokens[offset.*].kind == .indent) {
             return self.parseIndentedBlock(allocator, offset);
         }
@@ -96,7 +96,7 @@ pub const Parser = struct {
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
-    ) ParseError![]const ast.Statement {
+    ) ParseError![]ast.Statement {
         var position = offset.*;
         self.skipBlankLines(&position);
         const first = self.tokens[position];
@@ -128,7 +128,7 @@ pub const Parser = struct {
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
-    ) ParseError![]const ast.Statement {
+    ) ParseError![]ast.Statement {
         const statement = (try self.parseStatement(offset)) orelse {
             return self.fail(offset.*, error.ExpectedStatement);
         };

@@ -1,13 +1,13 @@
 const token = @import("token.zig");
 
 pub const Module = struct {
-    functions: []const Function,
+    functions: []Function,
 };
 
 pub const Function = struct {
     name: []const u8,
     return_type: Type,
-    body: []const Statement,
+    body: []Statement,
     location: token.Location,
 };
 
@@ -28,6 +28,7 @@ pub const StatementKind = union(enum) {
 
 pub const Expression = struct {
     kind: ExpressionKind,
+    primitive_type: ?token.PrimitiveType = null,
     location: token.Location,
 };
 
