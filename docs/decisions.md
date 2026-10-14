@@ -49,3 +49,4 @@
 
 - **C targets C23.** The output relies on C23's `bool` keyword, empty parameter lists meaning no parameters, binary literals and `'` digit separators.
 - **The C compiler is not invoked.** Choosing and running a C toolchain belongs to a future build system.
+- **JavaScript calls `main` after all functions.** The file ends with `main();`, so everything in it is set up before the program starts.

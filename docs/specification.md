@@ -205,6 +205,7 @@ arguments      = expression { "," expression } [ "," ]
 - **J4.** Number literals keep their base and separators and lose their suffix: `0xff_ff_u32` becomes `0xff_ff`. Literals of type `i64` or `u64` end with `n`: `1_000_i64` becomes `1_000n`.
 - **J5.** `_ = add(1, 2)` becomes the plain call, `add(1, 2);`.
 - **J6.** `String` values are JavaScript strings. String literals are written exactly as in the source: `"line\n"` stays `"line\n"`.
+- **J7.** If the module defines `main`, the output ends with a call to it, `main();`, after all functions.
 
 ### C
 
@@ -284,6 +285,8 @@ function main() {
     flag();
     greeting();
 }
+
+main();
 ```
 
 C:

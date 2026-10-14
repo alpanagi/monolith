@@ -14,6 +14,11 @@ pub const Generator = struct {
             if (index > 0) try writer.writeByte('\n');
             try self.generateFunction(writer, function);
         }
+
+        const has_main = for (self.module.functions) |function| {
+            if (std.mem.eql(u8, function.name, "main")) break true;
+        } else false;
+        if (has_main) try writer.writeAll("\nmain();\n");
     }
 
     fn generateFunction(
@@ -149,6 +154,28 @@ test "Generator.generate: separates functions with a blank line" {
     try std.testing.expectEqualStrings("function one() {}\n\nfunction two() {}\n", output.written());
 }
 
+test "Generator.generate: calls main after all functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): helper()\nfn helper(): noop");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try generator.generate(&output.writer);
+
+    try std.testing.expectEqualStrings(
+        "function main() {\n    helper();\n}\n\nfunction helper() {}\n\nmain();\n",
+        output.written(),
+    );
+}
+
 test "generateFunction: generates an empty function" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -165,7 +192,7 @@ test "generateFunction: generates an empty function" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("function main() {}\n", output.written());
+    try std.testing.expectEqualStrings("function main() {}\n\nmain();\n", output.written());
 }
 
 test "generateFunction: writes parameters" {
@@ -279,7 +306,7 @@ test "generateStatement: writes calls and discards" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("function log(value) {}\n\nfunction one() {\n    return 1;\n}\n\nfunction main() {\n    log(one());\n    one();\n}\n", output.written());
+    try std.testing.expectEqualStrings("function log(value) {}\n\nfunction one() {\n    return 1;\n}\n\nfunction main() {\n    log(one());\n    one();\n}\n\nmain();\n", output.written());
 }
 
 test "generateExpression: keeps the base and drops the suffix" {
@@ -355,7 +382,7 @@ test "generateExpression: writes 64-bit arguments as BigInt" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("function take(value) {}\n\nfunction main() {\n    take(5n);\n}\n", output.written());
+    try std.testing.expectEqualStrings("function take(value) {}\n\nfunction main() {\n    take(5n);\n}\n\nmain();\n", output.written());
 }
 
 test "generateExpression: writes strings as written" {
