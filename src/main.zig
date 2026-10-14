@@ -73,14 +73,7 @@ pub fn main(init: std.process.Init) !u8 {
     switch (target) {
         .javascript => {
             var generator = javascript.Generator.init(module);
-            generator.generate(&output.writer) catch |generate_error| switch (generate_error) {
-                error.WriteFailed => return error.WriteFailed,
-                error.UnsupportedType => {
-                    const message = "type is not supported on the javascript target";
-                    try report(stderr, path, generator.failure.?, message);
-                    return 1;
-                },
-            };
+            try generator.generate(&output.writer);
         },
         .c => {
             var generator = c.Generator.init(module);

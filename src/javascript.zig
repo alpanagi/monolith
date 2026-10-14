@@ -1,17 +1,15 @@
 const std = @import("std");
 const ast = @import("ast.zig");
-const token = @import("token.zig");
 
 pub const Generator = struct {
     module: ast.Module,
     depth: usize = 0,
-    failure: ?token.Location = null,
 
     pub fn init(module: ast.Module) Generator {
         return .{ .module = module };
     }
 
-    pub fn generate(self: *Generator, writer: *std.Io.Writer) GenerateError!void {
+    pub fn generate(self: *Generator, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         for (self.module.functions, 0..) |function, index| {
             if (index > 0) try writer.writeByte('\n');
             try self.generateFunction(writer, function);
@@ -22,10 +20,7 @@ pub const Generator = struct {
         self: *Generator,
         writer: *std.Io.Writer,
         function: ast.Function,
-    ) GenerateError!void {
-        for (function.parameters) |parameter| try self.checkSupported(parameter.parameter_type);
-        try self.checkSupported(function.return_type);
-
+    ) std.Io.Writer.Error!void {
         try writer.writeAll("function ");
         try self.generateIdentifier(writer, function.name);
         try writer.writeByte('(');
@@ -36,13 +31,6 @@ pub const Generator = struct {
         try writer.writeAll(") ");
         try self.generateBlock(writer, function.body);
         try writer.writeByte('\n');
-    }
-
-    fn checkSupported(self: *Generator, written_type: ast.Type) GenerateError!void {
-        switch (written_type.primitive_type) {
-            .i64, .u64 => return self.fail(written_type.location, error.UnsupportedType),
-            else => {},
-        }
     }
 
     fn generateIdentifier(
@@ -119,7 +107,13 @@ pub const Generator = struct {
         expression: ast.Expression,
     ) std.Io.Writer.Error!void {
         switch (expression.kind) {
-            .integer, .float => |literal| try writer.writeAll(literal.text),
+            .integer, .float => |literal| {
+                try writer.writeAll(literal.text);
+                switch (expression.primitive_type.?) {
+                    .i64, .u64 => try writer.writeByte('n'),
+                    else => {},
+                }
+            },
             .boolean => |value| try writer.writeAll(if (value) "true" else "false"),
             .identifier => |identifier| try self.generateIdentifier(writer, identifier.name),
             .call => |call| {
@@ -133,18 +127,7 @@ pub const Generator = struct {
             },
         }
     }
-
-    fn fail(
-        self: *Generator,
-        location: token.Location,
-        generate_error: GenerateError,
-    ) GenerateError {
-        self.failure = location;
-        return generate_error;
-    }
 };
-
-pub const GenerateError = std.Io.Writer.Error || error{UnsupportedType};
 
 test "Generator.generate: separates functions with a blank line" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -201,63 +184,6 @@ test "generateFunction: writes parameters" {
     try generator.generate(&output.writer);
 
     try std.testing.expectEqualStrings("function add(left, right) {\n    return left;\n}\n", output.written());
-}
-
-test "generateFunction: rejects i64" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn big() i64: return 1");
-    try lexer.lex(&arena);
-    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
-    try name_resolver.resolve();
-    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
-    try type_checker.check();
-    var generator = Generator.init(module);
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-
-    try std.testing.expectError(error.UnsupportedType, generator.generate(&output.writer));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 10 }, generator.failure.?);
-}
-
-test "generateFunction: rejects u64" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn big() u64: return 1");
-    try lexer.lex(&arena);
-    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
-    try name_resolver.resolve();
-    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
-    try type_checker.check();
-    var generator = Generator.init(module);
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-
-    try std.testing.expectError(error.UnsupportedType, generator.generate(&output.writer));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 10 }, generator.failure.?);
-}
-
-test "generateFunction: rejects an i64 parameter" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn take(value: i64): noop");
-    try lexer.lex(&arena);
-    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
-    try name_resolver.resolve();
-    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
-    try type_checker.check();
-    var generator = Generator.init(module);
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-
-    try std.testing.expectError(error.UnsupportedType, generator.generate(&output.writer));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, generator.failure.?);
 }
 
 test "generateIdentifier: appends an underscore to reserved words" {
@@ -391,4 +317,42 @@ test "generateExpression: writes booleans" {
     try generator.generate(&output.writer);
 
     try std.testing.expectEqualStrings("function ready() {\n    return false;\n}\n", output.written());
+}
+
+test "generateExpression: writes 64-bit integers as BigInt" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn big() i64: return 1\nfn huge() u64: return 0xffff_ffff_ffff_ffff");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try generator.generate(&output.writer);
+
+    try std.testing.expectEqualStrings("function big() {\n    return 1n;\n}\n\nfunction huge() {\n    return 0xffff_ffff_ffff_ffffn;\n}\n", output.written());
+}
+
+test "generateExpression: writes 64-bit arguments as BigInt" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn take(value: i64): noop\nfn main(): take(5)");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try generator.generate(&output.writer);
+
+    try std.testing.expectEqualStrings("function take(value) {}\n\nfunction main() {\n    take(5n);\n}\n", output.written());
 }
