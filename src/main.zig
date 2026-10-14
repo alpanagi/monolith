@@ -99,6 +99,7 @@ pub fn main(init: std.process.Init) !u8 {
         .{ module_name, output_extension },
     );
     const directory_path = try std.fs.path.join(allocator, &.{ "build", @tagName(target) });
+    try std.Io.Dir.cwd().deleteTree(io, directory_path);
     const directory = try std.Io.Dir.cwd().createDirPathOpen(io, directory_path, .{});
     defer directory.close(io);
     try directory.writeFile(io, .{ .sub_path = output_name, .data = output.written() });

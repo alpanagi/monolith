@@ -244,7 +244,7 @@ arguments      = expression { "," expression } [ "," ]
 
 - **K1.** The compiler is invoked as `monolith --target <javascript|c> <file.mn>`. Any other arguments print `usage: monolith --target <javascript|c> <file.mn>`.
 - **K2.** The source file name must end with `.mn` and have a name before it.
-- **K3.** The output is written to `build/<target>/<name>.<extension>`, where `<name>` is the source file name without `.mn` and the extension is `js` or `c`. The C target also writes `build/c/monolith.h` (C1). No file is written when compilation fails.
+- **K3.** The output is written to `build/<target>/<name>.<extension>`, where `<name>` is the source file name without `.mn` and the extension is `js` or `c`. The C target also writes `build/c/monolith.h` (C1). After a successful compilation, `build/<target>` is deleted and created again, so it only contains this output. No file is written or deleted when compilation fails.
 - **K4.** The compiler exits with status 0 on success and 1 on any error.
 
 ## Examples
