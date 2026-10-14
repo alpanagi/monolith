@@ -81,11 +81,25 @@ pub fn main(init: std.process.Init) !u8 {
     switch (target) {
         .javascript => {
             var generator = javascript.Generator.init(module);
-            try generator.generate(&output.writer);
+            generator.generate(&output.writer) catch |generate_error| switch (generate_error) {
+                error.WriteFailed => return error.WriteFailed,
+                error.NameDefinedInTarget => {
+                    const message = "name is already defined in the target";
+                    try report(stderr, path, generator.failure.?, message);
+                    return 1;
+                },
+            };
         },
         .c => {
             var generator = c.Generator.init(module);
-            try generator.generate(&output.writer);
+            generator.generate(&output.writer) catch |generate_error| switch (generate_error) {
+                error.WriteFailed => return error.WriteFailed,
+                error.NameDefinedInTarget => {
+                    const message = "name is already defined in the target";
+                    try report(stderr, path, generator.failure.?, message);
+                    return 1;
+                },
+            };
         },
     }
 
@@ -136,6 +150,8 @@ fn describeParseError(parse_error: ParseError) []const u8 {
         error.ExpectedLeftParenthesis => "expected '('",
         error.ExpectedRightParenthesis => "expected ')'",
         error.ExpectedColon => "expected ':'",
+        error.ExpectedFunctionKeyword => "expected 'fn'",
+        error.ExternalFunctionBody => "external functions have no body",
         error.ExpectedType => "expected a type",
         error.ExpectedEquals => "expected '='",
         error.ExpectedStatement => "expected a statement",
@@ -167,6 +183,7 @@ fn describeTypeError(type_error: TypeError) []const u8 {
         error.MainHasReturnType => "main cannot have a return type",
         error.MainHasParameters => "main cannot have parameters",
         error.MainCalled => "main cannot be called",
+        error.MainIsExternal => "main cannot be external",
         error.ArgumentCountMismatch => "wrong number of arguments",
         error.UnusedResult => "call result is unused, discard it with _ =",
         error.DiscardedVoid => "call returns no value to discard",

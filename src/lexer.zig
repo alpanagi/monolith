@@ -117,6 +117,7 @@ fn lexWord(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
 
     const keywords = [_]struct { text: []const u8, kind: token.TokenKind }{
         .{ .text = "fn", .kind = .keyword_fn },
+        .{ .text = "external", .kind = .keyword_external },
         .{ .text = "noop", .kind = .keyword_noop },
         .{ .text = "return", .kind = .keyword_return },
         .{ .text = "true", .kind = .keyword_true },
@@ -465,6 +466,16 @@ test "lexWord: distinguishes keyword from identifier" {
     try std.testing.expect(lexer.tokens.items[7].kind == .identifier);
     try std.testing.expectEqualStrings("i32x", lexer.tokens.items[7].kind.identifier);
     try std.testing.expect(lexer.tokens.items[8].kind == .eof);
+}
+
+test "lexWord: recognizes the external keyword" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("external fn");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_external);
+    try std.testing.expect(lexer.tokens.items[2].kind == .keyword_fn);
 }
 
 test "lexWord: recognizes return and boolean keywords" {

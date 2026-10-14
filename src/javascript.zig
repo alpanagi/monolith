@@ -1,48 +1,58 @@
 const std = @import("std");
 const ast = @import("ast.zig");
+const token = @import("token.zig");
 
 pub const Generator = struct {
     module: ast.Module,
     depth: usize = 0,
+    failure: ?token.Location = null,
 
     pub fn init(module: ast.Module) Generator {
         return .{ .module = module };
     }
 
-    pub fn generate(self: *Generator, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        for (self.module.functions, 0..) |function, index| {
-            if (index > 0) try writer.writeByte('\n');
+    pub fn generate(self: *Generator, writer: *std.Io.Writer) GenerateError!void {
+        try self.checkNames();
+
+        var written: usize = 0;
+        for (self.module.declarations) |declaration| {
+            const function = switch (declaration) {
+                .function => |function| function,
+                .external_function => continue,
+            };
+            if (written > 0) try writer.writeByte('\n');
             try self.generateFunction(writer, function);
+            written += 1;
         }
 
-        const has_main = for (self.module.functions) |function| {
-            if (std.mem.eql(u8, function.name, "main")) break true;
+        const has_main = for (self.module.declarations) |declaration| {
+            if (declaration != .function) continue;
+            if (std.mem.eql(u8, declaration.function.declaration.name, "main")) break true;
         } else false;
         if (has_main) try writer.writeAll("\nmain();\n");
     }
 
-    fn generateFunction(
-        self: *Generator,
-        writer: *std.Io.Writer,
-        function: ast.Function,
-    ) std.Io.Writer.Error!void {
-        try writer.writeAll("function ");
-        try self.generateIdentifier(writer, function.name);
-        try writer.writeByte('(');
-        for (function.parameters, 0..) |parameter, index| {
-            if (index > 0) try writer.writeAll(", ");
-            try self.generateIdentifier(writer, parameter.name);
+    fn checkNames(self: *Generator) error{NameDefinedInTarget}!void {
+        for (self.module.declarations) |declaration| {
+            switch (declaration) {
+                .function => |function| {
+                    try self.checkName(function.declaration.name, function.declaration.location);
+                    for (function.declaration.parameters) |parameter| {
+                        try self.checkName(parameter.name, parameter.location);
+                    }
+                },
+                .external_function => |external_function| {
+                    try self.checkName(external_function.name, external_function.location);
+                },
+            }
         }
-        try writer.writeAll(") ");
-        try self.generateBlock(writer, function.body);
-        try writer.writeByte('\n');
     }
 
-    fn generateIdentifier(
-        _: *Generator,
-        writer: *std.Io.Writer,
+    fn checkName(
+        self: *Generator,
         name: []const u8,
-    ) std.Io.Writer.Error!void {
+        location: token.Location,
+    ) error{NameDefinedInTarget}!void {
         const reserved_words = std.StaticStringMap(void).initComptime(.{
             .{"arguments"},  .{"await"},     .{"break"},      .{"case"},     .{"catch"},
             .{"class"},      .{"const"},     .{"continue"},   .{"debugger"}, .{"default"},
@@ -56,8 +66,26 @@ pub const Generator = struct {
             .{"while"},      .{"with"},      .{"yield"},
         });
 
-        try writer.writeAll(name);
-        if (reserved_words.has(name) or std.mem.endsWith(u8, name, "_")) try writer.writeByte('_');
+        if (!reserved_words.has(name)) return;
+        self.failure = location;
+        return error.NameDefinedInTarget;
+    }
+
+    fn generateFunction(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        function: ast.Function,
+    ) std.Io.Writer.Error!void {
+        try writer.writeAll("function ");
+        try writer.writeAll(function.declaration.name);
+        try writer.writeByte('(');
+        for (function.declaration.parameters, 0..) |parameter, index| {
+            if (index > 0) try writer.writeAll(", ");
+            try writer.writeAll(parameter.name);
+        }
+        try writer.writeAll(") ");
+        try self.generateBlock(writer, function.body);
+        try writer.writeByte('\n');
     }
 
     fn generateBlock(
@@ -121,9 +149,9 @@ pub const Generator = struct {
             },
             .boolean => |value| try writer.writeAll(if (value) "true" else "false"),
             .string => |text| try writer.print("\"{s}\"", .{text}),
-            .identifier => |identifier| try self.generateIdentifier(writer, identifier.name),
+            .identifier => |identifier| try writer.writeAll(identifier.name),
             .call => |call| {
-                try self.generateIdentifier(writer, call.name);
+                try writer.writeAll(call.name);
                 try writer.writeByte('(');
                 for (call.arguments, 0..) |argument, index| {
                     if (index > 0) try writer.writeAll(", ");
@@ -134,6 +162,8 @@ pub const Generator = struct {
         }
     }
 };
+
+pub const GenerateError = std.Io.Writer.Error || error{NameDefinedInTarget};
 
 test "Generator.generate: separates functions with a blank line" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -176,6 +206,129 @@ test "Generator.generate: calls main after all functions" {
     );
 }
 
+test "Generator.generate: writes nothing for external functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("external fn log(value: i32)\nfn one(): noop");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try generator.generate(&output.writer);
+
+    try std.testing.expectEqualStrings(
+        "function one() {}\n",
+        output.written(),
+    );
+}
+
+test "checkNames: rejects function names defined in the target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn one(): noop\nfn delete(): noop");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectError(error.NameDefinedInTarget, generator.generate(&output.writer));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, generator.failure.?);
+    try std.testing.expectEqualStrings("", output.written());
+}
+
+test "checkNames: rejects external function names defined in the target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("external fn delete()");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectError(error.NameDefinedInTarget, generator.generate(&output.writer));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, generator.failure.?);
+    try std.testing.expectEqualStrings("", output.written());
+}
+
+test "checkNames: rejects parameter names defined in the target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn add(left: i32, new: i32): noop");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectError(error.NameDefinedInTarget, generator.generate(&output.writer));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, generator.failure.?);
+    try std.testing.expectEqualStrings("", output.written());
+}
+
+test "checkNames: ignores parameter names of external functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("external fn write(new: i32)\nfn main(): write(1)");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try generator.generate(&output.writer);
+
+    try std.testing.expectEqualStrings(
+        "function main() {\n    write(1);\n}\n\nmain();\n",
+        output.written(),
+    );
+}
+
+test "checkName: matches whole names only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn delete_(): noop\nfn new(): noop");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectError(error.NameDefinedInTarget, generator.generate(&output.writer));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, generator.failure.?);
+}
+
 test "generateFunction: generates an empty function" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -212,44 +365,6 @@ test "generateFunction: writes parameters" {
     try generator.generate(&output.writer);
 
     try std.testing.expectEqualStrings("function add(left, right) {\n    return left;\n}\n", output.written());
-}
-
-test "generateIdentifier: appends an underscore to reserved words" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn delete(): noop");
-    try lexer.lex(&arena);
-    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
-    try name_resolver.resolve();
-    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
-    try type_checker.check();
-    var generator = Generator.init(module);
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    try generator.generate(&output.writer);
-
-    try std.testing.expectEqualStrings("function delete_() {}\n", output.written());
-}
-
-test "generateIdentifier: keeps escaped names apart" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn delete(): noop\nfn delete_(): noop");
-    try lexer.lex(&arena);
-    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
-    try name_resolver.resolve();
-    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
-    try type_checker.check();
-    var generator = Generator.init(module);
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    try generator.generate(&output.writer);
-
-    try std.testing.expectEqualStrings("function delete_() {}\n\nfunction delete__() {}\n", output.written());
 }
 
 test "generateBlock: writes statements on separate lines" {

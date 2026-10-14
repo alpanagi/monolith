@@ -11,33 +11,50 @@ pub const TypeChecker = struct {
     }
 
     pub fn check(self: *TypeChecker) TypeError!void {
-        for (self.module.functions) |function| try self.checkFunction(function);
+        for (self.module.declarations) |declaration| {
+            switch (declaration) {
+                .function => |function| try self.checkFunction(function),
+                .external_function => |external_function| {
+                    try self.checkExternalFunction(external_function);
+                },
+            }
+        }
     }
 
     fn checkFunction(self: *TypeChecker, function: ast.Function) TypeError!void {
-        const return_type = function.return_type;
-        if (std.mem.eql(u8, function.name, "main")) {
+        const declaration = function.declaration;
+        const return_type = declaration.return_type;
+        if (std.mem.eql(u8, declaration.name, "main")) {
             if (return_type.primitive_type != .void) {
                 return self.fail(return_type.location, error.MainHasReturnType);
             }
-            if (function.parameters.len > 0) {
-                return self.fail(function.parameters[0].location, error.MainHasParameters);
+            if (declaration.parameters.len > 0) {
+                return self.fail(declaration.parameters[0].location, error.MainHasParameters);
             }
         }
 
-        for (function.body) |*statement| try self.checkStatement(function, statement);
+        for (function.body) |*statement| try self.checkStatement(declaration, statement);
 
         if (return_type.primitive_type == .void) return;
         const last = function.body[function.body.len - 1];
         if (last.kind != .@"return") return self.fail(return_type.location, error.MissingReturn);
     }
 
+    fn checkExternalFunction(
+        self: *TypeChecker,
+        declaration: ast.FunctionDeclaration,
+    ) TypeError!void {
+        if (std.mem.eql(u8, declaration.name, "main")) {
+            return self.fail(declaration.location, error.MainIsExternal);
+        }
+    }
+
     fn checkStatement(
         self: *TypeChecker,
-        function: ast.Function,
+        declaration: ast.FunctionDeclaration,
         statement: *ast.Statement,
     ) TypeError!void {
-        const return_type = function.return_type.primitive_type;
+        const return_type = declaration.return_type.primitive_type;
         switch (statement.kind) {
             .noop => {},
             .@"return" => |*value| {
@@ -45,18 +62,18 @@ pub const TypeChecker = struct {
                     if (return_type == .void) {
                         return self.fail(expression.location, error.UnexpectedReturnValue);
                     }
-                    try self.checkExpression(function, expression, return_type);
+                    try self.checkExpression(declaration, expression, return_type);
                 } else if (return_type != .void) {
                     return self.fail(statement.location, error.MissingReturnValue);
                 }
             },
             .discard => |*expression| {
-                if (try self.checkCall(function, expression) == .void) {
+                if (try self.checkCall(declaration, expression) == .void) {
                     return self.fail(expression.location, error.DiscardedVoid);
                 }
             },
             .expression => |*expression| {
-                if (try self.checkCall(function, expression) != .void) {
+                if (try self.checkCall(declaration, expression) != .void) {
                     return self.fail(expression.location, error.UnusedResult);
                 }
             },
@@ -65,7 +82,7 @@ pub const TypeChecker = struct {
 
     fn checkExpression(
         self: *TypeChecker,
-        function: ast.Function,
+        declaration: ast.FunctionDeclaration,
         expression: *ast.Expression,
         expected: token.PrimitiveType,
     ) TypeError!void {
@@ -102,14 +119,14 @@ pub const TypeChecker = struct {
                 if (expected != .string) return self.fail(expression.location, error.TypeMismatch);
             },
             .identifier => |identifier| {
-                const bindings = function.parameters;
+                const bindings = declaration.parameters;
                 const binding_type = bindings[identifier.binding.?].parameter_type.primitive_type;
                 if (binding_type != expected) {
                     return self.fail(expression.location, error.TypeMismatch);
                 }
             },
             .call => {
-                if (try self.checkCall(function, expression) != expected) {
+                if (try self.checkCall(declaration, expression) != expected) {
                     return self.fail(expression.location, error.TypeMismatch);
                 }
             },
@@ -119,11 +136,11 @@ pub const TypeChecker = struct {
 
     fn checkCall(
         self: *TypeChecker,
-        function: ast.Function,
+        declaration: ast.FunctionDeclaration,
         expression: *ast.Expression,
     ) TypeError!token.PrimitiveType {
         const call = expression.kind.call;
-        const callee = self.module.functions[call.function.?];
+        const callee = functionDeclarationOf(self.module.declarations[call.declaration.?]);
         if (std.mem.eql(u8, callee.name, "main")) {
             return self.fail(expression.location, error.MainCalled);
         }
@@ -131,7 +148,8 @@ pub const TypeChecker = struct {
             return self.fail(expression.location, error.ArgumentCountMismatch);
         }
         for (call.arguments, callee.parameters) |*argument, parameter| {
-            try self.checkExpression(function, argument, parameter.parameter_type.primitive_type);
+            const parameter_type = parameter.parameter_type.primitive_type;
+            try self.checkExpression(declaration, argument, parameter_type);
         }
 
         const return_type = callee.return_type.primitive_type;
@@ -154,10 +172,18 @@ pub const TypeError = error{
     MainHasReturnType,
     MainHasParameters,
     MainCalled,
+    MainIsExternal,
     ArgumentCountMismatch,
     UnusedResult,
     DiscardedVoid,
 };
+
+fn functionDeclarationOf(declaration: ast.Declaration) ast.FunctionDeclaration {
+    return switch (declaration) {
+        .function => |function| function.declaration,
+        .external_function => |external_function| external_function,
+    };
+}
 
 fn integerMaximum(primitive_type: token.PrimitiveType) ?u64 {
     return switch (primitive_type) {
@@ -190,10 +216,10 @@ test "TypeChecker.check: sets the type of each returned value" {
     var type_checker = TypeChecker.init(module);
     try type_checker.check();
 
-    try std.testing.expectEqual(token.PrimitiveType.u8, module.functions[0].body[0].kind.@"return".?.primitive_type);
-    try std.testing.expectEqual(token.PrimitiveType.f32, module.functions[1].body[0].kind.@"return".?.primitive_type);
-    try std.testing.expectEqual(token.PrimitiveType.bool, module.functions[2].body[0].kind.@"return".?.primitive_type);
-    try std.testing.expectEqual(token.PrimitiveType.i64, module.functions[3].body[0].kind.@"return".?.primitive_type);
+    try std.testing.expectEqual(token.PrimitiveType.u8, module.declarations[0].function.body[0].kind.@"return".?.primitive_type);
+    try std.testing.expectEqual(token.PrimitiveType.f32, module.declarations[1].function.body[0].kind.@"return".?.primitive_type);
+    try std.testing.expectEqual(token.PrimitiveType.bool, module.declarations[2].function.body[0].kind.@"return".?.primitive_type);
+    try std.testing.expectEqual(token.PrimitiveType.i64, module.declarations[3].function.body[0].kind.@"return".?.primitive_type);
 }
 
 test "TypeChecker.check: sets the type of calls, arguments and names" {
@@ -208,8 +234,8 @@ test "TypeChecker.check: sets the type of calls, arguments and names" {
     var type_checker = TypeChecker.init(module);
     try type_checker.check();
 
-    try std.testing.expectEqual(token.PrimitiveType.i32, module.functions[0].body[0].kind.@"return".?.primitive_type);
-    const call = module.functions[1].body[0].kind.discard;
+    try std.testing.expectEqual(token.PrimitiveType.i32, module.declarations[0].function.body[0].kind.@"return".?.primitive_type);
+    const call = module.declarations[1].function.body[0].kind.discard;
     try std.testing.expectEqual(token.PrimitiveType.i32, call.primitive_type);
     try std.testing.expectEqual(token.PrimitiveType.i32, call.kind.call.arguments[0].primitive_type);
 }
@@ -257,6 +283,21 @@ test "checkFunction: rejects a missing return" {
 
     try std.testing.expectError(error.MissingReturn, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, type_checker.failure.?);
+}
+
+test "checkExternalFunction: rejects an external main" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("external fn main()");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(module);
+
+    try std.testing.expectError(error.MainIsExternal, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, type_checker.failure.?);
 }
 
 test "checkStatement: rejects a missing return value" {
@@ -546,6 +587,21 @@ test "checkCall: rejects calling main" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, type_checker.failure.?);
 }
 
+test "checkCall: checks arguments of external functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("external fn take(value: u8)\nfn main(): take(300)");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(module);
+
+    try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 17 }, type_checker.failure.?);
+}
+
 test "checkCall: rejects a wrong number of arguments" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -603,7 +659,7 @@ test "checkExpression: gives a string literal the String type" {
     var type_checker = TypeChecker.init(module);
     try type_checker.check();
 
-    try std.testing.expectEqual(token.PrimitiveType.string, module.functions[0].body[0].kind.@"return".?.primitive_type);
+    try std.testing.expectEqual(token.PrimitiveType.string, module.declarations[0].function.body[0].kind.@"return".?.primitive_type);
 }
 
 test "checkExpression: rejects a string for an integer type" {

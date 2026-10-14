@@ -23,18 +23,21 @@ The grammar uses this notation:
 `name`, `integer`, `float`, `string` and `newline` are defined in the Lexical structure chapter (L2, L6, L12 to L16, L18 to L22). The indentation of lines is described in S6 to S8.
 
 ```
-module         = { function }
-function       = "fn" name "(" [ parameters ] ")" [ type ] ":" block
-parameters     = parameter { "," parameter } [ "," ]
-parameter      = name ":" type
-type           = "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
-               | "f32" | "f64" | "Bool" | "String"
-block          = statement | indented_block
-indented_block = newline statement { newline statement }
-statement      = "noop" | "return" [ expression ] | "_" "=" call | call
-expression     = integer | float | string | "true" | "false" | name | call
-call           = name "(" [ arguments ] ")"
-arguments      = expression { "," expression } [ "," ]
+module               = { declaration }
+declaration          = function | external_function
+function             = function_declaration ":" block
+external_function    = "external" function_declaration
+function_declaration = "fn" name "(" [ parameters ] ")" [ type ]
+parameters           = parameter { "," parameter } [ "," ]
+parameter            = name ":" type
+type                 = "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
+                     | "f32" | "f64" | "Bool" | "String"
+block                = statement | indented_block
+indented_block       = newline statement { newline statement }
+statement            = "noop" | "return" [ expression ] | "_" "=" call | call
+expression           = integer | float | string | "true" | "false" | name | call
+call                 = name "(" [ arguments ] ")"
+arguments            = expression { "," expression } [ "," ]
 ```
 
 ## Lexical structure
@@ -50,7 +53,7 @@ arguments      = expression { "," expression } [ "," ]
 ### Words
 
 - **L6.** A word starts with a letter or `_` and continues with letters, digits and `_`.
-- **L7.** These words are keywords: `fn`, `noop`, `return`, `true`, `false`.
+- **L7.** These words are keywords: `fn`, `external`, `noop`, `return`, `true`, `false`.
 - **L8.** These words are type names: `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `Bool`, `String`. Type names that state a size in bits are lowercase. All other type names start with a capital letter.
 - **L9.** A lone `_` is the discard symbol. It is not a name.
 - **L10.** Every other word is a name. Keywords, type names and `_` cannot be used as names.
@@ -102,12 +105,12 @@ arguments      = expression { "," expression } [ "," ]
 
 ### Modules
 
-- **S1.** A source file is a module: a sequence of function definitions at indentation 0, separated by any number of blank lines.
-- **S2.** Anything other than a function definition at top level is rejected with `unexpected token`. An indented line at top level is rejected with `unexpected indentation`.
+- **S1.** A source file is a module: a sequence of declarations at indentation 0, separated by any number of blank lines. A declaration is a function or an external function.
+- **S2.** Anything other than a declaration at top level is rejected with `unexpected token`. An indented line at top level is rejected with `unexpected indentation`.
 
 ### Functions
 
-- **S3.** A function has a name, a parameter list, an optional return type and a block, following the `function` rule: `fn add(left: i32, right: i32) i32:`.
+- **S3.** A function is a function declaration, made of its name, parameters and optional return type, followed by a block, following the `function` rule: `fn add(left: i32, right: i32) i32:`.
 - **S4.** A trailing `,` after the last parameter is allowed.
 - **S5.** A missing return type means the function returns `void`. `void` cannot be written.
 
@@ -137,9 +140,14 @@ arguments      = expression { "," expression } [ "," ]
 
 - **S14.** A trailing `,` after the last argument is allowed: `add(1, 2,)`.
 
+### External functions
+
+- **S15.** An external function is a function declaration that the program calls but does not define: `external fn console_write(text: String)`. Whatever runs the program provides its definition (J8, C8).
+- **S16.** An external function has no body. A `:` after its declaration is rejected with `external functions have no body`.
+
 ## Names
 
-- **N1.** Function names are unique within a module. A second function with the same name is rejected with `function is already defined`, at its `fn`.
+- **N1.** Function names are unique within a module, external functions included. A second function with the same name is rejected with `function is already defined`, at its `fn` or `external`.
 - **N2.** Parameter names are unique within a parameter list. A repeated name is rejected with `parameter is already defined`, at the second parameter.
 - **N3.** A function can call functions defined before or after it.
 - **N4.** A name is looked up first among the parameters of the enclosing function, then among the module's functions. A parameter shadows a function with the same name.
@@ -190,12 +198,16 @@ arguments      = expression { "," expression } [ "," ]
 - **F8.** `main` is the program's entry point. A module does not need one.
 - **F9.** `main` has no parameters and no return type. Otherwise it is rejected with `main cannot have parameters` or `main cannot have a return type`.
 - **F10.** `main` cannot be called. A call to it is rejected with `main cannot be called`.
+- **F11.** `main` cannot be an external function. An external `main` is rejected with `main cannot be external`.
 
 ## Targets
 
 ### Names in the output
 
-- **G1.** A name keeps its spelling in the output, unless it is a reserved word of the target or ends with `_`. Then `_` is appended. In C, `string` and `MONOLITH_H` are also reserved, because the output defines them (C1). `delete` becomes `delete_` in JavaScript, `int` becomes `int_` in C, and `count_` becomes `count__` in both. Two different names never produce the same output name.
+- **G1.** Names are written to the output exactly as they are in the source.
+- **G2.** A function, external function or parameter whose name the target already defines is rejected with `name is already defined in the target`, at the function's `fn` or `external` keyword or at the parameter. Only the names of the target being compiled for are checked: `fn delete(): noop` compiles to C and is rejected for JavaScript.
+- **G3.** JavaScript defines `arguments`, `await`, `break`, `case`, `catch`, `class`, `const`, `continue`, `debugger`, `default`, `delete`, `do`, `else`, `enum`, `eval`, `export`, `extends`, `false`, `finally`, `for`, `function`, `if`, `implements`, `import`, `in`, `instanceof`, `interface`, `let`, `new`, `null`, `package`, `private`, `protected`, `public`, `return`, `static`, `super`, `switch`, `this`, `throw`, `true`, `try`, `typeof`, `var`, `void`, `while`, `with` and `yield`.
+- **G4.** C defines the C23 keywords `_Alignas`, `_Alignof`, `_Atomic`, `_BitInt`, `_Bool`, `_Complex`, `_Decimal128`, `_Decimal32`, `_Decimal64`, `_Generic`, `_Imaginary`, `_Noreturn`, `_Static_assert`, `_Thread_local`, `alignas`, `alignof`, `auto`, `bool`, `break`, `case`, `char`, `const`, `constexpr`, `continue`, `default`, `do`, `double`, `else`, `enum`, `extern`, `false`, `float`, `for`, `goto`, `if`, `inline`, `int`, `long`, `nullptr`, `register`, `restrict`, `return`, `short`, `signed`, `sizeof`, `static`, `static_assert`, `struct`, `switch`, `thread_local`, `true`, `typedef`, `typeof`, `typeof_unqual`, `union`, `unsigned`, `void`, `volatile` and `while`, and `asm`, which compilers such as GCC treat as a keyword outside strict C23. It also defines the names that C23 declares in `<stddef.h>` and `<stdint.h>`, which the header includes, such as `size_t`, `int32_t`, `NULL` and `INT32_MAX`. `string` and `MONOLITH_H` are defined by the header itself (C1).
 
 ### JavaScript
 
@@ -206,6 +218,7 @@ arguments      = expression { "," expression } [ "," ]
 - **J5.** `_ = add(1, 2)` becomes the plain call, `add(1, 2);`.
 - **J6.** `String` values are JavaScript strings. String literals are written exactly as in the source: `"line\n"` stays `"line\n"`.
 - **J7.** If the module defines `main`, the output ends with a call to it, `main();`, after all functions.
+- **J8.** An external function produces no output, so the names of its parameters are not checked (G2). Calls to it use its name exactly, so whatever runs the program must define a function with that name before `main` runs, for example as a global.
 
 ### C
 
@@ -239,6 +252,7 @@ arguments      = expression { "," expression } [ "," ]
 - **C5.** Number literals keep their base. `_` becomes `'`, `0o` becomes `0`, the suffix is removed, and literals of unsigned types end with `u`: `0o7_5_5` returned from a `u16` function becomes `07'5'5u`.
 - **C6.** `_ = add(1, 2)` becomes the plain call, `add(1, 2);`.
 - **C7.** A string literal becomes a `string` holding the literal as written and its length in bytes, counting each escape as one byte: `"line\n"` becomes `(string){ "line\n", 5 }`.
+- **C8.** An external function becomes a declaration without `static`. These declarations come before the other declarations, separated from them by a blank line: `external fn console_write(text: String)` becomes `void console_write(string text);`. Calls to it use its name exactly, so its definition must be linked into the program.
 
 ## Compiler
 
@@ -252,6 +266,8 @@ arguments      = expression { "," expression } [ "," ]
 ### A valid program
 
 ```monolith
+external fn console_write(text: String)
+
 fn add(left: i32, right: i32) i32: return left
 
 fn flag() Bool:
@@ -262,7 +278,7 @@ fn greeting() String: return "hello\n"
 fn main():
     _ = add(1, 2)
     _ = flag()
-    _ = greeting()
+    console_write(greeting())
 ```
 
 JavaScript:
@@ -283,7 +299,7 @@ function greeting() {
 function main() {
     add(1, 2);
     flag();
-    greeting();
+    console_write(greeting());
 }
 
 main();
@@ -293,6 +309,8 @@ C:
 
 ```c
 #include "monolith.h"
+
+void console_write(string text);
 
 static int32_t add(int32_t left, int32_t right);
 static bool flag();
@@ -313,7 +331,7 @@ static string greeting() {
 int main() {
     add(1, 2);
     flag();
-    greeting();
+    console_write(greeting());
 }
 ```
 
@@ -370,3 +388,9 @@ fn name() String: return "a\qb"
 ```
 
 → `1:28: error: unknown escape sequence` (L20)
+
+```monolith
+external fn log(): noop
+```
+
+→ `1:18: error: external functions have no body` (S16)

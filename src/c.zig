@@ -19,27 +19,136 @@ pub const Generator = struct {
     module: ast.Module,
     depth: usize = 0,
     in_main: bool = false,
+    failure: ?token.Location = null,
 
     pub fn init(module: ast.Module) Generator {
         return .{ .module = module };
     }
 
-    pub fn generate(self: *Generator, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        try writer.writeAll("#include \"monolith.h\"\n\n");
+    pub fn generate(self: *Generator, writer: *std.Io.Writer) GenerateError!void {
+        try self.checkNames();
 
+        try writer.writeAll("#include \"monolith.h\"\n\n");
+        try self.generateDeclarations(writer, .external_function);
+        try self.generateDeclarations(writer, .function);
+
+        var written: usize = 0;
+        for (self.module.declarations) |declaration| {
+            const function = switch (declaration) {
+                .function => |function| function,
+                .external_function => continue,
+            };
+            if (written > 0) try writer.writeByte('\n');
+            try self.generateFunction(writer, function);
+            written += 1;
+        }
+    }
+
+    fn checkNames(self: *Generator) error{NameDefinedInTarget}!void {
+        for (self.module.declarations) |declaration| {
+            const function_declaration = switch (declaration) {
+                .function => |function| function.declaration,
+                .external_function => |external_function| external_function,
+            };
+            try self.checkName(function_declaration.name, function_declaration.location);
+            for (function_declaration.parameters) |parameter| {
+                try self.checkName(parameter.name, parameter.location);
+            }
+        }
+    }
+
+    fn checkName(
+        self: *Generator,
+        name: []const u8,
+        location: token.Location,
+    ) error{NameDefinedInTarget}!void {
+        const reserved_words = std.StaticStringMap(void).initComptime(.{
+            .{"INT16_C"},                   .{"INT16_MAX"},          .{"INT16_MIN"},
+            .{"INT16_WIDTH"},               .{"INT32_C"},            .{"INT32_MAX"},
+            .{"INT32_MIN"},                 .{"INT32_WIDTH"},        .{"INT64_C"},
+            .{"INT64_MAX"},                 .{"INT64_MIN"},          .{"INT64_WIDTH"},
+            .{"INT8_C"},                    .{"INT8_MAX"},           .{"INT8_MIN"},
+            .{"INT8_WIDTH"},                .{"INTMAX_C"},           .{"INTMAX_MAX"},
+            .{"INTMAX_MIN"},                .{"INTMAX_WIDTH"},       .{"INTPTR_MAX"},
+            .{"INTPTR_MIN"},                .{"INTPTR_WIDTH"},       .{"INT_FAST16_MAX"},
+            .{"INT_FAST16_MIN"},            .{"INT_FAST16_WIDTH"},   .{"INT_FAST32_MAX"},
+            .{"INT_FAST32_MIN"},            .{"INT_FAST32_WIDTH"},   .{"INT_FAST64_MAX"},
+            .{"INT_FAST64_MIN"},            .{"INT_FAST64_WIDTH"},   .{"INT_FAST8_MAX"},
+            .{"INT_FAST8_MIN"},             .{"INT_FAST8_WIDTH"},    .{"INT_LEAST16_MAX"},
+            .{"INT_LEAST16_MIN"},           .{"INT_LEAST16_WIDTH"},  .{"INT_LEAST32_MAX"},
+            .{"INT_LEAST32_MIN"},           .{"INT_LEAST32_WIDTH"},  .{"INT_LEAST64_MAX"},
+            .{"INT_LEAST64_MIN"},           .{"INT_LEAST64_WIDTH"},  .{"INT_LEAST8_MAX"},
+            .{"INT_LEAST8_MIN"},            .{"INT_LEAST8_WIDTH"},   .{"MONOLITH_H"},
+            .{"NULL"},                      .{"PTRDIFF_MAX"},        .{"PTRDIFF_MIN"},
+            .{"PTRDIFF_WIDTH"},             .{"SIG_ATOMIC_MAX"},     .{"SIG_ATOMIC_MIN"},
+            .{"SIG_ATOMIC_WIDTH"},          .{"SIZE_MAX"},           .{"SIZE_WIDTH"},
+            .{"UINT16_C"},                  .{"UINT16_MAX"},         .{"UINT16_WIDTH"},
+            .{"UINT32_C"},                  .{"UINT32_MAX"},         .{"UINT32_WIDTH"},
+            .{"UINT64_C"},                  .{"UINT64_MAX"},         .{"UINT64_WIDTH"},
+            .{"UINT8_C"},                   .{"UINT8_MAX"},          .{"UINT8_WIDTH"},
+            .{"UINTMAX_C"},                 .{"UINTMAX_MAX"},        .{"UINTMAX_WIDTH"},
+            .{"UINTPTR_MAX"},               .{"UINTPTR_WIDTH"},      .{"UINT_FAST16_MAX"},
+            .{"UINT_FAST16_WIDTH"},         .{"UINT_FAST32_MAX"},    .{"UINT_FAST32_WIDTH"},
+            .{"UINT_FAST64_MAX"},           .{"UINT_FAST64_WIDTH"},  .{"UINT_FAST8_MAX"},
+            .{"UINT_FAST8_WIDTH"},          .{"UINT_LEAST16_MAX"},   .{"UINT_LEAST16_WIDTH"},
+            .{"UINT_LEAST32_MAX"},          .{"UINT_LEAST32_WIDTH"}, .{"UINT_LEAST64_MAX"},
+            .{"UINT_LEAST64_WIDTH"},        .{"UINT_LEAST8_MAX"},    .{"UINT_LEAST8_WIDTH"},
+            .{"WCHAR_MAX"},                 .{"WCHAR_MIN"},          .{"WCHAR_WIDTH"},
+            .{"WINT_MAX"},                  .{"WINT_MIN"},           .{"WINT_WIDTH"},
+            .{"_Alignas"},                  .{"_Alignof"},           .{"_Atomic"},
+            .{"_BitInt"},                   .{"_Bool"},              .{"_Complex"},
+            .{"_Decimal128"},               .{"_Decimal32"},         .{"_Decimal64"},
+            .{"_Generic"},                  .{"_Imaginary"},         .{"_Noreturn"},
+            .{"_Static_assert"},            .{"_Thread_local"},      .{"__STDC_VERSION_STDDEF_H__"},
+            .{"__STDC_VERSION_STDINT_H__"}, .{"alignas"},            .{"alignof"},
+            .{"asm"},                       .{"auto"},               .{"bool"},
+            .{"break"},                     .{"case"},               .{"char"},
+            .{"const"},                     .{"constexpr"},          .{"continue"},
+            .{"default"},                   .{"do"},                 .{"double"},
+            .{"else"},                      .{"enum"},               .{"extern"},
+            .{"false"},                     .{"float"},              .{"for"},
+            .{"goto"},                      .{"if"},                 .{"inline"},
+            .{"int"},                       .{"int16_t"},            .{"int32_t"},
+            .{"int64_t"},                   .{"int8_t"},             .{"int_fast16_t"},
+            .{"int_fast32_t"},              .{"int_fast64_t"},       .{"int_fast8_t"},
+            .{"int_least16_t"},             .{"int_least32_t"},      .{"int_least64_t"},
+            .{"int_least8_t"},              .{"intmax_t"},           .{"intptr_t"},
+            .{"long"},                      .{"max_align_t"},        .{"nullptr"},
+            .{"nullptr_t"},                 .{"offsetof"},           .{"ptrdiff_t"},
+            .{"register"},                  .{"restrict"},           .{"return"},
+            .{"short"},                     .{"signed"},             .{"size_t"},
+            .{"sizeof"},                    .{"static"},             .{"static_assert"},
+            .{"string"},                    .{"struct"},             .{"switch"},
+            .{"thread_local"},              .{"true"},               .{"typedef"},
+            .{"typeof"},                    .{"typeof_unqual"},      .{"uint16_t"},
+            .{"uint32_t"},                  .{"uint64_t"},           .{"uint8_t"},
+            .{"uint_fast16_t"},             .{"uint_fast32_t"},      .{"uint_fast64_t"},
+            .{"uint_fast8_t"},              .{"uint_least16_t"},     .{"uint_least32_t"},
+            .{"uint_least64_t"},            .{"uint_least8_t"},      .{"uintmax_t"},
+            .{"uintptr_t"},                 .{"union"},              .{"unreachable"},
+            .{"unsigned"},                  .{"void"},               .{"volatile"},
+            .{"wchar_t"},                   .{"while"},
+        });
+
+        if (!reserved_words.has(name)) return;
+        self.failure = location;
+        return error.NameDefinedInTarget;
+    }
+
+    fn generateDeclarations(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        kind: std.meta.Tag(ast.Declaration),
+    ) std.Io.Writer.Error!void {
         var declared = false;
-        for (self.module.functions) |function| {
-            if (isMain(function)) continue;
-            try self.generateSignature(writer, function);
+        for (self.module.declarations) |declaration| {
+            if (declaration != kind) continue;
+            if (declaration == .function and isMain(declaration.function)) continue;
+            try self.generateSignature(writer, declaration);
             try writer.writeAll(";\n");
             declared = true;
         }
         if (declared) try writer.writeByte('\n');
-
-        for (self.module.functions, 0..) |function, index| {
-            if (index > 0) try writer.writeByte('\n');
-            try self.generateFunction(writer, function);
-        }
     }
 
     fn generateFunction(
@@ -48,7 +157,7 @@ pub const Generator = struct {
         function: ast.Function,
     ) std.Io.Writer.Error!void {
         self.in_main = isMain(function);
-        try self.generateSignature(writer, function);
+        try self.generateSignature(writer, .{ .function = function });
         try writer.writeByte(' ');
         try self.generateBlock(writer, function.body);
         try writer.writeByte('\n');
@@ -57,20 +166,37 @@ pub const Generator = struct {
     fn generateSignature(
         self: *Generator,
         writer: *std.Io.Writer,
-        function: ast.Function,
+        declaration: ast.Declaration,
     ) std.Io.Writer.Error!void {
-        if (isMain(function)) return writer.writeAll("int main()");
+        switch (declaration) {
+            .function => |function| {
+                if (isMain(function)) return writer.writeAll("int main()");
+                try writer.writeAll("static ");
+                try self.generateType(writer, function.declaration.return_type.primitive_type);
+                try writer.writeByte(' ');
+                try writer.writeAll(function.declaration.name);
+                try self.generateParameters(writer, function.declaration.parameters);
+            },
+            .external_function => |external_function| {
+                try self.generateType(writer, external_function.return_type.primitive_type);
+                try writer.writeByte(' ');
+                try writer.writeAll(external_function.name);
+                try self.generateParameters(writer, external_function.parameters);
+            },
+        }
+    }
 
-        try writer.writeAll("static ");
-        try self.generateType(writer, function.return_type.primitive_type);
-        try writer.writeByte(' ');
-        try self.generateIdentifier(writer, function.name);
+    fn generateParameters(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        parameters: []const ast.Parameter,
+    ) std.Io.Writer.Error!void {
         try writer.writeByte('(');
-        for (function.parameters, 0..) |parameter, index| {
+        for (parameters, 0..) |parameter, index| {
             if (index > 0) try writer.writeAll(", ");
             try self.generateType(writer, parameter.parameter_type.primitive_type);
             try writer.writeByte(' ');
-            try self.generateIdentifier(writer, parameter.name);
+            try writer.writeAll(parameter.name);
         }
         try writer.writeByte(')');
     }
@@ -95,34 +221,6 @@ pub const Generator = struct {
             .string => "string",
             .void => "void",
         });
-    }
-
-    fn generateIdentifier(
-        _: *Generator,
-        writer: *std.Io.Writer,
-        name: []const u8,
-    ) std.Io.Writer.Error!void {
-        const reserved_words = std.StaticStringMap(void).initComptime(.{
-            .{"MONOLITH_H"},    .{"_Alignas"},       .{"_Alignof"},      .{"_Atomic"},
-            .{"_BitInt"},       .{"_Bool"},          .{"_Complex"},      .{"_Decimal128"},
-            .{"_Decimal32"},    .{"_Decimal64"},     .{"_Generic"},      .{"_Imaginary"},
-            .{"_Noreturn"},     .{"_Static_assert"}, .{"_Thread_local"}, .{"alignas"},
-            .{"alignof"},       .{"asm"},            .{"auto"},          .{"bool"},
-            .{"break"},         .{"case"},           .{"char"},          .{"const"},
-            .{"constexpr"},     .{"continue"},       .{"default"},       .{"do"},
-            .{"double"},        .{"else"},           .{"enum"},          .{"extern"},
-            .{"false"},         .{"float"},          .{"for"},           .{"goto"},
-            .{"if"},            .{"inline"},         .{"int"},           .{"long"},
-            .{"nullptr"},       .{"register"},       .{"restrict"},      .{"return"},
-            .{"short"},         .{"signed"},         .{"sizeof"},        .{"static"},
-            .{"static_assert"}, .{"string"},         .{"struct"},        .{"switch"},
-            .{"thread_local"},  .{"true"},           .{"typedef"},       .{"typeof"},
-            .{"typeof_unqual"}, .{"union"},          .{"unsigned"},      .{"void"},
-            .{"volatile"},      .{"while"},
-        });
-
-        try writer.writeAll(name);
-        if (reserved_words.has(name) or std.mem.endsWith(u8, name, "_")) try writer.writeByte('_');
     }
 
     fn generateBlock(
@@ -195,9 +293,9 @@ pub const Generator = struct {
             .string => |text| {
                 try writer.print("(string){{ \"{s}\", {d} }}", .{ text, countBytes(text) });
             },
-            .identifier => |identifier| try self.generateIdentifier(writer, identifier.name),
+            .identifier => |identifier| try writer.writeAll(identifier.name),
             .call => |call| {
-                try self.generateIdentifier(writer, call.name);
+                try writer.writeAll(call.name);
                 try writer.writeByte('(');
                 for (call.arguments, 0..) |argument, index| {
                     if (index > 0) try writer.writeAll(", ");
@@ -209,8 +307,10 @@ pub const Generator = struct {
     }
 };
 
+pub const GenerateError = std.Io.Writer.Error || error{NameDefinedInTarget};
+
 fn isMain(function: ast.Function) bool {
-    return std.mem.eql(u8, function.name, "main");
+    return std.mem.eql(u8, function.declaration.name, "main");
 }
 
 fn countBytes(text: []const u8) usize {
@@ -279,6 +379,167 @@ test "Generator.generate: declares every static function first" {
     try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic int32_t add(int32_t left, int32_t right);\n\nint main() {\n    add(1, 2);\n}\n\nstatic int32_t add(int32_t left, int32_t right) {\n    return left;\n}\n", output.written());
 }
 
+test "checkNames: rejects function names defined in the target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn one(): noop\nfn int(): noop");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectError(error.NameDefinedInTarget, generator.generate(&output.writer));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, generator.failure.?);
+    try std.testing.expectEqualStrings("", output.written());
+}
+
+test "checkNames: rejects external function names defined in the target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("external fn int()");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectError(error.NameDefinedInTarget, generator.generate(&output.writer));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, generator.failure.?);
+    try std.testing.expectEqualStrings("", output.written());
+}
+
+test "checkNames: rejects parameter names defined in the target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn add(left: i32, char: i32): noop");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectError(error.NameDefinedInTarget, generator.generate(&output.writer));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, generator.failure.?);
+    try std.testing.expectEqualStrings("", output.written());
+}
+
+test "checkName: rejects the string type name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn string(): noop");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectError(error.NameDefinedInTarget, generator.generate(&output.writer));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, generator.failure.?);
+    try std.testing.expectEqualStrings("", output.written());
+}
+
+test "checkName: rejects the header guard name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn MONOLITH_H(): noop");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectError(error.NameDefinedInTarget, generator.generate(&output.writer));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, generator.failure.?);
+    try std.testing.expectEqualStrings("", output.written());
+}
+
+test "checkName: rejects names from the included headers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn add(size_t: i32): noop");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectError(error.NameDefinedInTarget, generator.generate(&output.writer));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 8 }, generator.failure.?);
+    try std.testing.expectEqualStrings("", output.written());
+}
+
+test "checkName: matches whole names only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn int_(): noop\nfn int(): noop");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectError(error.NameDefinedInTarget, generator.generate(&output.writer));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, generator.failure.?);
+}
+
+test "generateDeclarations: separates external functions from static functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn one(): noop\nexternal fn log(value: i32)\nfn two(): noop");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try generator.generate(&output.writer);
+
+    try std.testing.expectEqualStrings(
+        "#include \"monolith.h\"\n\nvoid log(int32_t value);\n\nstatic void one();\nstatic void two();\n\nstatic void one() {}\n\nstatic void two() {}\n",
+        output.written(),
+    );
+}
+
 test "generateFunction: generates main as the entry point" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -317,6 +578,28 @@ test "generateFunction: generates other functions as static" {
     try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic void one();\n\nstatic void one() {}\n", output.written());
 }
 
+test "generateSignature: declares external functions without static" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("external fn print_(text: String)\nfn main(): print_(\"hi\")");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try generator.generate(&output.writer);
+
+    try std.testing.expectEqualStrings(
+        "#include \"monolith.h\"\n\nvoid print_(string text);\n\nint main() {\n    print_((string){ \"hi\", 2 });\n}\n",
+        output.written(),
+    );
+}
+
 test "generateType: maps floating point types" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -334,44 +617,6 @@ test "generateType: maps floating point types" {
     try generator.generate(&output.writer);
 
     try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic float half();\nstatic double whole();\n\nstatic float half() {\n    return 0.5;\n}\n\nstatic double whole() {\n    return 1.0;\n}\n", output.written());
-}
-
-test "generateIdentifier: appends an underscore to reserved words" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn int(): noop");
-    try lexer.lex(&arena);
-    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
-    try name_resolver.resolve();
-    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
-    try type_checker.check();
-    var generator = Generator.init(module);
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    try generator.generate(&output.writer);
-
-    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic void int_();\n\nstatic void int_() {}\n", output.written());
-}
-
-test "generateIdentifier: keeps escaped names apart" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn int(): noop\nfn int_(): noop");
-    try lexer.lex(&arena);
-    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
-    try name_resolver.resolve();
-    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
-    try type_checker.check();
-    var generator = Generator.init(module);
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    try generator.generate(&output.writer);
-
-    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic void int_();\nstatic void int__();\n\nstatic void int_() {}\n\nstatic void int__() {}\n", output.written());
 }
 
 test "generateBlock: writes statements on separate lines" {
@@ -524,45 +769,4 @@ test "generateExpression: writes strings with their length in bytes" {
     try generator.generate(&output.writer);
 
     try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic string greeting();\n\nstatic string greeting() {\n    return (string){ \"line\\n\\\"quoted\\\"\", 13 };\n}\n", output.written());
-}
-
-test "generateIdentifier: keeps the string type name free" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn string(): noop");
-    try lexer.lex(&arena);
-    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
-    try name_resolver.resolve();
-    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
-    try type_checker.check();
-    var generator = Generator.init(module);
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    try generator.generate(&output.writer);
-
-    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic void string_();\n\nstatic void string_() {}\n", output.written());
-}
-
-test "generateIdentifier: keeps the header guard name free" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn MONOLITH_H(): noop");
-    try lexer.lex(&arena);
-    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
-    try name_resolver.resolve();
-    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
-    try type_checker.check();
-    var generator = Generator.init(module);
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    try generator.generate(&output.writer);
-
-    try std.testing.expectEqualStrings(
-        "#include \"monolith.h\"\n\nstatic void MONOLITH_H_();\n\nstatic void MONOLITH_H_() {}\n",
-        output.written(),
-    );
 }

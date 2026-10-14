@@ -1,14 +1,23 @@
 const token = @import("token.zig");
 
 pub const Module = struct {
-    functions: []Function,
+    declarations: []Declaration,
+};
+
+pub const Declaration = union(enum) {
+    function: Function,
+    external_function: FunctionDeclaration,
 };
 
 pub const Function = struct {
+    declaration: FunctionDeclaration,
+    body: []Statement,
+};
+
+pub const FunctionDeclaration = struct {
     name: []const u8,
     parameters: []Parameter,
     return_type: Type,
-    body: []Statement,
     location: token.Location,
 };
 
@@ -58,5 +67,5 @@ pub const Identifier = struct {
 pub const Call = struct {
     name: []const u8,
     arguments: []Expression,
-    function: ?usize = null,
+    declaration: ?usize = null,
 };

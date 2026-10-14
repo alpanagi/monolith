@@ -5,6 +5,7 @@ pub const Token = struct {
 
 pub const TokenKind = union(enum) {
     keyword_fn,
+    keyword_external,
     keyword_noop,
     keyword_return,
     keyword_true,
