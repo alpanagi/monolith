@@ -243,6 +243,7 @@ pub const Parser = struct {
             .float => |literal| .{ .float = literal },
             .keyword_true => .{ .boolean = true },
             .keyword_false => .{ .boolean = false },
+            .string => |text| .{ .string = text },
             .identifier => |name| .{ .identifier = .{ .name = name } },
             else => return null,
         };
@@ -663,7 +664,7 @@ test "parseCallStatement: rejects a name that is not called" {
 test "parseExpression: parses each literal kind" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn one() u8: return 0xff_u8\nfn two() f64: return 2.5\nfn three() bool: return true\nfn four() bool: return false");
+    var lexer = @import("lexer.zig").Lexer.init("fn one() u8: return 0xff_u8\nfn two() f64: return 2.5\nfn three() Bool: return true\nfn four() Bool: return false");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -674,6 +675,17 @@ test "parseExpression: parses each literal kind" {
     try std.testing.expectEqualStrings("2.5", module.functions[1].body[0].kind.@"return".?.kind.float.text);
     try std.testing.expectEqual(true, module.functions[2].body[0].kind.@"return".?.kind.boolean);
     try std.testing.expectEqual(false, module.functions[3].body[0].kind.@"return".?.kind.boolean);
+}
+
+test "parseExpression: parses a string literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn greeting() String: return \"hello\"");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    try std.testing.expectEqualStrings("hello", module.functions[0].body[0].kind.@"return".?.kind.string);
 }
 
 test "parseExpression: parses a parameter reference" {

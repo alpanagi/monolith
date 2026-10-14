@@ -45,6 +45,7 @@ pub const ExpressionKind = union(enum) {
     integer: token.NumberLiteral,
     float: token.NumberLiteral,
     boolean: bool,
+    string: []const u8,
     identifier: Identifier,
     call: Call,
 };

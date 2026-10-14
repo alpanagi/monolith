@@ -115,6 +115,7 @@ pub const Generator = struct {
                 }
             },
             .boolean => |value| try writer.writeAll(if (value) "true" else "false"),
+            .string => |text| try writer.print("\"{s}\"", .{text}),
             .identifier => |identifier| try self.generateIdentifier(writer, identifier.name),
             .call => |call| {
                 try self.generateIdentifier(writer, call.name);
@@ -303,7 +304,7 @@ test "generateExpression: keeps the base and drops the suffix" {
 test "generateExpression: writes booleans" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn ready() bool: return false");
+    var lexer = @import("lexer.zig").Lexer.init("fn ready() Bool: return false");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -355,4 +356,23 @@ test "generateExpression: writes 64-bit arguments as BigInt" {
     try generator.generate(&output.writer);
 
     try std.testing.expectEqualStrings("function take(value) {}\n\nfunction main() {\n    take(5n);\n}\n", output.written());
+}
+
+test "generateExpression: writes strings as written" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn greeting() String: return \"line\\n\\\"quoted\\\"\"");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try generator.generate(&output.writer);
+
+    try std.testing.expectEqualStrings("function greeting() {\n    return \"line\\n\\\"quoted\\\"\";\n}\n", output.written());
 }

@@ -46,6 +46,14 @@ pub fn main(init: std.process.Init) !u8 {
             try report(stderr, path, lexer.failure.?, "tabs are not allowed, use spaces");
             return 1;
         },
+        error.InvalidEscape => {
+            try report(stderr, path, lexer.failure.?, "unknown escape sequence");
+            return 1;
+        },
+        error.UnterminatedString => {
+            try report(stderr, path, lexer.failure.?, "unterminated string");
+            return 1;
+        },
     };
 
     var parser = Parser.init(lexer.tokens.items);
@@ -94,6 +102,7 @@ pub fn main(init: std.process.Init) !u8 {
     const directory = try std.Io.Dir.cwd().createDirPathOpen(io, directory_path, .{});
     defer directory.close(io);
     try directory.writeFile(io, .{ .sub_path = output_name, .data = output.written() });
+    if (target == .c) try directory.writeFile(io, .{ .sub_path = "monolith.h", .data = c.header });
     return 0;
 }
 

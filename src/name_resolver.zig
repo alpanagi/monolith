@@ -49,7 +49,7 @@ pub const NameResolver = struct {
     ) NameError!void {
         const bindings = function.parameters;
         switch (expression.kind) {
-            .integer, .float, .boolean => {},
+            .integer, .float, .boolean, .string => {},
             .identifier => |*identifier| {
                 if (findBinding(bindings, identifier.name)) |index| {
                     identifier.binding = index;

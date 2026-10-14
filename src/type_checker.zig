@@ -98,6 +98,9 @@ pub const TypeChecker = struct {
             .boolean => {
                 if (expected != .bool) return self.fail(expression.location, error.TypeMismatch);
             },
+            .string => {
+                if (expected != .string) return self.fail(expression.location, error.TypeMismatch);
+            },
             .identifier => |identifier| {
                 const bindings = function.parameters;
                 const binding_type = bindings[identifier.binding.?].parameter_type.primitive_type;
@@ -166,7 +169,7 @@ fn integerMaximum(primitive_type: token.PrimitiveType) ?u64 {
         .u16 => std.math.maxInt(u16),
         .u32 => std.math.maxInt(u32),
         .u64 => std.math.maxInt(u64),
-        .f32, .f64, .bool, .void => null,
+        .f32, .f64, .bool, .string, .void => null,
     };
 }
 
@@ -178,7 +181,7 @@ fn fitsFloat(comptime Float: type, text: []const u8) bool {
 test "TypeChecker.check: sets the type of each returned value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn one() u8: return 255\nfn two() f32: return 2.5\nfn three() bool: return true\nfn four() i64: return 1_i64\nfn main(): return");
+    var lexer = @import("lexer.zig").Lexer.init("fn one() u8: return 255\nfn two() f32: return 2.5\nfn three() Bool: return true\nfn four() i64: return 1_i64\nfn main(): return");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -561,7 +564,7 @@ test "checkCall: rejects a wrong number of arguments" {
 test "checkCall: rejects an argument of another type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn flag(value: bool): noop\nfn main(): flag(1)");
+    var lexer = @import("lexer.zig").Lexer.init("fn flag(value: Bool): noop\nfn main(): flag(1)");
     try lexer.lex(&arena);
     var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -586,4 +589,49 @@ test "checkCall: checks literal arguments against their parameter" {
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, type_checker.failure.?);
+}
+
+test "checkExpression: gives a string literal the String type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn greeting() String: return \"hello\"");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(module);
+    try type_checker.check();
+
+    try std.testing.expectEqual(token.PrimitiveType.string, module.functions[0].body[0].kind.@"return".?.primitive_type);
+}
+
+test "checkExpression: rejects a string for an integer type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn answer() i32: return \"42\"");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(module);
+
+    try std.testing.expectError(error.TypeMismatch, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?);
+}
+
+test "checkExpression: rejects an integer for String" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn name() String: return 1");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(module);
+
+    try std.testing.expectError(error.TypeMismatch, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?);
 }

@@ -29,6 +29,7 @@ pub const Lexer = struct {
             lexTab,
             lexWord,
             lexNumber,
+            lexString,
             lexSymbols,
         };
 
@@ -59,7 +60,13 @@ pub const Lexer = struct {
     }
 };
 
-pub const LexError = error{ OutOfMemory, UnexpectedCharacter, UnexpectedTab };
+pub const LexError = error{
+    OutOfMemory,
+    UnexpectedCharacter,
+    UnexpectedTab,
+    InvalidEscape,
+    UnterminatedString,
+};
 
 fn lexIndentation(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
     var position = state.offset;
@@ -125,7 +132,8 @@ fn lexWord(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
         .{ .text = "u64", .kind = .{ .primitive_type = .u64 } },
         .{ .text = "f32", .kind = .{ .primitive_type = .f32 } },
         .{ .text = "f64", .kind = .{ .primitive_type = .f64 } },
-        .{ .text = "bool", .kind = .{ .primitive_type = .bool } },
+        .{ .text = "Bool", .kind = .{ .primitive_type = .bool } },
+        .{ .text = "String", .kind = .{ .primitive_type = .string } },
     };
 
     const kind: token.TokenKind = for (keywords) |keyword| {
@@ -197,6 +205,38 @@ fn lexNumber(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
     return true;
 }
 
+fn lexString(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
+    if (state.source[state.offset] != '"') return false;
+
+    var position = state.offset + 1;
+    while (true) {
+        const byte = state.peek(position) orelse {
+            return state.fail(state.offset, error.UnterminatedString);
+        };
+        switch (byte) {
+            '"' => break,
+            '\\' => switch (state.peek(position + 1) orelse 0) {
+                'n', 't', '\\', '"' => position += 2,
+                '\n', '\r', 0 => return state.fail(state.offset, error.UnterminatedString),
+                else => return state.fail(position, error.InvalidEscape),
+            },
+            '\n', '\r' => return state.fail(state.offset, error.UnterminatedString),
+            ' '...'!', '#'...'[', ']'...'~' => position += 1,
+            else => return state.fail(position, error.UnexpectedCharacter),
+        }
+    }
+    const text = state.source[state.offset + 1 .. position];
+    position += 1;
+
+    try state.tokens.append(allocator, .{
+        .kind = .{ .string = text },
+        .location = state.location,
+    });
+    state.location.column += position - state.offset;
+    state.offset = position;
+    return true;
+}
+
 fn lexSymbols(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
     const kind: token.TokenKind = switch (state.source[state.offset]) {
         ':' => .colon,
@@ -248,7 +288,8 @@ fn consumeSuffix(state: *Lexer, offset: *usize, is_float: bool) LexError!?token.
 
     const name = state.source[offset.*..][0..length];
     const suffix = std.meta.stringToEnum(token.PrimitiveType, name);
-    const is_number_type = suffix != null and suffix != .bool and suffix != .void;
+    const is_named_type = suffix == .bool or suffix == .string or suffix == .void;
+    const is_number_type = suffix != null and !is_named_type;
     const is_float_type = suffix == .f32 or suffix == .f64;
     const valid = is_number_type and is_float == is_float_type;
     if (!valid) return state.fail(offset.*, error.UnexpectedCharacter);
@@ -453,10 +494,12 @@ test "lexWord: recognizes a lone underscore" {
 test "lexWord: recognizes primitive types" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool");
+    var lexer = Lexer.init("i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 Bool String");
     try lexer.lex(&arena);
 
-    const expected = [_]token.PrimitiveType{ .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .f32, .f64, .bool };
+    const expected = [_]token.PrimitiveType{
+        .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .f32, .f64, .bool, .string,
+    };
     try std.testing.expectEqual(expected.len + 2, lexer.tokens.items.len);
     for (expected, lexer.tokens.items[1 .. expected.len + 1]) |primitive_type, lexed| {
         try std.testing.expect(lexed.kind == .primitive_type);
@@ -664,7 +707,7 @@ test "lexNumber: rejects float suffix on binary" {
 test "lexNumber: rejects bool suffix" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("5bool");
+    var lexer = Lexer.init("5Bool");
 
     try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.failure.?);
@@ -688,6 +731,72 @@ test "lexNumber: leaves the position untouched on failure" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 4 }, lexer.failure.?);
     try std.testing.expectEqual(0, lexer.offset);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, lexer.location);
+}
+
+test "lexString: lexes a string literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("return \"hello\"");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(4, lexer.tokens.items.len);
+    try std.testing.expectEqualStrings("hello", lexer.tokens.items[2].kind.string);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 8 }, lexer.tokens.items[2].location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 15 }, lexer.tokens.items[3].location);
+}
+
+test "lexString: keeps escapes as written" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"a\\nb\\tc\\\\d\\\"e\"");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqualStrings("a\\nb\\tc\\\\d\\\"e", lexer.tokens.items[1].kind.string);
+}
+
+test "lexString: rejects an unknown escape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"a\\qb\"");
+
+    try std.testing.expectError(error.InvalidEscape, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.failure.?);
+}
+
+test "lexString: rejects a string without a closing quote" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("return \"hello");
+
+    try std.testing.expectError(error.UnterminatedString, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 8 }, lexer.failure.?);
+}
+
+test "lexString: rejects a backslash at the end of the file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"abc\\");
+
+    try std.testing.expectError(error.UnterminatedString, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, lexer.failure.?);
+}
+
+test "lexString: rejects a line break inside a string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"hello\nworld\"");
+
+    try std.testing.expectError(error.UnterminatedString, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, lexer.failure.?);
+}
+
+test "lexString: rejects a control character inside a string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"a\tb\"");
+
+    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.failure.?);
 }
 
 test "lexSymbols: lexes adjacent symbols" {

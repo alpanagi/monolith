@@ -19,6 +19,7 @@ pub const TokenKind = union(enum) {
     identifier: []const u8,
     integer: NumberLiteral,
     float: NumberLiteral,
+    string: []const u8,
     indent: usize,
     eof,
 };
@@ -40,6 +41,7 @@ pub const PrimitiveType = enum {
     f32,
     f64,
     bool,
+    string,
     void,
 };
 

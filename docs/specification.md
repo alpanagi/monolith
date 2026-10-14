@@ -20,7 +20,7 @@ The grammar uses this notation:
 | `[ a ]` | `a`, optionally |
 | `{ a }` | `a`, repeated zero or more times |
 
-`name`, `integer`, `float` and `newline` are defined in the Lexical structure chapter (L2, L6, L12 to L16). The indentation of lines is described in S6 to S8.
+`name`, `integer`, `float`, `string` and `newline` are defined in the Lexical structure chapter (L2, L6, L12 to L16, L18 to L22). The indentation of lines is described in S6 to S8.
 
 ```
 module         = { function }
@@ -28,11 +28,11 @@ function       = "fn" name "(" [ parameters ] ")" [ type ] ":" block
 parameters     = parameter { "," parameter } [ "," ]
 parameter      = name ":" type
 type           = "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
-               | "f32" | "f64" | "bool"
+               | "f32" | "f64" | "Bool" | "String"
 block          = statement | indented_block
 indented_block = newline statement { newline statement }
 statement      = "noop" | "return" [ expression ] | "_" "=" call | call
-expression     = integer | float | "true" | "false" | name | call
+expression     = integer | float | string | "true" | "false" | name | call
 call           = name "(" [ arguments ] ")"
 arguments      = expression { "," expression } [ "," ]
 ```
@@ -43,7 +43,7 @@ arguments      = expression { "," expression } [ "," ]
 
 - **L1.** Source files are ASCII. Any character not described in this chapter is rejected with `unexpected character`.
 - **L2.** A line ends with a line feed (`\n`) or a carriage return followed by a line feed (`\r\n`). A carriage return on its own is rejected with `unexpected character`.
-- **L3.** Spaces separate tokens. Tabs are rejected anywhere with `tabs are not allowed, use spaces`.
+- **L3.** Spaces separate tokens. Outside string literals, tabs are rejected with `tabs are not allowed, use spaces`. Inside string literals, L22 applies.
 - **L4.** The first line of a file cannot start with a space. It is rejected with `unexpected character` at 1:1.
 - **L5.** The number of spaces at the start of a line is its indentation. A line containing only spaces is blank and is ignored, whatever its indentation.
 
@@ -51,7 +51,7 @@ arguments      = expression { "," expression } [ "," ]
 
 - **L6.** A word starts with a letter or `_` and continues with letters, digits and `_`.
 - **L7.** These words are keywords: `fn`, `noop`, `return`, `true`, `false`.
-- **L8.** These words are type names: `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `bool`.
+- **L8.** These words are type names: `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `Bool`, `String`. Type names that state a size in bits are lowercase. All other type names start with a capital letter.
 - **L9.** A lone `_` is the discard symbol. It is not a name.
 - **L10.** Every other word is a name. Keywords, type names and `_` cannot be used as names.
 
@@ -81,6 +81,22 @@ arguments      = expression { "," expression } [ "," ]
   - A float literal takes `f32` or `f64`. `1f64` is rejected: write `1.0f64`.
   - In hexadecimal literals, `f` is a digit, so `0x1f32` is the number `0x1F32` without a suffix.
 - **L17.** A letter, digit or `_` directly after a number literal that is not a valid suffix is rejected with `unexpected character`.
+
+### String literals
+
+- **L18.** A string literal is text between double quotes on a single line: `"hello"`.
+- **L19.** Between the quotes, a string literal contains printable ASCII characters other than `"` and `\`, and these escapes:
+
+  | Escape | Character |
+  |---|---|
+  | `\n` | line feed |
+  | `\t` | tab |
+  | `\\` | backslash |
+  | `\"` | double quote |
+
+- **L20.** A `\` followed by any other character is rejected with `unknown escape sequence`, at the `\`.
+- **L21.** A string literal that reaches the end of its line or of the file without a closing `"` is rejected with `unterminated string`, at its opening `"`.
+- **L22.** Any other character inside a string literal, such as a tab, is rejected with `unexpected character`.
 
 ## Program structure
 
@@ -142,7 +158,8 @@ arguments      = expression { "," expression } [ "," ]
   | `i8`, `i16`, `i32`, `i64` | signed integers of 8, 16, 32 and 64 bits |
   | `u8`, `u16`, `u32`, `u64` | unsigned integers of 8, 16, 32 and 64 bits |
   | `f32`, `f64` | 32-bit and 64-bit floating point numbers |
-  | `bool` | `true` and `false` |
+  | `Bool` | `true` and `false` |
+  | `String` | text, made of ASCII characters for now |
   | `void` | no value; only as the return type of a function without one |
 
 - **T2.** There are no implicit conversions between types.
@@ -150,7 +167,7 @@ arguments      = expression { "," expression } [ "," ]
 
 ### Types of expressions
 
-- **T4.** `true` and `false` have type `bool`.
+- **T4.** `true` and `false` have type `Bool`, and a string literal has type `String`.
 - **T5.** A number literal with a suffix has the suffix's type. A number literal without a suffix takes the type its context expects: the function's return type for a returned value, or the parameter's type for an argument.
 - **T6.** An integer literal can only have an integer type, and a float literal only a float type. `return 2` in an `f64` function is rejected: write `2.0`.
 - **T7.** An integer literal must not exceed its type's maximum, and a float literal must not overflow its type to infinity. Otherwise it is rejected with `literal out of range for its type`. A float literal too small for its type becomes 0 and is accepted.
@@ -178,7 +195,7 @@ arguments      = expression { "," expression } [ "," ]
 
 ### Names in the output
 
-- **G1.** A name keeps its spelling in the output, unless it is a reserved word of the target or ends with `_`. Then `_` is appended. `delete` becomes `delete_` in JavaScript, `int` becomes `int_` in C, and `count_` becomes `count__` in both. Two different names never produce the same output name.
+- **G1.** A name keeps its spelling in the output, unless it is a reserved word of the target or ends with `_`. Then `_` is appended. In C, `string` and `MONOLITH_H` are also reserved, because the output defines them (C1). `delete` becomes `delete_` in JavaScript, `int` becomes `int_` in C, and `count_` becomes `count__` in both. Two different names never produce the same output name.
 
 ### JavaScript
 
@@ -187,10 +204,24 @@ arguments      = expression { "," expression } [ "," ]
 - **J3.** Values of `i64` and `u64` are JavaScript BigInts, so every value of these types is exact. All other number types are JavaScript numbers.
 - **J4.** Number literals keep their base and separators and lose their suffix: `0xff_ff_u32` becomes `0xff_ff`. Literals of type `i64` or `u64` end with `n`: `1_000_i64` becomes `1_000n`.
 - **J5.** `_ = add(1, 2)` becomes the plain call, `add(1, 2);`.
+- **J6.** `String` values are JavaScript strings. String literals are written exactly as in the source: `"line\n"` stays `"line\n"`.
 
 ### C
 
-- **C1.** The output is C23 and starts with `#include <stdint.h>`.
+- **C1.** The output is C23. Every file starts with `#include "monolith.h"`. That header is written next to it and contains the definitions the output relies on:
+
+  ```c
+  #ifndef MONOLITH_H
+  #define MONOLITH_H
+
+  #include <stddef.h>
+  #include <stdint.h>
+
+  typedef struct { const char *bytes; size_t length; } string;
+
+  #endif
+  ```
+
 - **C2.** Every function except `main` becomes a `static` function, and a declaration of each follows the include, so functions can call each other in any order.
 - **C3.** `main` becomes `int main()`. A `return` without a value inside `main` becomes `return 0;`.
 - **C4.** Types become C types:
@@ -200,17 +231,19 @@ arguments      = expression { "," expression } [ "," ]
   | `i8` to `i64` | `int8_t` to `int64_t` |
   | `u8` to `u64` | `uint8_t` to `uint64_t` |
   | `f32`, `f64` | `float`, `double` |
-  | `bool` | `bool` |
+  | `Bool` | `bool` |
+  | `String` | `string` |
   | `void` | `void` |
 
 - **C5.** Number literals keep their base. `_` becomes `'`, `0o` becomes `0`, the suffix is removed, and literals of unsigned types end with `u`: `0o7_5_5` returned from a `u16` function becomes `07'5'5u`.
 - **C6.** `_ = add(1, 2)` becomes the plain call, `add(1, 2);`.
+- **C7.** A string literal becomes a `string` holding the literal as written and its length in bytes, counting each escape as one byte: `"line\n"` becomes `(string){ "line\n", 5 }`.
 
 ## Compiler
 
 - **K1.** The compiler is invoked as `monolith --target <javascript|c> <file.mn>`. Any other arguments print `usage: monolith --target <javascript|c> <file.mn>`.
 - **K2.** The source file name must end with `.mn` and have a name before it.
-- **K3.** The output is written to `build/<target>/<name>.<extension>`, where `<name>` is the source file name without `.mn` and the extension is `js` or `c`. No file is written when compilation fails.
+- **K3.** The output is written to `build/<target>/<name>.<extension>`, where `<name>` is the source file name without `.mn` and the extension is `js` or `c`. The C target also writes `build/c/monolith.h` (C1). No file is written when compilation fails.
 - **K4.** The compiler exits with status 0 on success and 1 on any error.
 
 ## Examples
@@ -220,12 +253,15 @@ arguments      = expression { "," expression } [ "," ]
 ```monolith
 fn add(left: i32, right: i32) i32: return left
 
-fn flag() bool:
+fn flag() Bool:
     return true
+
+fn greeting() String: return "hello\n"
 
 fn main():
     _ = add(1, 2)
     _ = flag()
+    _ = greeting()
 ```
 
 JavaScript:
@@ -239,19 +275,25 @@ function flag() {
     return true;
 }
 
+function greeting() {
+    return "hello\n";
+}
+
 function main() {
     add(1, 2);
     flag();
+    greeting();
 }
 ```
 
 C:
 
 ```c
-#include <stdint.h>
+#include "monolith.h"
 
 static int32_t add(int32_t left, int32_t right);
 static bool flag();
+static string greeting();
 
 static int32_t add(int32_t left, int32_t right) {
     return left;
@@ -261,9 +303,14 @@ static bool flag() {
     return true;
 }
 
+static string greeting() {
+    return (string){ "hello\n", 6 };
+}
+
 int main() {
     add(1, 2);
     flag();
+    greeting();
 }
 ```
 
@@ -314,3 +361,9 @@ fn value() u8: return 007
 ```
 
 → `1:24: error: unexpected character` (L13)
+
+```monolith
+fn name() String: return "a\qb"
+```
+
+→ `1:28: error: unknown escape sequence` (L20)

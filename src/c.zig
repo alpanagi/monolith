@@ -2,6 +2,19 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const token = @import("token.zig");
 
+pub const header =
+    \\#ifndef MONOLITH_H
+    \\#define MONOLITH_H
+    \\
+    \\#include <stddef.h>
+    \\#include <stdint.h>
+    \\
+    \\typedef struct { const char *bytes; size_t length; } string;
+    \\
+    \\#endif
+    \\
+;
+
 pub const Generator = struct {
     module: ast.Module,
     depth: usize = 0,
@@ -12,7 +25,7 @@ pub const Generator = struct {
     }
 
     pub fn generate(self: *Generator, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        try writer.writeAll("#include <stdint.h>\n\n");
+        try writer.writeAll("#include \"monolith.h\"\n\n");
 
         var declared = false;
         for (self.module.functions) |function| {
@@ -79,6 +92,7 @@ pub const Generator = struct {
             .f32 => "float",
             .f64 => "double",
             .bool => "bool",
+            .string => "string",
             .void => "void",
         });
     }
@@ -89,21 +103,22 @@ pub const Generator = struct {
         name: []const u8,
     ) std.Io.Writer.Error!void {
         const reserved_words = std.StaticStringMap(void).initComptime(.{
-            .{"_Alignas"},       .{"_Alignof"},      .{"_Atomic"},       .{"_BitInt"},
-            .{"_Bool"},          .{"_Complex"},      .{"_Decimal128"},   .{"_Decimal32"},
-            .{"_Decimal64"},     .{"_Generic"},      .{"_Imaginary"},    .{"_Noreturn"},
-            .{"_Static_assert"}, .{"_Thread_local"}, .{"alignas"},       .{"alignof"},
-            .{"asm"},            .{"auto"},          .{"bool"},          .{"break"},
-            .{"case"},           .{"char"},          .{"const"},         .{"constexpr"},
-            .{"continue"},       .{"default"},       .{"do"},            .{"double"},
-            .{"else"},           .{"enum"},          .{"extern"},        .{"false"},
-            .{"float"},          .{"for"},           .{"goto"},          .{"if"},
-            .{"inline"},         .{"int"},           .{"long"},          .{"nullptr"},
-            .{"register"},       .{"restrict"},      .{"return"},        .{"short"},
-            .{"signed"},         .{"sizeof"},        .{"static"},        .{"static_assert"},
-            .{"struct"},         .{"switch"},        .{"thread_local"},  .{"true"},
-            .{"typedef"},        .{"typeof"},        .{"typeof_unqual"}, .{"union"},
-            .{"unsigned"},       .{"void"},          .{"volatile"},      .{"while"},
+            .{"MONOLITH_H"},    .{"_Alignas"},       .{"_Alignof"},      .{"_Atomic"},
+            .{"_BitInt"},       .{"_Bool"},          .{"_Complex"},      .{"_Decimal128"},
+            .{"_Decimal32"},    .{"_Decimal64"},     .{"_Generic"},      .{"_Imaginary"},
+            .{"_Noreturn"},     .{"_Static_assert"}, .{"_Thread_local"}, .{"alignas"},
+            .{"alignof"},       .{"asm"},            .{"auto"},          .{"bool"},
+            .{"break"},         .{"case"},           .{"char"},          .{"const"},
+            .{"constexpr"},     .{"continue"},       .{"default"},       .{"do"},
+            .{"double"},        .{"else"},           .{"enum"},          .{"extern"},
+            .{"false"},         .{"float"},          .{"for"},           .{"goto"},
+            .{"if"},            .{"inline"},         .{"int"},           .{"long"},
+            .{"nullptr"},       .{"register"},       .{"restrict"},      .{"return"},
+            .{"short"},         .{"signed"},         .{"sizeof"},        .{"static"},
+            .{"static_assert"}, .{"string"},         .{"struct"},        .{"switch"},
+            .{"thread_local"},  .{"true"},           .{"typedef"},       .{"typeof"},
+            .{"typeof_unqual"}, .{"union"},          .{"unsigned"},      .{"void"},
+            .{"volatile"},      .{"while"},
         });
 
         try writer.writeAll(name);
@@ -177,6 +192,9 @@ pub const Generator = struct {
                 }
             },
             .boolean => |value| try writer.writeAll(if (value) "true" else "false"),
+            .string => |text| {
+                try writer.print("(string){{ \"{s}\", {d} }}", .{ text, countBytes(text) });
+            },
             .identifier => |identifier| try self.generateIdentifier(writer, identifier.name),
             .call => |call| {
                 try self.generateIdentifier(writer, call.name);
@@ -195,6 +213,15 @@ fn isMain(function: ast.Function) bool {
     return std.mem.eql(u8, function.name, "main");
 }
 
+fn countBytes(text: []const u8) usize {
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) : (count += 1) {
+        index += if (text[index] == '\\') 2 else 1;
+    }
+    return count;
+}
+
 test "Generator.generate: separates functions with a blank line" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -211,7 +238,7 @@ test "Generator.generate: separates functions with a blank line" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("#include <stdint.h>\n\nstatic void two();\n\nint main() {}\n\nstatic void two() {}\n", output.written());
+    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic void two();\n\nint main() {}\n\nstatic void two() {}\n", output.written());
 }
 
 test "Generator.generate: includes stdint" {
@@ -230,7 +257,7 @@ test "Generator.generate: includes stdint" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("#include <stdint.h>\n\nstatic int32_t answer();\n\nstatic int32_t answer() {\n    return 42;\n}\n", output.written());
+    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic int32_t answer();\n\nstatic int32_t answer() {\n    return 42;\n}\n", output.written());
 }
 
 test "Generator.generate: declares every static function first" {
@@ -249,7 +276,7 @@ test "Generator.generate: declares every static function first" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("#include <stdint.h>\n\nstatic int32_t add(int32_t left, int32_t right);\n\nint main() {\n    add(1, 2);\n}\n\nstatic int32_t add(int32_t left, int32_t right) {\n    return left;\n}\n", output.written());
+    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic int32_t add(int32_t left, int32_t right);\n\nint main() {\n    add(1, 2);\n}\n\nstatic int32_t add(int32_t left, int32_t right) {\n    return left;\n}\n", output.written());
 }
 
 test "generateFunction: generates main as the entry point" {
@@ -268,7 +295,7 @@ test "generateFunction: generates main as the entry point" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("#include <stdint.h>\n\nint main() {}\n", output.written());
+    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nint main() {}\n", output.written());
 }
 
 test "generateFunction: generates other functions as static" {
@@ -287,7 +314,7 @@ test "generateFunction: generates other functions as static" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("#include <stdint.h>\n\nstatic void one();\n\nstatic void one() {}\n", output.written());
+    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic void one();\n\nstatic void one() {}\n", output.written());
 }
 
 test "generateType: maps floating point types" {
@@ -306,7 +333,7 @@ test "generateType: maps floating point types" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("#include <stdint.h>\n\nstatic float half();\nstatic double whole();\n\nstatic float half() {\n    return 0.5;\n}\n\nstatic double whole() {\n    return 1.0;\n}\n", output.written());
+    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic float half();\nstatic double whole();\n\nstatic float half() {\n    return 0.5;\n}\n\nstatic double whole() {\n    return 1.0;\n}\n", output.written());
 }
 
 test "generateIdentifier: appends an underscore to reserved words" {
@@ -325,7 +352,7 @@ test "generateIdentifier: appends an underscore to reserved words" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("#include <stdint.h>\n\nstatic void int_();\n\nstatic void int_() {}\n", output.written());
+    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic void int_();\n\nstatic void int_() {}\n", output.written());
 }
 
 test "generateIdentifier: keeps escaped names apart" {
@@ -344,7 +371,7 @@ test "generateIdentifier: keeps escaped names apart" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("#include <stdint.h>\n\nstatic void int_();\nstatic void int__();\n\nstatic void int_() {}\n\nstatic void int__() {}\n", output.written());
+    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic void int_();\nstatic void int__();\n\nstatic void int_() {}\n\nstatic void int__() {}\n", output.written());
 }
 
 test "generateBlock: writes statements on separate lines" {
@@ -363,7 +390,7 @@ test "generateBlock: writes statements on separate lines" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("#include <stdint.h>\n\nstatic void stop();\n\nstatic void stop() {\n    return;\n}\n", output.written());
+    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic void stop();\n\nstatic void stop() {\n    return;\n}\n", output.written());
 }
 
 test "generateStatement: returns zero from main" {
@@ -382,7 +409,7 @@ test "generateStatement: returns zero from main" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("#include <stdint.h>\n\nint main() {\n    return 0;\n}\n", output.written());
+    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nint main() {\n    return 0;\n}\n", output.written());
 }
 
 test "generateStatement: writes calls and discards" {
@@ -401,7 +428,7 @@ test "generateStatement: writes calls and discards" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("#include <stdint.h>\n\nstatic void log(int32_t value);\nstatic int32_t one();\n\nstatic void log(int32_t value) {}\n\nstatic int32_t one() {\n    return 1;\n}\n\nint main() {\n    log(one());\n    one();\n}\n", output.written());
+    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic void log(int32_t value);\nstatic int32_t one();\n\nstatic void log(int32_t value) {}\n\nstatic int32_t one() {\n    return 1;\n}\n\nint main() {\n    log(one());\n    one();\n}\n", output.written());
 }
 
 test "generateExpression: converts separators and octal" {
@@ -420,7 +447,7 @@ test "generateExpression: converts separators and octal" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("#include <stdint.h>\n\nstatic uint16_t mode();\nstatic uint32_t big();\n\nstatic uint16_t mode() {\n    return 07'5'5u;\n}\n\nstatic uint32_t big() {\n    return 1'000u;\n}\n", output.written());
+    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic uint16_t mode();\nstatic uint32_t big();\n\nstatic uint16_t mode() {\n    return 07'5'5u;\n}\n\nstatic uint32_t big() {\n    return 1'000u;\n}\n", output.written());
 }
 
 test "generateExpression: marks unsigned literals" {
@@ -439,7 +466,7 @@ test "generateExpression: marks unsigned literals" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("#include <stdint.h>\n\nstatic uint8_t mask();\nstatic uint64_t big();\n\nstatic uint8_t mask() {\n    return 0xffu;\n}\n\nstatic uint64_t big() {\n    return 18446744073709551615u;\n}\n", output.written());
+    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic uint8_t mask();\nstatic uint64_t big();\n\nstatic uint8_t mask() {\n    return 0xffu;\n}\n\nstatic uint64_t big() {\n    return 18446744073709551615u;\n}\n", output.written());
 }
 
 test "generateExpression: leaves signed literals unmarked" {
@@ -458,7 +485,7 @@ test "generateExpression: leaves signed literals unmarked" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("#include <stdint.h>\n\nstatic int64_t big();\n\nstatic int64_t big() {\n    return 9223372036854775807;\n}\n", output.written());
+    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic int64_t big();\n\nstatic int64_t big() {\n    return 9223372036854775807;\n}\n", output.written());
 }
 
 test "generateExpression: marks unsigned arguments" {
@@ -477,5 +504,65 @@ test "generateExpression: marks unsigned arguments" {
     defer output.deinit();
     try generator.generate(&output.writer);
 
-    try std.testing.expectEqualStrings("#include <stdint.h>\n\nstatic void small(uint8_t value);\n\nstatic void small(uint8_t value) {}\n\nint main() {\n    small(255u);\n}\n", output.written());
+    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic void small(uint8_t value);\n\nstatic void small(uint8_t value) {}\n\nint main() {\n    small(255u);\n}\n", output.written());
+}
+
+test "generateExpression: writes strings with their length in bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn greeting() String: return \"line\\n\\\"quoted\\\"\"");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try generator.generate(&output.writer);
+
+    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic string greeting();\n\nstatic string greeting() {\n    return (string){ \"line\\n\\\"quoted\\\"\", 13 };\n}\n", output.written());
+}
+
+test "generateIdentifier: keeps the string type name free" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn string(): noop");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try generator.generate(&output.writer);
+
+    try std.testing.expectEqualStrings("#include \"monolith.h\"\n\nstatic void string_();\n\nstatic void string_() {}\n", output.written());
+}
+
+test "generateIdentifier: keeps the header guard name free" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn MONOLITH_H(): noop");
+    try lexer.lex(&arena);
+    var parser = @import("parser.zig").Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(module);
+    try name_resolver.resolve();
+    var type_checker = @import("type_checker.zig").TypeChecker.init(module);
+    try type_checker.check();
+    var generator = Generator.init(module);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try generator.generate(&output.writer);
+
+    try std.testing.expectEqualStrings(
+        "#include \"monolith.h\"\n\nstatic void MONOLITH_H_();\n\nstatic void MONOLITH_H_() {}\n",
+        output.written(),
+    );
 }
