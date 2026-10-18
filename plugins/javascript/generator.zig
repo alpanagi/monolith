@@ -52,6 +52,11 @@ pub const Generator = struct {
 
         var files: std.ArrayList(File) = .empty;
         for (self.program.modules, 0..) |module, index| {
+            const defines_functions = for (module.declarations) |declaration| {
+                if (declaration.kind == .function_definition) break true;
+            } else false;
+            if (!defines_functions) continue;
+
             self.module_index = index;
             var contents: std.Io.Writer.Allocating = .init(allocator);
             try self.generateModule(allocator, &contents.writer, module);
@@ -670,6 +675,34 @@ test "generateFiles: writes one file per module" {
         "export function add(value) {}\n",
         files[1].contents,
     );
+}
+
+test "generateFiles: writes no file for a module without functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    try compiler_directory.dir.createDirPath(std.testing.io, "std");
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/console.mn", .data = "external fn mn_console_write(text: String)\nconst write = mn_console_write" });
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    const compiler_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &compiler_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): std::console::write(\"hi\")" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(allocator);
+
+    try std.testing.expectEqual(2, loader.modules.items.len);
+    try std.testing.expectEqual(1, files.len);
+    try std.testing.expectEqualStrings("main.js", files[0].path);
 }
 
 test "checkDeclarationNames: rejects function names defined in the target" {

@@ -252,7 +252,7 @@ constant             = "const" name "=" expression
 
 ### JavaScript
 
-- **J1.** Every module becomes an ES module file (K3). Each function becomes an exported `function` declaration with the same parameters, without types: `export function add(left, right)`. Every module exports its functions, so any module can be imported, the main module included.
+- **J1.** Every module that defines functions becomes an ES module file (K3). A module without functions produces no file, because nothing imports it (J9). Each function becomes an exported `function` declaration with the same parameters, without types: `export function add(left, right)`. Every module exports its functions, so any module can be imported, the main module included.
 - **J2.** A function whose body only contains `noop` becomes an empty function, `{}`.
 - **J3.** Values of `i64` and `u64` are JavaScript BigInts, so every value of these types is exact. All other number types are JavaScript numbers.
 - **J4.** Number literals keep their base and separators and lose their suffix: `0xff_ff_u32` becomes `0xff_ff`. Literals of type `i64` or `u64` end with `n`: `1_000_i64` becomes `1_000n`.
@@ -280,7 +280,7 @@ constant             = "const" name "=" expression
   #endif
   ```
 
-- **C2.** Every module becomes a `.c` file and a `.h` file (K3).
+- **C2.** Every module becomes a `.h` file, and a module that defines functions also becomes a `.c` file (K3).
   - The `.h` file includes `runtime/monolith.h`, with a path relative to the file, and declares the module's functions: first its external functions, then, after a blank line, its other functions. The main module's `main` is not declared.
   - The `.c` file includes its own header, then the header of every other module its calls reach, in the order of their first call, and then defines its functions. Includes use paths relative to the file: `#include "std/console.h"`.
   - No function is `static`, so any module can be imported, the main module included.
@@ -309,8 +309,9 @@ constant             = "const" name "=" expression
 - **K3.** The output is written to `build/<target>/`, in the directory the compiler runs in. The extension of every generated file is `js` or `c`:
   - The main module is written as `<name>.<extension>`, where `<name>` is the source file name without `.mn`.
   - Every other module is written at its module path, the standard library's modules included: `utils::math` as `utils/math.<extension>`, and `std::console` as `std/console.<extension>`.
+  - A module without functions, the main module included, gets no `js` or `c` file (J1, C2).
   - The runtime files whose functions the program calls are copied to `runtime/`, such as `runtime/console.js` (D2).
-  - The C target writes a `.h` file next to every `.c` file (C2), and always copies `runtime/monolith.h` (C1).
+  - The C target writes a `.h` file for every module (C2), and always copies `runtime/monolith.h` (C1).
   - When the main module defines `main`, the C target also builds the executable `<name>` with GCC, from every `.c` file of the output: `gcc -std=c23 -Wall -Wextra -pedantic -O2 -flto`. GCC's warnings are shown. If GCC cannot be run, the compiler stops with `error: cannot run gcc: <reason>`. If GCC fails, it stops with `error: gcc could not build the executable`. GCC runs after the output is written, so the C files stay when it fails.
   - After a successful compilation, `build/<target>` is deleted and created again, so it only contains this output. No file is written or deleted when compilation fails.
 - **K4.** The compiler exits with status 0 on success and 1 on any error.
@@ -377,7 +378,7 @@ export function main() {
 main();
 ```
 
-`std/console.js` is empty, because `std::console` only declares an external function and a constant (D1).
+No `std/console.js` or `std/console.c` is written, because `std::console` only declares an external function and a constant (D1).
 
 C, `hello.h`:
 

@@ -69,6 +69,11 @@ pub const Generator = struct {
                 .contents = header_contents.written(),
             });
 
+            const defines_functions = for (module.declarations) |declaration| {
+                if (declaration.kind == .function_definition) break true;
+            } else false;
+            if (!defines_functions) continue;
+
             var source_contents: std.Io.Writer.Allocating = .init(allocator);
             const source_path = try std.mem.concat(allocator, u8, &.{ path, ".c" });
             try self.generateSource(allocator, &source_contents.writer, source_path, module);
@@ -839,8 +844,7 @@ test "generateFiles: writes the standard library at its module path" {
         "#include \"../runtime/monolith.h\"\n\nvoid mn_console_write(string text);\n",
         files[2].contents,
     );
-    try std.testing.expectEqualStrings("std/console.c", files[3].path);
-    try std.testing.expectEqualStrings("#include \"console.h\"\n", files[3].contents);
+    try std.testing.expectEqual(3, files.len);
     try std.testing.expectEqual(2, generator.runtime_files.items.len);
     try std.testing.expectEqualStrings("console.c", generator.runtime_files.items[1]);
 }
