@@ -83,7 +83,9 @@ pub fn main(init: std.process.Init) !u8 {
 
 fn parseArguments(arguments: []const [:0]const u8) ?Arguments {
     if (arguments.len != 4 or !std.mem.eql(u8, arguments[1], "--target")) return null;
-    const target = std.meta.stringToEnum(Target, arguments[2]) orelse return null;
+    const target = for (std.enums.values(Target)) |candidate| {
+        if (std.ascii.eqlIgnoreCase(arguments[2], @tagName(candidate))) break candidate;
+    } else if (std.ascii.eqlIgnoreCase(arguments[2], "js")) .javascript else return null;
     const path = arguments[3];
     const file_name = std.fs.path.basename(path);
     const source_extension = ".mn";
@@ -105,7 +107,7 @@ const Target = enum {
 };
 
 fn printUsage(stderr: *std.Io.Writer) std.Io.Writer.Error!u8 {
-    try stderr.writeAll("usage: monolith --target <javascript|c> <file.mn>\n");
+    try stderr.writeAll("usage: monolith --target <javascript|js|c> <file.mn>\n");
     try stderr.flush();
     return 1;
 }

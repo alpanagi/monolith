@@ -304,7 +304,7 @@ constant             = "const" name "=" expression
 
 ## Compiler
 
-- **K1.** The compiler is invoked as `monolith --target <javascript|c> <file.mn>`, where the file name ends with `.mn` and has a name before it. Any other arguments print `usage: monolith --target <javascript|c> <file.mn>`.
+- **K1.** The compiler is invoked as `monolith --target <javascript|js|c> <file.mn>`, where the file name ends with `.mn` and has a name before it. Any other arguments print `usage: monolith --target <javascript|js|c> <file.mn>`. `js` is another name for `javascript`. The target ignores case: `--target JavaScript` and `--target JS` are the same as `--target javascript`, and their output still goes to `build/javascript` (K3).
 - **K2.** The file name without `.mn` must be a valid name (L6, L10), and neither a built-in type name (T1) nor `std` (M4). Otherwise the compiler stops with `error: file name must be a valid name`, before reading the file.
 - **K3.** The output is written to `build/<target>/`, in the directory the compiler runs in. The extension of every generated file is `js` or `c`:
   - The main module is written as `<name>.<extension>`, where `<name>` is the source file name without `.mn`.
