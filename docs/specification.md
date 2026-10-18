@@ -311,6 +311,7 @@ constant             = "const" name "=" expression
   - Every other module is written at its module path, the standard library's modules included: `utils::math` as `utils/math.<extension>`, and `std::console` as `std/console.<extension>`.
   - The runtime files whose functions the program calls are copied to `runtime/`, such as `runtime/console.js` (D2).
   - The C target writes a `.h` file next to every `.c` file (C2), and always copies `runtime/monolith.h` (C1).
+  - When the main module defines `main`, the C target also builds the executable `<name>` with GCC, from every `.c` file of the output: `gcc -std=c23 -Wall -Wextra -pedantic -O2 -flto`. GCC's warnings are shown. If GCC cannot be run, the compiler stops with `error: cannot run gcc: <reason>`. If GCC fails, it stops with `error: gcc could not build the executable`. GCC runs after the output is written, so the C files stay when it fails.
   - After a successful compilation, `build/<target>` is deleted and created again, so it only contains this output. No file is written or deleted when compilation fails.
 - **K4.** The compiler exits with status 0 on success and 1 on any error.
 - **K5.** The compiler's executable comes with two directories next to it: `std/`, the standard library's modules, and `plugins/`, with one directory for each target. A target's runtime (D2) is in the `runtime/` directory of its plugin: `plugins/javascript/runtime/console.js`.

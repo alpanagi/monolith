@@ -45,6 +45,7 @@ pub const Generator = struct {
             try output_directory.createDirPath(io, "runtime");
             try plugin_directory.copyFile(path, output_directory, path, io, .{});
         }
+        try self.buildExecutable(allocator, io, output_directory, files);
     }
 
     fn generateFiles(
@@ -77,6 +78,51 @@ pub const Generator = struct {
             });
         }
         return files.items;
+    }
+
+    fn buildExecutable(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        output_directory: std.Io.Dir,
+        files: []const File,
+    ) GenerateError!void {
+        const main_module = self.program.modules[0];
+        const has_main = for (main_module.declarations) |declaration| {
+            if (declaration.kind != .function_definition) continue;
+            const name = declaration.kind.function_definition.signature.name;
+            if (std.mem.eql(u8, name, "main")) break true;
+        } else false;
+        if (!has_main) return;
+
+        var arguments: std.ArrayList([]const u8) = .empty;
+        const flags = &.{ "gcc", "-std=c23", "-Wall", "-Wextra", "-pedantic", "-O2", "-flto" };
+        try arguments.appendSlice(allocator, flags);
+        for (files) |file| {
+            if (std.mem.endsWith(u8, file.path, ".c")) try arguments.append(allocator, file.path);
+        }
+        for (self.runtime_files.items) |name| {
+            if (!std.mem.endsWith(u8, name, ".c")) continue;
+            const path = try std.mem.concat(allocator, u8, &.{ "runtime/", name });
+            try arguments.append(allocator, path);
+        }
+        try arguments.appendSlice(allocator, &.{ "-o", main_module.path[0] });
+
+        var compiler = std.process.spawn(io, .{
+            .argv = arguments.items,
+            .cwd = .{ .dir = output_directory },
+            .stdin = .ignore,
+        }) catch |spawn_error| {
+            const format = "cannot run gcc: {t}";
+            const message = try std.fmt.allocPrint(allocator, format, .{spawn_error});
+            self.failure = .{ .message = message };
+            return spawn_error;
+        };
+        const term = try compiler.wait(io);
+        if (term != .exited or term.exited != 0) {
+            self.failure = .{ .message = "gcc could not build the executable" };
+            return error.CompilerFailed;
+        }
     }
 
     fn checkNames(self: *Generator) error{NameDefinedInTarget}!void {
@@ -444,7 +490,9 @@ pub const GenerateError = std.mem.Allocator.Error ||
     std.Io.Dir.CreateDirPathError ||
     std.Io.Dir.WriteFileError ||
     std.Io.Dir.CopyFileError ||
-    error{NameDefinedInTarget};
+    std.process.SpawnError ||
+    std.process.Child.WaitError ||
+    error{ NameDefinedInTarget, CompilerFailed };
 
 const File = struct {
     path: []const u8,
@@ -596,7 +644,7 @@ test "Generator.generate: writes the modules and the runtime files they use" {
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
     const compiler_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &compiler_directory.sub_path });
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): std::console::write(\"hi\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(): std::console::write(\"hi\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader);
     try name_resolver.resolve();
@@ -641,6 +689,36 @@ test "Generator.generate: leaves the output alone when a name is defined in the 
 
     try std.testing.expectError(error.NameDefinedInTarget, generator.generate(allocator, std.testing.io, program_path, output_path));
     try std.testing.expectEqualStrings("old", try output_directory.dir.readFileAlloc(std.testing.io, "build/old.txt", allocator, .unlimited));
+}
+
+test "Generator.generate: builds an executable when the main module defines main" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    try compiler_directory.dir.createDirPath(std.testing.io, "std");
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/console.mn", .data = "external fn mn_console_write(text: String)\nconst write = mn_console_write" });
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    const compiler_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &compiler_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "hello.mn", .data = "fn main(): std::console::write(\"hi\\n\")" });
+    try loader.loadMainModule(&arena, std.testing.io, "hello");
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+
+    const executable = try output_directory.dir.statFile(std.testing.io, "build/hello", .{});
+    try std.testing.expectEqual(.file, executable.kind);
 }
 
 test "generateFiles: writes a header and a source file per module" {
