@@ -6,4 +6,5 @@ if [[ $# -ne 1 || $1 != *.c ]]; then
     exit 1
 fi
 
-gcc -std=c23 -Wall -Wextra -pedantic "$1" -o "${1%.c}"
+mapfile -t files < <(find "$(dirname "$1")" -name '*.c')
+gcc -std=c23 -Wall -Wextra -pedantic "${files[@]}" -o "${1%.c}"

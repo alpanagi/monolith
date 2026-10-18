@@ -1,0 +1,3 @@
+external fn mn_console_write(text: String)
+
+const write = mn_console_write

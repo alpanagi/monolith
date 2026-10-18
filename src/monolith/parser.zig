@@ -1,12 +1,15 @@
 const std = @import("std");
-const ast = @import("ast.zig");
-const token = @import("token.zig");
+const core = @import("core");
+const ast = core.ast;
+const token = core.token;
+
+const Failure = core.Failure;
 
 pub const Parser = struct {
     tokens: []const token.Token,
     offset: usize = 0,
-    failure: ?token.Token = null,
     declarations: std.ArrayList(ast.Declaration) = .empty,
+    failure: ?Failure = null,
 
     pub fn init(tokens: []const token.Token) Parser {
         return .{ .tokens = tokens };
@@ -18,7 +21,7 @@ pub const Parser = struct {
         while (true) {
             self.skipBlankLines(&self.offset);
             if (self.tokens[self.offset].kind == .eof) break;
-            if (try self.parseTopLevelDeclaration(allocator, &self.offset)) continue;
+            if (try self.parseTopLevelStatement(allocator, &self.offset)) continue;
             return self.fail(self.offset, error.UnexpectedToken);
         }
 
@@ -34,7 +37,7 @@ pub const Parser = struct {
         }
     }
 
-    fn parseTopLevelDeclaration(
+    fn parseTopLevelStatement(
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
@@ -53,67 +56,74 @@ pub const Parser = struct {
         allocator: std.mem.Allocator,
         offset: *usize,
     ) ParseError!?ast.Declaration {
-        if (try self.parseExternalFunction(allocator, offset)) |external_function| {
-            return .{ .external_function = external_function };
-        }
-        if (try self.parseFunction(allocator, offset)) |function| return .{ .function = function };
-        return null;
-    }
-
-    fn parseExternalFunction(
-        self: *Parser,
-        allocator: std.mem.Allocator,
-        offset: *usize,
-    ) ParseError!?ast.FunctionDeclaration {
-        var position = offset.*;
-        const keyword = self.match(&position, .keyword_external) orelse return null;
-        var declaration = (try self.parseFunctionDeclaration(allocator, &position)) orelse {
-            return self.fail(position, error.ExpectedFunctionKeyword);
-        };
-        if (self.tokens[position].kind == .colon) {
-            return self.fail(position, error.ExternalFunctionBody);
-        }
-        declaration.location = keyword.location;
-
-        offset.* = position;
-        return declaration;
-    }
-
-    fn parseFunction(
-        self: *Parser,
-        allocator: std.mem.Allocator,
-        offset: *usize,
-    ) ParseError!?ast.Function {
-        var position = offset.*;
-        const declaration = (try self.parseFunctionDeclaration(allocator, &position)) orelse {
+        const location = self.tokens[offset.*].location;
+        const kind: ast.DeclarationKind = kind: {
+            if (try self.parseFunctionDeclaration(allocator, offset)) |function_declaration| {
+                break :kind .{ .function_declaration = function_declaration };
+            }
+            if (try self.parseFunctionDefinition(allocator, offset)) |function| {
+                break :kind .{ .function_definition = function };
+            }
+            if (try self.parseConstantDeclaration(allocator, offset)) |constant| {
+                break :kind .{ .constant_declaration = constant };
+            }
             return null;
         };
-        _ = try self.expect(&position, .colon, error.ExpectedColon);
-        const body = try self.parseBlock(allocator, &position);
-
-        offset.* = position;
-        return .{ .declaration = declaration, .body = body };
+        return .{ .kind = kind, .location = location };
     }
 
     fn parseFunctionDeclaration(
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
-    ) ParseError!?ast.FunctionDeclaration {
+    ) ParseError!?ast.FunctionSignature {
         var position = offset.*;
-        const keyword = self.match(&position, .keyword_fn) orelse return null;
+        _ = self.match(&position, .keyword_external) orelse return null;
+        const signature = (try self.parseFunctionSignature(allocator, &position)) orelse {
+            return self.fail(position, error.ExpectedFunctionKeyword);
+        };
+        if (self.tokens[position].kind == .colon) {
+            return self.fail(position, error.ExternalFunctionBody);
+        }
+
+        offset.* = position;
+        return signature;
+    }
+
+    fn parseFunctionDefinition(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.FunctionDefinition {
+        var position = offset.*;
+        const signature = (try self.parseFunctionSignature(allocator, &position)) orelse {
+            return null;
+        };
+        _ = try self.expect(&position, .colon, error.ExpectedColon);
+        const body = try self.parseBlock(allocator, &position);
+
+        offset.* = position;
+        return .{ .signature = signature, .body = body };
+    }
+
+    fn parseFunctionSignature(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.FunctionSignature {
+        var position = offset.*;
+        _ = self.match(&position, .keyword_fn) orelse return null;
         const name = try self.expect(&position, .identifier, error.ExpectedIdentifier);
         _ = try self.expect(&position, .left_parenthesis, error.ExpectedLeftParenthesis);
         const parameters = try self.parseParameters(allocator, &position);
         _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
-        const return_type = try self.parseReturnType(&position);
+        const return_type = try self.parseReturnType(allocator, &position);
 
         offset.* = position;
         return .{
             .name = name.kind.identifier,
             .parameters = parameters,
             .return_type = return_type,
-            .location = keyword.location,
         };
     }
 
@@ -125,7 +135,7 @@ pub const Parser = struct {
         var position = offset.*;
         var parameters: std.ArrayList(ast.Parameter) = .empty;
         while (self.tokens[position].kind != .right_parenthesis) {
-            try parameters.append(allocator, try self.parseParameter(&position));
+            try parameters.append(allocator, try self.parseParameter(allocator, &position));
             if (self.match(&position, .comma) == null) break;
         }
 
@@ -133,31 +143,42 @@ pub const Parser = struct {
         return parameters.items;
     }
 
-    fn parseParameter(self: *Parser, offset: *usize) ParseError!ast.Parameter {
+    fn parseParameter(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!ast.Parameter {
         var position = offset.*;
         const name = try self.expect(&position, .identifier, error.ExpectedIdentifier);
         _ = try self.expect(&position, .colon, error.ExpectedColon);
-        const parameter_type = try self.parseType(&position);
+        const parameter_type = (try self.parseExpression(allocator, &position)) orelse {
+            return self.fail(position, error.ExpectedType);
+        };
 
         offset.* = position;
         return .{
             .name = name.kind.identifier,
-            .parameter_type = parameter_type,
+            .type = parameter_type,
             .location = name.location,
         };
     }
 
-    fn parseType(self: *Parser, offset: *usize) ParseError!ast.Type {
-        const type_keyword = try self.expect(offset, .primitive_type, error.ExpectedType);
-        return .{
-            .primitive_type = type_keyword.kind.primitive_type,
-            .location = type_keyword.location,
+    fn parseReturnType(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!ast.Expression {
+        const next = self.tokens[offset.*];
+        switch (next.kind) {
+            .colon, .indent, .eof => {
+                const kind: ast.ExpressionKind = .{ .identifier = .{ .name = "void" } };
+                return .{ .kind = kind, .location = next.location };
+            },
+            else => {},
+        }
+        return (try self.parseExpression(allocator, offset)) orelse {
+            return self.fail(offset.*, error.ExpectedType);
         };
-    }
-
-    fn parseReturnType(self: *Parser, offset: *usize) ParseError!ast.Type {
-        if (self.tokens[offset.*].kind == .primitive_type) return self.parseType(offset);
-        return .{ .primitive_type = .void, .location = self.tokens[offset.*].location };
     }
 
     fn parseBlock(
@@ -271,7 +292,7 @@ pub const Parser = struct {
         offset: *usize,
     ) ParseError!?ast.Statement {
         const call = (try self.parseCall(allocator, offset)) orelse return null;
-        return .{ .kind = .{ .expression = call }, .location = call.location };
+        return .{ .kind = .{ .call = call }, .location = call.location };
     }
 
     fn parseExpression(
@@ -280,19 +301,8 @@ pub const Parser = struct {
         offset: *usize,
     ) ParseError!?ast.Expression {
         if (try self.parseCall(allocator, offset)) |call| return call;
-
-        const current = self.tokens[offset.*];
-        const kind: ast.ExpressionKind = switch (current.kind) {
-            .integer => |literal| .{ .integer = literal },
-            .float => |literal| .{ .float = literal },
-            .keyword_true => .{ .boolean = true },
-            .keyword_false => .{ .boolean = false },
-            .string => |text| .{ .string = text },
-            .identifier => |name| .{ .identifier = .{ .name = name } },
-            else => return null,
-        };
-        offset.* += 1;
-        return .{ .kind = kind, .location = current.location };
+        if (try self.parseNameExpression(allocator, offset)) |name| return name;
+        return self.parseLiteral(offset);
     }
 
     fn parseCall(
@@ -301,16 +311,77 @@ pub const Parser = struct {
         offset: *usize,
     ) ParseError!?ast.Expression {
         var position = offset.*;
-        const name = self.match(&position, .identifier) orelse return null;
+        const first = self.match(&position, .identifier) orelse return null;
+        const callee = try self.parseName(allocator, &position, first);
         if (self.match(&position, .left_parenthesis) == null) return null;
         const arguments = try self.parseArguments(allocator, &position);
         _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
 
         offset.* = position;
         return .{
-            .kind = .{ .call = .{ .name = name.kind.identifier, .arguments = arguments } },
-            .location = name.location,
+            .kind = .{ .call = .{ .callee = callee, .arguments = arguments } },
+            .location = first.location,
         };
+    }
+
+    fn parseNameExpression(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.Expression {
+        var position = offset.*;
+        const first = self.match(&position, .identifier) orelse return null;
+        const name = try self.parseName(allocator, &position, first);
+
+        offset.* = position;
+        const kind: ast.ExpressionKind = switch (name) {
+            .identifier => |identifier| .{ .identifier = identifier },
+            .path_expression => |path_expression| .{ .path_expression = path_expression },
+        };
+        return .{ .kind = kind, .location = first.location };
+    }
+
+    fn parseName(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        first: token.Token,
+    ) ParseError!ast.Name {
+        const path = try self.parsePath(allocator, offset, first);
+        if (path.len == 1) return .{ .identifier = .{ .name = first.kind.identifier } };
+        return .{ .path_expression = .{ .path = path } };
+    }
+
+    fn parsePath(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        first: token.Token,
+    ) ParseError!ast.Path {
+        var position = offset.*;
+        var path: std.ArrayList([]const u8) = .empty;
+        try path.append(allocator, first.kind.identifier);
+        while (self.match(&position, .double_colon) != null) {
+            const name = try self.expect(&position, .identifier, error.ExpectedIdentifier);
+            try path.append(allocator, name.kind.identifier);
+        }
+
+        offset.* = position;
+        return path.items;
+    }
+
+    fn parseLiteral(self: *Parser, offset: *usize) ?ast.Expression {
+        const current = self.tokens[offset.*];
+        const kind: ast.ExpressionKind = switch (current.kind) {
+            .integer_literal => |literal| .{ .integer_literal = literal },
+            .float_literal => |literal| .{ .float_literal = literal },
+            .keyword_true => .{ .boolean_literal = true },
+            .keyword_false => .{ .boolean_literal = false },
+            .string_literal => |text| .{ .string_literal = text },
+            else => return null,
+        };
+        offset.* += 1;
+        return .{ .kind = kind, .location = current.location };
     }
 
     fn parseArguments(
@@ -332,6 +403,23 @@ pub const Parser = struct {
         return arguments.items;
     }
 
+    fn parseConstantDeclaration(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.ConstantDeclaration {
+        var position = offset.*;
+        _ = self.match(&position, .keyword_const) orelse return null;
+        const name = try self.expect(&position, .identifier, error.ExpectedIdentifier);
+        _ = try self.expect(&position, .equals, error.ExpectedEquals);
+        const value = (try self.parseExpression(allocator, &position)) orelse {
+            return self.fail(position, error.ExpectedExpression);
+        };
+
+        offset.* = position;
+        return .{ .name = name.kind.identifier, .value = value };
+    }
+
     fn expect(
         self: *Parser,
         offset: *usize,
@@ -349,7 +437,10 @@ pub const Parser = struct {
     }
 
     fn fail(self: *Parser, offset: usize, parse_error: ParseError) ParseError {
-        self.failure = self.tokens[offset];
+        self.failure = .{
+            .location = self.tokens[offset].location,
+            .message = describeError(parse_error),
+        };
         return parse_error;
     }
 };
@@ -373,6 +464,27 @@ pub const ParseError = error{
     InconsistentIndentation,
 };
 
+fn describeError(parse_error: ParseError) []const u8 {
+    return switch (parse_error) {
+        error.OutOfMemory => "out of memory",
+        error.UnexpectedToken => "unexpected token",
+        error.ExpectedIdentifier => "expected an identifier",
+        error.ExpectedLeftParenthesis => "expected '('",
+        error.ExpectedRightParenthesis => "expected ')'",
+        error.ExpectedColon => "expected ':'",
+        error.ExpectedFunctionKeyword => "expected 'fn'",
+        error.ExternalFunctionBody => "external functions have no body",
+        error.ExpectedType => "expected a type",
+        error.ExpectedEquals => "expected '='",
+        error.ExpectedStatement => "expected a statement",
+        error.ExpectedExpression => "expected an expression",
+        error.ExpectedCall => "expected a call",
+        error.ExpectedBlock => "expected an indented block",
+        error.UnexpectedIndentation => "unexpected indentation",
+        error.InconsistentIndentation => "indentation does not match any outer level",
+    };
+}
+
 test "Parser.parse: parses several functions" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -382,8 +494,8 @@ test "Parser.parse: parses several functions" {
     const module = try parser.parse(&arena);
 
     try std.testing.expectEqual(2, module.declarations.len);
-    try std.testing.expectEqualStrings("one", module.declarations[0].function.declaration.name);
-    try std.testing.expectEqualStrings("two", module.declarations[1].function.declaration.name);
+    try std.testing.expectEqualStrings("one", module.declarations[0].kind.function_definition.signature.name);
+    try std.testing.expectEqualStrings("two", module.declarations[1].kind.function_definition.signature.name);
 }
 
 test "Parser.parse: skips blank lines" {
@@ -395,10 +507,10 @@ test "Parser.parse: skips blank lines" {
     const module = try parser.parse(&arena);
 
     try std.testing.expectEqual(2, module.declarations.len);
-    try std.testing.expectEqualStrings("one", module.declarations[0].function.declaration.name);
-    try std.testing.expectEqual(2, module.declarations[0].function.body.len);
-    try std.testing.expectEqualStrings("two", module.declarations[1].function.declaration.name);
-    try std.testing.expectEqual(1, module.declarations[1].function.body.len);
+    try std.testing.expectEqualStrings("one", module.declarations[0].kind.function_definition.signature.name);
+    try std.testing.expectEqual(2, module.declarations[0].kind.function_definition.body.len);
+    try std.testing.expectEqualStrings("two", module.declarations[1].kind.function_definition.signature.name);
+    try std.testing.expectEqual(1, module.declarations[1].kind.function_definition.body.len);
 }
 
 test "Parser.parse: rejects statement at top level" {
@@ -409,10 +521,10 @@ test "Parser.parse: rejects statement at top level" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.UnexpectedToken, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
 }
 
-test "parseTopLevelDeclaration: rejects indentation at top level" {
+test "parseTopLevelStatement: rejects indentation at top level" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("fn main(): noop\n    noop");
@@ -420,10 +532,24 @@ test "parseTopLevelDeclaration: rejects indentation at top level" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.UnexpectedIndentation, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
 }
 
-test "parseExternalFunction: parses an external function" {
+test "parseTopLevelStatement: parses constants between functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("const one = two\nfn main(): noop\nconst three = four");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    try std.testing.expectEqual(3, module.declarations.len);
+    try std.testing.expectEqualStrings("one", module.declarations[0].kind.constant_declaration.name);
+    try std.testing.expectEqualStrings("main", module.declarations[1].kind.function_definition.signature.name);
+    try std.testing.expectEqualStrings("three", module.declarations[2].kind.constant_declaration.name);
+}
+
+test "parseFunctionDeclaration: parses an external function" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("external fn console_write(text: String)\nfn main(): noop");
@@ -431,13 +557,13 @@ test "parseExternalFunction: parses an external function" {
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    const declaration = module.declarations[0].external_function;
-    try std.testing.expectEqualStrings("console_write", declaration.name);
-    try std.testing.expectEqual(1, declaration.parameters.len);
+    const declaration = module.declarations[0];
+    try std.testing.expectEqualStrings("console_write", declaration.kind.function_declaration.name);
+    try std.testing.expectEqual(1, declaration.kind.function_declaration.parameters.len);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, declaration.location);
 }
 
-test "parseExternalFunction: rejects a body" {
+test "parseFunctionDeclaration: rejects a body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("external fn log(): noop");
@@ -445,10 +571,10 @@ test "parseExternalFunction: rejects a body" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExternalFunctionBody, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, parser.failure.?.location.?);
 }
 
-test "parseExternalFunction: rejects external without fn" {
+test "parseFunctionDeclaration: rejects external without fn" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("external log()");
@@ -456,10 +582,10 @@ test "parseExternalFunction: rejects external without fn" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedFunctionKeyword, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 10 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 10 }, parser.failure.?.location.?);
 }
 
-test "parseFunction: parses an indented body" {
+test "parseFunctionDefinition: parses an indented body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("fn main():\n    noop\n");
@@ -468,14 +594,14 @@ test "parseFunction: parses an indented body" {
     const module = try parser.parse(&arena);
 
     try std.testing.expectEqual(1, module.declarations.len);
-    try std.testing.expectEqualStrings("main", module.declarations[0].function.declaration.name);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, module.declarations[0].function.declaration.location);
-    try std.testing.expectEqual(1, module.declarations[0].function.body.len);
-    try std.testing.expect(module.declarations[0].function.body[0].kind == .noop);
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, module.declarations[0].function.body[0].location);
+    try std.testing.expectEqualStrings("main", module.declarations[0].kind.function_definition.signature.name);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, module.declarations[0].location);
+    try std.testing.expectEqual(1, module.declarations[0].kind.function_definition.body.len);
+    try std.testing.expect(module.declarations[0].kind.function_definition.body[0].kind == .noop);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, module.declarations[0].kind.function_definition.body[0].location);
 }
 
-test "parseFunction: parses an inline body" {
+test "parseFunctionDefinition: parses an inline body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("fn main(): noop");
@@ -484,13 +610,13 @@ test "parseFunction: parses an inline body" {
     const module = try parser.parse(&arena);
 
     try std.testing.expectEqual(1, module.declarations.len);
-    try std.testing.expectEqualStrings("main", module.declarations[0].function.declaration.name);
-    try std.testing.expectEqual(1, module.declarations[0].function.body.len);
-    try std.testing.expect(module.declarations[0].function.body[0].kind == .noop);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, module.declarations[0].function.body[0].location);
+    try std.testing.expectEqualStrings("main", module.declarations[0].kind.function_definition.signature.name);
+    try std.testing.expectEqual(1, module.declarations[0].kind.function_definition.body.len);
+    try std.testing.expect(module.declarations[0].kind.function_definition.body[0].kind == .noop);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, module.declarations[0].kind.function_definition.body[0].location);
 }
 
-test "parseFunctionDeclaration: rejects missing parenthesis" {
+test "parseFunctionSignature: rejects missing parenthesis" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("fn main): noop");
@@ -498,7 +624,7 @@ test "parseFunctionDeclaration: rejects missing parenthesis" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedLeftParenthesis, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 8 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 8 }, parser.failure.?.location.?);
 }
 
 test "parseParameters: parses each parameter" {
@@ -509,14 +635,14 @@ test "parseParameters: parses each parameter" {
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    const parameters = module.declarations[0].function.declaration.parameters;
+    const parameters = module.declarations[0].kind.function_definition.signature.parameters;
     try std.testing.expectEqual(2, parameters.len);
     try std.testing.expectEqualStrings("left", parameters[0].name);
-    try std.testing.expectEqual(token.PrimitiveType.i32, parameters[0].parameter_type.primitive_type);
+    try std.testing.expectEqualStrings("i32", parameters[0].type.kind.identifier.name);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 8 }, parameters[0].location);
     try std.testing.expectEqualStrings("right", parameters[1].name);
-    try std.testing.expectEqual(token.PrimitiveType.u8, parameters[1].parameter_type.primitive_type);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, parameters[1].parameter_type.location);
+    try std.testing.expectEqualStrings("u8", parameters[1].type.kind.identifier.name);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, parameters[1].type.location);
 }
 
 test "parseParameters: accepts a trailing comma" {
@@ -527,7 +653,7 @@ test "parseParameters: accepts a trailing comma" {
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    try std.testing.expectEqual(2, module.declarations[0].function.declaration.parameters.len);
+    try std.testing.expectEqual(2, module.declarations[0].kind.function_definition.signature.parameters.len);
 }
 
 test "parseParameter: rejects a missing colon" {
@@ -538,7 +664,7 @@ test "parseParameter: rejects a missing colon" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedColon, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, parser.failure.?.location.?);
 }
 
 test "parseParameter: rejects an underscore as a name" {
@@ -549,7 +675,7 @@ test "parseParameter: rejects an underscore as a name" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 6 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 6 }, parser.failure.?.location.?);
 }
 
 test "parseType: rejects a missing type" {
@@ -560,7 +686,7 @@ test "parseType: rejects a missing type" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedType, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, parser.failure.?.location.?);
 }
 
 test "parseReturnType: reads a written return type" {
@@ -571,11 +697,12 @@ test "parseReturnType: reads a written return type" {
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    try std.testing.expectEqual(token.PrimitiveType.i32, module.declarations[0].function.declaration.return_type.primitive_type);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, module.declarations[0].function.declaration.return_type.location);
+    const return_type = module.declarations[0].kind.function_definition.signature.return_type;
+    try std.testing.expectEqualStrings("i32", return_type.kind.identifier.name);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, return_type.location);
 }
 
-test "parseReturnType: defaults to void at the colon" {
+test "parseReturnType: returns void when no type is written" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("fn main(): noop");
@@ -583,8 +710,9 @@ test "parseReturnType: defaults to void at the colon" {
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    try std.testing.expectEqual(token.PrimitiveType.void, module.declarations[0].function.declaration.return_type.primitive_type);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 10 }, module.declarations[0].function.declaration.return_type.location);
+    const return_type = module.declarations[0].kind.function_definition.signature.return_type;
+    try std.testing.expectEqualStrings("void", return_type.kind.identifier.name);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 10 }, return_type.location);
 }
 
 test "parseIndentedBlock: rejects line deeper than the first" {
@@ -595,7 +723,7 @@ test "parseIndentedBlock: rejects line deeper than the first" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.UnexpectedIndentation, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 1 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 1 }, parser.failure.?.location.?);
 }
 
 test "parseIndentedBlock: rejects a dedent that matches no outer level" {
@@ -606,7 +734,7 @@ test "parseIndentedBlock: rejects a dedent that matches no outer level" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.InconsistentIndentation, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 1 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 1 }, parser.failure.?.location.?);
 }
 
 test "parseIndentedBlock: rejects line that is not a statement" {
@@ -617,7 +745,7 @@ test "parseIndentedBlock: rejects line that is not a statement" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedStatement, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, parser.failure.?.location.?);
 }
 
 test "parseIndentedBlock: rejects empty block" {
@@ -628,7 +756,7 @@ test "parseIndentedBlock: rejects empty block" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedBlock, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
 }
 
 test "parseInlineBlock: rejects line that is not a statement" {
@@ -639,7 +767,7 @@ test "parseInlineBlock: rejects line that is not a statement" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedStatement, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, parser.failure.?.location.?);
 }
 
 test "parseReturn: parses return with a value" {
@@ -650,10 +778,10 @@ test "parseReturn: parses return with a value" {
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    const statement = module.declarations[0].function.body[0];
+    const statement = module.declarations[0].kind.function_definition.body[0];
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, statement.location);
     const value = statement.kind.@"return".?;
-    try std.testing.expectEqualStrings("42", value.kind.integer.text);
+    try std.testing.expectEqualStrings("42", value.kind.integer_literal.text);
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, value.location);
 }
 
@@ -665,8 +793,8 @@ test "parseReturn: parses return without a value" {
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    try std.testing.expect(module.declarations[0].function.body[0].kind == .@"return");
-    try std.testing.expectEqual(null, module.declarations[0].function.body[0].kind.@"return");
+    try std.testing.expect(module.declarations[0].kind.function_definition.body[0].kind == .@"return");
+    try std.testing.expectEqual(null, module.declarations[0].kind.function_definition.body[0].kind.@"return");
 }
 
 test "parseReturn: rejects return followed by a non-expression" {
@@ -677,7 +805,7 @@ test "parseReturn: rejects return followed by a non-expression" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
 }
 
 test "parseDiscard: parses a discarded call" {
@@ -688,10 +816,10 @@ test "parseDiscard: parses a discarded call" {
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    const statement = module.declarations[0].function.body[0];
+    const statement = module.declarations[0].kind.function_definition.body[0];
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, statement.location);
     const call = statement.kind.discard.kind.call;
-    try std.testing.expectEqualStrings("add", call.name);
+    try std.testing.expectEqualStrings("add", call.callee.identifier.name);
     try std.testing.expectEqual(1, call.arguments.len);
 }
 
@@ -703,7 +831,7 @@ test "parseDiscard: rejects a missing equals sign" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedEquals, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, parser.failure.?.location.?);
 }
 
 test "parseDiscard: rejects a discarded literal" {
@@ -714,7 +842,7 @@ test "parseDiscard: rejects a discarded literal" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedCall, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
 }
 
 test "parseCallStatement: parses a call as a statement" {
@@ -725,11 +853,11 @@ test "parseCallStatement: parses a call as a statement" {
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    const call = module.declarations[0].function.body[0].kind.expression.kind.call;
-    try std.testing.expectEqualStrings("log", call.name);
+    const call = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call;
+    try std.testing.expectEqualStrings("log", call.callee.identifier.name);
     try std.testing.expectEqual(2, call.arguments.len);
-    try std.testing.expectEqualStrings("1", call.arguments[0].kind.integer.text);
-    try std.testing.expectEqual(true, call.arguments[1].kind.boolean);
+    try std.testing.expectEqualStrings("1", call.arguments[0].kind.integer_literal.text);
+    try std.testing.expectEqual(true, call.arguments[1].kind.boolean_literal);
 }
 
 test "parseCallStatement: rejects a name that is not called" {
@@ -740,7 +868,7 @@ test "parseCallStatement: rejects a name that is not called" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedStatement, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, parser.failure.?.location.?);
 }
 
 test "parseExpression: parses each literal kind" {
@@ -751,12 +879,12 @@ test "parseExpression: parses each literal kind" {
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    const integer = module.declarations[0].function.body[0].kind.@"return".?.kind.integer;
+    const integer = module.declarations[0].kind.function_definition.body[0].kind.@"return".?.kind.integer_literal;
     try std.testing.expectEqualStrings("0xff", integer.text);
-    try std.testing.expectEqual(token.PrimitiveType.u8, integer.suffix);
-    try std.testing.expectEqualStrings("2.5", module.declarations[1].function.body[0].kind.@"return".?.kind.float.text);
-    try std.testing.expectEqual(true, module.declarations[2].function.body[0].kind.@"return".?.kind.boolean);
-    try std.testing.expectEqual(false, module.declarations[3].function.body[0].kind.@"return".?.kind.boolean);
+    try std.testing.expectEqualStrings("u8", integer.suffix.?);
+    try std.testing.expectEqualStrings("2.5", module.declarations[1].kind.function_definition.body[0].kind.@"return".?.kind.float_literal.text);
+    try std.testing.expectEqual(true, module.declarations[2].kind.function_definition.body[0].kind.@"return".?.kind.boolean_literal);
+    try std.testing.expectEqual(false, module.declarations[3].kind.function_definition.body[0].kind.@"return".?.kind.boolean_literal);
 }
 
 test "parseExpression: parses a string literal" {
@@ -767,7 +895,7 @@ test "parseExpression: parses a string literal" {
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    try std.testing.expectEqualStrings("hello", module.declarations[0].function.body[0].kind.@"return".?.kind.string);
+    try std.testing.expectEqualStrings("hello", module.declarations[0].kind.function_definition.body[0].kind.@"return".?.kind.string_literal);
 }
 
 test "parseExpression: parses a parameter reference" {
@@ -778,7 +906,7 @@ test "parseExpression: parses a parameter reference" {
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    try std.testing.expectEqualStrings("value", module.declarations[0].function.body[0].kind.@"return".?.kind.identifier.name);
+    try std.testing.expectEqualStrings("value", module.declarations[0].kind.function_definition.body[0].kind.@"return".?.kind.identifier.name);
 }
 
 test "parseCall: parses nested calls" {
@@ -789,11 +917,30 @@ test "parseCall: parses nested calls" {
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    const outer = module.declarations[0].function.body[0].kind.expression.kind.call;
-    try std.testing.expectEqualStrings("log", outer.name);
+    const outer = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call;
+    try std.testing.expectEqualStrings("log", outer.callee.identifier.name);
     const inner = outer.arguments[0].kind.call;
-    try std.testing.expectEqualStrings("add", inner.name);
+    try std.testing.expectEqualStrings("add", inner.callee.identifier.name);
     try std.testing.expectEqual(2, inner.arguments.len);
+}
+
+test "parseCall: parses a path as the callee" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): std::console::write(1)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const expression = module.declarations[0].kind.function_definition.body[0].kind.call;
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, expression.location);
+    const call = expression.kind.call;
+    const path = call.callee.path_expression.path;
+    try std.testing.expectEqual(3, path.len);
+    try std.testing.expectEqualStrings("std", path[0]);
+    try std.testing.expectEqualStrings("console", path[1]);
+    try std.testing.expectEqualStrings("write", path[2]);
+    try std.testing.expectEqual(1, call.arguments.len);
 }
 
 test "parseCall: rejects a missing closing parenthesis" {
@@ -804,7 +951,32 @@ test "parseCall: rejects a missing closing parenthesis" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedRightParenthesis, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, parser.failure.?.location.?);
+}
+
+test "parseNameExpression: parses a path used as a value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn value() i32: return utils::value");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const path_expression = module.declarations[0].kind.function_definition.body[0].kind.@"return".?.kind.path_expression;
+    try std.testing.expectEqual(2, path_expression.path.len);
+    try std.testing.expectEqualStrings("utils", path_expression.path[0]);
+    try std.testing.expectEqualStrings("value", path_expression.path[1]);
+}
+
+test "parsePath: rejects a separator without a name after it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("const console = std::");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 22 }, parser.failure.?.location.?);
 }
 
 test "parseArguments: accepts a trailing comma" {
@@ -815,7 +987,7 @@ test "parseArguments: accepts a trailing comma" {
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    try std.testing.expectEqual(2, module.declarations[0].function.body[0].kind.expression.kind.call.arguments.len);
+    try std.testing.expectEqual(2, module.declarations[0].kind.function_definition.body[0].kind.call.kind.call.arguments.len);
 }
 
 test "parseArguments: rejects a missing argument" {
@@ -826,5 +998,68 @@ test "parseArguments: rejects a missing argument" {
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
+}
+
+test "parseConstantDeclaration: parses a path as the value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("const console = std::console");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const constant = module.declarations[0].kind.constant_declaration;
+    try std.testing.expectEqualStrings("console", constant.name);
+    try std.testing.expectEqual(2, constant.value.kind.path_expression.path.len);
+    try std.testing.expectEqualStrings("std", constant.value.kind.path_expression.path[0]);
+    try std.testing.expectEqualStrings("console", constant.value.kind.path_expression.path[1]);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, module.declarations[0].location);
+}
+
+test "parseConstantDeclaration: parses a name as the value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("const write = mn_console_write");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const constant = module.declarations[0].kind.constant_declaration;
+    try std.testing.expectEqualStrings("mn_console_write", constant.value.kind.identifier.name);
+}
+
+test "parseConstantDeclaration: parses a literal as the value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("const limit = 5i32");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const constant = module.declarations[0].kind.constant_declaration;
+    try std.testing.expectEqualStrings("5", constant.value.kind.integer_literal.text);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 15 }, constant.value.location);
+}
+
+test "parseConstantDeclaration: rejects a missing equals sign" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("const write mn_console_write");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedEquals, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, parser.failure.?.location.?);
+}
+
+test "parseConstantDeclaration: rejects a missing value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("const write =\nfn main(): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
 }

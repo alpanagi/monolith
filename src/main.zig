@@ -1,125 +1,108 @@
 const std = @import("std");
-const c = @import("c.zig");
-const javascript = @import("javascript.zig");
-const token = @import("token.zig");
+const c = @import("c");
+const javascript = @import("javascript");
+const core = @import("core");
+const monolith = @import("monolith");
+const ast = core.ast;
+const types = core.types;
 
-const Lexer = @import("lexer.zig").Lexer;
-const Parser = @import("parser.zig").Parser;
-const ParseError = @import("parser.zig").ParseError;
-const NameResolver = @import("name_resolver.zig").NameResolver;
-const NameError = @import("name_resolver.zig").NameError;
-const TypeChecker = @import("type_checker.zig").TypeChecker;
-const TypeError = @import("type_checker.zig").TypeError;
+const Failure = core.Failure;
+const Loader = monolith.Loader;
+const NameResolver = monolith.NameResolver;
+const TypeChecker = monolith.TypeChecker;
+
+const isName = monolith.isName;
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
-    const allocator = init.arena.allocator();
+    const arena = init.arena;
+    const allocator = arena.allocator();
 
     var stderr_buffer: [1024]u8 = undefined;
     var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
-    const arguments = try init.minimal.args.toSlice(allocator);
-    if (arguments.len != 4 or !std.mem.eql(u8, arguments[1], "--target")) return printUsage(stderr);
-    const target = std.meta.stringToEnum(Target, arguments[2]) orelse return printUsage(stderr);
+    const arguments = parseArguments(try init.minimal.args.toSlice(allocator)) orelse {
+        return printUsage(stderr);
+    };
+
+    const compiler_path = try std.process.executableDirPathAlloc(io, allocator);
+    const program_path = std.fs.path.dirname(arguments.path) orelse ".";
+    var loader = Loader.init(program_path, compiler_path);
+
+    const module_name = arguments.module_name;
+    const is_type_name = types.findBuiltInType(module_name) != null;
+    if (!isName(module_name) or is_type_name or std.mem.eql(u8, module_name, "std")) {
+        const failure: Failure = .{ .message = "file name must be a valid name" };
+        return report(allocator, stderr, &loader, failure);
+    }
+
+    loader.loadMainModule(arena, io, module_name) catch |load_error| {
+        const failure = loader.failure orelse return load_error;
+        return report(allocator, stderr, &loader, failure);
+    };
+
+    var name_resolver = NameResolver.init(arena, io, &loader);
+    name_resolver.resolve() catch |resolve_error| {
+        const failure = name_resolver.failure orelse return resolve_error;
+        return report(allocator, stderr, &loader, failure);
+    };
+    const program: ast.Program = .{ .modules = loader.modules.items };
+
+    var type_checker = TypeChecker.init(program);
+    type_checker.check() catch |type_error| {
+        const failure = type_checker.failure orelse return type_error;
+        return report(allocator, stderr, &loader, failure);
+    };
+
+    const target_name = @tagName(arguments.target);
+    const plugin_path = try std.fs.path.join(
+        allocator,
+        &.{ compiler_path, "plugins", target_name },
+    );
+    const output_path = try std.fs.path.join(allocator, &.{ "build", target_name });
+    switch (arguments.target) {
+        inline else => |target| {
+            const Generator = switch (target) {
+                .javascript => javascript.Generator,
+                .c => c.Generator,
+            };
+            return generateProgram(
+                allocator,
+                io,
+                Generator,
+                stderr,
+                &loader,
+                program,
+                plugin_path,
+                output_path,
+            );
+        },
+    }
+}
+
+fn parseArguments(arguments: []const [:0]const u8) ?Arguments {
+    if (arguments.len != 4 or !std.mem.eql(u8, arguments[1], "--target")) return null;
+    const target = std.meta.stringToEnum(Target, arguments[2]) orelse return null;
     const path = arguments[3];
     const file_name = std.fs.path.basename(path);
     const source_extension = ".mn";
     const has_extension = std.mem.endsWith(u8, file_name, source_extension);
-    if (!has_extension or file_name.len == source_extension.len) return printUsage(stderr);
+    if (!has_extension or file_name.len == source_extension.len) return null;
     const module_name = file_name[0 .. file_name.len - source_extension.len];
-
-    const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch |read_error| {
-        try stderr.print("error: cannot read '{s}': {t}\n", .{ path, read_error });
-        try stderr.flush();
-        return 1;
-    };
-
-    var lexer = Lexer.init(source);
-    lexer.lex(init.arena) catch |lex_error| switch (lex_error) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.UnexpectedCharacter => {
-            try report(stderr, path, lexer.failure.?, "unexpected character");
-            return 1;
-        },
-        error.UnexpectedTab => {
-            try report(stderr, path, lexer.failure.?, "tabs are not allowed, use spaces");
-            return 1;
-        },
-        error.InvalidEscape => {
-            try report(stderr, path, lexer.failure.?, "unknown escape sequence");
-            return 1;
-        },
-        error.UnterminatedString => {
-            try report(stderr, path, lexer.failure.?, "unterminated string");
-            return 1;
-        },
-    };
-
-    var parser = Parser.init(lexer.tokens.items);
-    const module = parser.parse(init.arena) catch |parse_error| switch (parse_error) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            try report(stderr, path, parser.failure.?.location, describeParseError(parse_error));
-            return 1;
-        },
-    };
-
-    var name_resolver = NameResolver.init(module);
-    name_resolver.resolve() catch |name_error| {
-        try report(stderr, path, name_resolver.failure.?, describeNameError(name_error));
-        return 1;
-    };
-
-    var type_checker = TypeChecker.init(module);
-    type_checker.check() catch |type_error| {
-        try report(stderr, path, type_checker.failure.?, describeTypeError(type_error));
-        return 1;
-    };
-
-    var output: std.Io.Writer.Allocating = .init(allocator);
-    switch (target) {
-        .javascript => {
-            var generator = javascript.Generator.init(module);
-            generator.generate(&output.writer) catch |generate_error| switch (generate_error) {
-                error.WriteFailed => return error.WriteFailed,
-                error.NameDefinedInTarget => {
-                    const message = "name is already defined in the target";
-                    try report(stderr, path, generator.failure.?, message);
-                    return 1;
-                },
-            };
-        },
-        .c => {
-            var generator = c.Generator.init(module);
-            generator.generate(&output.writer) catch |generate_error| switch (generate_error) {
-                error.WriteFailed => return error.WriteFailed,
-                error.NameDefinedInTarget => {
-                    const message = "name is already defined in the target";
-                    try report(stderr, path, generator.failure.?, message);
-                    return 1;
-                },
-            };
-        },
-    }
-
-    const output_extension = switch (target) {
-        .javascript => "js",
-        .c => "c",
-    };
-    const output_name = try std.fmt.allocPrint(
-        allocator,
-        "{s}.{s}",
-        .{ module_name, output_extension },
-    );
-    const directory_path = try std.fs.path.join(allocator, &.{ "build", @tagName(target) });
-    try std.Io.Dir.cwd().deleteTree(io, directory_path);
-    const directory = try std.Io.Dir.cwd().createDirPathOpen(io, directory_path, .{});
-    defer directory.close(io);
-    try directory.writeFile(io, .{ .sub_path = output_name, .data = output.written() });
-    if (target == .c) try directory.writeFile(io, .{ .sub_path = "monolith.h", .data = c.header });
-    return 0;
+    return .{ .target = target, .path = path, .module_name = module_name };
 }
+
+const Arguments = struct {
+    target: Target,
+    path: []const u8,
+    module_name: []const u8,
+};
+
+const Target = enum {
+    javascript,
+    c,
+};
 
 fn printUsage(stderr: *std.Io.Writer) std.Io.Writer.Error!u8 {
     try stderr.writeAll("usage: monolith --target <javascript|c> <file.mn>\n");
@@ -127,74 +110,35 @@ fn printUsage(stderr: *std.Io.Writer) std.Io.Writer.Error!u8 {
     return 1;
 }
 
-const Target = enum {
-    javascript,
-    c,
-};
-
 fn report(
+    allocator: std.mem.Allocator,
     stderr: *std.Io.Writer,
-    path: []const u8,
-    location: token.Location,
-    message: []const u8,
-) std.Io.Writer.Error!void {
-    try stderr.print("{s}:{d}:{d}: error: {s}\n", .{ path, location.row, location.column, message });
+    loader: *Loader,
+    failure: Failure,
+) !u8 {
+    if (failure.location) |location| {
+        const file = try loader.buildModuleFileName(allocator, failure.module.?);
+        try stderr.print("{s}:{d}:{d}: ", .{ file, location.row, location.column });
+    }
+    try stderr.print("error: {s}\n", .{failure.message});
     try stderr.flush();
+    return 1;
 }
 
-fn describeParseError(parse_error: ParseError) []const u8 {
-    return switch (parse_error) {
-        error.OutOfMemory => "out of memory",
-        error.UnexpectedToken => "unexpected token",
-        error.ExpectedIdentifier => "expected an identifier",
-        error.ExpectedLeftParenthesis => "expected '('",
-        error.ExpectedRightParenthesis => "expected ')'",
-        error.ExpectedColon => "expected ':'",
-        error.ExpectedFunctionKeyword => "expected 'fn'",
-        error.ExternalFunctionBody => "external functions have no body",
-        error.ExpectedType => "expected a type",
-        error.ExpectedEquals => "expected '='",
-        error.ExpectedStatement => "expected a statement",
-        error.ExpectedExpression => "expected an expression",
-        error.ExpectedCall => "expected a call",
-        error.ExpectedBlock => "expected an indented block",
-        error.UnexpectedIndentation => "unexpected indentation",
-        error.InconsistentIndentation => "indentation does not match any outer level",
+fn generateProgram(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    comptime Generator: type,
+    stderr: *std.Io.Writer,
+    loader: *Loader,
+    program: ast.Program,
+    plugin_path: []const u8,
+    output_path: []const u8,
+) !u8 {
+    var generator = Generator.init(program);
+    generator.generate(allocator, io, plugin_path, output_path) catch |generate_error| {
+        const failure = generator.failure orelse return generate_error;
+        return report(allocator, stderr, loader, failure);
     };
-}
-
-fn describeNameError(name_error: NameError) []const u8 {
-    return switch (name_error) {
-        error.DuplicateFunction => "function is already defined",
-        error.DuplicateParameter => "parameter is already defined",
-        error.UnknownName => "unknown name",
-        error.NotAFunction => "name is not a function",
-        error.FunctionUsedAsValue => "functions cannot be used as values",
-    };
-}
-
-fn describeTypeError(type_error: TypeError) []const u8 {
-    return switch (type_error) {
-        error.TypeMismatch => "value does not match the expected type",
-        error.LiteralOutOfRange => "literal out of range for its type",
-        error.MissingReturnValue => "missing return value",
-        error.UnexpectedReturnValue => "void function cannot return a value",
-        error.MissingReturn => "function must end with a return",
-        error.MainHasReturnType => "main cannot have a return type",
-        error.MainHasParameters => "main cannot have parameters",
-        error.MainCalled => "main cannot be called",
-        error.MainIsExternal => "main cannot be external",
-        error.ArgumentCountMismatch => "wrong number of arguments",
-        error.UnusedResult => "call result is unused, discard it with _ =",
-        error.DiscardedVoid => "call returns no value to discard",
-    };
-}
-
-test {
-    _ = @import("lexer.zig");
-    _ = @import("parser.zig");
-    _ = @import("name_resolver.zig");
-    _ = @import("type_checker.zig");
-    _ = @import("javascript.zig");
-    _ = @import("c.zig");
+    return 0;
 }

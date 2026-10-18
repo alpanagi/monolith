@@ -4,9 +4,9 @@ Monolith is a statically typed language that compiles to readable source code in
 
 This specification is the reference for writing Monolith. Every rule has an identifier, such as `L3` or `T7`. A rule that rejects a program states the error message the compiler reports.
 
-Errors are reported as `path:row:column: error: message`. Rows and columns start at 1, and columns count bytes. The examples in this document show only `row:column: error: message`.
+Errors are reported as `path:row:column: error: message`, where `path` is the file of the module the error is in. Rows and columns start at 1, and columns count bytes. An error that has no place in a module, such as an invalid file name (K2), is reported as `error: message`. The examples in this document show only `row:column: error: message`.
 
-A program is a single source file. The compiler stops at the first error.
+A program is the source file given to the compiler and the modules its paths reach (M1). The compiler stops at the first error.
 
 ## Grammar
 
@@ -20,47 +20,48 @@ The grammar uses this notation:
 | `[ a ]` | `a`, optionally |
 | `{ a }` | `a`, repeated zero or more times |
 
-`name`, `integer`, `float`, `string` and `newline` are defined in the Lexical structure chapter (L2, L6, L12 to L16, L18 to L22). The indentation of lines is described in S6 to S8.
+`name`, `integer`, `float`, `string` and `newline` are defined in the Lexical structure chapter (L2, L6, L12 to L16, L18 to L21). The indentation of lines is described in S6 to S8.
 
 ```
 module               = { declaration }
-declaration          = function | external_function
+declaration          = function | external_function | constant
 function             = function_declaration ":" block
 external_function    = "external" function_declaration
 function_declaration = "fn" name "(" [ parameters ] ")" [ type ]
 parameters           = parameter { "," parameter } [ "," ]
 parameter            = name ":" type
-type                 = "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
-                     | "f32" | "f64" | "Bool" | "String"
+type                 = expression
 block                = statement | indented_block
 indented_block       = newline statement { newline statement }
 statement            = "noop" | "return" [ expression ] | "_" "=" call | call
-expression           = integer | float | string | "true" | "false" | name | call
-call                 = name "(" [ arguments ] ")"
+expression           = integer | float | string | "true" | "false" | path | call
+call                 = path "(" [ arguments ] ")"
 arguments            = expression { "," expression } [ "," ]
+path                 = name { "::" name }
+constant             = "const" name "=" expression
 ```
 
 ## Lexical structure
 
 ### Characters and lines
 
-- **L1.** Source files are ASCII. Any character not described in this chapter is rejected with `unexpected character`.
+- **L1.** Source files are ASCII outside string literals, which can contain any bytes (L19). Any character not described in this chapter is rejected with `unexpected character`.
 - **L2.** A line ends with a line feed (`\n`) or a carriage return followed by a line feed (`\r\n`). A carriage return on its own is rejected with `unexpected character`.
-- **L3.** Spaces separate tokens. Outside string literals, tabs are rejected with `tabs are not allowed, use spaces`. Inside string literals, L22 applies.
+- **L3.** Spaces separate tokens. Outside string literals, tabs are rejected with `tabs are not allowed, use spaces`.
 - **L4.** The first line of a file cannot start with a space. It is rejected with `unexpected character` at 1:1.
 - **L5.** The number of spaces at the start of a line is its indentation. A line containing only spaces is blank and is ignored, whatever its indentation.
 
 ### Words
 
 - **L6.** A word starts with a letter or `_` and continues with letters, digits and `_`.
-- **L7.** These words are keywords: `fn`, `external`, `noop`, `return`, `true`, `false`.
-- **L8.** These words are type names: `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `Bool`, `String`. Type names that state a size in bits are lowercase. All other type names start with a capital letter.
+- **L7.** These words are keywords: `fn`, `external`, `const`, `noop`, `return`, `true`, `false`.
+- **L8.** The built-in types (T1) are named `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `Bool`, `String` and `void`. The names that state a size in bits, and `void`, are lowercase. The others start with a capital letter. Type names are names, not keywords.
 - **L9.** A lone `_` is the discard symbol. It is not a name.
-- **L10.** Every other word is a name. Keywords, type names and `_` cannot be used as names.
+- **L10.** Every other word is a name. Keywords and `_` cannot be used as names. The built-in type names and names that start with `mn_` are reserved (N14).
 
 ### Symbols
 
-- **L11.** The symbols are `(`, `)`, `:`, `,` and `=`.
+- **L11.** The symbols are `(`, `)`, `:`, `::`, `,` and `=`. Two `:` with nothing between them are the symbol `::`.
 
 ### Number literals
 
@@ -79,16 +80,14 @@ arguments            = expression { "," expression } [ "," ]
 - **L15.** A decimal literal becomes a float literal when it has a fractional part, an exponent, or both:
   - A fractional part is a `.` followed by optional digits: `2.5`, `5.`. A `.` only belongs to the number when it is not followed by another `.`, a `_` or a letter.
   - An exponent is `e` or `E`, an optional `+` or `-`, and at least one digit: `1e10`, `2.5e-3`.
-- **L16.** A number literal may end with a type suffix, optionally separated by `_`: `5u8`, `1_000_u32`, `2.5f32`, `1.0_f64`.
-  - An integer literal takes an integer type suffix: `i8` to `u64`.
-  - A float literal takes `f32` or `f64`. `1f64` is rejected: write `1.0f64`.
+- **L16.** A number literal may end with a suffix: a word directly after its digits, optionally separated by `_`: `5u8`, `1_000_u32`, `2.5f32`, `1.0_f64`. The suffix belongs to the literal, and which suffixes are valid is decided by types (T5, T6).
   - In hexadecimal literals, `f` is a digit, so `0x1f32` is the number `0x1F32` without a suffix.
-- **L17.** A letter, digit or `_` directly after a number literal that is not a valid suffix is rejected with `unexpected character`.
+- **L17.** A `_` directly after a number literal that is not followed by a letter is rejected with `unexpected character`.
 
 ### String literals
 
 - **L18.** A string literal is text between double quotes on a single line: `"hello"`.
-- **L19.** Between the quotes, a string literal contains printable ASCII characters other than `"` and `\`, and these escapes:
+- **L19.** Between the quotes, a string literal contains any bytes other than `"`, `\`, line feeds and carriage returns, and these escapes:
 
   | Escape | Character |
   |---|---|
@@ -98,21 +97,20 @@ arguments            = expression { "," expression } [ "," ]
   | `\"` | double quote |
 
 - **L20.** A `\` followed by any other character is rejected with `unknown escape sequence`, at the `\`.
-- **L21.** A string literal that reaches the end of its line or of the file without a closing `"` is rejected with `unterminated string`, at its opening `"`.
-- **L22.** Any other character inside a string literal, such as a tab, is rejected with `unexpected character`.
+- **L21.** A string literal that reaches a line feed, a carriage return or the end of the file without a closing `"` is rejected with `unterminated string`, at its opening `"`.
 
 ## Program structure
 
-### Modules
+### Top level
 
-- **S1.** A source file is a module: a sequence of declarations at indentation 0, separated by any number of blank lines. A declaration is a function or an external function.
+- **S1.** A source file is a module: a sequence of declarations at indentation 0, in any order, separated by any number of blank lines. A declaration is a function, an external function or a constant (N10).
 - **S2.** Anything other than a declaration at top level is rejected with `unexpected token`. An indented line at top level is rejected with `unexpected indentation`.
 
 ### Functions
 
-- **S3.** A function is a function declaration, made of its name, parameters and optional return type, followed by a block, following the `function` rule: `fn add(left: i32, right: i32) i32:`.
+- **S3.** A function is a function declaration, made of its name, parameters and return type, followed by a block (the `function` rule): `fn add(left: i32, right: i32) i32:`.
 - **S4.** A trailing `,` after the last parameter is allowed.
-- **S5.** A missing return type means the function returns `void`. `void` cannot be written.
+- **S5.** A missing return type is the return type `void`. `fn main():` and `fn main() void:` are the same.
 
 ### Blocks
 
@@ -142,24 +140,61 @@ arguments            = expression { "," expression } [ "," ]
 
 ### External functions
 
-- **S15.** An external function is a function declaration that the program calls but does not define: `external fn console_write(text: String)`. Whatever runs the program provides its definition (J8, C8).
+- **S15.** An external function is a function declaration that the program calls but does not define: `external fn write(text: String)`. Its definition is written in the target's code. The standard library's external functions are defined by each target's runtime (D2). Every external function is called by its exact name (J8, C8).
 - **S16.** An external function has no body. A `:` after its declaration is rejected with `external functions have no body`.
+
+## Modules
+
+- **M1.** Every source file is a module. The file given to the compiler is the main module. A module's path is the path of its file, with directories separated by `::` and without `.mn`: `utils/math.mn` is the module `utils::math`, and the main file `hello.mn` is the module `hello`.
+- **M2.** Every module's file name, without `.mn`, and every directory name in a module path must be a valid name (L6, L10). Paths can only spell valid names, so only the main file's name is checked (K2).
+- **M3.** Every path is a namespace. A namespace is a module when a file has its path (M1), and it contains the namespaces whose paths continue its path: `std` contains `std::console`. A namespace can be both: with `utils.mn` and `utils/math.mn`, `utils` is a module and contains `utils::math`. A path reaches namespaces directly: `std::console::write("hello\n")` calls `write` in the module `std::console`.
+- **M4.** A path that starts with `std` refers to the standard library, which comes with the compiler (K5). Every other path is a namespace of the program, relative to the directory of the main file, from every module.
+- **M5.** The first name of a path that continues with `::` is looked up only among namespaces: first the module's constants that name a namespace, then `std`, then the program's namespaces (M4).
+- **M6.** The namespaces a namespace contains are reached through it: `std::console::write("hello\n")`. A namespace that is a module and contains namespaces reaches both its module's functions and its namespaces: `utils::add()` and `utils::math::add()`.
+- **M7.** Each module is loaded once, however often it is reached, and modules can reach each other. Loading starts with the main module, and a module is read when resolving a module that is already loaded reaches it. Nothing else is read.
+- **M8.** Every declaration of a module can be used by the other modules through a path, external functions and constants included.
+- **M9.** In a namespace that contains namespaces, a name before a `::` that is none of them is rejected with `module not found`, at the path.
+- **M10.** The name `monolith` is reserved. A path whose first name is `monolith` is rejected with `module name is reserved`.
+- **M11.** If the main file's directory has its own `std.mn` or `std/`, a path whose first name is `std` is rejected with `name is ambiguous`.
 
 ## Names
 
-- **N1.** Function names are unique within a module, external functions included. A second function with the same name is rejected with `function is already defined`, at its `fn` or `external`.
+- **N1.** Function and constant names are unique within a module, external functions included. A second function with the name of a function or constant is rejected with `function is already defined`, at its `fn` or `external`. A second constant with the name of a function or constant is rejected with `constant is already defined`, at its `const`.
 - **N2.** Parameter names are unique within a parameter list. A repeated name is rejected with `parameter is already defined`, at the second parameter.
 - **N3.** A function can call functions defined before or after it.
-- **N4.** A name is looked up first among the parameters of the enclosing function, then among the module's functions. A parameter shadows a function with the same name.
-- **N5.** A name that matches neither is rejected with `unknown name`.
-- **N6.** A call to a name that refers to a parameter is rejected with `name is not a function`.
-- **N7.** A function name that is not directly followed by a call is rejected with `functions cannot be used as values`.
+- **N4.** A name is looked up first among the parameters of the enclosing function, then among the module's functions and constants, then among the built-in types (T1), then among `std` and the program's namespaces (M4). A name in a type (T11) is not looked up among the parameters.
+- **N5.** A name that matches none of them is rejected with `unknown name`.
+- **N6.** A call to a name that does not refer to a function, such as a parameter, a type, a namespace or a constant whose value is a literal, is rejected with `name is not a function`.
+- **N7.** A function used as a value, named directly, through a path or through a constant, is rejected with `functions cannot be used as values`. A namespace used as a value is rejected with `unknown name`. A type can be used as a value (T11).
+- **N8.** A path is resolved one name at a time. The first name is looked up as M5 describes. Each following name before a `::` goes through a namespace (M6): a constant of its module that names a namespace comes first, then the namespaces it contains. The last name is a declaration of the module reached, or a namespace it contains. A function and a namespace can have the same name: with `fn math()` in `utils.mn` and the module `utils::math`, `utils::math()` calls the function and `utils::math::add()` calls into the module. A parameter does not hide a namespace before a `::`: with a parameter `utils`, `utils::add()` still calls into the module `utils`.
+- **N9.** Errors in a path, at the path:
+
+  | Situation | Error |
+  |---|---|
+  | The first name does not exist | `unknown name` |
+  | A `::` follows a parameter, a declaration or a built-in type, and no namespace has its name | `name has no members` |
+  | A name before a `::` is none of the namespaces that its namespace contains (M9) | `module not found` |
+  | The module reached does not declare the last name | `unknown name` |
+  | The last name of a call is a namespace | `name is not a function` |
+
+### Constants
+
+- **N10.** `const name = expression` declares a constant. Its value is evaluated at compile time, and can be a function, a type, a namespace or a literal. `const console = std::console` lets `console::write(...)` reach the module, `const write = mn_console_write` lets `write(...)` call the function, `const Integer = i32` lets `Integer` be used as a type, and `const limit = 5i32` lets `limit` be used as a value of type `i32`.
+  - A number literal as the value has a suffix, which gives its type (T5): `const limit = 5i32`. Otherwise it is rejected with `value has no known type`, at the literal.
+  - Errors in a literal value are reported at the literal, in the module of the constant.
+- **N11.** A constant means the same as its value, so every rule for that value applies to it. A constant produces no output: each use writes what the constant names, such as the function it calls or its literal.
+- **N12.** A constant is only resolved and checked when something uses it. An unused constant is not an error, because other modules can use it (M8), and the modules its value names are not loaded for it (M7).
+- **N13.** A used constant whose value reaches itself, directly or through other constants, is rejected with `constant refers to itself`, at its `const`.
+
+### Reserved names
+
+- **N14.** A function, external function, parameter or constant whose name starts with `mn_` is rejected with `name is reserved`, at its `fn`, `external` or `const`, or at the parameter. The modules of the standard library may use these names, because they declare the runtime's functions (D2). A function, external function, parameter or constant named like a built-in type (T1) is rejected with `name is reserved` in every module, the standard library included.
 
 ## Types
 
-### Primitive types
+### Built-in types
 
-- **T1.** The primitive types are:
+- **T1.** The built-in types are:
 
   | Type | Values |
   |---|---|
@@ -167,8 +202,10 @@ arguments            = expression { "," expression } [ "," ]
   | `u8`, `u16`, `u32`, `u64` | unsigned integers of 8, 16, 32 and 64 bits |
   | `f32`, `f64` | 32-bit and 64-bit floating point numbers |
   | `Bool` | `true` and `false` |
-  | `String` | text, made of ASCII characters for now |
-  | `void` | no value; only as the return type of a function without one |
+  | `String` | text, stored as bytes in any encoding |
+  | `void` | no value; only as a return type |
+
+  A parameter of type `void` is rejected with `parameter cannot have type void`, at its type.
 
 - **T2.** There are no implicit conversions between types.
 - **T3.** What happens when arithmetic exceeds a type's range is left to the target. It is not defined by Monolith.
@@ -176,12 +213,16 @@ arguments            = expression { "," expression } [ "," ]
 ### Types of expressions
 
 - **T4.** `true` and `false` have type `Bool`, and a string literal has type `String`.
-- **T5.** A number literal with a suffix has the suffix's type. A number literal without a suffix takes the type its context expects: the function's return type for a returned value, or the parameter's type for an argument.
-- **T6.** An integer literal can only have an integer type, and a float literal only a float type. `return 2` in an `f64` function is rejected: write `2.0`.
+- **T5.** A number literal with a suffix has the suffix's type, and the suffix must be the name of a number type. Any other suffix is rejected with `unknown suffix`, at the literal: `5Bool`. A number literal without a suffix takes the type its context expects: the function's return type for a returned value, or the parameter's type for an argument.
+- **T6.** An integer literal can only have an integer type, and a float literal only a float type. `return 2` in an `f64` function is rejected: write `2.0`. This includes suffixes: `1f64` and `2.5u8` are rejected with `value does not match the expected type`.
 - **T7.** An integer literal must not exceed its type's maximum, and a float literal must not overflow its type to infinity. Otherwise it is rejected with `literal out of range for its type`. A float literal too small for its type becomes 0 and is accepted.
-- **T8.** A name has the type of the parameter it refers to.
+- **T8.** A name that refers to a parameter has the type of the parameter. A name that refers to a type has the type of types (T11). A name that refers to a constant has the type of its value (N10).
 - **T9.** A call has the return type of the called function.
 - **T10.** An expression whose type differs from the expected type is rejected with `value does not match the expected type`. This includes a call to a `void` function where a value is expected.
+
+### Types as values
+
+- **T11.** Types are values, and their type is the type of types. Each parameter type and return type is an expression that must have the type of types. Otherwise it is rejected with `value does not match the expected type`, at the expression: `fn add(value: 5)`. A type used where a value of another type is expected is rejected the same way: `return i32` in an `i32` function.
 
 ## Functions
 
@@ -195,34 +236,37 @@ arguments            = expression { "," expression } [ "," ]
 
 ### The main function
 
-- **F8.** `main` is the program's entry point. A module does not need one.
-- **F9.** `main` has no parameters and no return type. Otherwise it is rejected with `main cannot have parameters` or `main cannot have a return type`.
-- **F10.** `main` cannot be called. A call to it is rejected with `main cannot be called`.
+- **F8.** The main module's `main` is the program's entry point. A module does not need one. Any module may define `main`, but only the main module's `main` is the entry point.
+- **F9.** Every `main` has no parameters and returns `void`. Otherwise it is rejected with `main cannot have parameters` or `main cannot have a return type`.
+- **F10.** No `main` can be called. A call to it is rejected with `main cannot be called`.
 - **F11.** `main` cannot be an external function. An external `main` is rejected with `main cannot be external`.
 
 ## Targets
 
 ### Names in the output
 
-- **G1.** Names are written to the output exactly as they are in the source.
-- **G2.** A function, external function or parameter whose name the target already defines is rejected with `name is already defined in the target`, at the function's `fn` or `external` keyword or at the parameter. Only the names of the target being compiled for are checked: `fn delete(): noop` compiles to C and is rejected for JavaScript.
+- **G1.** Names are written to the output exactly as they are in the source, except the generated names: C function names (C9) and JavaScript module names (J9). A generated name is `mn_` followed by the module path with `::` replaced by `_`, so it cannot be a name written in the source (N14).
+- **G2.** A function, external function or parameter whose name, as written to the output, the target already defines is rejected with `name is already defined in the target`, at the function's `fn` or `external` keyword or at the parameter. Constants are not checked, because they produce no output (N11). Only the names of the target being compiled for are checked: `fn delete(): noop` compiles to C as `mn_hello_delete` (C9) and is rejected for JavaScript.
 - **G3.** JavaScript defines `arguments`, `await`, `break`, `case`, `catch`, `class`, `const`, `continue`, `debugger`, `default`, `delete`, `do`, `else`, `enum`, `eval`, `export`, `extends`, `false`, `finally`, `for`, `function`, `if`, `implements`, `import`, `in`, `instanceof`, `interface`, `let`, `new`, `null`, `package`, `private`, `protected`, `public`, `return`, `static`, `super`, `switch`, `this`, `throw`, `true`, `try`, `typeof`, `var`, `void`, `while`, `with` and `yield`.
-- **G4.** C defines the C23 keywords `_Alignas`, `_Alignof`, `_Atomic`, `_BitInt`, `_Bool`, `_Complex`, `_Decimal128`, `_Decimal32`, `_Decimal64`, `_Generic`, `_Imaginary`, `_Noreturn`, `_Static_assert`, `_Thread_local`, `alignas`, `alignof`, `auto`, `bool`, `break`, `case`, `char`, `const`, `constexpr`, `continue`, `default`, `do`, `double`, `else`, `enum`, `extern`, `false`, `float`, `for`, `goto`, `if`, `inline`, `int`, `long`, `nullptr`, `register`, `restrict`, `return`, `short`, `signed`, `sizeof`, `static`, `static_assert`, `struct`, `switch`, `thread_local`, `true`, `typedef`, `typeof`, `typeof_unqual`, `union`, `unsigned`, `void`, `volatile` and `while`, and `asm`, which compilers such as GCC treat as a keyword outside strict C23. It also defines the names that C23 declares in `<stddef.h>` and `<stdint.h>`, which the header includes, such as `size_t`, `int32_t`, `NULL` and `INT32_MAX`. `string` and `MONOLITH_H` are defined by the header itself (C1).
+- **G4.** C defines the C23 keywords `_Alignas`, `_Alignof`, `_Atomic`, `_BitInt`, `_Bool`, `_Complex`, `_Decimal128`, `_Decimal32`, `_Decimal64`, `_Generic`, `_Imaginary`, `_Noreturn`, `_Static_assert`, `_Thread_local`, `alignas`, `alignof`, `auto`, `bool`, `break`, `case`, `char`, `const`, `constexpr`, `continue`, `default`, `do`, `double`, `else`, `enum`, `extern`, `false`, `float`, `for`, `goto`, `if`, `inline`, `int`, `long`, `nullptr`, `register`, `restrict`, `return`, `short`, `signed`, `sizeof`, `static`, `static_assert`, `struct`, `switch`, `thread_local`, `true`, `typedef`, `typeof`, `typeof_unqual`, `union`, `unsigned`, `void`, `volatile` and `while`, and `asm`, which compilers such as GCC treat as a keyword outside strict C23. It also defines the names that C23 declares in `<stddef.h>` and `<stdint.h>`, which the header includes, such as `size_t`, `int32_t`, `NULL` and `INT32_MAX`. `string` and `MONOLITH_H` are defined by `runtime/monolith.h` itself (C1).
 
 ### JavaScript
 
-- **J1.** Each function becomes a `function` declaration with the same parameters, without types.
+- **J1.** Every module becomes an ES module file (K3). Each function becomes an exported `function` declaration with the same parameters, without types: `export function add(left, right)`. Every module exports its functions, so any module can be imported, the main module included.
 - **J2.** A function whose body only contains `noop` becomes an empty function, `{}`.
 - **J3.** Values of `i64` and `u64` are JavaScript BigInts, so every value of these types is exact. All other number types are JavaScript numbers.
 - **J4.** Number literals keep their base and separators and lose their suffix: `0xff_ff_u32` becomes `0xff_ff`. Literals of type `i64` or `u64` end with `n`: `1_000_i64` becomes `1_000n`.
 - **J5.** `_ = add(1, 2)` becomes the plain call, `add(1, 2);`.
 - **J6.** `String` values are JavaScript strings. String literals are written exactly as in the source: `"line\n"` stays `"line\n"`.
-- **J7.** If the module defines `main`, the output ends with a call to it, `main();`, after all functions.
-- **J8.** An external function produces no output, so the names of its parameters are not checked (G2). Calls to it use its name exactly, so whatever runs the program must define a function with that name before `main` runs, for example as a global.
+- **J7.** If the main module defines `main`, its file ends with a call to it, `main();`, after all functions.
+- **J8.** An external function produces no output, so the names of its parameters are not checked (G2). Calls to it use its name exactly. A runtime function, an external function whose name starts with `mn_` (N14, D2), is imported from the runtime file its name gives (J11). For the program's own external functions, whatever runs the program must define them as globals before `main` runs.
+- **J9.** A module starts with one import for every runtime file and every other module its calls reach, with paths relative to its own file. Runtime files come first (J11), then modules in the order of their first call. A module is named with its generated name (G1): `import * as mn_utils_math from "./utils/math.js";`.
+- **J10.** A call to a function of another module uses that module's name: `utils::math::add(1, 2)` becomes `mn_utils_math.add(1, 2);`, whatever namespaces and constants the path goes through. A call to a function of the same module, or to an external function, uses its name: `add(1, 2);`, `mn_console_write("hello\n");`.
+- **J11.** A runtime function is imported by name from the runtime file named by the part of its name between `mn_` and the next `_`: `mn_console_write` comes from `runtime/console.js`, with `import { mn_console_write } from "./runtime/console.js";`. The runtime functions a module calls from one file share one import, in the order of their first call.
 
 ### C
 
-- **C1.** The output is C23. Every file starts with `#include "monolith.h"`. That header is written next to it and contains the definitions the output relies on:
+- **C1.** The output is C23. Every module's header includes `runtime/monolith.h`, a file of the C runtime that is copied into every C output (K3). It contains the definitions the output and the runtime rely on:
 
   ```c
   #ifndef MONOLITH_H
@@ -236,8 +280,11 @@ arguments            = expression { "," expression } [ "," ]
   #endif
   ```
 
-- **C2.** Every function except `main` becomes a `static` function, and a declaration of each follows the include, so functions can call each other in any order.
-- **C3.** `main` becomes `int main()`. A `return` without a value inside `main` becomes `return 0;`.
+- **C2.** Every module becomes a `.c` file and a `.h` file (K3).
+  - The `.h` file includes `runtime/monolith.h`, with a path relative to the file, and declares the module's functions: first its external functions, then, after a blank line, its other functions. The main module's `main` is not declared.
+  - The `.c` file includes its own header, then the header of every other module its calls reach, in the order of their first call, and then defines its functions. Includes use paths relative to the file: `#include "std/console.h"`.
+  - No function is `static`, so any module can be imported, the main module included.
+- **C3.** The main module's `main` becomes `int main()`. A `return` without a value inside it becomes `return 0;`.
 - **C4.** Types become C types:
 
   | Monolith | C |
@@ -250,23 +297,45 @@ arguments            = expression { "," expression } [ "," ]
   | `void` | `void` |
 
 - **C5.** Number literals keep their base. `_` becomes `'`, `0o` becomes `0`, the suffix is removed, and literals of unsigned types end with `u`: `0o7_5_5` returned from a `u16` function becomes `07'5'5u`.
-- **C6.** `_ = add(1, 2)` becomes the plain call, `add(1, 2);`.
+- **C6.** `_ = add(1, 2)` becomes the plain call, `mn_hello_add(1, 2);` (C9).
 - **C7.** A string literal becomes a `string` holding the literal as written and its length in bytes, counting each escape as one byte: `"line\n"` becomes `(string){ "line\n", 5 }`.
-- **C8.** An external function becomes a declaration without `static`. These declarations come before the other declarations, separated from them by a blank line: `external fn console_write(text: String)` becomes `void console_write(string text);`. Calls to it use its name exactly, so its definition must be linked into the program.
+- **C8.** An external function keeps exactly the name written in the source, so its definition, linked into the program, uses that name: `external fn console_write(text: String)` becomes `void console_write(string text);`. The runtime defines the standard library's external functions this way (D2).
+- **C9.** C has one namespace for all files, so a function's C name is its module's generated name (G1), followed by `_` and its name: `greeting` in `hello.mn` becomes `mn_hello_greeting`, and `add` in `utils::math` becomes `mn_utils_math_add`. The main module's `main` stays `main`.
 
 ## Compiler
 
-- **K1.** The compiler is invoked as `monolith --target <javascript|c> <file.mn>`. Any other arguments print `usage: monolith --target <javascript|c> <file.mn>`.
-- **K2.** The source file name must end with `.mn` and have a name before it.
-- **K3.** The output is written to `build/<target>/<name>.<extension>`, where `<name>` is the source file name without `.mn` and the extension is `js` or `c`. The C target also writes `build/c/monolith.h` (C1). After a successful compilation, `build/<target>` is deleted and created again, so it only contains this output. No file is written or deleted when compilation fails.
+- **K1.** The compiler is invoked as `monolith --target <javascript|c> <file.mn>`, where the file name ends with `.mn` and has a name before it. Any other arguments print `usage: monolith --target <javascript|c> <file.mn>`.
+- **K2.** The file name without `.mn` must be a valid name (L6, L10), and neither a built-in type name (T1) nor `std` (M4). Otherwise the compiler stops with `error: file name must be a valid name`, before reading the file.
+- **K3.** The output is written to `build/<target>/`, in the directory the compiler runs in. The extension of every generated file is `js` or `c`:
+  - The main module is written as `<name>.<extension>`, where `<name>` is the source file name without `.mn`.
+  - Every other module is written at its module path, the standard library's modules included: `utils::math` as `utils/math.<extension>`, and `std::console` as `std/console.<extension>`.
+  - The runtime files whose functions the program calls are copied to `runtime/`, such as `runtime/console.js` (D2).
+  - The C target writes a `.h` file next to every `.c` file (C2), and always copies `runtime/monolith.h` (C1).
+  - After a successful compilation, `build/<target>` is deleted and created again, so it only contains this output. No file is written or deleted when compilation fails.
 - **K4.** The compiler exits with status 0 on success and 1 on any error.
+- **K5.** The compiler's executable comes with two directories next to it: `std/`, the standard library's modules, and `plugins/`, with one directory for each target. A target's runtime (D2) is in the `runtime/` directory of its plugin: `plugins/javascript/runtime/console.js`.
+
+## Standard library
+
+- **D1.** The standard library is a set of Monolith modules under `std` (M4). `std::console` provides `write(text: String)`, which writes text to the console:
+
+  ```monolith
+  external fn mn_console_write(text: String)
+
+  const write = mn_console_write
+  ```
+
+- **D2.** The runtime is a library for each target that does not depend on the standard library. Its function names start with `mn_`, followed by the name of the runtime file that defines them: `mn_console_write` is in `console.js` and `console.c`. In JavaScript, the runtime files export their functions (J11). In C, they are linked by name (C8). The standard library declares them as external functions and names them with constants (D1), so a call such as `console::write(...)` calls the runtime function directly. Only the runtime files whose functions the program calls are copied into the output (K3).
+- **D3.** The JavaScript runtime only uses what every JavaScript environment provides. Its `mn_console_write` buffers text across calls and writes a line with `console.log` when it sees a newline character. Text after the last newline stays in the buffer. In C, `mn_console_write` writes the text exactly as given.
 
 ## Examples
 
 ### A valid program
 
+`hello.mn`:
+
 ```monolith
-external fn console_write(text: String)
+const console = std::console
 
 fn add(left: i32, right: i32) i32: return left
 
@@ -278,60 +347,128 @@ fn greeting() String: return "hello\n"
 fn main():
     _ = add(1, 2)
     _ = flag()
-    console_write(greeting())
+    console::write(greeting())
 ```
 
-JavaScript:
+JavaScript, `hello.js`:
 
 ```javascript
-function add(left, right) {
+import { mn_console_write } from "./runtime/console.js";
+
+export function add(left, right) {
     return left;
 }
 
-function flag() {
+export function flag() {
     return true;
 }
 
-function greeting() {
+export function greeting() {
     return "hello\n";
 }
 
-function main() {
+export function main() {
     add(1, 2);
     flag();
-    console_write(greeting());
+    mn_console_write(greeting());
 }
 
 main();
 ```
 
-C:
+`std/console.js` is empty, because `std::console` only declares an external function and a constant (D1).
+
+C, `hello.h`:
 
 ```c
-#include "monolith.h"
+#include "runtime/monolith.h"
 
-void console_write(string text);
+int32_t mn_hello_add(int32_t left, int32_t right);
+bool mn_hello_flag();
+string mn_hello_greeting();
+```
 
-static int32_t add(int32_t left, int32_t right);
-static bool flag();
-static string greeting();
+`hello.c`:
 
-static int32_t add(int32_t left, int32_t right) {
+```c
+#include "hello.h"
+#include "std/console.h"
+
+int32_t mn_hello_add(int32_t left, int32_t right) {
     return left;
 }
 
-static bool flag() {
+bool mn_hello_flag() {
     return true;
 }
 
-static string greeting() {
+string mn_hello_greeting() {
     return (string){ "hello\n", 6 };
 }
 
 int main() {
-    add(1, 2);
-    flag();
-    console_write(greeting());
+    mn_hello_add(1, 2);
+    mn_hello_flag();
+    mn_console_write(mn_hello_greeting());
+}
+```
+
+`std/console.h`:
+
+```c
+#include "../runtime/monolith.h"
+
+void mn_console_write(string text);
+```
+
+### A program with its own module
+
+`hello.mn`:
+
+```monolith
+fn main(): _ = utils::math::add(1, 2)
+```
+
+`utils/math.mn`:
+
+```monolith
+fn add(left: i32, right: i32) i32: return left
+```
+
+JavaScript, `hello.js` and `utils/math.js`:
+
+```javascript
+import * as mn_utils_math from "./utils/math.js";
+
+export function main() {
+    mn_utils_math.add(1, 2);
+}
+
+main();
+```
+
+```javascript
+export function add(left, right) {
+    return left;
+}
+```
+
+C, `hello.c` and `utils/math.c`:
+
+```c
+#include "hello.h"
+#include "utils/math.h"
+
+int main() {
+    mn_utils_math_add(1, 2);
+}
+```
+
+```c
+#include "math.h"
+
+int32_t mn_utils_math_add(int32_t left, int32_t right) {
+    return left;
 }
 ```
 
@@ -394,3 +531,27 @@ external fn log(): noop
 ```
 
 → `1:18: error: external functions have no body` (S16)
+
+```monolith
+fn mn_write(): noop
+```
+
+→ `1:1: error: name is reserved` (N14)
+
+```monolith
+const one = two
+const two = one
+
+fn main(): one()
+```
+
+→ `1:1: error: constant refers to itself` (N13)
+
+```monolith
+const limit = 5
+
+fn main(): _ = one()
+fn one() i32: return limit
+```
+
+→ `1:15: error: value has no known type` (N10)
