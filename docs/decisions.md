@@ -1,21 +1,18 @@
 ## Direction
 
 - **Transpile to readable source.** Monolith compiles to source code in other languages, not machine code, and the output must stay readable.
-- **No interoperability with host languages.** Monolith code cannot call JavaScript, C or other host code directly, so the language is not tied to any existing environment.
-- **Platforms differ only through packages.** A program that uses a standard library package a target lacks does not compile for that target. There is no other per-target behavior.
+- **Host code only through external functions.** Monolith code reaches code of the target only through external functions (S15), so the rest of the language is not tied to any environment.
 - **No borrow checker.** Keeping references valid is the programmer's responsibility, as in Zig. A borrow checker restricts programs and bloats them, especially performance-focused ones.
 
 ## Memory and errors
 
 - **Explicit allocation.** Every allocation goes through an allocator the caller passes in.
-- **One memory model for every target.** Code is written as low-level code once. C and WebAssembly allocate for real, and JavaScript ignores allocation calls.
 - **Errors are values that carry data.** Like Rust's results, not Zig's bare error codes. Payloads that allocate go through an allocator.
 
 ## Types
 
 - **Overflow is left to the target.** Defining it in the language would make Monolith describe platform details.
 - **Types must be representable exactly.** A type whose values would change on a target cannot exist there, because it would change what the program means.
-- **64-bit integers are BigInts in JavaScript.** Their values stay exact, and only code using `i64` or `u64` pays the speed cost.
 - **No arbitrary-width integers.** Types such as Zig's `u7` add casts everywhere and masking in the output.
 - **Named types are capitalized.** Types that state a size in bits stay lowercase (`i32`, `f64`), and all other types start with a capital letter (`Bool`, `String`), so `String` looks like any other named type.
 - **No integer literals for float types.** A float is written with its decimal point: `2.`, not `2`.
@@ -37,16 +34,14 @@
 
 ## Strings
 
-- **Text and bytes are separate types.** A string's encoding is the target's business, so string operations are defined on text, never on bytes.
+- **Text and bytes are separate types.** A `String` is an abstraction over a byte array, and string operations are defined on text, never on bytes.
 - **Characters are Unicode code points.** Not grapheme clusters.
 - **Code point validity is not checked.**
 - **`String` is a single view type.** Its bytes are owned by something else: the program for literals, a byte buffer with an allocator for text built at runtime. There is no separate owned string type as in Rust.
-- **JavaScript uses native strings.** Byte arrays would make the output unreadable.
 - **C uses a pointer and a length.** A null-terminated `const char *` needs a scan to find its length and is a common source of security bugs.
-- **No built-in print.** Printing waits for modules and a standard library.
+- **No built-in print.** Printing is in the standard library (`std::console`), not in the language.
 
 ## Targets
 
 - **C targets C23.** The output relies on C23's `bool` keyword, empty parameter lists meaning no parameters, binary literals and `'` digit separators.
-- **The C compiler is not invoked.** Choosing and running a C toolchain belongs to a future build system.
-- **JavaScript calls `main` after all functions.** The file ends with `main();`, so everything in it is set up before the program starts.
+- **GCC builds the executable.** Only GCC, with a release build.

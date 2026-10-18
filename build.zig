@@ -17,13 +17,6 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "core", .module = core }},
     });
 
-    const javascript_plugin = b.createModule(.{
-        .root_source_file = b.path("plugins/javascript/generator.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "core", .module = core }},
-    });
-
     const c_plugin = b.createModule(.{
         .root_source_file = b.path("plugins/c/generator.zig"),
         .target = target,
@@ -40,7 +33,6 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "core", .module = core },
                 .{ .name = "monolith", .module = monolith },
-                .{ .name = "javascript", .module = javascript_plugin },
                 .{ .name = "c", .module = c_plugin },
             },
         }),
@@ -53,13 +45,11 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "std",
     });
 
-    for ([_][]const u8{ "javascript", "c" }) |plugin| {
-        b.installDirectory(.{
-            .source_dir = b.path(b.fmt("plugins/{s}/runtime", .{plugin})),
-            .install_dir = .bin,
-            .install_subdir = b.fmt("plugins/{s}/runtime", .{plugin}),
-        });
-    }
+    b.installDirectory(.{
+        .source_dir = b.path("plugins/c/runtime"),
+        .install_dir = .bin,
+        .install_subdir = "plugins/c/runtime",
+    });
 
     const test_step = b.step("test", "Run tests");
     for ([_]*std.Build.Module{ core, monolith }) |module| {
@@ -67,17 +57,16 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
 
-    for ([_][]const u8{ "javascript", "c" }) |plugin| {
-        const module = b.createModule(.{
-            .root_source_file = b.path(b.fmt("plugins/{s}/generator.zig", .{plugin})),
+    const c_plugin_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("plugins/c/generator.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "core", .module = core },
                 .{ .name = "monolith", .module = monolith },
             },
-        });
-        const tests = b.addTest(.{ .root_module = module });
-        test_step.dependOn(&b.addRunArtifact(tests).step);
-    }
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(c_plugin_tests).step);
 }

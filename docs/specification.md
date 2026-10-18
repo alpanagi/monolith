@@ -1,6 +1,6 @@
 ## Overview
 
-Monolith is a statically typed language that compiles to readable source code in another language, called the target. The supported targets are JavaScript and C (C23).
+Monolith is a statically typed language that compiles to readable source code in another language, called the target. The target is C (C23).
 
 This specification is the reference for writing Monolith. Every rule has an identifier, such as `L3` or `T7`. A rule that rejects a program states the error message the compiler reports.
 
@@ -140,7 +140,7 @@ constant             = "const" name "=" expression
 
 ### External functions
 
-- **S15.** An external function is a function declaration that the program calls but does not define: `external fn write(text: String)`. Its definition is written in the target's code. The standard library's external functions are defined by each target's runtime (D2). Every external function is called by its exact name (J8, C8).
+- **S15.** An external function is a function declaration that the program calls but does not define: `external fn write(text: String)`. Its definition is written in the target's code. The standard library's external functions are defined by the target's runtime (D2). Every external function is called by its exact name (C8).
 - **S16.** An external function has no body. A `:` after its declaration is rejected with `external functions have no body`.
 
 ## Modules
@@ -245,24 +245,9 @@ constant             = "const" name "=" expression
 
 ### Names in the output
 
-- **G1.** Names are written to the output exactly as they are in the source, except the generated names: C function names (C9) and JavaScript module names (J9). A generated name is `mn_` followed by the module path with `::` replaced by `_`, so it cannot be a name written in the source (N14).
-- **G2.** A function, external function or parameter whose name, as written to the output, the target already defines is rejected with `name is already defined in the target`, at the function's `fn` or `external` keyword or at the parameter. Constants are not checked, because they produce no output (N11). Only the names of the target being compiled for are checked: `fn delete(): noop` compiles to C as `mn_hello_delete` (C9) and is rejected for JavaScript.
-- **G3.** JavaScript defines `arguments`, `await`, `break`, `case`, `catch`, `class`, `const`, `continue`, `debugger`, `default`, `delete`, `do`, `else`, `enum`, `eval`, `export`, `extends`, `false`, `finally`, `for`, `function`, `if`, `implements`, `import`, `in`, `instanceof`, `interface`, `let`, `new`, `null`, `package`, `private`, `protected`, `public`, `return`, `static`, `super`, `switch`, `this`, `throw`, `true`, `try`, `typeof`, `var`, `void`, `while`, `with` and `yield`.
-- **G4.** C defines the C23 keywords `_Alignas`, `_Alignof`, `_Atomic`, `_BitInt`, `_Bool`, `_Complex`, `_Decimal128`, `_Decimal32`, `_Decimal64`, `_Generic`, `_Imaginary`, `_Noreturn`, `_Static_assert`, `_Thread_local`, `alignas`, `alignof`, `auto`, `bool`, `break`, `case`, `char`, `const`, `constexpr`, `continue`, `default`, `do`, `double`, `else`, `enum`, `extern`, `false`, `float`, `for`, `goto`, `if`, `inline`, `int`, `long`, `nullptr`, `register`, `restrict`, `return`, `short`, `signed`, `sizeof`, `static`, `static_assert`, `struct`, `switch`, `thread_local`, `true`, `typedef`, `typeof`, `typeof_unqual`, `union`, `unsigned`, `void`, `volatile` and `while`, and `asm`, which compilers such as GCC treat as a keyword outside strict C23. It also defines the names that C23 declares in `<stddef.h>` and `<stdint.h>`, which the header includes, such as `size_t`, `int32_t`, `NULL` and `INT32_MAX`. `string` and `MONOLITH_H` are defined by `runtime/monolith.h` itself (C1).
-
-### JavaScript
-
-- **J1.** Every module that defines functions becomes an ES module file (K3). A module without functions produces no file, because nothing imports it (J9). Each function becomes an exported `function` declaration with the same parameters, without types: `export function add(left, right)`. Every module exports its functions, so any module can be imported, the main module included.
-- **J2.** A function whose body only contains `noop` becomes an empty function, `{}`.
-- **J3.** Values of `i64` and `u64` are JavaScript BigInts, so every value of these types is exact. All other number types are JavaScript numbers.
-- **J4.** Number literals keep their base and separators and lose their suffix: `0xff_ff_u32` becomes `0xff_ff`. Literals of type `i64` or `u64` end with `n`: `1_000_i64` becomes `1_000n`.
-- **J5.** `_ = add(1, 2)` becomes the plain call, `add(1, 2);`.
-- **J6.** `String` values are JavaScript strings. String literals are written exactly as in the source: `"line\n"` stays `"line\n"`.
-- **J7.** If the main module defines `main`, its file ends with a call to it, `main();`, after all functions.
-- **J8.** An external function produces no output, so the names of its parameters are not checked (G2). Calls to it use its name exactly. A runtime function, an external function whose name starts with `mn_` (N14, D2), is imported from the runtime file its name gives (J11). For the program's own external functions, whatever runs the program must define them as globals before `main` runs.
-- **J9.** A module starts with one import for every runtime file and every other module its calls reach, with paths relative to its own file. Runtime files come first (J11), then modules in the order of their first call. A module is named with its generated name (G1): `import * as mn_utils_math from "./utils/math.js";`.
-- **J10.** A call to a function of another module uses that module's name: `utils::math::add(1, 2)` becomes `mn_utils_math.add(1, 2);`, whatever namespaces and constants the path goes through. A call to a function of the same module, or to an external function, uses its name: `add(1, 2);`, `mn_console_write("hello\n");`.
-- **J11.** A runtime function is imported by name from the runtime file named by the part of its name between `mn_` and the next `_`: `mn_console_write` comes from `runtime/console.js`, with `import { mn_console_write } from "./runtime/console.js";`. The runtime functions a module calls from one file share one import, in the order of their first call.
+- **G1.** Names are written to the output exactly as they are in the source, except the generated names: C function names (C9). A generated name is `mn_` followed by the module path with `::` replaced by `_`, so it cannot be a name written in the source (N14).
+- **G2.** A function, external function or parameter whose name, as written to the output, the target already defines is rejected with `name is already defined in the target`, at the function's `fn` or `external` keyword or at the parameter. Constants are not checked, because they produce no output (N11). A function's name is checked as it is written to the output: `fn int(): noop` becomes `mn_hello_int` (C9) and is accepted, but a parameter named `int` is rejected.
+- **G3.** C defines the C23 keywords `_Alignas`, `_Alignof`, `_Atomic`, `_BitInt`, `_Bool`, `_Complex`, `_Decimal128`, `_Decimal32`, `_Decimal64`, `_Generic`, `_Imaginary`, `_Noreturn`, `_Static_assert`, `_Thread_local`, `alignas`, `alignof`, `auto`, `bool`, `break`, `case`, `char`, `const`, `constexpr`, `continue`, `default`, `do`, `double`, `else`, `enum`, `extern`, `false`, `float`, `for`, `goto`, `if`, `inline`, `int`, `long`, `nullptr`, `register`, `restrict`, `return`, `short`, `signed`, `sizeof`, `static`, `static_assert`, `struct`, `switch`, `thread_local`, `true`, `typedef`, `typeof`, `typeof_unqual`, `union`, `unsigned`, `void`, `volatile` and `while`, and `asm`, which compilers such as GCC treat as a keyword outside strict C23. It also defines the names that C23 declares in `<stddef.h>` and `<stdint.h>`, which the header includes, such as `size_t`, `int32_t`, `NULL` and `INT32_MAX`. `string` and `MONOLITH_H` are defined by `runtime/monolith.h` itself (C1).
 
 ### C
 
@@ -304,18 +289,18 @@ constant             = "const" name "=" expression
 
 ## Compiler
 
-- **K1.** The compiler is invoked as `monolith --target <javascript|js|c> <file.mn>`, where the file name ends with `.mn` and has a name before it. Any other arguments print `usage: monolith --target <javascript|js|c> <file.mn>`. `js` is another name for `javascript`. The target ignores case: `--target JavaScript` and `--target JS` are the same as `--target javascript`, and their output still goes to `build/javascript` (K3).
+- **K1.** The compiler is invoked as `monolith <file.mn>`, where the file name ends with `.mn` and has a name before it. Any other arguments print `usage: monolith <file.mn>`.
 - **K2.** The file name without `.mn` must be a valid name (L6, L10), and neither a built-in type name (T1) nor `std` (M4). Otherwise the compiler stops with `error: file name must be a valid name`, before reading the file.
-- **K3.** The output is written to `build/<target>/`, in the directory the compiler runs in. The extension of every generated file is `js` or `c`:
-  - The main module is written as `<name>.<extension>`, where `<name>` is the source file name without `.mn`.
-  - Every other module is written at its module path, the standard library's modules included: `utils::math` as `utils/math.<extension>`, and `std::console` as `std/console.<extension>`.
-  - A module without functions, the main module included, gets no `js` or `c` file (J1, C2).
-  - The runtime files whose functions the program calls are copied to `runtime/`, such as `runtime/console.js` (D2).
-  - The C target writes a `.h` file for every module (C2), and always copies `runtime/monolith.h` (C1).
-  - When the main module defines `main`, the C target also builds the executable `<name>` with GCC, from every `.c` file of the output: `gcc -std=c23 -Wall -Wextra -pedantic -O2 -flto`. GCC's warnings are shown. If GCC cannot be run, the compiler stops with `error: cannot run gcc: <reason>`. If GCC fails, it stops with `error: gcc could not build the executable`. GCC runs after the output is written, so the C files stay when it fails.
-  - After a successful compilation, `build/<target>` is deleted and created again, so it only contains this output. No file is written or deleted when compilation fails.
+- **K3.** The output is written to `build/`, in the directory the compiler runs in. The C files are written to `build/source/`:
+  - The main module is written as `<name>.h` and `<name>.c`, where `<name>` is the source file name without `.mn`.
+  - Every other module is written at its module path, the standard library's modules included: `utils::math` as `utils/math.h` and `utils/math.c`, and `std::console` as `std/console.h`.
+  - A module without functions, the main module included, gets no `.c` file (C2).
+  - The runtime files whose functions the program calls are copied to `runtime/`, such as `runtime/console.c` (D2).
+  - `runtime/monolith.h` is always copied (C1).
+  - When the main module defines `main`, the compiler also builds the executable `build/<name>` with GCC, from every `.c` file of the output: `gcc -std=c23 -Wall -Wextra -pedantic -O2 -flto`. GCC's warnings are shown. If GCC cannot be run, the compiler stops with `error: cannot run gcc: <reason>`. If GCC fails, it stops with `error: gcc could not build the executable`. GCC runs after the output is written, so the C files stay when it fails.
+  - After a successful compilation, `build` is deleted and created again, so it only contains this output. No file is written or deleted when compilation fails.
 - **K4.** The compiler exits with status 0 on success and 1 on any error.
-- **K5.** The compiler's executable comes with two directories next to it: `std/`, the standard library's modules, and `plugins/`, with one directory for each target. A target's runtime (D2) is in the `runtime/` directory of its plugin: `plugins/javascript/runtime/console.js`.
+- **K5.** The compiler's executable comes with two directories next to it: `std/`, the standard library's modules, and `plugins/`, with one directory for each target. A target's runtime (D2) is in the `runtime/` directory of its plugin: `plugins/c/runtime/console.c`.
 
 ## Standard library
 
@@ -327,8 +312,8 @@ constant             = "const" name "=" expression
   const write = mn_console_write
   ```
 
-- **D2.** The runtime is a library for each target that does not depend on the standard library. Its function names start with `mn_`, followed by the name of the runtime file that defines them: `mn_console_write` is in `console.js` and `console.c`. In JavaScript, the runtime files export their functions (J11). In C, they are linked by name (C8). The standard library declares them as external functions and names them with constants (D1), so a call such as `console::write(...)` calls the runtime function directly. Only the runtime files whose functions the program calls are copied into the output (K3).
-- **D3.** The JavaScript runtime only uses what every JavaScript environment provides. Its `mn_console_write` buffers text across calls and writes a line with `console.log` when it sees a newline character. Text after the last newline stays in the buffer. In C, `mn_console_write` writes the text exactly as given.
+- **D2.** The runtime is a library of the target that does not depend on the standard library. Its function names start with `mn_`, followed by the name of the runtime file that defines them: `mn_console_write` is in `console.c`. Its functions are linked by name (C8). The standard library declares them as external functions and names them with constants (D1), so a call such as `console::write(...)` calls the runtime function directly. Only the runtime files whose functions the program calls are copied into the output (K3).
+- **D3.** `mn_console_write` writes the text exactly as given.
 
 ## Examples
 
@@ -352,35 +337,9 @@ fn main():
     console::write(greeting())
 ```
 
-JavaScript, `hello.js`:
+No `std/console.c` is written, because `std::console` only declares an external function and a constant (D1).
 
-```javascript
-import { mn_console_write } from "./runtime/console.js";
-
-export function add(left, right) {
-    return left;
-}
-
-export function flag() {
-    return true;
-}
-
-export function greeting() {
-    return "hello\n";
-}
-
-export function main() {
-    add(1, 2);
-    flag();
-    mn_console_write(greeting());
-}
-
-main();
-```
-
-No `std/console.js` or `std/console.c` is written, because `std::console` only declares an external function and a constant (D1).
-
-C, `hello.h`:
+`hello.h`:
 
 ```c
 #include "runtime/monolith.h"
@@ -437,25 +396,7 @@ fn main(): _ = utils::math::add(1, 2)
 fn add(left: i32, right: i32) i32: return left
 ```
 
-JavaScript, `hello.js` and `utils/math.js`:
-
-```javascript
-import * as mn_utils_math from "./utils/math.js";
-
-export function main() {
-    mn_utils_math.add(1, 2);
-}
-
-main();
-```
-
-```javascript
-export function add(left, right) {
-    return left;
-}
-```
-
-C, `hello.c` and `utils/math.c`:
+`hello.c` and `utils/math.c`:
 
 ```c
 #include "hello.h"

@@ -33,19 +33,21 @@ pub const Generator = struct {
         try std.Io.Dir.cwd().deleteTree(io, output_path);
         const output_directory = try std.Io.Dir.cwd().createDirPathOpen(io, output_path, .{});
         defer output_directory.close(io);
+        const source_directory = try output_directory.createDirPathOpen(io, "source", .{});
+        defer source_directory.close(io);
 
         for (files) |file| {
             if (std.fs.path.dirname(file.path)) |directory_path| {
-                try output_directory.createDirPath(io, directory_path);
+                try source_directory.createDirPath(io, directory_path);
             }
-            try output_directory.writeFile(io, .{ .sub_path = file.path, .data = file.contents });
+            try source_directory.writeFile(io, .{ .sub_path = file.path, .data = file.contents });
         }
         for (self.runtime_files.items) |name| {
             const path = try std.mem.concat(allocator, u8, &.{ "runtime/", name });
-            try output_directory.createDirPath(io, "runtime");
-            try plugin_directory.copyFile(path, output_directory, path, io, .{});
+            try source_directory.createDirPath(io, "runtime");
+            try plugin_directory.copyFile(path, source_directory, path, io, .{});
         }
-        try self.buildExecutable(allocator, io, output_directory, files);
+        try self.buildExecutable(allocator, io, source_directory, files);
     }
 
     fn generateFiles(
@@ -89,7 +91,7 @@ pub const Generator = struct {
         self: *Generator,
         allocator: std.mem.Allocator,
         io: std.Io,
-        output_directory: std.Io.Dir,
+        source_directory: std.Io.Dir,
         files: []const File,
     ) GenerateError!void {
         const main_module = self.program.modules[0];
@@ -111,11 +113,12 @@ pub const Generator = struct {
             const path = try std.mem.concat(allocator, u8, &.{ "runtime/", name });
             try arguments.append(allocator, path);
         }
-        try arguments.appendSlice(allocator, &.{ "-o", main_module.path[0] });
+        const executable_path = try std.mem.concat(allocator, u8, &.{ "../", main_module.path[0] });
+        try arguments.appendSlice(allocator, &.{ "-o", executable_path });
 
         var compiler = std.process.spawn(io, .{
             .argv = arguments.items,
-            .cwd = .{ .dir = output_directory },
+            .cwd = .{ .dir = source_directory },
             .stdin = .ignore,
         }) catch |spawn_error| {
             const format = "cannot run gcc: {t}";
@@ -663,10 +666,10 @@ test "Generator.generate: writes the modules and the runtime files they use" {
     try output_directory.dir.writeFile(std.testing.io, .{ .sub_path = "build/old.txt", .data = "old" });
     try generator.generate(allocator, std.testing.io, plugin_path, output_path);
 
-    try std.testing.expectEqualStrings("header", try output_directory.dir.readFileAlloc(std.testing.io, "build/runtime/monolith.h", allocator, .unlimited));
-    try std.testing.expectEqualStrings("console", try output_directory.dir.readFileAlloc(std.testing.io, "build/runtime/console.c", allocator, .unlimited));
-    try std.testing.expect(std.mem.startsWith(u8, try output_directory.dir.readFileAlloc(std.testing.io, "build/main.c", allocator, .unlimited), "#include \"main.h\""));
-    try std.testing.expectError(error.FileNotFound, output_directory.dir.readFileAlloc(std.testing.io, "build/runtime/unused.c", allocator, .unlimited));
+    try std.testing.expectEqualStrings("header", try output_directory.dir.readFileAlloc(std.testing.io, "build/source/runtime/monolith.h", allocator, .unlimited));
+    try std.testing.expectEqualStrings("console", try output_directory.dir.readFileAlloc(std.testing.io, "build/source/runtime/console.c", allocator, .unlimited));
+    try std.testing.expect(std.mem.startsWith(u8, try output_directory.dir.readFileAlloc(std.testing.io, "build/source/main.c", allocator, .unlimited), "#include \"main.h\""));
+    try std.testing.expectError(error.FileNotFound, output_directory.dir.readFileAlloc(std.testing.io, "build/source/runtime/unused.c", allocator, .unlimited));
     try std.testing.expectError(error.FileNotFound, output_directory.dir.readFileAlloc(std.testing.io, "build/old.txt", allocator, .unlimited));
 }
 
@@ -1511,8 +1514,8 @@ test "buildRelativePath: walks into directories" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const path = try buildRelativePath(arena.allocator(), "hello.js", "std/console.js");
-    try std.testing.expectEqualStrings("std/console.js", path);
+    const path = try buildRelativePath(arena.allocator(), "hello.c", "std/console.h");
+    try std.testing.expectEqualStrings("std/console.h", path);
 }
 
 test "buildRelativePath: walks out of directories" {
@@ -1522,16 +1525,16 @@ test "buildRelativePath: walks out of directories" {
     const allocator = arena.allocator();
     const path = try buildRelativePath(allocator, "std/console.h", "monolith.h");
     try std.testing.expectEqualStrings("../monolith.h", path);
-    const runtime = try buildRelativePath(allocator, "utils/math/add.js", "runtime/console.js");
-    try std.testing.expectEqualStrings("../../runtime/console.js", runtime);
+    const runtime = try buildRelativePath(allocator, "utils/math/add.c", "runtime/monolith.h");
+    try std.testing.expectEqualStrings("../../runtime/monolith.h", runtime);
 }
 
 test "buildRelativePath: keeps a file named like a directory apart from it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const path = try buildRelativePath(arena.allocator(), "utils.js", "utils/math.js");
-    try std.testing.expectEqualStrings("utils/math.js", path);
+    const path = try buildRelativePath(arena.allocator(), "utils.c", "utils/math.h");
+    try std.testing.expectEqualStrings("utils/math.h", path);
 }
 
 test "isRuntimeFunction: recognizes the reserved prefix" {
