@@ -147,10 +147,10 @@ constant             = "const" name "=" expression
 
 - **M1.** Every source file is a module. The file given to the compiler is the main module. A module's path is the path of its file, with directories separated by `::` and without `.mn`: `utils/math.mn` is the module `utils::math`, and the main file `hello.mn` is the module `hello`.
 - **M2.** Every module's file name, without `.mn`, and every directory name in a module path must be a valid name (L6, L10). Paths can only spell valid names, so only the main file's name is checked (K2).
-- **M3.** Every path is a namespace. A namespace is a module when a file has its path (M1), and it contains the namespaces whose paths continue its path: `std` contains `std::stdout`. A namespace can be both: with `utils.mn` and `utils/math.mn`, `utils` is a module and contains `utils::math`. A path reaches namespaces directly: `std::stdout::write("hello\n")` calls `write` in the module `std::stdout`.
+- **M3.** Every path is a namespace. A namespace is a module when a file has its path (M1), and it contains the namespaces whose paths continue its path: `std::io` contains `std::io::stdout`. A namespace can be both: with `utils.mn` and `utils/math.mn`, `utils` is a module and contains `utils::math`. A path reaches namespaces directly: `std::io::stdout::write("hello\n")` calls `write` in the module `std::io::stdout`.
 - **M4.** A path that starts with `std` refers to the standard library, which comes with the compiler (K5). Every other path is a namespace of the program, relative to the directory of the main file, from every module.
 - **M5.** The first name of a path that continues with `::` is looked up only among namespaces: first the module's constants that name a namespace, then `std`, then the program's namespaces (M4).
-- **M6.** The namespaces a namespace contains are reached through it: `std::stdout::write("hello\n")`. A namespace that is a module and contains namespaces reaches both its module's functions and its namespaces: `utils::add()` and `utils::math::add()`.
+- **M6.** The namespaces a namespace contains are reached through it: `std::io::stdout::write("hello\n")`. A namespace that is a module and contains namespaces reaches both its module's functions and its namespaces: `utils::add()` and `utils::math::add()`.
 - **M7.** Each module is loaded once, however often it is reached, and modules can reach each other. Loading starts with the main module, and a module is read when resolving a module that is already loaded reaches it. Nothing else is read.
 - **M8.** Every declaration of a module can be used by the other modules through a path, external functions and constants included.
 - **M9.** In a namespace that contains namespaces, a name before a `::` that is none of them is rejected with `module not found`, at the path.
@@ -179,7 +179,7 @@ constant             = "const" name "=" expression
 
 ### Constants
 
-- **N10.** `const name = expression` declares a constant. Its value is evaluated at compile time, and can be a function, a type, a namespace or a literal. `const stdout = std::stdout` lets `stdout::write(...)` reach the module, `const write = mn_stdout_write` lets `write(...)` call the function, `const Integer = i32` lets `Integer` be used as a type, and `const limit = 5i32` lets `limit` be used as a value of type `i32`.
+- **N10.** `const name = expression` declares a constant. Its value is evaluated at compile time, and can be a function, a type, a namespace or a literal. `const stdout = std::io::stdout` lets `stdout::write(...)` reach the module, `const write = mn_stdout_write` lets `write(...)` call the function, `const Integer = i32` lets `Integer` be used as a type, and `const limit = 5i32` lets `limit` be used as a value of type `i32`.
   - A number literal as the value has a suffix, which gives its type (T5): `const limit = 5i32`. Otherwise it is rejected with `value has no known type`, at the literal.
   - Errors in a literal value are reported at the literal, in the module of the constant.
 - **N11.** A constant means the same as its value, so every rule for that value applies to it. A constant produces no output: each use writes what the constant names, such as the function it calls or its literal.
@@ -267,7 +267,7 @@ constant             = "const" name "=" expression
 
 - **C2.** Every module becomes a `.h` file, and a module that defines functions also becomes a `.c` file (K3).
   - The `.h` file includes `runtime/monolith.h`, with a path relative to the file, and declares the module's functions: first its external functions, then, after a blank line, its other functions. The main module's `main` is not declared.
-  - The `.c` file includes its own header, then the header of every other module its calls reach, in the order of their first call, and then defines its functions. Includes use paths relative to the file: `#include "std/stdout.h"`.
+  - The `.c` file includes its own header, then the header of every other module its calls reach, in the order of their first call, and then defines its functions. Includes use paths relative to the file: `#include "std/io/stdout.h"`.
   - No function is `static`, so any module can be imported, the main module included.
 - **C3.** The main module's `main` becomes `int main()`. A `return` without a value inside it becomes `return 0;`.
 - **C4.** Types become C types:
@@ -293,7 +293,7 @@ constant             = "const" name "=" expression
 - **K2.** The file name without `.mn` must be a valid name (L6, L10), and neither a built-in type name (T1) nor `std` (M4). Otherwise the compiler stops with `error: file name must be a valid name`, before reading the file.
 - **K3.** The output is written to `build/`, in the directory the compiler runs in. The C files are written to `build/source/`:
   - The main module is written as `<name>.h` and `<name>.c`, where `<name>` is the source file name without `.mn`.
-  - Every other module is written at its module path, the standard library's modules included: `utils::math` as `utils/math.h` and `utils/math.c`, and `std::stdout` as `std/stdout.h`.
+  - Every other module is written at its module path, the standard library's modules included: `utils::math` as `utils/math.h` and `utils/math.c`, and `std::io::stdout` as `std/io/stdout.h`.
   - A module without functions, the main module included, gets no `.c` file (C2).
   - The runtime files whose functions the program calls are copied to `runtime/`, such as `runtime/stdout.c` (D2).
   - `runtime/monolith.h` is always copied (C1).
@@ -304,7 +304,7 @@ constant             = "const" name "=" expression
 
 ## Standard library
 
-- **D1.** The standard library is a set of Monolith modules under `std` (M4). `std::stdout` provides `write(text: String)`, which writes text to the standard output:
+- **D1.** The standard library is a set of Monolith modules under `std` (M4). `std::io::stdout` provides `write(text: String)`, which writes text to the standard output:
 
   ```monolith
   external fn mn_stdout_write(text: String)
@@ -322,7 +322,7 @@ constant             = "const" name "=" expression
 `hello.mn`:
 
 ```monolith
-const stdout = std::stdout
+const stdout = std::io::stdout
 
 fn add(left: i32, right: i32) i32: return left
 
@@ -337,7 +337,7 @@ fn main():
     stdout::write(greeting())
 ```
 
-No `std/stdout.c` is written, because `std::stdout` only declares an external function and a constant (D1).
+No `std/io/stdout.c` is written, because `std::io::stdout` only declares an external function and a constant (D1).
 
 `hello.h`:
 
@@ -353,7 +353,7 @@ string mn_hello_greeting();
 
 ```c
 #include "hello.h"
-#include "std/stdout.h"
+#include "std/io/stdout.h"
 
 int32_t mn_hello_add(int32_t left, int32_t right) {
     return left;
@@ -374,10 +374,10 @@ int main() {
 }
 ```
 
-`std/stdout.h`:
+`std/io/stdout.h`:
 
 ```c
-#include "../runtime/monolith.h"
+#include "../../runtime/monolith.h"
 
 void mn_stdout_write(string text);
 ```

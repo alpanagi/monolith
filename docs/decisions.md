@@ -39,7 +39,7 @@
 - **Code point validity is not checked.**
 - **`String` is a single view type.** Its bytes are owned by something else: the program for literals, a byte buffer with an allocator for text built at runtime. There is no separate owned string type as in Rust.
 - **C uses a pointer and a length.** A null-terminated `const char *` needs a scan to find its length and is a common source of security bugs.
-- **No built-in print.** Printing is in the standard library (`std::stdout`), not in the language.
+- **No built-in print.** Printing is in the standard library (`std::io::stdout`), not in the language.
 
 ## Targets
 
