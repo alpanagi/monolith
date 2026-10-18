@@ -147,10 +147,10 @@ constant             = "const" name "=" expression
 
 - **M1.** Every source file is a module. The file given to the compiler is the main module. A module's path is the path of its file, with directories separated by `::` and without `.mn`: `utils/math.mn` is the module `utils::math`, and the main file `hello.mn` is the module `hello`.
 - **M2.** Every module's file name, without `.mn`, and every directory name in a module path must be a valid name (L6, L10). Paths can only spell valid names, so only the main file's name is checked (K2).
-- **M3.** Every path is a namespace. A namespace is a module when a file has its path (M1), and it contains the namespaces whose paths continue its path: `std` contains `std::console`. A namespace can be both: with `utils.mn` and `utils/math.mn`, `utils` is a module and contains `utils::math`. A path reaches namespaces directly: `std::console::write("hello\n")` calls `write` in the module `std::console`.
+- **M3.** Every path is a namespace. A namespace is a module when a file has its path (M1), and it contains the namespaces whose paths continue its path: `std` contains `std::stdout`. A namespace can be both: with `utils.mn` and `utils/math.mn`, `utils` is a module and contains `utils::math`. A path reaches namespaces directly: `std::stdout::write("hello\n")` calls `write` in the module `std::stdout`.
 - **M4.** A path that starts with `std` refers to the standard library, which comes with the compiler (K5). Every other path is a namespace of the program, relative to the directory of the main file, from every module.
 - **M5.** The first name of a path that continues with `::` is looked up only among namespaces: first the module's constants that name a namespace, then `std`, then the program's namespaces (M4).
-- **M6.** The namespaces a namespace contains are reached through it: `std::console::write("hello\n")`. A namespace that is a module and contains namespaces reaches both its module's functions and its namespaces: `utils::add()` and `utils::math::add()`.
+- **M6.** The namespaces a namespace contains are reached through it: `std::stdout::write("hello\n")`. A namespace that is a module and contains namespaces reaches both its module's functions and its namespaces: `utils::add()` and `utils::math::add()`.
 - **M7.** Each module is loaded once, however often it is reached, and modules can reach each other. Loading starts with the main module, and a module is read when resolving a module that is already loaded reaches it. Nothing else is read.
 - **M8.** Every declaration of a module can be used by the other modules through a path, external functions and constants included.
 - **M9.** In a namespace that contains namespaces, a name before a `::` that is none of them is rejected with `module not found`, at the path.
@@ -179,7 +179,7 @@ constant             = "const" name "=" expression
 
 ### Constants
 
-- **N10.** `const name = expression` declares a constant. Its value is evaluated at compile time, and can be a function, a type, a namespace or a literal. `const console = std::console` lets `console::write(...)` reach the module, `const write = mn_console_write` lets `write(...)` call the function, `const Integer = i32` lets `Integer` be used as a type, and `const limit = 5i32` lets `limit` be used as a value of type `i32`.
+- **N10.** `const name = expression` declares a constant. Its value is evaluated at compile time, and can be a function, a type, a namespace or a literal. `const stdout = std::stdout` lets `stdout::write(...)` reach the module, `const write = mn_stdout_write` lets `write(...)` call the function, `const Integer = i32` lets `Integer` be used as a type, and `const limit = 5i32` lets `limit` be used as a value of type `i32`.
   - A number literal as the value has a suffix, which gives its type (T5): `const limit = 5i32`. Otherwise it is rejected with `value has no known type`, at the literal.
   - Errors in a literal value are reported at the literal, in the module of the constant.
 - **N11.** A constant means the same as its value, so every rule for that value applies to it. A constant produces no output: each use writes what the constant names, such as the function it calls or its literal.
@@ -267,7 +267,7 @@ constant             = "const" name "=" expression
 
 - **C2.** Every module becomes a `.h` file, and a module that defines functions also becomes a `.c` file (K3).
   - The `.h` file includes `runtime/monolith.h`, with a path relative to the file, and declares the module's functions: first its external functions, then, after a blank line, its other functions. The main module's `main` is not declared.
-  - The `.c` file includes its own header, then the header of every other module its calls reach, in the order of their first call, and then defines its functions. Includes use paths relative to the file: `#include "std/console.h"`.
+  - The `.c` file includes its own header, then the header of every other module its calls reach, in the order of their first call, and then defines its functions. Includes use paths relative to the file: `#include "std/stdout.h"`.
   - No function is `static`, so any module can be imported, the main module included.
 - **C3.** The main module's `main` becomes `int main()`. A `return` without a value inside it becomes `return 0;`.
 - **C4.** Types become C types:
@@ -284,7 +284,7 @@ constant             = "const" name "=" expression
 - **C5.** Number literals keep their base. `_` becomes `'`, `0o` becomes `0`, the suffix is removed, and literals of unsigned types end with `u`: `0o7_5_5` returned from a `u16` function becomes `07'5'5u`.
 - **C6.** `_ = add(1, 2)` becomes the plain call, `mn_hello_add(1, 2);` (C9).
 - **C7.** A string literal becomes a `string` holding the literal as written and its length in bytes, counting each escape as one byte: `"line\n"` becomes `(string){ "line\n", 5 }`.
-- **C8.** An external function keeps exactly the name written in the source, so its definition, linked into the program, uses that name: `external fn console_write(text: String)` becomes `void console_write(string text);`. The runtime defines the standard library's external functions this way (D2).
+- **C8.** An external function keeps exactly the name written in the source, so its definition, linked into the program, uses that name: `external fn stdout_write(text: String)` becomes `void stdout_write(string text);`. The runtime defines the standard library's external functions this way (D2).
 - **C9.** C has one namespace for all files, so a function's C name is its module's generated name (G1), followed by `_` and its name: `greeting` in `hello.mn` becomes `mn_hello_greeting`, and `add` in `utils::math` becomes `mn_utils_math_add`. The main module's `main` stays `main`.
 
 ## Compiler
@@ -293,27 +293,27 @@ constant             = "const" name "=" expression
 - **K2.** The file name without `.mn` must be a valid name (L6, L10), and neither a built-in type name (T1) nor `std` (M4). Otherwise the compiler stops with `error: file name must be a valid name`, before reading the file.
 - **K3.** The output is written to `build/`, in the directory the compiler runs in. The C files are written to `build/source/`:
   - The main module is written as `<name>.h` and `<name>.c`, where `<name>` is the source file name without `.mn`.
-  - Every other module is written at its module path, the standard library's modules included: `utils::math` as `utils/math.h` and `utils/math.c`, and `std::console` as `std/console.h`.
+  - Every other module is written at its module path, the standard library's modules included: `utils::math` as `utils/math.h` and `utils/math.c`, and `std::stdout` as `std/stdout.h`.
   - A module without functions, the main module included, gets no `.c` file (C2).
-  - The runtime files whose functions the program calls are copied to `runtime/`, such as `runtime/console.c` (D2).
+  - The runtime files whose functions the program calls are copied to `runtime/`, such as `runtime/stdout.c` (D2).
   - `runtime/monolith.h` is always copied (C1).
   - When the main module defines `main`, the compiler also builds the executable `build/<name>` with GCC, from every `.c` file of the output: `gcc -std=c23 -Wall -Wextra -pedantic -O2 -flto`. GCC's warnings are shown. If GCC cannot be run, the compiler stops with `error: cannot run gcc: <reason>`. If GCC fails, it stops with `error: gcc could not build the executable`. GCC runs after the output is written, so the C files stay when it fails.
   - After a successful compilation, `build` is deleted and created again, so it only contains this output. No file is written or deleted when compilation fails.
 - **K4.** The compiler exits with status 0 on success and 1 on any error.
-- **K5.** The compiler's executable comes with two directories next to it: `std/`, the standard library's modules, and `plugins/`, with one directory for each target. A target's runtime (D2) is in the `runtime/` directory of its plugin: `plugins/c/runtime/console.c`.
+- **K5.** The compiler's executable comes with two directories next to it: `std/`, the standard library's modules, and `plugins/`, with one directory for each target. A target's runtime (D2) is in the `runtime/` directory of its plugin: `plugins/c/runtime/stdout.c`.
 
 ## Standard library
 
-- **D1.** The standard library is a set of Monolith modules under `std` (M4). `std::console` provides `write(text: String)`, which writes text to the console:
+- **D1.** The standard library is a set of Monolith modules under `std` (M4). `std::stdout` provides `write(text: String)`, which writes text to the standard output:
 
   ```monolith
-  external fn mn_console_write(text: String)
+  external fn mn_stdout_write(text: String)
 
-  const write = mn_console_write
+  const write = mn_stdout_write
   ```
 
-- **D2.** The runtime is a library of the target that does not depend on the standard library. Its function names start with `mn_`, followed by the name of the runtime file that defines them: `mn_console_write` is in `console.c`. Its functions are linked by name (C8). The standard library declares them as external functions and names them with constants (D1), so a call such as `console::write(...)` calls the runtime function directly. Only the runtime files whose functions the program calls are copied into the output (K3).
-- **D3.** `mn_console_write` writes the text exactly as given.
+- **D2.** The runtime is a library of the target that does not depend on the standard library. Its function names start with `mn_`, followed by the name of the runtime file that defines them: `mn_stdout_write` is in `stdout.c`. Its functions are linked by name (C8). The standard library declares them as external functions and names them with constants (D1), so a call such as `stdout::write(...)` calls the runtime function directly. Only the runtime files whose functions the program calls are copied into the output (K3).
+- **D3.** `mn_stdout_write` writes the text exactly as given.
 
 ## Examples
 
@@ -322,7 +322,7 @@ constant             = "const" name "=" expression
 `hello.mn`:
 
 ```monolith
-const console = std::console
+const stdout = std::stdout
 
 fn add(left: i32, right: i32) i32: return left
 
@@ -334,10 +334,10 @@ fn greeting() String: return "hello\n"
 fn main():
     _ = add(1, 2)
     _ = flag()
-    console::write(greeting())
+    stdout::write(greeting())
 ```
 
-No `std/console.c` is written, because `std::console` only declares an external function and a constant (D1).
+No `std/stdout.c` is written, because `std::stdout` only declares an external function and a constant (D1).
 
 `hello.h`:
 
@@ -353,7 +353,7 @@ string mn_hello_greeting();
 
 ```c
 #include "hello.h"
-#include "std/console.h"
+#include "std/stdout.h"
 
 int32_t mn_hello_add(int32_t left, int32_t right) {
     return left;
@@ -370,16 +370,16 @@ string mn_hello_greeting() {
 int main() {
     mn_hello_add(1, 2);
     mn_hello_flag();
-    mn_console_write(mn_hello_greeting());
+    mn_stdout_write(mn_hello_greeting());
 }
 ```
 
-`std/console.h`:
+`std/stdout.h`:
 
 ```c
 #include "../runtime/monolith.h"
 
-void mn_console_write(string text);
+void mn_stdout_write(string text);
 ```
 
 ### A program with its own module

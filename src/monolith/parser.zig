@@ -552,13 +552,13 @@ test "parseTopLevelStatement: parses constants between functions" {
 test "parseFunctionDeclaration: parses an external function" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("external fn console_write(text: String)\nfn main(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("external fn stdout_write(text: String)\nfn main(): noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const declaration = module.declarations[0];
-    try std.testing.expectEqualStrings("console_write", declaration.kind.function_declaration.name);
+    try std.testing.expectEqualStrings("stdout_write", declaration.kind.function_declaration.name);
     try std.testing.expectEqual(1, declaration.kind.function_declaration.parameters.len);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, declaration.location);
 }
@@ -927,7 +927,7 @@ test "parseCall: parses nested calls" {
 test "parseCall: parses a path as the callee" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): std::console::write(1)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): std::stdout::write(1)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -938,7 +938,7 @@ test "parseCall: parses a path as the callee" {
     const path = call.callee.path_expression.path;
     try std.testing.expectEqual(3, path.len);
     try std.testing.expectEqualStrings("std", path[0]);
-    try std.testing.expectEqualStrings("console", path[1]);
+    try std.testing.expectEqualStrings("stdout", path[1]);
     try std.testing.expectEqualStrings("write", path[2]);
     try std.testing.expectEqual(1, call.arguments.len);
 }
@@ -971,12 +971,12 @@ test "parseNameExpression: parses a path used as a value" {
 test "parsePath: rejects a separator without a name after it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const console = std::");
+    var lexer = @import("lexer.zig").Lexer.init("const stdout = std::");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 22 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 21 }, parser.failure.?.location.?);
 }
 
 test "parseArguments: accepts a trailing comma" {
@@ -1004,29 +1004,29 @@ test "parseArguments: rejects a missing argument" {
 test "parseConstantDeclaration: parses a path as the value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const console = std::console");
+    var lexer = @import("lexer.zig").Lexer.init("const stdout = std::stdout");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const constant = module.declarations[0].kind.constant_declaration;
-    try std.testing.expectEqualStrings("console", constant.name);
+    try std.testing.expectEqualStrings("stdout", constant.name);
     try std.testing.expectEqual(2, constant.value.kind.path_expression.path.len);
     try std.testing.expectEqualStrings("std", constant.value.kind.path_expression.path[0]);
-    try std.testing.expectEqualStrings("console", constant.value.kind.path_expression.path[1]);
+    try std.testing.expectEqualStrings("stdout", constant.value.kind.path_expression.path[1]);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, module.declarations[0].location);
 }
 
 test "parseConstantDeclaration: parses a name as the value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const write = mn_console_write");
+    var lexer = @import("lexer.zig").Lexer.init("const write = mn_stdout_write");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const constant = module.declarations[0].kind.constant_declaration;
-    try std.testing.expectEqualStrings("mn_console_write", constant.value.kind.identifier.name);
+    try std.testing.expectEqualStrings("mn_stdout_write", constant.value.kind.identifier.name);
 }
 
 test "parseConstantDeclaration: parses a literal as the value" {
@@ -1045,7 +1045,7 @@ test "parseConstantDeclaration: parses a literal as the value" {
 test "parseConstantDeclaration: rejects a missing equals sign" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const write mn_console_write");
+    var lexer = @import("lexer.zig").Lexer.init("const write mn_stdout_write");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 

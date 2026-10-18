@@ -500,7 +500,7 @@ test "NameResolver.resolve: resolves calls to external functions" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn console_write(text: String)\nfn main(): console_write(\"hi\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn stdout_write(text: String)\nfn main(): stdout_write(\"hi\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader);
     try name_resolver.resolve();
@@ -590,7 +590,7 @@ test "resolveModule: allows reserved names in the standard library" {
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/console.mn", .data = "external fn mn_console_write(text: String)\nconst write = mn_console_write" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_stdout_write(text: String)\nconst write = mn_stdout_write" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -600,7 +600,7 @@ test "resolveModule: allows reserved names in the standard library" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): std::console::write(\"hi\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): std::stdout::write(\"hi\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader);
     try name_resolver.resolve();
@@ -990,7 +990,7 @@ test "resolvePath: resolves a call through a directory" {
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/console.mn", .data = "external fn write()" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn write()" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -1000,7 +1000,7 @@ test "resolvePath: resolves a call through a directory" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): std::console::write()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): std::stdout::write()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader);
     try name_resolver.resolve();
@@ -1018,7 +1018,7 @@ test "resolvePath: resolves a call through a constant that names a module" {
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/console.mn", .data = "external fn write()" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn write()" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -1028,7 +1028,7 @@ test "resolvePath: resolves a call through a constant that names a module" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const console = std::console\nfn main(): console::write()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const stdout = std::stdout\nfn main(): stdout::write()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader);
     try name_resolver.resolve();
@@ -1306,7 +1306,7 @@ test "resolveConstant: reports errors in the value at the constant" {
     defer compiler_directory.cleanup();
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "output.mn", .data = "const write = std::missing" });
     try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/console.mn", .data = "external fn write()" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn write()" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },

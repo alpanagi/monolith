@@ -777,12 +777,12 @@ test "lexSymbols: lexes adjacent symbols" {
 test "lexSymbols: lexes two colons as one symbol" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("std::console:");
+    var lexer = Lexer.init("std::stdout:");
     try lexer.lex(&arena);
 
     try std.testing.expectEqual(6, lexer.tokens.items.len);
     try std.testing.expect(lexer.tokens.items[2].kind == .double_colon);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 4 }, lexer.tokens.items[2].location);
-    try std.testing.expectEqualStrings("console", lexer.tokens.items[3].kind.identifier);
+    try std.testing.expectEqualStrings("stdout", lexer.tokens.items[3].kind.identifier);
     try std.testing.expect(lexer.tokens.items[4].kind == .colon);
 }

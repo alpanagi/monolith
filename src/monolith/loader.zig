@@ -241,7 +241,7 @@ test "loadRoot: reads std from the compiler's directory" {
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
     try compiler_directory.dir.createDirPath(io, "std");
-    try compiler_directory.dir.writeFile(io, .{ .sub_path = "std/console.mn", .data = "fn one(): noop" });
+    try compiler_directory.dir.writeFile(io, .{ .sub_path = "std/stdout.mn", .data = "fn one(): noop" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -258,8 +258,8 @@ test "loadRoot: reads std from the compiler's directory" {
 
     try std.testing.expectEqual(null, namespace.module);
     try std.testing.expect(namespace.directory);
-    _ = try loader.loadMember(&arena, io, namespace, "console");
-    const expected = try std.fs.path.join(arena.allocator(), &.{ compiler_path, "std/console.mn" });
+    _ = try loader.loadMember(&arena, io, namespace, "stdout");
+    const expected = try std.fs.path.join(arena.allocator(), &.{ compiler_path, "std/stdout.mn" });
     try std.testing.expectEqualStrings(expected, try loader.buildModuleFileName(arena.allocator(), loader.modules.items[1].path));
 }
 

@@ -643,16 +643,16 @@ test "Generator.generate: writes the modules and the runtime files they use" {
     var output_directory = std.testing.tmpDir(.{});
     defer output_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/console.mn", .data = "external fn mn_console_write(text: String)\nconst write = mn_console_write" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_stdout_write(text: String)\nconst write = mn_stdout_write" });
     try plugin_directory.dir.createDirPath(std.testing.io, "runtime");
     try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/monolith.h", .data = "header" });
-    try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/console.c", .data = "console" });
+    try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/stdout.c", .data = "stdout" });
     try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/unused.c", .data = "unused" });
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
     const compiler_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &compiler_directory.sub_path });
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(): std::console::write(\"hi\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(): std::stdout::write(\"hi\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader);
     try name_resolver.resolve();
@@ -667,7 +667,7 @@ test "Generator.generate: writes the modules and the runtime files they use" {
     try generator.generate(allocator, std.testing.io, plugin_path, output_path);
 
     try std.testing.expectEqualStrings("header", try output_directory.dir.readFileAlloc(std.testing.io, "build/source/runtime/monolith.h", allocator, .unlimited));
-    try std.testing.expectEqualStrings("console", try output_directory.dir.readFileAlloc(std.testing.io, "build/source/runtime/console.c", allocator, .unlimited));
+    try std.testing.expectEqualStrings("stdout", try output_directory.dir.readFileAlloc(std.testing.io, "build/source/runtime/stdout.c", allocator, .unlimited));
     try std.testing.expect(std.mem.startsWith(u8, try output_directory.dir.readFileAlloc(std.testing.io, "build/source/main.c", allocator, .unlimited), "#include \"main.h\""));
     try std.testing.expectError(error.FileNotFound, output_directory.dir.readFileAlloc(std.testing.io, "build/source/runtime/unused.c", allocator, .unlimited));
     try std.testing.expectError(error.FileNotFound, output_directory.dir.readFileAlloc(std.testing.io, "build/old.txt", allocator, .unlimited));
@@ -709,12 +709,12 @@ test "Generator.generate: builds an executable when the main module defines main
     var output_directory = std.testing.tmpDir(.{});
     defer output_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/console.mn", .data = "external fn mn_console_write(text: String)\nconst write = mn_console_write" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_stdout_write(text: String)\nconst write = mn_stdout_write" });
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
     const compiler_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &compiler_directory.sub_path });
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "hello.mn", .data = "fn main(): std::console::write(\"hi\\n\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "hello.mn", .data = "fn main(): std::stdout::write(\"hi\\n\")" });
     try loader.loadMainModule(&arena, std.testing.io, "hello");
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader);
     try name_resolver.resolve();
@@ -818,7 +818,7 @@ test "generateFiles: writes the standard library at its module path" {
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/console.mn", .data = "external fn mn_console_write(text: String)\nconst write = mn_console_write" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_stdout_write(text: String)\nconst write = mn_stdout_write" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -828,7 +828,7 @@ test "generateFiles: writes the standard library at its module path" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): std::console::write(\"hi\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): std::stdout::write(\"hi\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader);
     try name_resolver.resolve();
@@ -839,17 +839,17 @@ test "generateFiles: writes the standard library at its module path" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n#include \"std/console.h\"\n\nint main() {\n    mn_console_write((string){ \"hi\", 2 });\n}\n",
+        "#include \"main.h\"\n#include \"std/stdout.h\"\n\nint main() {\n    mn_stdout_write((string){ \"hi\", 2 });\n}\n",
         files[1].contents,
     );
-    try std.testing.expectEqualStrings("std/console.h", files[2].path);
+    try std.testing.expectEqualStrings("std/stdout.h", files[2].path);
     try std.testing.expectEqualStrings(
-        "#include \"../runtime/monolith.h\"\n\nvoid mn_console_write(string text);\n",
+        "#include \"../runtime/monolith.h\"\n\nvoid mn_stdout_write(string text);\n",
         files[2].contents,
     );
     try std.testing.expectEqual(3, files.len);
     try std.testing.expectEqual(2, generator.runtime_files.items.len);
-    try std.testing.expectEqualStrings("console.c", generator.runtime_files.items[1]);
+    try std.testing.expectEqualStrings("stdout.c", generator.runtime_files.items[1]);
 }
 
 test "checkNames: names functions after their module" {
@@ -1514,8 +1514,8 @@ test "buildRelativePath: walks into directories" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const path = try buildRelativePath(arena.allocator(), "hello.c", "std/console.h");
-    try std.testing.expectEqualStrings("std/console.h", path);
+    const path = try buildRelativePath(arena.allocator(), "hello.c", "std/stdout.h");
+    try std.testing.expectEqualStrings("std/stdout.h", path);
 }
 
 test "buildRelativePath: walks out of directories" {
@@ -1523,7 +1523,7 @@ test "buildRelativePath: walks out of directories" {
     defer arena.deinit();
 
     const allocator = arena.allocator();
-    const path = try buildRelativePath(allocator, "std/console.h", "monolith.h");
+    const path = try buildRelativePath(allocator, "std/stdout.h", "monolith.h");
     try std.testing.expectEqualStrings("../monolith.h", path);
     const runtime = try buildRelativePath(allocator, "utils/math/add.c", "runtime/monolith.h");
     try std.testing.expectEqualStrings("../../runtime/monolith.h", runtime);
@@ -1538,16 +1538,16 @@ test "buildRelativePath: keeps a file named like a directory apart from it" {
 }
 
 test "isRuntimeFunction: recognizes the reserved prefix" {
-    try std.testing.expect(isRuntimeFunction("mn_console_write"));
-    try std.testing.expect(!isRuntimeFunction("console_write"));
+    try std.testing.expect(isRuntimeFunction("mn_stdout_write"));
+    try std.testing.expect(!isRuntimeFunction("stdout_write"));
 }
 
 test "extractRuntimeFile: takes the file from the name" {
-    try std.testing.expectEqualStrings("console", extractRuntimeFile("mn_console_write"));
+    try std.testing.expectEqualStrings("stdout", extractRuntimeFile("mn_stdout_write"));
     try std.testing.expectEqualStrings("exit", extractRuntimeFile("mn_exit"));
 }
 
 test "containsName: matches whole names only" {
-    try std.testing.expect(containsName(&.{ "console", "file" }, "file"));
-    try std.testing.expect(!containsName(&.{"console"}, "consol"));
+    try std.testing.expect(containsName(&.{ "stdout", "file" }, "file"));
+    try std.testing.expect(!containsName(&.{"stdout"}, "stdou"));
 }
