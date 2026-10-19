@@ -158,6 +158,7 @@ pub const NameResolver = struct {
                     try self.resolveNamesInExpression(bindings, argument);
                 }
             },
+            .field_access => |access| try self.resolveNamesInExpression(bindings, access.value),
             .@"struct" => unreachable,
         }
     }
@@ -348,7 +349,7 @@ pub const NameResolver = struct {
             .integer_literal, .float_literal, .boolean_literal, .string_literal => .{
                 .constant = .{ .module = module_index, .declaration = index },
             },
-            .call => self.fail(value.location, error.CannotEvaluate),
+            .call, .field_access => self.fail(value.location, error.CannotEvaluate),
             .@"struct" => .{ .type = try self.resolveStruct(module_index, index) },
         };
     }
@@ -922,6 +923,27 @@ test "resolveNamesInExpression: rejects a function of another module used as a v
 
     try std.testing.expectError(error.FunctionUsedAsValue, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveNamesInExpression: resolves the value of a field access" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Point = struct:\n    x: i32\nfn read(point: Point) i32: return point.x" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const returned = loader.modules.items[0].declarations[1].kind.function_definition.body[0].kind.@"return".?;
+    const value = returned.kind.field_access.value.kind.identifier;
+    try std.testing.expectEqual(ast.Resolution{ .parameter = 0 }, value.resolution.?);
 }
 
 test "resolveIdentifier: lets a parameter shadow a function" {
@@ -1587,6 +1609,25 @@ test "resolveConstant: rejects a struct that contains itself" {
 
     try std.testing.expectError(error.ConstantRefersToItself, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveConstant: rejects a field access as the value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Point = struct:\n    x: i32\nconst origin = Point.x\nfn read() i32: return origin" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 16 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveStruct: gives every use of a struct the same type" {

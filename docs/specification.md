@@ -34,7 +34,8 @@ type                 = expression
 block                = statement | indented_block
 indented_block       = newline statement { newline statement }
 statement            = "noop" | "return" [ expression ] | "_" "=" call | call
-expression           = integer | float | string | "true" | "false" | path | call
+expression           = operand { "." name }
+operand              = integer | float | string | "true" | "false" | path | call
 call                 = path "(" [ arguments ] ")"
 arguments            = expression { "," expression } [ "," ]
 path                 = name { "::" name }
@@ -64,7 +65,7 @@ field                = name ":" type
 
 ### Symbols
 
-- **L11.** The symbols are `(`, `)`, `:`, `::`, `,` and `=`. Two `:` with nothing between them are the symbol `::`.
+- **L11.** The symbols are `(`, `)`, `:`, `::`, `,`, `.` and `=`. Two `:` with nothing between them are the symbol `::`.
 
 ### Number literals
 
@@ -133,8 +134,8 @@ field                = name ":" type
 
 - **S9.** `noop` does nothing.
 - **S10.** `return` ends the function. Its value, if any, is on the same line.
-- **S11.** `_ = add(1, 2)` calls a function and discards its result. Anything other than a call after `_ =`, such as `_ = 5`, is rejected with `expected a call`.
-- **S12.** A call on its own, such as `log(1)`, is a statement. A name or literal on its own is rejected with `expected a statement`.
+- **S11.** `_ = add(1, 2)` calls a function and discards its result. Anything other than a call after `_ =`, such as `_ = 5` or `_ = make().x`, is rejected with `expected a call`.
+- **S12.** A call on its own, such as `log(1)`, is a statement. A name, a literal or a field access on its own is rejected with `expected a statement`.
 - **S13.** Each statement is on its own line, except for the single statement of an inline block.
 
 ### Expressions
@@ -157,6 +158,7 @@ field                = name ":" type
   ```
 
 - **S18.** A struct without fields is written `struct`, without the `:`: `const Marker = struct`.
+- **S19.** A field of a struct value is read with `.` and the field's name, after any expression: `point.x`, `line.start.x`, `make().x`. A `.` that is not followed by a name is rejected with `expected an identifier`.
 
 ## Modules
 
@@ -197,6 +199,7 @@ field                = name ":" type
 - **N10.** `const name = expression` declares a constant. Its value is evaluated at compile time, and can be a function, a type, a namespace or a literal. `const stdout = std::io::stdout` lets `stdout::write(...)` reach the module, `const write = mn_runtime_stdout_write` lets `write(...)` call the function, `const Integer = i32` lets `Integer` be used as a type, and `const limit = 5i32` lets `limit` be used as a value of type `i32`.
   - A number literal as the value has a suffix, which gives its type (T5): `const limit = 5i32`. Otherwise it is rejected with `value has no known type`, at the literal.
   - Errors in a literal value are reported at the literal, in the module of the constant.
+  - A call or a field access as the value is rejected with `cannot be evaluated at compile time`, at the value.
 - **N11.** A constant means the same as its value, so every rule for that value applies to it. A constant produces no output: each use writes what the constant names, such as the function it calls or its literal. A struct is the exception, because C defines it (C10).
 - **N12.** A constant is only resolved and checked when something uses it. An unused constant is not an error, because other modules can use it (M8), and the modules its value names are not loaded for it (M7).
 - **N13.** A used constant whose value reaches itself, directly or through other constants, is rejected with `constant refers to itself`, at its `const`. This includes a struct that contains itself, directly or through the fields of other structs.
@@ -243,6 +246,10 @@ field                = name ":" type
 
 - **T12.** Each struct is a type of its own, even when another struct has the same fields. A constant that names a struct names the same type: with `const Other = Point`, `Other` and `Point` are one type.
 - **T13.** Each field type is an expression that must have the type of types (T11). A field of type `void` is rejected with `field cannot have type void`, at its type.
+- **T14.** A field access has the type of the field. The name after the `.` is not looked up as a name (N4); it must be a field of the value's struct. Errors are reported at that name:
+  - A value whose type is not a struct is rejected with `value has no fields`: `value.x` with `value: i32`.
+  - A name that is not a field of the struct is rejected with `unknown field`.
+  - A number literal without a suffix before the `.` has no type to take, and is rejected with `value has no known type`, at the literal: `5.x`.
 
 ## Functions
 
@@ -317,8 +324,9 @@ field                = name ":" type
   } mn_hello_Point;
   ```
 
-- **C11.** A zero-sized type is a struct whose fields all have zero-sized types, such as a struct without fields. It has no definition in C. Fields, parameters and arguments of a zero-sized type are left out, and a function that returns one returns `void`. A call that gives a zero-sized argument runs before the call that receives it: `use(make(marker), 1)` becomes `(mn_hello_make(), mn_hello_use(1))`. A returned call of a zero-sized type runs before the `return;`.
+- **C11.** A zero-sized type is a struct whose fields all have zero-sized types, such as a struct without fields. It has no definition in C. Fields, parameters and arguments of a zero-sized type are left out, and a function that returns one returns `void`. The calls in a zero-sized argument run before the call that receives it: `use(make(marker), 1)` becomes `(mn_hello_make(), mn_hello_use(1))`, and `use(holder().marker, 1)` becomes `(mn_hello_holder(), mn_hello_use(1))`. The calls in a returned zero-sized value run before the `return;`. A zero-sized value without calls, such as `holder.marker`, writes nothing.
 - **C12.** Modules whose structs contain each other's structs, directly or through other modules, are rejected with `modules contain each other's structs`, at the field.
+- **C13.** A field access is written as in Monolith: `line.start.x` stays `line.start.x`, and `make().x` becomes `mn_hello_make().x`.
 
 ## Compiler
 

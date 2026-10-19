@@ -239,6 +239,7 @@ fn lexSymbols(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
         '(' => .left_parenthesis,
         ')' => .right_parenthesis,
         ',' => .comma,
+        '.' => .dot,
         '=' => .equals,
         else => return false,
     };
@@ -602,9 +603,11 @@ test "lexNumber: does not read a point followed by a letter as a float" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = Lexer.init("5.a");
+    try lexer.lex(&arena);
 
-    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.failure.?.location.?);
+    try std.testing.expectEqualStrings("5", lexer.tokens.items[1].kind.integer_literal.text);
+    try std.testing.expect(lexer.tokens.items[2].kind == .dot);
+    try std.testing.expectEqualStrings("a", lexer.tokens.items[3].kind.identifier);
 }
 
 test "lexNumber: accepts a zero on its own" {
@@ -773,15 +776,16 @@ test "lexString: keeps any other byte as text" {
 test "lexSymbols: lexes adjacent symbols" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init(":(,=)");
+    var lexer = Lexer.init(":(,.=)");
     try lexer.lex(&arena);
 
-    try std.testing.expectEqual(7, lexer.tokens.items.len);
+    try std.testing.expectEqual(8, lexer.tokens.items.len);
     try std.testing.expect(lexer.tokens.items[1].kind == .colon);
     try std.testing.expect(lexer.tokens.items[2].kind == .left_parenthesis);
     try std.testing.expect(lexer.tokens.items[3].kind == .comma);
-    try std.testing.expect(lexer.tokens.items[4].kind == .equals);
-    try std.testing.expect(lexer.tokens.items[5].kind == .right_parenthesis);
+    try std.testing.expect(lexer.tokens.items[4].kind == .dot);
+    try std.testing.expect(lexer.tokens.items[5].kind == .equals);
+    try std.testing.expect(lexer.tokens.items[6].kind == .right_parenthesis);
 }
 
 test "lexSymbols: lexes two colons as one symbol" {

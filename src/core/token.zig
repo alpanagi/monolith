@@ -18,6 +18,7 @@ pub const TokenKind = union(enum) {
     colon,
     double_colon,
     comma,
+    dot,
     equals,
     identifier: []const u8,
     integer_literal: NumberLiteral,

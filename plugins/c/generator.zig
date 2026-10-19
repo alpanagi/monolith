@@ -507,6 +507,9 @@ pub const Generator = struct {
         }
         const call = switch (expression.kind) {
             .call => |call| call,
+            .field_access => |access| {
+                return self.collectReachedModulesOf(allocator, reached, access.value.*);
+            },
             else => return,
         };
         const function = switch (call.callee) {
@@ -655,8 +658,10 @@ pub const Generator = struct {
                     return writer.writeAll(if (self.in_main) "return 0;\n" else "return;\n");
                 };
                 if (isZeroSized(returned.type.?)) {
-                    if (returned.kind == .call) {
-                        try self.generateExpressionStatement(writer, returned);
+                    if (hasEffects(returned)) {
+                        try self.generateIndentation(writer);
+                        try self.generateEffects(writer, returned);
+                        try writer.writeAll(";\n");
                     }
                     try self.generateIndentation(writer);
                     return writer.writeAll("return;\n");
@@ -736,7 +741,7 @@ pub const Generator = struct {
                     try writer.writeByte('(');
                     for (call.arguments) |argument| {
                         if (!isHoisted(argument)) continue;
-                        try self.generateExpression(writer, argument);
+                        try self.generateEffects(writer, argument);
                         try writer.writeAll(", ");
                     }
                 }
@@ -752,7 +757,30 @@ pub const Generator = struct {
                 try writer.writeByte(')');
                 if (hoists) try writer.writeByte(')');
             },
+            .field_access => |access| {
+                try self.generateExpression(writer, access.value.*);
+                try writer.print(".{s}", .{access.field});
+            },
             .@"struct" => unreachable,
+        }
+    }
+
+    fn generateEffects(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        expression: ast.Expression,
+    ) std.Io.Writer.Error!void {
+        switch (expression.kind) {
+            .call => try self.generateExpression(writer, expression),
+            .field_access => |access| try self.generateEffects(writer, access.value.*),
+            .integer_literal,
+            .float_literal,
+            .boolean_literal,
+            .string_literal,
+            .identifier,
+            .path_expression,
+            .@"struct",
+            => unreachable,
         }
     }
 
@@ -828,7 +856,22 @@ fn findContainedModule(field_type: types.Type) ?usize {
 }
 
 fn isHoisted(argument: ast.Expression) bool {
-    return argument.kind == .call and isZeroSized(argument.type.?);
+    return isZeroSized(argument.type.?) and hasEffects(argument);
+}
+
+fn hasEffects(expression: ast.Expression) bool {
+    return switch (expression.kind) {
+        .call => true,
+        .field_access => |access| hasEffects(access.value.*),
+        .integer_literal,
+        .float_literal,
+        .boolean_literal,
+        .string_literal,
+        .identifier,
+        .path_expression,
+        => false,
+        .@"struct" => unreachable,
+    };
 }
 
 fn isZeroSized(value_type: types.Type) bool {
@@ -1178,6 +1221,35 @@ test "generateFiles: writes the standard library at its module path" {
     try std.testing.expectEqual(3, files.len);
     try std.testing.expectEqual(1, generator.runtime_functions.items.len);
     try std.testing.expectEqualStrings("mn_runtime_stdout_write", generator.runtime_functions.items[0]);
+}
+
+test "generateFiles: includes the headers of the modules a field access reaches" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "const Line = struct:\n    width: i32\nexternal fn make() Line" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn width() i32: return shapes::make().width" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings("main.c", files[1].path);
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n#include \"shapes.h\"\n\nint32_t mn_main_width() {\n    return make().width;\n}\n",
+        files[1].contents,
+    );
 }
 
 test "checkNames: names functions after their module" {
@@ -1588,6 +1660,39 @@ test "generateDeclarations: separates external functions from other functions" {
         "#pragma once\n\n#include \"runtime/monolith.h\"\n\nvoid log(int32_t value);\n\nvoid mn_main_one();\nvoid mn_main_two();\n",
         files[0].contents,
     );
+}
+
+test "collectReachedModulesOf: records the runtime functions that a field access calls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    try compiler_directory.dir.createDirPath(std.testing.io, "std");
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/clock.mn", .data = "const Time = struct:\n    seconds: i64\nexternal fn mn_runtime_clock_now() Time\nconst now = mn_runtime_clock_now" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn seconds() i64: return std::clock::now().seconds" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    _ = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqual(1, generator.runtime_functions.items.len);
+    try std.testing.expectEqualStrings("mn_runtime_clock_now", generator.runtime_functions.items[0]);
 }
 
 test "generateFunction: generates main as the entry point" {
@@ -2099,6 +2204,87 @@ test "generateExpression: moves zero-sized calls out of the arguments" {
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\nvoid mn_main_make() {\n    return;\n}\n\nvoid mn_main_use(int32_t value) {}\n\nvoid mn_main_run() {\n    (mn_main_make(), mn_main_use(1));\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateExpression: writes field accesses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Point = struct:\n    x: i32\nconst Line = struct:\n    start: Point\nexternal fn make() Line\nfn read(line: Line) i32: return line.start.x\nfn first() i32: return make().start.x" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_read(mn_main_Line line) {\n    return line.start.x;\n}\n\nint32_t mn_main_first() {\n    return make().start.x;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateEffects: runs the calls of a zero-sized field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Marker = struct\nconst Holder = struct:\n    marker: Marker\n    value: i32\nexternal fn make() Holder\nfn use(marker: Marker, value: i32): noop\nfn take(holder: Holder) Marker: return holder.marker\nfn get() Marker: return make().marker\nfn main(): use(make().marker, 1)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nvoid mn_main_use(int32_t value) {}\n\nvoid mn_main_take(mn_main_Holder holder) {\n    return;\n}\n\nvoid mn_main_get() {\n    make();\n    return;\n}\n\nint main() {\n    (make(), mn_main_use(1));\n}\n",
+        files[1].contents,
+    );
+}
+
+test "isHoisted: leaves out zero-sized fields that call nothing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Marker = struct\nconst Holder = struct:\n    marker: Marker\n    value: i32\nfn use(marker: Marker, value: i32): noop\nfn pass(holder: Holder): use(holder.marker, 1)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nvoid mn_main_use(int32_t value) {}\n\nvoid mn_main_pass(mn_main_Holder holder) {\n    mn_main_use(1);\n}\n",
         files[1].contents,
     );
 }

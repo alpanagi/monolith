@@ -236,9 +236,11 @@ pub const Parser = struct {
         var position = offset.*;
         const underscore = self.match(&position, .underscore) orelse return null;
         _ = try self.expect(&position, .equals, error.ExpectedEquals);
-        const call = (try self.parseCall(allocator, &position)) orelse {
-            return self.fail(position, error.ExpectedCall);
+        const start = position;
+        const call = (try self.parseExpression(allocator, &position)) orelse {
+            return self.fail(start, error.ExpectedCall);
         };
+        if (call.kind != .call) return self.fail(start, error.ExpectedCall);
 
         offset.* = position;
         return .{ .kind = .{ .discard = call }, .location = underscore.location };
@@ -249,7 +251,11 @@ pub const Parser = struct {
         allocator: std.mem.Allocator,
         offset: *usize,
     ) ParseError!?ast.Statement {
-        const call = (try self.parseCall(allocator, offset)) orelse return null;
+        var position = offset.*;
+        const call = (try self.parseExpression(allocator, &position)) orelse return null;
+        if (call.kind != .call) return null;
+
+        offset.* = position;
         return .{ .kind = .{ .call = call }, .location = call.location };
     }
 
@@ -359,6 +365,21 @@ pub const Parser = struct {
         allocator: std.mem.Allocator,
         offset: *usize,
     ) ParseError!?ast.Expression {
+        var position = offset.*;
+        var expression = (try self.parseOperand(allocator, &position)) orelse return null;
+        while (self.match(&position, .dot) != null) {
+            expression = try self.parseFieldAccess(allocator, &position, expression);
+        }
+
+        offset.* = position;
+        return expression;
+    }
+
+    fn parseOperand(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.Expression {
         if (try self.parseCall(allocator, offset)) |call| return call;
         if (try self.parseNameExpression(allocator, offset)) |name| return name;
         return self.parseLiteral(offset);
@@ -460,6 +481,23 @@ pub const Parser = struct {
 
         offset.* = position;
         return arguments.items;
+    }
+
+    fn parseFieldAccess(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        value: ast.Expression,
+    ) ParseError!ast.Expression {
+        const field = try self.expect(offset, .identifier, error.ExpectedIdentifier);
+        const stored = try allocator.create(ast.Expression);
+        stored.* = value;
+        const access: ast.FieldAccess = .{
+            .value = stored,
+            .field = field.kind.identifier,
+            .field_location = field.location,
+        };
+        return .{ .kind = .{ .field_access = access }, .location = value.location };
     }
 
     fn expect(
@@ -834,6 +872,17 @@ test "parseDiscard: rejects a discarded literal" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
 }
 
+test "parseDiscard: rejects a discarded field access" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): _ = make().x");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedCall, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
+}
+
 test "parseCallStatement: parses a call as a statement" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -853,6 +902,17 @@ test "parseCallStatement: rejects a name that is not called" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("fn main(): value");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedStatement, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, parser.failure.?.location.?);
+}
+
+test "parseCallStatement: rejects a field access as a statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): make().x");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -1113,6 +1173,36 @@ test "parseExpression: parses a parameter reference" {
     try std.testing.expectEqualStrings("value", module.declarations[0].kind.function_definition.body[0].kind.@"return".?.kind.identifier.name);
 }
 
+test "parseExpression: parses a chain of field accesses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): log(line.start.x)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const outer = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call.arguments[0];
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, outer.location);
+    try std.testing.expectEqualStrings("x", outer.kind.field_access.field);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 27 }, outer.kind.field_access.field_location);
+    const inner = outer.kind.field_access.value.kind.field_access;
+    try std.testing.expectEqualStrings("start", inner.field);
+    try std.testing.expectEqualStrings("line", inner.value.kind.identifier.name);
+}
+
+test "parseExpression: parses a field access on a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): log(make().x)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const access = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call.arguments[0].kind.field_access;
+    try std.testing.expectEqualStrings("x", access.field);
+    try std.testing.expectEqualStrings("make", access.value.kind.call.callee.identifier.name);
+}
+
 test "parseCall: parses nested calls" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1203,4 +1293,15 @@ test "parseArguments: rejects a missing argument" {
 
     try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
+}
+
+test "parseFieldAccess: rejects a dot without a name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): log(point.)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 22 }, parser.failure.?.location.?);
 }

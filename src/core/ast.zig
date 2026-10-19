@@ -64,6 +64,7 @@ pub const ExpressionKind = union(enum) {
     identifier: Identifier,
     path_expression: PathExpression,
     call: Call,
+    field_access: FieldAccess,
     @"struct": Struct,
 };
 
@@ -104,6 +105,12 @@ pub const Resolution = union(enum) {
         module: usize,
         declaration: usize,
     };
+};
+
+pub const FieldAccess = struct {
+    value: *Expression,
+    field: []const u8,
+    field_location: token.Location,
 };
 
 pub const Struct = struct {
