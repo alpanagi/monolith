@@ -666,7 +666,7 @@ test "resolveModule: allows reserved names in the standard library" {
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_stdout_write(text: String)\nconst write = mn_stdout_write" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: String)\nconst write = mn_runtime_stdout_write" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },

@@ -879,13 +879,13 @@ test "parseConstantDeclaration: parses a path as the value" {
 test "parseConstantDeclaration: parses a name as the value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const write = mn_stdout_write");
+    var lexer = @import("lexer.zig").Lexer.init("const write = mn_runtime_stdout_write");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const constant = module.declarations[0].kind.constant_declaration;
-    try std.testing.expectEqualStrings("mn_stdout_write", constant.value.kind.identifier.name);
+    try std.testing.expectEqualStrings("mn_runtime_stdout_write", constant.value.kind.identifier.name);
 }
 
 test "parseConstantDeclaration: parses a literal as the value" {
@@ -904,7 +904,7 @@ test "parseConstantDeclaration: parses a literal as the value" {
 test "parseConstantDeclaration: rejects a missing equals sign" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const write mn_stdout_write");
+    var lexer = @import("lexer.zig").Lexer.init("const write mn_runtime_stdout_write");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 

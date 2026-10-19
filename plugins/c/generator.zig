@@ -8,7 +8,7 @@ const Failure = core.Failure;
 
 pub const Generator = struct {
     program: ast.Program,
-    runtime_files: std.ArrayList([]const u8) = .empty,
+    runtime_functions: std.ArrayList([]const u8) = .empty,
     names: []const []const ?[]const u8 = &.{},
     module_index: usize = 0,
     depth: usize = 0,
@@ -42,12 +42,27 @@ pub const Generator = struct {
             }
             try source_directory.writeFile(io, .{ .sub_path = file.path, .data = file.contents });
         }
-        for (self.runtime_files.items) |name| {
-            const path = try std.mem.concat(allocator, u8, &.{ "runtime/", name });
-            try source_directory.createDirPath(io, "runtime");
+        const runtime_files = try self.collectRuntimeFiles(allocator, io, plugin_directory);
+        for (runtime_files) |path| {
+            try source_directory.createDirPath(io, std.fs.path.dirname(path).?);
             try plugin_directory.copyFile(path, source_directory, path, io, .{});
         }
-        try self.buildExecutable(allocator, io, source_directory, files);
+        try self.buildExecutable(allocator, io, source_directory, files, runtime_files);
+    }
+
+    fn collectRuntimeFiles(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        plugin_directory: std.Io.Dir,
+    ) GenerateError![]const []const u8 {
+        var runtime_files: std.ArrayList([]const u8) = .empty;
+        try runtime_files.append(allocator, "runtime/monolith.h");
+        for (self.runtime_functions.items) |name| {
+            const path = try findRuntimeFile(allocator, io, plugin_directory, name);
+            if (!containsName(runtime_files.items, path)) try runtime_files.append(allocator, path);
+        }
+        return runtime_files.items;
     }
 
     fn generateFiles(
@@ -59,7 +74,6 @@ pub const Generator = struct {
         try self.checkStructCycles(allocator);
 
         var files: std.ArrayList(File) = .empty;
-        try self.runtime_files.append(allocator, "monolith.h");
         for (self.program.modules, 0..) |module, index| {
             self.module_index = index;
             const path = try std.mem.join(allocator, "/", module.path);
@@ -94,6 +108,7 @@ pub const Generator = struct {
         io: std.Io,
         source_directory: std.Io.Dir,
         files: []const File,
+        runtime_files: []const []const u8,
     ) GenerateError!void {
         const main_module = self.program.modules[0];
         const has_main = for (main_module.declarations) |declaration| {
@@ -109,10 +124,8 @@ pub const Generator = struct {
         for (files) |file| {
             if (std.mem.endsWith(u8, file.path, ".c")) try arguments.append(allocator, file.path);
         }
-        for (self.runtime_files.items) |name| {
-            if (!std.mem.endsWith(u8, name, ".c")) continue;
-            const path = try std.mem.concat(allocator, u8, &.{ "runtime/", name });
-            try arguments.append(allocator, path);
+        for (runtime_files) |path| {
+            if (std.mem.endsWith(u8, path, ".c")) try arguments.append(allocator, path);
         }
         const executable_path = try std.mem.concat(allocator, u8, &.{ "../", main_module.path[0] });
         try arguments.appendSlice(allocator, &.{ "-o", executable_path });
@@ -504,8 +517,10 @@ pub const Generator = struct {
         if (module != self.module_index and !known) try reached.append(allocator, module);
         switch (self.program.modules[module].declarations[function.declaration].kind) {
             .function_declaration => |function_declaration| {
-                if (isRuntimeFunction(function_declaration.name)) {
-                    try self.addRuntimeFile(allocator, function_declaration.name);
+                const name = function_declaration.name;
+                const recorded = containsName(self.runtime_functions.items, name);
+                if (isRuntimeFunction(name) and !recorded) {
+                    try self.runtime_functions.append(allocator, name);
                 }
             },
             .function_definition, .constant_declaration => {},
@@ -524,16 +539,6 @@ pub const Generator = struct {
         const module = findContainedModule(value_type) orelse return;
         const known = std.mem.findScalar(usize, reached.items, module) != null;
         if (module != self.module_index and !known) try reached.append(allocator, module);
-    }
-
-    fn addRuntimeFile(
-        self: *Generator,
-        allocator: std.mem.Allocator,
-        name: []const u8,
-    ) std.mem.Allocator.Error!void {
-        const file = try std.mem.concat(allocator, u8, &.{ extractRuntimeFile(name), ".c" });
-        if (containsName(self.runtime_files.items, file)) return;
-        try self.runtime_files.append(allocator, file);
     }
 
     fn generateFunction(
@@ -765,6 +770,7 @@ pub const GenerateError = std.mem.Allocator.Error ||
     std.Io.Dir.CreateDirPathError ||
     std.Io.Dir.WriteFileError ||
     std.Io.Dir.CopyFileError ||
+    std.Io.Dir.AccessError ||
     std.process.SpawnError ||
     std.process.Child.WaitError ||
     error{ NameDefinedInTarget, StructsContainEachOther, CompilerFailed };
@@ -886,10 +892,24 @@ fn isRuntimeFunction(name: []const u8) bool {
     return std.mem.startsWith(u8, name, "mn_");
 }
 
-fn extractRuntimeFile(name: []const u8) []const u8 {
-    const rest = name["mn_".len..];
-    const end = std.mem.findScalar(u8, rest, '_') orelse rest.len;
-    return rest[0..end];
+fn findRuntimeFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    plugin_directory: std.Io.Dir,
+    name: []const u8,
+) (std.mem.Allocator.Error || std.Io.Dir.AccessError)![]const u8 {
+    const parts = name["mn_".len..];
+    var end = std.mem.findScalar(u8, parts, '_');
+    while (end) |index| : (end = std.mem.findScalarPos(u8, parts, index + 1, '_')) {
+        const path = try std.mem.concat(allocator, u8, &.{ parts[0..index], ".c" });
+        std.mem.replaceScalar(u8, path, '_', '/');
+        plugin_directory.access(io, path, .{}) catch |access_error| switch (access_error) {
+            error.FileNotFound => continue,
+            else => return access_error,
+        };
+        return path;
+    }
+    return error.FileNotFound;
 }
 
 fn containsName(names: []const []const u8, name: []const u8) bool {
@@ -918,7 +938,7 @@ test "Generator.generate: writes the modules and the runtime files they use" {
     var output_directory = std.testing.tmpDir(.{});
     defer output_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_stdout_write(text: String)\nconst write = mn_stdout_write" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: String)\nconst write = mn_runtime_stdout_write" });
     try plugin_directory.dir.createDirPath(std.testing.io, "runtime");
     try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/monolith.h", .data = "header" });
     try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/stdout.c", .data = "stdout" });
@@ -986,7 +1006,7 @@ test "Generator.generate: builds an executable when the main module defines main
     var output_directory = std.testing.tmpDir(.{});
     defer output_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_stdout_write(text: String)\nconst write = mn_stdout_write" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: String)\nconst write = mn_runtime_stdout_write" });
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
     const compiler_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &compiler_directory.sub_path });
@@ -1035,7 +1055,6 @@ test "generateFiles: writes a header and a source file per module" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqual(2, files.len);
-    try std.testing.expectEqualStrings("monolith.h", generator.runtime_files.items[0]);
     try std.testing.expectEqualStrings("main.h", files[0].path);
     try std.testing.expectEqualStrings(
         "#pragma once\n\n#include \"runtime/monolith.h\"\n\nvoid mn_main_two();\n",
@@ -1126,7 +1145,7 @@ test "generateFiles: writes the standard library at its module path" {
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_stdout_write(text: String)\nconst write = mn_stdout_write" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: String)\nconst write = mn_runtime_stdout_write" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -1148,17 +1167,17 @@ test "generateFiles: writes the standard library at its module path" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n#include \"std/stdout.h\"\n\nint main() {\n    mn_stdout_write((string){ \"hi\", 2 });\n}\n",
+        "#include \"main.h\"\n#include \"std/stdout.h\"\n\nint main() {\n    mn_runtime_stdout_write((string){ \"hi\", 2 });\n}\n",
         files[1].contents,
     );
     try std.testing.expectEqualStrings("std/stdout.h", files[2].path);
     try std.testing.expectEqualStrings(
-        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\nvoid mn_stdout_write(string text);\n",
+        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\nvoid mn_runtime_stdout_write(string text);\n",
         files[2].contents,
     );
     try std.testing.expectEqual(3, files.len);
-    try std.testing.expectEqual(2, generator.runtime_files.items.len);
-    try std.testing.expectEqualStrings("stdout.c", generator.runtime_files.items[1]);
+    try std.testing.expectEqual(1, generator.runtime_functions.items.len);
+    try std.testing.expectEqualStrings("mn_runtime_stdout_write", generator.runtime_functions.items[0]);
 }
 
 test "checkNames: names functions after their module" {
@@ -2112,13 +2131,58 @@ test "buildRelativePath: keeps a file named like a directory apart from it" {
 }
 
 test "isRuntimeFunction: recognizes the reserved prefix" {
-    try std.testing.expect(isRuntimeFunction("mn_stdout_write"));
+    try std.testing.expect(isRuntimeFunction("mn_runtime_stdout_write"));
     try std.testing.expect(!isRuntimeFunction("stdout_write"));
 }
 
-test "extractRuntimeFile: takes the file from the name" {
-    try std.testing.expectEqualStrings("stdout", extractRuntimeFile("mn_stdout_write"));
-    try std.testing.expectEqualStrings("exit", extractRuntimeFile("mn_exit"));
+test "findRuntimeFile: follows the name as a path to the file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var plugin_directory = std.testing.tmpDir(.{});
+    defer plugin_directory.cleanup();
+    try plugin_directory.dir.createDirPath(std.testing.io, "runtime");
+    try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/stdout.c", .data = "" });
+
+    const path = try findRuntimeFile(arena.allocator(), std.testing.io, plugin_directory.dir, "mn_runtime_stdout_write");
+
+    try std.testing.expectEqualStrings("runtime/stdout.c", path);
+}
+
+test "findRuntimeFile: finds a file in a nested folder" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var plugin_directory = std.testing.tmpDir(.{});
+    defer plugin_directory.cleanup();
+    try plugin_directory.dir.createDirPath(std.testing.io, "runtime/io");
+    try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/io/stdout.c", .data = "" });
+
+    const path = try findRuntimeFile(arena.allocator(), std.testing.io, plugin_directory.dir, "mn_runtime_io_stdout_write");
+
+    try std.testing.expectEqualStrings("runtime/io/stdout.c", path);
+}
+
+test "findRuntimeFile: keeps underscores of the function name out of the path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var plugin_directory = std.testing.tmpDir(.{});
+    defer plugin_directory.cleanup();
+    try plugin_directory.dir.createDirPath(std.testing.io, "runtime");
+    try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/stdout.c", .data = "" });
+
+    const path = try findRuntimeFile(arena.allocator(), std.testing.io, plugin_directory.dir, "mn_runtime_stdout_write_line");
+
+    try std.testing.expectEqualStrings("runtime/stdout.c", path);
+}
+
+test "findRuntimeFile: rejects a name that leads to no file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var plugin_directory = std.testing.tmpDir(.{});
+    defer plugin_directory.cleanup();
+
+    const result = findRuntimeFile(arena.allocator(), std.testing.io, plugin_directory.dir, "mn_runtime_stdout_write");
+
+    try std.testing.expectError(error.FileNotFound, result);
 }
 
 test "containsName: matches whole names only" {

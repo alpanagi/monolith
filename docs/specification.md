@@ -194,7 +194,7 @@ field                = name ":" type
 
 ### Constants
 
-- **N10.** `const name = expression` declares a constant. Its value is evaluated at compile time, and can be a function, a type, a namespace or a literal. `const stdout = std::io::stdout` lets `stdout::write(...)` reach the module, `const write = mn_stdout_write` lets `write(...)` call the function, `const Integer = i32` lets `Integer` be used as a type, and `const limit = 5i32` lets `limit` be used as a value of type `i32`.
+- **N10.** `const name = expression` declares a constant. Its value is evaluated at compile time, and can be a function, a type, a namespace or a literal. `const stdout = std::io::stdout` lets `stdout::write(...)` reach the module, `const write = mn_runtime_stdout_write` lets `write(...)` call the function, `const Integer = i32` lets `Integer` be used as a type, and `const limit = 5i32` lets `limit` be used as a value of type `i32`.
   - A number literal as the value has a suffix, which gives its type (T5): `const limit = 5i32`. Otherwise it is rejected with `value has no known type`, at the literal.
   - Errors in a literal value are reported at the literal, in the module of the constant.
 - **N11.** A constant means the same as its value, so every rule for that value applies to it. A constant produces no output: each use writes what the constant names, such as the function it calls or its literal. A struct is the exception, because C defines it (C10).
@@ -340,13 +340,13 @@ field                = name ":" type
 - **D1.** The standard library is a set of Monolith modules under `std` (M4). `std::io::stdout` provides `write(text: String)`, which writes text to the standard output:
 
   ```monolith
-  external fn mn_stdout_write(text: String)
+  external fn mn_runtime_stdout_write(text: String)
 
-  const write = mn_stdout_write
+  const write = mn_runtime_stdout_write
   ```
 
-- **D2.** The runtime is a library of the target that does not depend on the standard library. Its function names start with `mn_`, followed by the name of the runtime file that defines them: `mn_stdout_write` is in `stdout.c`. Its functions are linked by name (C8). The standard library declares them as external functions and names them with constants (D1), so a call such as `stdout::write(...)` calls the runtime function directly. Only the runtime files whose functions the program calls are copied into the output (K3).
-- **D3.** `mn_stdout_write` writes the text exactly as given.
+- **D2.** The runtime is a library of the target that does not depend on the standard library. A runtime function is named like a generated name (G1): `mn_`, then the path of the file that defines it, with `/` replaced by `_`, then `_` and its name. `mn_runtime_stdout_write` is `write` in `runtime/stdout.c`. The compiler finds the file by following the name's parts as folders until a file exists, so a function name can contain `_`. Its functions are linked by name (C8). The standard library declares them as external functions and names them with constants (D1), so a call such as `stdout::write(...)` calls the runtime function directly. Only the runtime files whose functions the program calls are copied into the output (K3).
+- **D3.** `mn_runtime_stdout_write` writes the text exactly as given.
 
 ## Examples
 
@@ -405,7 +405,7 @@ string mn_hello_greeting() {
 int main() {
     mn_hello_add(1, 2);
     mn_hello_flag();
-    mn_stdout_write(mn_hello_greeting());
+    mn_runtime_stdout_write(mn_hello_greeting());
 }
 ```
 
@@ -416,7 +416,7 @@ int main() {
 
 #include "../../runtime/monolith.h"
 
-void mn_stdout_write(string text);
+void mn_runtime_stdout_write(string text);
 ```
 
 ### A program with its own module
