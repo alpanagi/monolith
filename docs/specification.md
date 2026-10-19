@@ -37,7 +37,8 @@ statement            = "noop" | "return" [ expression ] | "_" "=" call | call
 expression           = operand { "." name }
 operand              = integer | float | string | "true" | "false" | path | call
 call                 = path "(" [ arguments ] ")"
-arguments            = expression { "," expression } [ "," ]
+arguments            = argument { "," argument } [ "," ]
+argument             = [ name "=" ] expression
 path                 = name { "::" name }
 constant             = "const" name "=" ( expression | struct )
 struct               = "struct" [ ":" fields ]
@@ -134,7 +135,7 @@ field                = name ":" type
 
 - **S9.** `noop` does nothing.
 - **S10.** `return` ends the function. Its value, if any, is on the same line.
-- **S11.** `_ = add(1, 2)` calls a function and discards its result. Anything other than a call after `_ =`, such as `_ = 5` or `_ = make().x`, is rejected with `expected a call`.
+- **S11.** `_ = add(1, 2)` calls a function and discards its result. Anything other than a call to a function after `_ =`, such as `_ = 5`, `_ = make().x` or the struct value `_ = Point(x = 1)`, is rejected with `expected a call`.
 - **S12.** A call on its own, such as `log(1)`, is a statement. A name, a literal or a field access on its own is rejected with `expected a statement`.
 - **S13.** Each statement is on its own line, except for the single statement of an inline block.
 
@@ -159,6 +160,7 @@ field                = name ":" type
 
 - **S18.** A struct without fields is written `struct`, without the `:`: `const Marker = struct`.
 - **S19.** A field of a struct value is read with `.` and the field's name, after any expression: `point.x`, `line.start.x`, `make().x`. A `.` that is not followed by a name is rejected with `expected an identifier`.
+- **S20.** A struct value is built by calling its struct with one argument for each field, written as the field's name, `=` and the value: `Point(x = 0, y = 0)`. The fields can be given in any order. A struct without fields is built with `Marker()`. The value of a named argument is required: `Point(x = )` is rejected with `expected an expression`.
 
 ## Modules
 
@@ -181,7 +183,7 @@ field                = name ":" type
 - **N3.** A function can call functions defined before or after it.
 - **N4.** A name is looked up first among the parameters of the enclosing function, then among the module's functions and constants, then among the built-in types (T1), then among `std` and the program's namespaces (M4). A name in a type (T11) is not looked up among the parameters.
 - **N5.** A name that matches none of them is rejected with `unknown name`.
-- **N6.** A call to a name that does not refer to a function, such as a parameter, a type, a namespace or a constant whose value is a literal, is rejected with `name is not a function`.
+- **N6.** A call to a name that does not refer to a function or a type, such as a parameter, a namespace or a constant whose value is a literal, is rejected with `name is not a function`. A call to a type builds a value of it (S20).
 - **N7.** A function used as a value, named directly, through a path or through a constant, is rejected with `functions cannot be used as values`. A namespace used as a value is rejected with `unknown name`. A type can be used as a value (T11).
 - **N8.** A path is resolved one name at a time. The first name is looked up as M5 describes. Each following name before a `::` goes through a namespace (M6): a constant of its module that names a namespace comes first, then the namespaces it contains. The last name is a declaration of the module reached, or a namespace it contains. A function and a namespace can have the same name: with `fn math()` in `utils.mn` and the module `utils::math`, `utils::math()` calls the function and `utils::math::add()` calls into the module. A parameter does not hide a namespace before a `::`: with a parameter `utils`, `utils::add()` still calls into the module `utils`.
 - **N9.** Errors in a path, at the path:
@@ -196,10 +198,11 @@ field                = name ":" type
 
 ### Constants
 
-- **N10.** `const name = expression` declares a constant. Its value is evaluated at compile time, and can be a function, a type, a namespace or a literal. `const stdout = std::io::stdout` lets `stdout::write(...)` reach the module, `const write = mn_runtime_stdout_write` lets `write(...)` call the function, `const Integer = i32` lets `Integer` be used as a type, and `const limit = 5i32` lets `limit` be used as a value of type `i32`.
+- **N10.** `const name = expression` declares a constant. Its value is evaluated at compile time, and can be a function, a type, a namespace, a literal or a struct value (S20). `const stdout = std::io::stdout` lets `stdout::write(...)` reach the module, `const write = mn_runtime_stdout_write` lets `write(...)` call the function, `const Integer = i32` lets `Integer` be used as a type, and `const limit = 5i32` lets `limit` be used as a value of type `i32`.
   - A number literal as the value has a suffix, which gives its type (T5): `const limit = 5i32`. Otherwise it is rejected with `value has no known type`, at the literal.
   - Errors in a literal value are reported at the literal, in the module of the constant.
-  - A call or a field access as the value is rejected with `cannot be evaluated at compile time`, at the value.
+  - A struct value as the value must be known at compile time: each field's value is a literal, a constant or another struct value. `const origin = Point(x = 0, y = 0)` lets `origin` be used as a value of type `Point`.
+  - A call to a function or a field access, as the value or inside a struct value, is rejected with `cannot be evaluated at compile time`, at the call or the field access.
 - **N11.** A constant means the same as its value, so every rule for that value applies to it. A constant produces no output: each use writes what the constant names, such as the function it calls or its literal. A struct is the exception, because C defines it (C10).
 - **N12.** A constant is only resolved and checked when something uses it. An unused constant is not an error, because other modules can use it (M8), and the modules its value names are not loaded for it (M7).
 - **N13.** A used constant whose value reaches itself, directly or through other constants, is rejected with `constant refers to itself`, at its `const`. This includes a struct that contains itself, directly or through the fields of other structs.
@@ -250,10 +253,19 @@ field                = name ":" type
   - A value whose type is not a struct is rejected with `value has no fields`: `value.x` with `value: i32`.
   - A name that is not a field of the struct is rejected with `unknown field`.
   - A number literal without a suffix before the `.` has no type to take, and is rejected with `value has no known type`, at the literal: `5.x`.
+- **T15.** A struct value (S20) has the type of its struct, and each field's value must have the field's type (T10). Errors:
+
+  | Situation | Error | At |
+  |---|---|---|
+  | The called type is not a struct: `i32(x = 1)` | `type is not a struct` | the call |
+  | An argument has no field name: `Point(1, y = 2)` | `expected a field name` | the argument |
+  | The struct has no field with that name | `unknown field` | the argument |
+  | A field is given twice | `field is already given` | the second argument |
+  | A field is not given | `missing field` | the call |
 
 ## Functions
 
-- **F1.** A call passes exactly as many arguments as the function has parameters. Otherwise it is rejected with `wrong number of arguments`.
+- **F1.** A call passes exactly as many arguments as the function has parameters. Otherwise it is rejected with `wrong number of arguments`. The arguments of a function have no names: `add(value = 1)` is rejected with `function arguments have no names`, at the argument.
 - **F2.** Each argument must have the type of its parameter (T10).
 - **F3.** A `void` function returns with `return` without a value. `return` with a value in a `void` function is rejected with `void function cannot return a value`.
 - **F4.** A function with a return type returns with `return` and a value. `return` without a value is rejected with `missing return value`.
@@ -327,6 +339,7 @@ field                = name ":" type
 - **C11.** A zero-sized type is a struct whose fields all have zero-sized types, such as a struct without fields. It has no definition in C. Fields, parameters and arguments of a zero-sized type are left out, and a function that returns one returns `void`. The calls in a zero-sized argument run before the call that receives it: `use(make(marker), 1)` becomes `(mn_hello_make(), mn_hello_use(1))`, and `use(holder().marker, 1)` becomes `(mn_hello_holder(), mn_hello_use(1))`. The calls in a returned zero-sized value run before the `return;`. A zero-sized value without calls, such as `holder.marker`, writes nothing.
 - **C12.** Modules whose structs contain each other's structs, directly or through other modules, are rejected with `modules contain each other's structs`, at the field.
 - **C13.** A field access is written as in Monolith: `line.start.x` stays `line.start.x`, and `make().x` becomes `mn_hello_make().x`.
+- **C14.** A struct value becomes a compound literal that names each field, in the order written: `Point(y = 2, x = 1)` becomes `(mn_hello_Point){ .y = 2, .x = 1 }`. Fields of a zero-sized type are left out (C11). A constant that holds a struct value writes it at each use (N11).
 
 ## Compiler
 

@@ -468,19 +468,36 @@ pub const Parser = struct {
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
-    ) ParseError![]ast.Expression {
+    ) ParseError![]ast.Argument {
         var position = offset.*;
-        var arguments: std.ArrayList(ast.Expression) = .empty;
+        var arguments: std.ArrayList(ast.Argument) = .empty;
         while (self.tokens[position].kind != .right_parenthesis) {
-            const argument = (try self.parseExpression(allocator, &position)) orelse {
-                return self.fail(position, error.ExpectedExpression);
-            };
-            try arguments.append(allocator, argument);
+            try arguments.append(allocator, try self.parseArgument(allocator, &position));
             if (self.match(&position, .comma) == null) break;
         }
 
         offset.* = position;
         return arguments.items;
+    }
+
+    fn parseArgument(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!ast.Argument {
+        var position = offset.*;
+        const first = self.tokens[position];
+        var name: ?[]const u8 = null;
+        if (first.kind == .identifier and self.tokens[position + 1].kind == .equals) {
+            name = first.kind.identifier;
+            position += 2;
+        }
+        const value = (try self.parseExpression(allocator, &position)) orelse {
+            return self.fail(position, error.ExpectedExpression);
+        };
+
+        offset.* = position;
+        return .{ .name = name, .value = value, .location = first.location };
     }
 
     fn parseFieldAccess(
@@ -894,8 +911,8 @@ test "parseCallStatement: parses a call as a statement" {
     const call = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call;
     try std.testing.expectEqualStrings("log", call.callee.identifier.name);
     try std.testing.expectEqual(2, call.arguments.len);
-    try std.testing.expectEqualStrings("1", call.arguments[0].kind.integer_literal.text);
-    try std.testing.expectEqual(true, call.arguments[1].kind.boolean_literal);
+    try std.testing.expectEqualStrings("1", call.arguments[0].value.kind.integer_literal.text);
+    try std.testing.expectEqual(true, call.arguments[1].value.kind.boolean_literal);
 }
 
 test "parseCallStatement: rejects a name that is not called" {
@@ -1181,7 +1198,7 @@ test "parseExpression: parses a chain of field accesses" {
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    const outer = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call.arguments[0];
+    const outer = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call.arguments[0].value;
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, outer.location);
     try std.testing.expectEqualStrings("x", outer.kind.field_access.field);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 27 }, outer.kind.field_access.field_location);
@@ -1198,7 +1215,7 @@ test "parseExpression: parses a field access on a call" {
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    const access = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call.arguments[0].kind.field_access;
+    const access = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call.arguments[0].value.kind.field_access;
     try std.testing.expectEqualStrings("x", access.field);
     try std.testing.expectEqualStrings("make", access.value.kind.call.callee.identifier.name);
 }
@@ -1213,7 +1230,7 @@ test "parseCall: parses nested calls" {
 
     const outer = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call;
     try std.testing.expectEqualStrings("log", outer.callee.identifier.name);
-    const inner = outer.arguments[0].kind.call;
+    const inner = outer.arguments[0].value.kind.call;
     try std.testing.expectEqualStrings("add", inner.callee.identifier.name);
     try std.testing.expectEqual(2, inner.arguments.len);
 }
@@ -1293,6 +1310,34 @@ test "parseArguments: rejects a missing argument" {
 
     try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
+}
+
+test "parseArgument: parses named arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): log(Point(x = 1, y = 2), 3)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const outer = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call;
+    try std.testing.expectEqual(null, outer.arguments[1].name);
+    const inner = outer.arguments[0].value.kind.call;
+    try std.testing.expectEqualStrings("x", inner.arguments[0].name.?);
+    try std.testing.expectEqualStrings("1", inner.arguments[0].value.kind.integer_literal.text);
+    try std.testing.expectEqualStrings("y", inner.arguments[1].name.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 29 }, inner.arguments[1].location);
+}
+
+test "parseArgument: rejects a name without a value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): log(Point(x = ))");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, parser.failure.?.location.?);
 }
 
 test "parseFieldAccess: rejects a dot without a name" {

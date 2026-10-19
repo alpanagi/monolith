@@ -48,6 +48,7 @@ pub const StatementKind = union(enum) {
 pub const ConstantDeclaration = struct {
     name: []const u8,
     value: Expression,
+    resolved: bool = false,
 };
 
 pub const Expression = struct {
@@ -70,7 +71,7 @@ pub const ExpressionKind = union(enum) {
 
 pub const Call = struct {
     callee: Name,
-    arguments: []Expression,
+    arguments: []Argument,
 };
 
 pub const Name = union(enum) {
@@ -107,6 +108,12 @@ pub const Resolution = union(enum) {
     };
 };
 
+pub const Argument = struct {
+    name: ?[]const u8,
+    value: Expression,
+    location: token.Location,
+};
+
 pub const FieldAccess = struct {
     value: *Expression,
     field: []const u8,
@@ -128,5 +135,11 @@ pub fn extractType(expression: Expression) types.Type {
     return switch (expression.kind) {
         inline .identifier, .path_expression => |name| name.resolution.?.type,
         else => unreachable,
+    };
+}
+
+pub fn extractResolution(name: Name) Resolution {
+    return switch (name) {
+        inline else => |named| named.resolution.?,
     };
 }
