@@ -41,12 +41,13 @@ pub fn main(init: std.process.Init) !u8 {
         return report(allocator, stderr, &loader, failure);
     };
 
-    var name_resolver = NameResolver.init(arena, io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(arena, io, &loader, &type_registry);
     name_resolver.resolve() catch |resolve_error| {
         const failure = name_resolver.failure orelse return resolve_error;
         return report(allocator, stderr, &loader, failure);
     };
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
 
     var type_checker = TypeChecker.init(program);
     type_checker.check() catch |type_error| {

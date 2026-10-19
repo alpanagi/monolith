@@ -475,6 +475,16 @@ test "lexWord: recognizes the const keyword" {
     try std.testing.expectEqualStrings("constant", lexer.tokens.items[2].kind.identifier);
 }
 
+test "lexWord: recognizes the struct keyword" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("struct structure");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_struct);
+    try std.testing.expectEqualStrings("structure", lexer.tokens.items[2].kind.identifier);
+}
+
 test "lexWord: recognizes return and boolean keywords" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

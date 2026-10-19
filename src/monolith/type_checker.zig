@@ -18,18 +18,6 @@ pub const TypeChecker = struct {
     pub fn check(self: *TypeChecker) TypeError!void {
         for (self.program.modules, 0..) |module, index| {
             self.module_index = index;
-            for (module.declarations) |*declaration| {
-                switch (declaration.kind) {
-                    .function_declaration => |*signature| try self.checkSignature(signature),
-                    .function_definition => |*function| {
-                        try self.checkSignature(&function.signature);
-                    },
-                    .constant_declaration => {},
-                }
-            }
-        }
-        for (self.program.modules, 0..) |module, index| {
-            self.module_index = index;
             for (module.declarations) |declaration| {
                 switch (declaration.kind) {
                     .function_definition => |function| try self.checkFunction(function),
@@ -40,16 +28,6 @@ pub const TypeChecker = struct {
                 }
             }
         }
-    }
-
-    fn checkSignature(self: *TypeChecker, signature: *ast.FunctionSignature) TypeError!void {
-        for (signature.parameters) |*parameter| {
-            try self.checkExpression(signature.*, &parameter.type, .type);
-            if (ast.extractType(parameter.type) == .void) {
-                return self.fail(parameter.type.location, error.VoidParameter);
-            }
-        }
-        try self.checkExpression(signature.*, &signature.return_type, .type);
     }
 
     fn checkFunction(self: *TypeChecker, function: ast.FunctionDefinition) TypeError!void {
@@ -86,6 +64,7 @@ pub const TypeChecker = struct {
         signature: ast.FunctionSignature,
         statement: *ast.Statement,
     ) TypeError!void {
+        const parameters = signature.parameters;
         const return_type = ast.extractType(signature.return_type);
         switch (statement.kind) {
             .noop => {},
@@ -94,18 +73,18 @@ pub const TypeChecker = struct {
                     if (return_type == .void) {
                         return self.fail(expression.location, error.UnexpectedReturnValue);
                     }
-                    try self.checkExpression(signature, expression, return_type);
+                    try self.checkExpression(parameters, expression, return_type);
                 } else if (return_type != .void) {
                     return self.fail(statement.location, error.MissingReturnValue);
                 }
             },
             .discard => |*expression| {
-                if (try self.checkCall(signature, expression) == .void) {
+                if (try self.checkCall(parameters, expression) == .void) {
                     return self.fail(expression.location, error.DiscardedVoid);
                 }
             },
             .call => |*expression| {
-                if (try self.checkCall(signature, expression) != .void) {
+                if (try self.checkCall(parameters, expression) != .void) {
                     return self.fail(expression.location, error.UnusedResult);
                 }
             },
@@ -114,7 +93,7 @@ pub const TypeChecker = struct {
 
     fn checkExpression(
         self: *TypeChecker,
-        signature: ast.FunctionSignature,
+        parameters: []const ast.TypedName,
         expression: *ast.Expression,
         expected: types.Type,
     ) TypeError!void {
@@ -123,18 +102,62 @@ pub const TypeChecker = struct {
                 try self.checkLiteral(expression.*, expected);
             },
             inline .identifier, .path_expression => |name| {
-                const value_type = try self.computeValueType(signature, name.resolution.?);
+                const value_type = try self.computeValueType(parameters, name.resolution.?);
                 if (!std.meta.eql(value_type, expected)) {
                     return self.fail(expression.location, error.TypeMismatch);
                 }
             },
             .call => {
-                if (!std.meta.eql(try self.checkCall(signature, expression), expected)) {
+                if (!std.meta.eql(try self.checkCall(parameters, expression), expected)) {
                     return self.fail(expression.location, error.TypeMismatch);
                 }
             },
+            .@"struct" => unreachable,
         }
         expression.type = expected;
+    }
+
+    fn computeValueType(
+        self: *TypeChecker,
+        parameters: []const ast.TypedName,
+        resolution: ast.Resolution,
+    ) TypeError!types.Type {
+        return switch (resolution) {
+            .parameter => |index| ast.extractType(parameters[index].type),
+            .type => .type,
+            .constant => |constant| self.checkConstant(constant),
+            .function => unreachable,
+        };
+    }
+
+    fn checkConstant(self: *TypeChecker, constant: ast.Resolution.Constant) TypeError!types.Type {
+        const module = self.program.modules[constant.module];
+        const value = &module.declarations[constant.declaration].kind.constant_declaration.value;
+        if (value.type) |value_type| return value_type;
+        const caller_module_index = self.module_index;
+        self.module_index = constant.module;
+        defer self.module_index = caller_module_index;
+        const value_type = try self.computeLiteralType(value.*);
+        try self.checkLiteral(value.*, value_type);
+        value.type = value_type;
+        return value_type;
+    }
+
+    fn computeLiteralType(self: *TypeChecker, expression: ast.Expression) TypeError!types.Type {
+        return switch (expression.kind) {
+            .integer_literal, .float_literal => |literal| {
+                const suffix = literal.suffix orelse {
+                    return self.fail(expression.location, error.UnknownValueType);
+                };
+                const number = types.findNumberType(suffix) orelse {
+                    return self.fail(expression.location, error.UnknownSuffix);
+                };
+                return .{ .number = number };
+            },
+            .boolean_literal => .boolean,
+            .string_literal => .string,
+            .identifier, .path_expression, .call, .@"struct" => unreachable,
+        };
     }
 
     fn checkLiteral(
@@ -172,51 +195,8 @@ pub const TypeChecker = struct {
             .string_literal => {
                 if (expected != .string) return self.fail(expression.location, error.TypeMismatch);
             },
-            .identifier, .path_expression, .call => unreachable,
+            .identifier, .path_expression, .call, .@"struct" => unreachable,
         }
-    }
-
-    fn computeValueType(
-        self: *TypeChecker,
-        signature: ast.FunctionSignature,
-        resolution: ast.Resolution,
-    ) TypeError!types.Type {
-        return switch (resolution) {
-            .parameter => |index| ast.extractType(signature.parameters[index].type),
-            .type => .type,
-            .constant => |constant| self.checkConstant(constant),
-            .function => unreachable,
-        };
-    }
-
-    fn checkConstant(self: *TypeChecker, constant: ast.Resolution.Constant) TypeError!types.Type {
-        const module = self.program.modules[constant.module];
-        const value = &module.declarations[constant.declaration].kind.constant_declaration.value;
-        if (value.type) |value_type| return value_type;
-        const caller_module_index = self.module_index;
-        self.module_index = constant.module;
-        defer self.module_index = caller_module_index;
-        const value_type = try self.computeLiteralType(value.*);
-        try self.checkLiteral(value.*, value_type);
-        value.type = value_type;
-        return value_type;
-    }
-
-    fn computeLiteralType(self: *TypeChecker, expression: ast.Expression) TypeError!types.Type {
-        return switch (expression.kind) {
-            .integer_literal, .float_literal => |literal| {
-                const suffix = literal.suffix orelse {
-                    return self.fail(expression.location, error.UnknownValueType);
-                };
-                const number = types.findNumberType(suffix) orelse {
-                    return self.fail(expression.location, error.UnknownSuffix);
-                };
-                return .{ .number = number };
-            },
-            .boolean_literal => .boolean,
-            .string_literal => .string,
-            .identifier, .path_expression, .call => unreachable,
-        };
     }
 
     fn expectNumber(
@@ -227,7 +207,9 @@ pub const TypeChecker = struct {
     ) TypeError!types.NumberType {
         const number = switch (expected) {
             .number => |number| number,
-            .boolean, .string, .void, .type => return self.fail(location, error.TypeMismatch),
+            .boolean, .string, .void, .type, .@"struct" => {
+                return self.fail(location, error.TypeMismatch);
+            },
         };
         const suffix = literal.suffix orelse return number;
         const suffix_type = types.findNumberType(suffix) orelse {
@@ -239,7 +221,7 @@ pub const TypeChecker = struct {
 
     fn checkCall(
         self: *TypeChecker,
-        signature: ast.FunctionSignature,
+        parameters: []const ast.TypedName,
         expression: *ast.Expression,
     ) TypeError!types.Type {
         const call = expression.kind.call;
@@ -256,7 +238,7 @@ pub const TypeChecker = struct {
         }
         for (call.arguments, callee.parameters) |*argument, parameter| {
             const parameter_type = ast.extractType(parameter.type);
-            try self.checkExpression(signature, argument, parameter_type);
+            try self.checkExpression(parameters, argument, parameter_type);
         }
 
         const return_type = ast.extractType(callee.return_type);
@@ -288,7 +270,6 @@ pub const TypeError = error{
     UnusedResult,
     DiscardedVoid,
     UnknownSuffix,
-    VoidParameter,
     UnknownValueType,
 };
 
@@ -307,7 +288,6 @@ fn describeError(type_error: TypeError) []const u8 {
         error.UnusedResult => "call result is unused, discard it with _ =",
         error.DiscardedVoid => "call returns no value to discard",
         error.UnknownSuffix => "unknown suffix",
-        error.VoidParameter => "parameter cannot have type void",
         error.UnknownValueType => "value has no known type",
     };
 }
@@ -357,9 +337,10 @@ test "TypeChecker.check: sets the type of each returned value" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() u8: return 255\nfn two() f32: return 2.5\nfn three() Bool: return true\nfn four() i64: return 1_i64\nfn main(): return" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
     try type_checker.check();
 
@@ -387,9 +368,10 @@ test "TypeChecker.check: sets the type of calls, arguments and names" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn add(left: i32, right: i32) i32: return left\nfn main(): _ = add(1, 2)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
     try type_checker.check();
 
@@ -397,69 +379,6 @@ test "TypeChecker.check: sets the type of calls, arguments and names" {
     const call = loader.modules.items[0].declarations[1].kind.function_definition.body[0].kind.discard;
     try std.testing.expectEqual(types.Type{ .number = .i32 }, call.type);
     try std.testing.expectEqual(types.Type{ .number = .i32 }, call.kind.call.arguments[0].type);
-}
-
-test "checkSignature: rejects a value that is not a type" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn add(value: 5): noop\nfn main(): noop" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
-    try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
-    var type_checker = TypeChecker.init(program);
-
-    try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 15 }, type_checker.failure.?.location.?);
-}
-
-test "checkSignature: checks the signature of a function called before it" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): add(1)\nfn add(value: true): noop" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
-    try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
-    var type_checker = TypeChecker.init(program);
-
-    try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 15 }, type_checker.failure.?.location.?);
-}
-
-test "checkSignature: rejects a void parameter" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn add(value: void): noop\nfn main(): noop" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
-    try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
-    var type_checker = TypeChecker.init(program);
-
-    try std.testing.expectError(error.VoidParameter, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 15 }, type_checker.failure.?.location.?);
 }
 
 test "checkFunction: rejects a return type on main" {
@@ -480,9 +399,10 @@ test "checkFunction: rejects a return type on main" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main() i32: return 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.MainHasReturnType, type_checker.check());
@@ -507,9 +427,10 @@ test "checkFunction: rejects parameters on main" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(value: i32): noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.MainHasParameters, type_checker.check());
@@ -534,9 +455,10 @@ test "checkFunction: rejects a missing return" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() i32: noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.MissingReturn, type_checker.check());
@@ -561,9 +483,10 @@ test "checkExternalFunction: rejects an external main" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn main()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.MainIsExternal, type_checker.check());
@@ -588,9 +511,10 @@ test "checkStatement: rejects a missing return value" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() i32: return" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.MissingReturnValue, type_checker.check());
@@ -615,9 +539,10 @@ test "checkStatement: rejects a value in a void function" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): return 5" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.UnexpectedReturnValue, type_checker.check());
@@ -642,9 +567,10 @@ test "checkStatement: rejects an unused result" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() i32: return 1\nfn main(): one()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.UnusedResult, type_checker.check());
@@ -669,9 +595,10 @@ test "checkStatement: rejects discarding a void call" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn log(): noop\nfn main(): _ = log()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.DiscardedVoid, type_checker.check());
@@ -696,9 +623,10 @@ test "checkExpression: rejects a boolean for an integer type" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() i32: return true" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
@@ -723,9 +651,10 @@ test "checkExpression: rejects an integer literal for a float type" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn ratio() f64: return 2" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
@@ -750,9 +679,10 @@ test "checkExpression: rejects a float literal for an integer type" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() i32: return 2.5" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
@@ -777,9 +707,10 @@ test "checkExpression: rejects a suffix of another type" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() i32: return 5u8" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
@@ -804,9 +735,10 @@ test "checkExpression: rejects a float suffix of another type" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn ratio() f64: return 2.5f32" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
@@ -843,9 +775,10 @@ test "checkExpression: accepts the maximum of each integer type" {
         ,
     });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try type_checker.check();
@@ -874,9 +807,10 @@ test "checkExpression: rejects one past the maximum of each integer type" {
         var loader = @import("loader.zig").Loader.init(program_path, program_path);
         try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = source });
         try loader.loadMainModule(&arena, std.testing.io, "main");
-        var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+        var type_registry: types.Registry = .{};
+        var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
         try name_resolver.resolve();
-        var type_checker = TypeChecker.init(.{ .modules = loader.modules.items });
+        var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
 
         try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
     }
@@ -900,9 +834,10 @@ test "checkExpression: rejects a suffixed literal out of range" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn small() u8: return 300u8" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
@@ -927,9 +862,10 @@ test "checkExpression: rejects an integer beyond 64 bits" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn big() u64: return 18446744073709551616" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
@@ -954,9 +890,10 @@ test "checkExpression: rejects a float out of range" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn huge() f32: return 1e39" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
@@ -975,9 +912,10 @@ test "checkExpression: rejects a type as a value" {
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() i32: return i32\nfn main(): noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
@@ -1003,9 +941,10 @@ test "checkExpression: rejects a parameter of another type" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn same(value: i32) u8: return value" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
@@ -1030,9 +969,10 @@ test "checkExpression: rejects a call of another type" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() u8: return 1\nfn two() i32: return one()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
@@ -1057,13 +997,98 @@ test "checkExpression: rejects a void call as a value" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn log(): noop\nfn two() i32: return log()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 22 }, type_checker.failure.?.location.?);
+}
+
+test "checkExpression: gives a string literal the String type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() String: return \"hello\"" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = TypeChecker.init(program);
+    try type_checker.check();
+
+    try std.testing.expectEqual(types.Type.string, loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.@"return".?.type);
+}
+
+test "checkExpression: rejects a string for an integer type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() i32: return \"42\"" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = TypeChecker.init(program);
+
+    try std.testing.expectError(error.TypeMismatch, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?.location.?);
+}
+
+test "checkExpression: rejects an integer for String" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn name() String: return 1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = TypeChecker.init(program);
+
+    try std.testing.expectError(error.TypeMismatch, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
 }
 
 test "checkConstant: gives each use the type of the value" {
@@ -1078,9 +1103,10 @@ test "checkConstant: gives each use the type of the value" {
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() u64: return limit\nfn two() u64: return limit\nconst limit = 7u64\nfn main(): noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items });
+    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
     try type_checker.check();
 
     const declarations = loader.modules.items[0].declarations;
@@ -1101,9 +1127,10 @@ test "checkConstant: rejects a value of another type" {
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() i32: return limit\nconst limit = true\nfn main(): noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items });
+    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 22 }, type_checker.failure.?.location.?);
@@ -1122,9 +1149,10 @@ test "checkConstant: checks the value in the module of the constant" {
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "limits.mn", .data = "const maximum = 300u8" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() u8: return limits::maximum\nfn main(): noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items });
+    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
     try std.testing.expectEqual(loader.modules.items[1].path, type_checker.failure.?.module.?);
@@ -1143,9 +1171,10 @@ test "computeLiteralType: rejects a number without a suffix" {
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() i32: return limit\nconst limit = 5\nfn main(): noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items });
+    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.UnknownValueType, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 15 }, type_checker.failure.?.location.?);
@@ -1163,9 +1192,10 @@ test "computeLiteralType: rejects an unknown suffix" {
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() i32: return limit\nconst limit = 5Bool\nfn main(): noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items });
+    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.UnknownSuffix, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 15 }, type_checker.failure.?.location.?);
@@ -1183,9 +1213,10 @@ test "expectNumber: rejects an unknown suffix" {
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn value() u8: return 5Bool" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items });
+    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.UnknownSuffix, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
@@ -1203,9 +1234,10 @@ test "expectNumber: rejects a float suffix on an integer" {
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn value() f64: return 1f64" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items });
+    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, type_checker.failure.?.location.?);
@@ -1223,9 +1255,10 @@ test "expectNumber: rejects an integer suffix on a float" {
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn value() u8: return 2.5u8" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items });
+    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
@@ -1249,9 +1282,10 @@ test "checkCall: rejects calling main" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn helper(): main()\nfn main(): helper()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.MainCalled, type_checker.check());
@@ -1276,9 +1310,10 @@ test "checkCall: checks arguments of external functions" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(value: u8)\nfn main(): take(300)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
@@ -1304,9 +1339,10 @@ test "checkCall: checks arguments against a function of another module" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): utils::take(true)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
@@ -1332,9 +1368,10 @@ test "checkCall: rejects a wrong number of arguments" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn add(left: i32, right: i32) i32: return left\nfn main(): _ = add(1)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.ArgumentCountMismatch, type_checker.check());
@@ -1359,9 +1396,10 @@ test "checkCall: rejects an argument of another type" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn flag(value: Bool): noop\nfn main(): flag(1)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
@@ -1386,92 +1424,12 @@ test "checkCall: checks literal arguments against their parameter" {
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn small(value: u8): noop\nfn main(): small(300)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(program);
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, type_checker.failure.?.location.?);
-}
-
-test "checkExpression: gives a string literal the String type" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    var compiler_directory = std.testing.tmpDir(.{});
-    defer compiler_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    const compiler_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() String: return \"hello\"" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
-    try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
-    var type_checker = TypeChecker.init(program);
-    try type_checker.check();
-
-    try std.testing.expectEqual(types.Type.string, loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.@"return".?.type);
-}
-
-test "checkExpression: rejects a string for an integer type" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    var compiler_directory = std.testing.tmpDir(.{});
-    defer compiler_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    const compiler_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() i32: return \"42\"" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
-    try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
-    var type_checker = TypeChecker.init(program);
-
-    try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?.location.?);
-}
-
-test "checkExpression: rejects an integer for String" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    var compiler_directory = std.testing.tmpDir(.{});
-    defer compiler_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    const compiler_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn name() String: return 1" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader);
-    try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items };
-    var type_checker = TypeChecker.init(program);
-
-    try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
 }

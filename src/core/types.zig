@@ -1,4 +1,5 @@
 const std = @import("std");
+const token = @import("token.zig");
 
 pub const Type = union(enum) {
     number: NumberType,
@@ -6,6 +7,7 @@ pub const Type = union(enum) {
     string,
     void,
     type,
+    @"struct": Struct,
 };
 
 pub const NumberType = enum {
@@ -21,6 +23,30 @@ pub const NumberType = enum {
     f64,
 };
 
+pub const Struct = struct {
+    module: usize,
+    name: []const u8,
+    fields: []const Field,
+};
+
+pub const Field = struct {
+    name: []const u8,
+    type: Type,
+    location: token.Location,
+};
+
+pub const Registry = struct {
+    entries: std.ArrayList(Type) = .empty,
+
+    pub fn add(
+        self: *Registry,
+        allocator: std.mem.Allocator,
+        value_type: Type,
+    ) std.mem.Allocator.Error!void {
+        try self.entries.append(allocator, value_type);
+    }
+};
+
 pub fn findBuiltInType(name: []const u8) ?Type {
     if (findNumberType(name)) |number| return .{ .number = number };
     if (std.mem.eql(u8, name, "Bool")) return .boolean;
@@ -31,6 +57,20 @@ pub fn findBuiltInType(name: []const u8) ?Type {
 
 pub fn findNumberType(name: []const u8) ?NumberType {
     return std.meta.stringToEnum(NumberType, name);
+}
+
+test "Registry.add: records each type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var type_registry: Registry = .{};
+
+    const one: Type = .{ .@"struct" = .{ .module = 0, .name = "One", .fields = &.{} } };
+    const two: Type = .{ .@"struct" = .{ .module = 0, .name = "Two", .fields = &.{} } };
+    try type_registry.add(arena.allocator(), one);
+    try type_registry.add(arena.allocator(), two);
+
+    try std.testing.expectEqualStrings("One", type_registry.entries.items[0].@"struct".name);
+    try std.testing.expectEqualStrings("Two", type_registry.entries.items[1].@"struct".name);
 }
 
 test "findBuiltInType: finds number types, Bool, String and void" {

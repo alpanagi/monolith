@@ -20,7 +20,7 @@ The grammar uses this notation:
 | `[ a ]` | `a`, optionally |
 | `{ a }` | `a`, repeated zero or more times |
 
-`name`, `integer`, `float`, `string` and `newline` are defined in the Lexical structure chapter (L2, L6, L12 to L16, L18 to L21). The indentation of lines is described in S6 to S8.
+`name`, `integer`, `float`, `string` and `newline` are defined in the Lexical structure chapter (L2, L6, L12 to L16, L18 to L21). The indentation of lines is described in S6 to S8, and applies to `fields` as to `indented_block`.
 
 ```
 module               = { declaration }
@@ -38,7 +38,10 @@ expression           = integer | float | string | "true" | "false" | path | call
 call                 = path "(" [ arguments ] ")"
 arguments            = expression { "," expression } [ "," ]
 path                 = name { "::" name }
-constant             = "const" name "=" expression
+constant             = "const" name "=" ( expression | struct )
+struct               = "struct" [ ":" fields ]
+fields               = newline field { newline field }
+field                = name ":" type
 ```
 
 ## Lexical structure
@@ -54,7 +57,7 @@ constant             = "const" name "=" expression
 ### Words
 
 - **L6.** A word starts with a letter or `_` and continues with letters, digits and `_`.
-- **L7.** These words are keywords: `fn`, `external`, `const`, `noop`, `return`, `true`, `false`.
+- **L7.** These words are keywords: `fn`, `external`, `const`, `struct`, `noop`, `return`, `true`, `false`.
 - **L8.** The built-in types (T1) are named `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `Bool`, `String` and `void`. The names that state a size in bits, and `void`, are lowercase. The others start with a capital letter. Type names are names, not keywords.
 - **L9.** A lone `_` is the discard symbol. It is not a name.
 - **L10.** Every other word is a name. Keywords and `_` cannot be used as names. The built-in type names and names that start with `mn_` are reserved (N14).
@@ -143,6 +146,18 @@ constant             = "const" name "=" expression
 - **S15.** An external function is a function declaration that the program calls but does not define: `external fn write(text: String)`. Its definition is written in the target's code. The standard library's external functions are defined by the target's runtime (D2). Every external function is called by its exact name (C8).
 - **S16.** An external function has no body. A `:` after its declaration is rejected with `external functions have no body`.
 
+### Structs
+
+- **S17.** A struct is a type made of fields. It is written as the value of a constant: `struct:` followed by an indented block with one field on each line. A field is a name and a type, `x: i32`. A line of the block that is not a field is rejected with `expected a field`.
+
+  ```monolith
+  const Point = struct:
+      x: i32
+      y: i32
+  ```
+
+- **S18.** A struct without fields is written `struct`, without the `:`: `const Marker = struct`.
+
 ## Modules
 
 - **M1.** Every source file is a module. The file given to the compiler is the main module. A module's path is the path of its file, with directories separated by `::` and without `.mn`: `utils/math.mn` is the module `utils::math`, and the main file `hello.mn` is the module `hello`.
@@ -160,7 +175,7 @@ constant             = "const" name "=" expression
 ## Names
 
 - **N1.** Function and constant names are unique within a module, external functions included. A second function with the name of a function or constant is rejected with `function is already defined`, at its `fn` or `external`. A second constant with the name of a function or constant is rejected with `constant is already defined`, at its `const`.
-- **N2.** Parameter names are unique within a parameter list. A repeated name is rejected with `parameter is already defined`, at the second parameter.
+- **N2.** Parameter names are unique within a parameter list, and field names within a struct. A repeated name is rejected with `parameter is already defined` or `field is already defined`, at the second parameter or field.
 - **N3.** A function can call functions defined before or after it.
 - **N4.** A name is looked up first among the parameters of the enclosing function, then among the module's functions and constants, then among the built-in types (T1), then among `std` and the program's namespaces (M4). A name in a type (T11) is not looked up among the parameters.
 - **N5.** A name that matches none of them is rejected with `unknown name`.
@@ -182,13 +197,13 @@ constant             = "const" name "=" expression
 - **N10.** `const name = expression` declares a constant. Its value is evaluated at compile time, and can be a function, a type, a namespace or a literal. `const stdout = std::io::stdout` lets `stdout::write(...)` reach the module, `const write = mn_stdout_write` lets `write(...)` call the function, `const Integer = i32` lets `Integer` be used as a type, and `const limit = 5i32` lets `limit` be used as a value of type `i32`.
   - A number literal as the value has a suffix, which gives its type (T5): `const limit = 5i32`. Otherwise it is rejected with `value has no known type`, at the literal.
   - Errors in a literal value are reported at the literal, in the module of the constant.
-- **N11.** A constant means the same as its value, so every rule for that value applies to it. A constant produces no output: each use writes what the constant names, such as the function it calls or its literal.
+- **N11.** A constant means the same as its value, so every rule for that value applies to it. A constant produces no output: each use writes what the constant names, such as the function it calls or its literal. A struct is the exception, because C defines it (C10).
 - **N12.** A constant is only resolved and checked when something uses it. An unused constant is not an error, because other modules can use it (M8), and the modules its value names are not loaded for it (M7).
-- **N13.** A used constant whose value reaches itself, directly or through other constants, is rejected with `constant refers to itself`, at its `const`.
+- **N13.** A used constant whose value reaches itself, directly or through other constants, is rejected with `constant refers to itself`, at its `const`. This includes a struct that contains itself, directly or through the fields of other structs.
 
 ### Reserved names
 
-- **N14.** A function, external function, parameter or constant whose name starts with `mn_` is rejected with `name is reserved`, at its `fn`, `external` or `const`, or at the parameter. The modules of the standard library may use these names, because they declare the runtime's functions (D2). A function, external function, parameter or constant named like a built-in type (T1) is rejected with `name is reserved` in every module, the standard library included.
+- **N14.** A function, external function, parameter, constant or field whose name starts with `mn_` is rejected with `name is reserved`, at its `fn`, `external` or `const`, or at the parameter or field. The modules of the standard library may use these names, because they declare the runtime's functions (D2). A function, external function, parameter, constant or field named like a built-in type (T1) is rejected with `name is reserved` in every module, the standard library included.
 
 ## Types
 
@@ -224,6 +239,11 @@ constant             = "const" name "=" expression
 
 - **T11.** Types are values, and their type is the type of types. Each parameter type and return type is an expression that must have the type of types. Otherwise it is rejected with `value does not match the expected type`, at the expression: `fn add(value: 5)`. A type used where a value of another type is expected is rejected the same way: `return i32` in an `i32` function.
 
+### Structs
+
+- **T12.** Each struct is a type of its own, even when another struct has the same fields. A constant that names a struct names the same type: with `const Other = Point`, `Other` and `Point` are one type.
+- **T13.** Each field type is an expression that must have the type of types (T11). A field of type `void` is rejected with `field cannot have type void`, at its type.
+
 ## Functions
 
 - **F1.** A call passes exactly as many arguments as the function has parameters. Otherwise it is rejected with `wrong number of arguments`.
@@ -245,8 +265,8 @@ constant             = "const" name "=" expression
 
 ### Names in the output
 
-- **G1.** Names are written to the output exactly as they are in the source, except the generated names: C function names (C9). A generated name is `mn_` followed by the module path with `::` replaced by `_`, so it cannot be a name written in the source (N14).
-- **G2.** A function, external function or parameter whose name, as written to the output, the target already defines is rejected with `name is already defined in the target`, at the function's `fn` or `external` keyword or at the parameter. Constants are not checked, because they produce no output (N11). A function's name is checked as it is written to the output: `fn int(): noop` becomes `mn_hello_int` (C9) and is accepted, but a parameter named `int` is rejected.
+- **G1.** Names are written to the output exactly as they are in the source, except the generated names: C function names (C9) and C struct names (C10). A generated name is `mn_` followed by the module path with `::` replaced by `_`, so it cannot be a name written in the source (N14).
+- **G2.** A function, external function, parameter or field whose name, as written to the output, the target already defines is rejected with `name is already defined in the target`, at the function's `fn` or `external` keyword or at the parameter or field. Constants are not checked, because they produce no output (N11), or a generated name for a struct (C10). A function's name is checked as it is written to the output: `fn int(): noop` becomes `mn_hello_int` (C9) and is accepted, but a parameter named `int` is rejected.
 - **G3.** C defines the C23 keywords `_Alignas`, `_Alignof`, `_Atomic`, `_BitInt`, `_Bool`, `_Complex`, `_Decimal128`, `_Decimal32`, `_Decimal64`, `_Generic`, `_Imaginary`, `_Noreturn`, `_Static_assert`, `_Thread_local`, `alignas`, `alignof`, `auto`, `bool`, `break`, `case`, `char`, `const`, `constexpr`, `continue`, `default`, `do`, `double`, `else`, `enum`, `extern`, `false`, `float`, `for`, `goto`, `if`, `inline`, `int`, `long`, `nullptr`, `register`, `restrict`, `return`, `short`, `signed`, `sizeof`, `static`, `static_assert`, `struct`, `switch`, `thread_local`, `true`, `typedef`, `typeof`, `typeof_unqual`, `union`, `unsigned`, `void`, `volatile` and `while`, and `asm`, which compilers such as GCC treat as a keyword outside strict C23. It also defines the names that C23 declares in `<stddef.h>` and `<stdint.h>`, which the header includes, such as `size_t`, `int32_t`, `NULL` and `INT32_MAX`. `string` and `MONOLITH_H` are defined by `runtime/monolith.h` itself (C1).
 
 ### C
@@ -266,8 +286,9 @@ constant             = "const" name "=" expression
   ```
 
 - **C2.** Every module becomes a `.h` file, and a module that defines functions also becomes a `.c` file (K3).
-  - The `.h` file includes `runtime/monolith.h`, with a path relative to the file, and declares the module's functions: first its external functions, then, after a blank line, its other functions. The main module's `main` is not declared.
-  - The `.c` file includes its own header, then the header of every other module its calls reach, in the order of their first call, and then defines its functions. Includes use paths relative to the file: `#include "std/io/stdout.h"`.
+  - The `.h` file starts with `#pragma once`. It includes `runtime/monolith.h`, then the header of every other module whose structs its structs contain. Then it defines the module's structs (C10). Then it declares each struct of another module that its function declarations use, with `typedef struct mn_shapes_Line mn_shapes_Line;`. Last, it declares the module's functions: first its external functions, then, after a blank line, its other functions. The main module's `main` is not declared.
+  - The `.c` file includes its own header, then the header of every other module that its calls reach or whose structs its functions use, in the order of their first use, and then defines its functions.
+  - Includes use paths relative to the file: `#include "std/io/stdout.h"`.
   - No function is `static`, so any module can be imported, the main module included.
 - **C3.** The main module's `main` becomes `int main()`. A `return` without a value inside it becomes `return 0;`.
 - **C4.** Types become C types:
@@ -280,12 +301,24 @@ constant             = "const" name "=" expression
   | `Bool` | `bool` |
   | `String` | `string` |
   | `void` | `void` |
+  | a struct | its C name (C10) |
 
 - **C5.** Number literals keep their base. `_` becomes `'`, `0o` becomes `0`, the suffix is removed, and literals of unsigned types end with `u`: `0o7_5_5` returned from a `u16` function becomes `07'5'5u`.
 - **C6.** `_ = add(1, 2)` becomes the plain call, `mn_hello_add(1, 2);` (C9).
 - **C7.** A string literal becomes a `string` holding the literal as written and its length in bytes, counting each escape as one byte: `"line\n"` becomes `(string){ "line\n", 5 }`.
 - **C8.** An external function keeps exactly the name written in the source, so its definition, linked into the program, uses that name: `external fn stdout_write(text: String)` becomes `void stdout_write(string text);`. The runtime defines the standard library's external functions this way (D2).
 - **C9.** C has one namespace for all files, so a function's C name is its module's generated name (G1), followed by `_` and its name: `greeting` in `hello.mn` becomes `mn_hello_greeting`, and `add` in `utils::math` becomes `mn_utils_math_add`. The main module's `main` stays `main`.
+- **C10.** A struct that something uses (N12) becomes a `typedef` in the header of its module, with one field on each line. Its C name is its module's generated name (G1), followed by `_` and the name of its constant, as for functions (C9). The structs of a module are defined after the structs they contain.
+
+  ```c
+  typedef struct mn_hello_Point {
+      int32_t x;
+      int32_t y;
+  } mn_hello_Point;
+  ```
+
+- **C11.** A zero-sized type is a struct whose fields all have zero-sized types, such as a struct without fields. It has no definition in C. Fields, parameters and arguments of a zero-sized type are left out, and a function that returns one returns `void`. A call that gives a zero-sized argument runs before the call that receives it: `use(make(marker), 1)` becomes `(mn_hello_make(), mn_hello_use(1))`. A returned call of a zero-sized type runs before the `return;`.
+- **C12.** Modules whose structs contain each other's structs, directly or through other modules, are rejected with `modules contain each other's structs`, at the field.
 
 ## Compiler
 
@@ -342,6 +375,8 @@ No `std/io/stdout.c` is written, because `std::io::stdout` only declares an exte
 `hello.h`:
 
 ```c
+#pragma once
+
 #include "runtime/monolith.h"
 
 int32_t mn_hello_add(int32_t left, int32_t right);
@@ -377,6 +412,8 @@ int main() {
 `std/io/stdout.h`:
 
 ```c
+#pragma once
+
 #include "../../runtime/monolith.h"
 
 void mn_stdout_write(string text);
@@ -413,6 +450,42 @@ int main() {
 int32_t mn_utils_math_add(int32_t left, int32_t right) {
     return left;
 }
+```
+
+### A program with structs
+
+`hello.mn`:
+
+```monolith
+const Point = struct:
+    x: i32
+    y: i32
+
+const Line = struct:
+    start: Point
+    end: Point
+
+fn length(line: Line) i32: return 0
+```
+
+`hello.h`:
+
+```c
+#pragma once
+
+#include "runtime/monolith.h"
+
+typedef struct mn_hello_Point {
+    int32_t x;
+    int32_t y;
+} mn_hello_Point;
+
+typedef struct mn_hello_Line {
+    mn_hello_Point start;
+    mn_hello_Point end;
+} mn_hello_Line;
+
+int32_t mn_hello_length(mn_hello_Line line);
 ```
 
 ### Invalid programs
@@ -498,3 +571,12 @@ fn one() i32: return limit
 ```
 
 → `1:15: error: value has no known type` (N10)
+
+```monolith
+const Point = struct:
+    x: void
+
+fn show(point: Point): noop
+```
+
+→ `2:8: error: field cannot have type void` (T13)

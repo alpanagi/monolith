@@ -3,6 +3,7 @@ const types = @import("types.zig");
 
 pub const Program = struct {
     modules: []Module,
+    types: *const types.Registry,
 };
 
 pub const Module = struct {
@@ -28,14 +29,8 @@ pub const FunctionDefinition = struct {
 
 pub const FunctionSignature = struct {
     name: []const u8,
-    parameters: []Parameter,
+    parameters: []TypedName,
     return_type: Expression,
-};
-
-pub const Parameter = struct {
-    name: []const u8,
-    type: Expression,
-    location: token.Location,
 };
 
 pub const Statement = struct {
@@ -69,6 +64,7 @@ pub const ExpressionKind = union(enum) {
     identifier: Identifier,
     path_expression: PathExpression,
     call: Call,
+    @"struct": Struct,
 };
 
 pub const Call = struct {
@@ -108,6 +104,17 @@ pub const Resolution = union(enum) {
         module: usize,
         declaration: usize,
     };
+};
+
+pub const Struct = struct {
+    fields: []TypedName,
+    value: ?types.Type = null,
+};
+
+pub const TypedName = struct {
+    name: []const u8,
+    type: Expression,
+    location: token.Location,
 };
 
 pub fn extractType(expression: Expression) types.Type {
