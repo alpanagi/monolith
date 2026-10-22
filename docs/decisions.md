@@ -32,6 +32,13 @@
 - **`main` is optional.** A module does not need one, so libraries are possible.
 - **No limit on nesting depth.** Like Zig, Rust, GCC and Clang, the compiler does not guard against deeply nested source.
 
+## Traits
+
+- **A trait as a parameter's type means a value.** `shape: Shape` takes a value whose type implements `Shape`, because functions that take values are the common case. A type parameter is marked with `type`: `type T: Hashable`.
+- **Type parameters are constrained by traits.** In Zig, the type of every type is `type`, so a type parameter accepts any type, and a wrong type fails inside the generic code.
+- **Every type parameter states its constraint.** `type T` alone is not a parameter. A type parameter without a constraint is `type T: Any`, so "no constraint" is a value that compile-time code can compute.
+- **No keyword for dynamic dispatch.** Unlike Rust's `dyn` and Swift's `any`, dynamic dispatch is a type built from the trait, such as `Dynamic(Shape)`.
+
 ## Strings
 
 - **Text and bytes are separate types.** A `String` is an abstraction over a byte array, and string operations are defined on text, never on bytes.

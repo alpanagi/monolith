@@ -21,6 +21,7 @@ pub const DeclarationKind = union(enum) {
     function_declaration: FunctionSignature,
     function_definition: FunctionDefinition,
     constant_declaration: ConstantDeclaration,
+    struct_definition: StructDefinition,
 };
 
 pub const FunctionDefinition = struct {
@@ -50,6 +51,11 @@ pub const ConstantDeclaration = struct {
     name: []const u8,
     value: Expression,
     resolved: bool = false,
+};
+
+pub const StructDefinition = struct {
+    name: []const u8,
+    body: Struct,
 };
 
 pub const Expression = struct {
@@ -124,6 +130,7 @@ pub const FieldAccess = struct {
 pub const Struct = struct {
     fields: []TypedName,
     value: ?types.Type = null,
+    resolving: bool = false,
 };
 
 pub const TypedName = struct {
@@ -150,7 +157,7 @@ pub fn extractFunctionSignature(declaration: Declaration) FunctionSignature {
     return switch (declaration.kind) {
         .function_definition => |function| function.signature,
         .function_declaration => |function_declaration| function_declaration,
-        .constant_declaration => unreachable,
+        .constant_declaration, .struct_definition => unreachable,
     };
 }
 

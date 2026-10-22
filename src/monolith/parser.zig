@@ -58,6 +58,9 @@ pub const Parser = struct {
             if (try self.parseConstantDeclaration(allocator, offset)) |constant| {
                 break :kind .{ .constant_declaration = constant };
             }
+            if (try self.parseStructDefinition(allocator, offset)) |definition| {
+                break :kind .{ .struct_definition = definition };
+            }
             return null;
         };
         return .{ .kind = kind, .location = location };
@@ -268,7 +271,7 @@ pub const Parser = struct {
         _ = self.match(&position, .keyword_const) orelse return null;
         const name = try self.expect(&position, .identifier, error.ExpectedIdentifier);
         _ = try self.expect(&position, .equals, error.ExpectedEquals);
-        const value = (try self.parseStruct(allocator, &position)) orelse
+        const value = (try self.parseAnonymousStruct(allocator, &position)) orelse
             (try self.parseExpression(allocator, &position)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
@@ -277,20 +280,40 @@ pub const Parser = struct {
         return .{ .name = name.kind.identifier, .value = value };
     }
 
-    fn parseStruct(
+    fn parseAnonymousStruct(
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
     ) ParseError!?ast.Expression {
         var position = offset.*;
         const keyword = self.match(&position, .keyword_struct) orelse return null;
-        var fields: []ast.TypedName = &.{};
-        if (self.match(&position, .colon) != null) {
-            fields = try self.parseFields(allocator, &position);
-        }
+        const body = try self.parseStructBody(allocator, &position);
 
         offset.* = position;
-        return .{ .kind = .{ .@"struct" = .{ .fields = fields } }, .location = keyword.location };
+        return .{ .kind = .{ .@"struct" = body }, .location = keyword.location };
+    }
+
+    fn parseStructDefinition(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.StructDefinition {
+        var position = offset.*;
+        _ = self.match(&position, .keyword_struct) orelse return null;
+        const name = try self.expect(&position, .identifier, error.ExpectedIdentifier);
+        const body = try self.parseStructBody(allocator, &position);
+
+        offset.* = position;
+        return .{ .name = name.kind.identifier, .body = body };
+    }
+
+    fn parseStructBody(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!ast.Struct {
+        if (self.match(offset, .colon) == null) return .{ .fields = &.{} };
+        return .{ .fields = try self.parseFields(allocator, offset) };
     }
 
     fn parseFields(
@@ -1011,7 +1034,7 @@ test "parseConstantDeclaration: rejects a missing value" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
 }
 
-test "parseStruct: parses fields in an indented block" {
+test "parseAnonymousStruct: parses fields in an indented block" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("const Point = struct:\n    x: i32\n    y: f64");
@@ -1024,12 +1047,10 @@ test "parseStruct: parses fields in an indented block" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 15 }, value.location);
     try std.testing.expectEqual(2, fields.len);
     try std.testing.expectEqualStrings("x", fields[0].name);
-    try std.testing.expectEqualStrings("i32", fields[0].type.kind.identifier.name);
     try std.testing.expectEqualStrings("y", fields[1].name);
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, fields[1].location);
 }
 
-test "parseStruct: parses a struct without fields" {
+test "parseAnonymousStruct: parses a struct without fields" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("const Marker = struct\nfn main(): noop");
@@ -1042,7 +1063,7 @@ test "parseStruct: parses a struct without fields" {
     try std.testing.expect(module.declarations[1].kind == .function_definition);
 }
 
-test "parseStruct: rejects a struct that is not the value of a constant" {
+test "parseAnonymousStruct: rejects a struct that is not the value of a constant" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("fn show(point: struct): noop");
@@ -1053,21 +1074,63 @@ test "parseStruct: rejects a struct that is not the value of a constant" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
 }
 
+test "parseStructDefinition: parses fields in an indented block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("struct Point:\n    x: i32\n    y: f64");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const definition = module.declarations[0].kind.struct_definition;
+    const fields = definition.body.fields;
+    try std.testing.expectEqualStrings("Point", definition.name);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, module.declarations[0].location);
+    try std.testing.expectEqual(2, fields.len);
+    try std.testing.expectEqualStrings("x", fields[0].name);
+    try std.testing.expectEqualStrings("i32", fields[0].type.kind.identifier.name);
+    try std.testing.expectEqualStrings("y", fields[1].name);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, fields[1].location);
+}
+
+test "parseStructDefinition: parses a struct without fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("struct Marker\nfn main(): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    try std.testing.expectEqual(0, module.declarations[0].kind.struct_definition.body.fields.len);
+    try std.testing.expect(module.declarations[1].kind == .function_definition);
+}
+
+test "parseStructDefinition: rejects a struct without a name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("struct:\n    x: i32");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 7 }, parser.failure.?.location.?);
+}
+
 test "parseFields: rejects a field on the line of the colon" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const Meters = struct: value: f64");
+    var lexer = @import("lexer.zig").Lexer.init("struct Meters: value: f64");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedBlock, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
 }
 
 test "parseFields: rejects a line that is not a field" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const Point = struct:\n    noop");
+    var lexer = @import("lexer.zig").Lexer.init("struct Point:\n    noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -1089,7 +1152,7 @@ test "parseTypedName: rejects a missing colon" {
 test "parseTypedName: rejects a name without a type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const Point = struct:\n    x:\n");
+    var lexer = @import("lexer.zig").Lexer.init("struct Point:\n    x:\n");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -1111,12 +1174,12 @@ test "parseTypedName: rejects a missing type" {
 test "parseTypedName: parses a default value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const Point = struct:\n    x: i32 = 0\nfn draw(width: i32 = 1): noop");
+    var lexer = @import("lexer.zig").Lexer.init("struct Point:\n    x: i32 = 0\nfn draw(width: i32 = 1): noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    const field = module.declarations[0].kind.constant_declaration.value.kind.@"struct".fields[0];
+    const field = module.declarations[0].kind.struct_definition.body.fields[0];
     try std.testing.expectEqualStrings("0", field.default.?.kind.integer_literal.text);
     const parameter = module.declarations[1].kind.function_definition.signature.parameters[0];
     try std.testing.expectEqualStrings("1", parameter.default.?.kind.integer_literal.text);
@@ -1158,7 +1221,7 @@ test "expectBlock: rejects a blank line before the block" {
 test "expectBlock: rejects a blank indented line before the block" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const Point = struct:\n    \n    x: i32");
+    var lexer = @import("lexer.zig").Lexer.init("struct Point:\n    \n    x: i32");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
