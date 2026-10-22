@@ -514,6 +514,8 @@ pub const Generator = struct {
             .@"return" => |value| value orelse return,
             .discard, .call => |expression| expression,
             .constant_declaration => |constant| constant.value,
+            .variable_declaration => |variable| variable.value,
+            .assignment => |assignment| assignment.value,
         };
         try self.collectReachedModulesOf(allocator, reached, expression);
     }
@@ -691,19 +693,31 @@ pub const Generator = struct {
             .discard, .call => |expression| {
                 try self.generateExpressionStatement(writer, expression);
             },
-            .constant_declaration => |*constant| try self.generateLocalConstant(writer, constant),
+            .constant_declaration, .variable_declaration => {
+                try self.generateLocal(writer, statement);
+            },
+            .assignment => |assignment| try self.generateAssignment(writer, assignment),
         }
     }
 
     fn hasOutput(self: *const Generator, statement: *const ast.Statement) bool {
         return switch (statement.kind) {
             .noop => false,
-            .constant_declaration => |*constant| {
-                return self.findLocalName(constant) != null or hasEffects(constant.value);
+            .constant_declaration, .variable_declaration => {
+                const value = extractLocal(statement.*).?.value;
+                return self.findLocalName(statement) != null or hasEffects(value);
+            },
+            .assignment => |assignment| {
+                return self.hasTarget(assignment.target) or hasEffects(assignment.value);
             },
             .discard => |expression| expression.kind != .identifier,
             .@"return", .call => true,
         };
+    }
+
+    fn hasTarget(self: *const Generator, target: ast.Expression) bool {
+        if (isZeroSized(target.type.?)) return false;
+        return self.findLocalName(extractTargetRoot(target)) != null;
     }
 
     fn generateExpressionStatement(
@@ -716,20 +730,40 @@ pub const Generator = struct {
         try writer.writeAll(";\n");
     }
 
-    fn generateLocalConstant(
+    fn generateLocal(
         self: *Generator,
         writer: *std.Io.Writer,
-        constant: *const ast.ConstantDeclaration,
+        statement: *const ast.Statement,
     ) std.Io.Writer.Error!void {
+        const value = extractLocal(statement.*).?.value;
         try self.generateIndentation(writer);
-        const name = self.findLocalName(constant) orelse {
-            try self.generateEffects(writer, constant.value);
+        const name = self.findLocalName(statement) orelse {
+            try self.generateEffects(writer, value);
             return writer.writeAll(";\n");
         };
-        try writer.writeAll("const ");
-        try self.generateType(writer, constant.value.type.?);
-        try writer.print(" {s} = ", .{name});
-        try self.generateExpression(writer, constant.value);
+        if (statement.kind == .constant_declaration) try writer.writeAll("const ");
+        try self.generateType(writer, value.type.?);
+        try writer.print(" {s}", .{name});
+        if (value.kind != .undefined) {
+            try writer.writeAll(" = ");
+            try self.generateExpression(writer, value);
+        }
+        try writer.writeAll(";\n");
+    }
+
+    fn generateAssignment(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        assignment: ast.Assignment,
+    ) std.Io.Writer.Error!void {
+        try self.generateIndentation(writer);
+        if (!self.hasTarget(assignment.target)) {
+            try self.generateEffects(writer, assignment.value);
+            return writer.writeAll(";\n");
+        }
+        try self.generateExpression(writer, assignment.target);
+        try writer.writeAll(" = ");
+        try self.generateExpression(writer, assignment.value);
         try writer.writeAll(";\n");
     }
 
@@ -759,6 +793,7 @@ pub const Generator = struct {
             .string_literal => |text| {
                 try writer.print("(string){{ \"{s}\", {d} }}", .{ text, countBytes(text) });
             },
+            .undefined => unreachable,
             .identifier => |identifier| switch (identifier.resolution.?) {
                 .parameter => try writer.writeAll(identifier.name),
                 .constant => |constant| {
@@ -766,7 +801,7 @@ pub const Generator = struct {
                     const kind = module.declarations[constant.declaration].kind;
                     try self.generateExpression(writer, kind.constant_declaration.value);
                 },
-                .local => |constant| try writer.writeAll(self.findLocalName(constant).?),
+                .local => |statement| try writer.writeAll(self.findLocalName(statement).?),
                 .function, .type => unreachable,
             },
             .path_expression => |path_expression| switch (path_expression.resolution.?) {
@@ -804,9 +839,9 @@ pub const Generator = struct {
         }
     }
 
-    fn findLocalName(self: *const Generator, constant: *const ast.ConstantDeclaration) ?[]const u8 {
+    fn findLocalName(self: *const Generator, statement: *const ast.Statement) ?[]const u8 {
         for (self.local_names) |local_name| {
-            if (local_name.constant == constant) return local_name.name;
+            if (local_name.statement == statement) return local_name.name;
         }
         return null;
     }
@@ -922,6 +957,7 @@ pub const Generator = struct {
             .float_literal,
             .boolean_literal,
             .string_literal,
+            .undefined,
             .identifier,
             .path_expression,
             .@"struct",
@@ -954,9 +990,14 @@ const File = struct {
 };
 
 const LocalName = struct {
-    constant: *const ast.ConstantDeclaration,
+    statement: *const ast.Statement,
     name: []const u8,
     location: token.Location,
+};
+
+const Local = struct {
+    name: []const u8,
+    value: ast.Expression,
 };
 
 fn buildCNames(
@@ -1024,6 +1065,7 @@ fn hasEffects(expression: ast.Expression) bool {
         .float_literal,
         .boolean_literal,
         .string_literal,
+        .undefined,
         .identifier,
         .path_expression,
         => false,
@@ -1052,30 +1094,25 @@ fn buildLocalNames(
         try taken.append(allocator, parameter.name);
     }
     for (body) |statement| {
-        switch (statement.kind) {
-            .constant_declaration => |constant| try written.append(allocator, constant.name),
-            .noop, .@"return", .discard, .call => {},
-        }
+        const local = extractLocal(statement) orelse continue;
+        try written.append(allocator, local.name);
     }
 
     var local_names: std.ArrayList(LocalName) = .empty;
     for (body) |*statement| {
-        const constant = switch (statement.kind) {
-            .constant_declaration => |*constant| constant,
-            .noop, .@"return", .discard, .call => continue,
-        };
-        if (!isDeclared(body, constant)) continue;
-        var name = constant.name;
+        if (!isDeclared(body, statement)) continue;
+        const source_name = extractLocal(statement.*).?.name;
+        var name = source_name;
         var number: usize = 1;
         while (containsName(taken.items, name) or
             (number > 1 and containsName(written.items, name)))
         {
             number += 1;
-            name = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ constant.name, number });
+            name = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ source_name, number });
         }
         try taken.append(allocator, name);
         try local_names.append(allocator, .{
-            .constant = constant,
+            .statement = statement,
             .name = name,
             .location = statement.location,
         });
@@ -1083,22 +1120,46 @@ fn buildLocalNames(
     return local_names.items;
 }
 
-fn isDeclared(body: []const ast.Statement, constant: *const ast.ConstantDeclaration) bool {
-    if (ast.isAlias(constant.*)) return false;
-    if (isZeroSized(constant.value.type.?)) return false;
-    return !isDiscarded(body, .{ .local = constant });
+fn extractLocal(statement: ast.Statement) ?Local {
+    return switch (statement.kind) {
+        .constant_declaration => |constant| .{ .name = constant.name, .value = constant.value },
+        .variable_declaration => |variable| .{ .name = variable.name, .value = variable.value },
+        .noop, .@"return", .discard, .call, .assignment => null,
+    };
+}
+
+fn isDeclared(body: []const ast.Statement, statement: *const ast.Statement) bool {
+    const local = extractLocal(statement.*) orelse return false;
+    const kind = statement.kind;
+    if (kind == .constant_declaration and ast.isAlias(kind.constant_declaration)) return false;
+    if (isZeroSized(local.value.type.?)) return false;
+    return !isDiscarded(body, .{ .local = statement });
 }
 
 fn isDiscarded(body: []const ast.Statement, resolution: ast.Resolution) bool {
     for (body) |statement| {
         const expression = switch (statement.kind) {
             .discard => |expression| expression,
-            .noop, .@"return", .call, .constant_declaration => continue,
+            .noop,
+            .@"return",
+            .call,
+            .constant_declaration,
+            .variable_declaration,
+            .assignment,
+            => continue,
         };
         if (expression.kind != .identifier) continue;
         if (std.meta.eql(expression.kind.identifier.resolution.?, resolution)) return true;
     }
     return false;
+}
+
+fn extractTargetRoot(target: ast.Expression) *const ast.Statement {
+    return switch (target.kind) {
+        .identifier => |identifier| identifier.resolution.?.local,
+        .field_access => |access| extractTargetRoot(access.value.*),
+        else => unreachable,
+    };
 }
 
 fn isZeroSized(value_type: types.Type) bool {
@@ -2396,7 +2457,7 @@ test "hasOutput: writes nothing for discards" {
     );
 }
 
-test "generateLocalConstant: declares a local constant in C" {
+test "generateLocal: declares a local constant in C" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -2429,7 +2490,7 @@ test "generateLocalConstant: declares a local constant in C" {
     );
 }
 
-test "generateLocalConstant: renames a constant that shadows" {
+test "generateLocal: renames a constant that shadows" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -2462,7 +2523,7 @@ test "generateLocalConstant: renames a constant that shadows" {
     );
 }
 
-test "generateLocalConstant: skips names written in the function" {
+test "generateLocal: skips names written in the function" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -2495,7 +2556,7 @@ test "generateLocalConstant: skips names written in the function" {
     );
 }
 
-test "generateLocalConstant: writes only the calls of a discarded constant" {
+test "generateLocal: writes only the calls of a discarded constant" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -2528,7 +2589,7 @@ test "generateLocalConstant: writes only the calls of a discarded constant" {
     );
 }
 
-test "generateLocalConstant: writes only the calls of a zero-sized constant" {
+test "generateLocal: writes only the calls of a zero-sized constant" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -2557,6 +2618,237 @@ test "generateLocalConstant: writes only the calls of a zero-sized constant" {
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\nvoid mn_main_make() {\n    return;\n}\n\nvoid mn_main_use() {}\n\nint main() {\n    mn_main_make();\n    mn_main_use();\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateLocal: declares a variable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show() i32:\n    var count = 1i32\n    count = 2i32\n    return count" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_show() {\n    int32_t count = 1;\n    count = 2;\n    return count;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateLocal: declares an undefined variable without a value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show() i32:\n    var count: i32 = undefined\n    count = 5\n    return count" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_show() {\n    int32_t count;\n    count = 5;\n    return count;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateLocal: writes nothing for a discarded variable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    var count = 1i32\n    count = 2i32\n    _ = count" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint main() {}\n",
+        files[1].contents,
+    );
+}
+
+test "generateLocal: numbers a variable that shadows a local constant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show() i32:\n    const value = 1i32\n    var value = value\n    value = 2i32\n    return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_show() {\n    const int32_t value = 1;\n    int32_t value_2 = value;\n    value_2 = 2;\n    return value_2;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateAssignment: assigns a field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nfn show() Point:\n    var point = Point(x = 1, y = 2)\n    point.x = 3\n    return point" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nmn_main_Point mn_main_show() {\n    mn_main_Point point = (mn_main_Point){ .x = 1, .y = 2 };\n    point.x = 3;\n    return point;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateAssignment: writes only the calls when the variable is not declared" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() i32: return 1\nfn main():\n    var value = 1i32\n    value = make()\n    _ = value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_make() {\n    return 1;\n}\n\nint main() {\n    mn_main_make();\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateAssignment: assigns a nested field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nstruct Line:\n    start: Point\nfn show() Line:\n    var line = Line(start = Point(x = 1))\n    line.start.x = 2\n    return line" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nmn_main_Line mn_main_show() {\n    mn_main_Line line = (mn_main_Line){ .start = (mn_main_Point){ .x = 1 } };\n    line.start.x = 2;\n    return line;\n}\n",
         files[1].contents,
     );
 }

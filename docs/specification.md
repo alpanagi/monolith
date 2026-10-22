@@ -34,13 +34,16 @@ type                 = expression
 block                = statement | indented_block
 indented_block       = newline statement { newline statement }
 statement            = "noop" | "return" [ expression ] | "_" "=" ( call | name ) | call | constant
+                     | variable | assignment
 expression           = operand { "." name }
-operand              = integer | float | string | "true" | "false" | path | call
+operand              = integer | float | string | "true" | "false" | "undefined" | path | call
 call                 = path "(" [ arguments ] ")"
 arguments            = argument { "," argument } [ "," ]
 argument             = [ name "=" ] expression
 path                 = name { "::" name }
 constant             = "const" name ( [ ":" type ] "=" expression | "=" anonymous_struct )
+variable             = "var" name [ ":" type ] "=" expression
+assignment           = expression "=" expression
 anonymous_struct     = "struct" [ ":" fields ]
 struct               = "struct" name [ ":" fields ]
 fields               = newline field { newline field }
@@ -60,7 +63,7 @@ field                = name ":" type [ "=" expression ]
 ### Words
 
 - **L6.** A word starts with a letter or `_` and continues with letters, digits and `_`.
-- **L7.** These words are keywords: `fn`, `external`, `const`, `struct`, `noop`, `return`, `true`, `false`.
+- **L7.** These words are keywords: `fn`, `external`, `const`, `var`, `struct`, `noop`, `return`, `true`, `false`, `undefined`.
 - **L8.** The built-in types (T1) are named `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `Bool`, `String` and `void`. The names that state a size in bits, and `void`, are lowercase. The others start with a capital letter. Type names are names, not keywords.
 - **L9.** A lone `_` is the discard symbol. It is not a name.
 - **L10.** Every other word is a name. Keywords and `_` cannot be used as names. The built-in type names and names that start with `mn_` are reserved (N14).
@@ -138,7 +141,7 @@ field                = name ":" type [ "=" expression ]
 - **S10.** `return` ends the function. Its value, if any, is on the same line.
 - **S11.** `_ = add(1, 2)` calls a function and discards its result, and `_ = value` discards a parameter or a local constant (N19). Anything other than a call or a name after `_ =`, such as `_ = 5` or `_ = make().x`, is rejected with `expected a call or a name`. A struct value, `_ = Point(x = 1)`, is rejected with `expected a call`.
 - **S12.** A call on its own, such as `log(1)`, is a statement. A name, a literal or a field access on its own is rejected with `expected a statement`.
-- **S13.** A constant (N10) is also a statement. Inside a function, it declares a local constant (N15).
+- **S13.** A constant (N10) is also a statement. Inside a function, it declares a local constant (N15). `var` declares a variable (N20), and `target = value` assigns to one (N21). A target that is not a name or a field access, such as `make() = 1`, is rejected with `expected a name or a field access before '='`, at the target.
 - **S14.** Each statement is on its own line, except for the single statement of an inline block.
 
 ### Expressions
@@ -172,7 +175,7 @@ field                = name ":" type [ "=" expression ]
 - **M2.** Every module's file name, without `.mn`, and every directory name in a module path must be a valid name (L6, L10). Paths can only spell valid names, so only the main file's name is checked (K2).
 - **M3.** Every path is a namespace. A namespace is a module when a file has its path (M1), and it contains the namespaces whose paths continue its path: `std::io` contains `std::io::stdout`. A namespace can be both: with `utils.mn` and `utils/math.mn`, `utils` is a module and contains `utils::math`. A path reaches namespaces directly: `std::io::stdout::write("hello\n")` calls `write` in the module `std::io::stdout`.
 - **M4.** A path that starts with `std` refers to the standard library, which comes with the compiler (K5). Every other path is a namespace of the program, relative to the directory of the main file, from every module.
-- **M5.** The first name of a path that continues with `::` is looked up first among the local constants (N15) and parameters of the enclosing function, which hide any namespace with their name. A local constant that names a namespace reaches it. Any other local constant, and any parameter, is rejected with `name has no members`. Otherwise the name is looked up only among namespaces: first the module's constants that name a namespace, then `std`, then the program's namespaces (M4).
+- **M5.** The first name of a path that continues with `::` is looked up first among the local constants (N15), variables (N20) and parameters of the enclosing function, which hide any namespace with their name. A local constant that names a namespace reaches it. Any other local constant, and any variable or parameter, is rejected with `name has no members`. Otherwise the name is looked up only among namespaces: first the module's constants that name a namespace, then `std`, then the program's namespaces (M4).
 - **M6.** The namespaces a namespace contains are reached through it: `std::io::stdout::write("hello\n")`. A namespace that is a module and contains namespaces reaches both its module's functions and its namespaces: `utils::add()` and `utils::math::add()`.
 - **M7.** Each module is loaded once, however often it is reached, and modules can reach each other. Loading starts with the main module, and a module is read when resolving a module that is already loaded reaches it. Nothing else is read.
 - **M8.** Every declaration of a module can be used by the other modules through a path, external functions and constants included.
@@ -185,7 +188,7 @@ field                = name ":" type [ "=" expression ]
 - **N1.** Function, constant and struct names are unique within a module, external functions included. A second declaration with the name of a function, constant or struct is rejected at its `fn`, `external`, `const` or `struct`: a function with `function is already defined`, a constant with `constant is already defined`, and a struct with `struct is already defined`.
 - **N2.** Parameter names are unique within a parameter list, and field names within a struct. A repeated name is rejected with `parameter is already defined` or `field is already defined`, at the second parameter or field.
 - **N3.** A function can call functions defined before or after it.
-- **N4.** A name is looked up first among the local constants declared before it in the enclosing function (N15), then among the parameters of the enclosing function, then among the module's functions, constants and structs, then among the built-in types (T1), then among `std` and the program's namespaces (M4). A name in a type (T11) is not looked up among the parameters, but it is looked up among the local constants.
+- **N4.** A name is looked up first among the local constants (N15) and variables (N20) declared before it in the enclosing function, then among the parameters of the enclosing function, then among the module's functions, constants and structs, then among the built-in types (T1), then among `std` and the program's namespaces (M4). A name in a type (T11) is not looked up among the parameters, but it is looked up among the local constants and variables.
 - **N5.** A name that matches none of them is rejected with `unknown name`.
 - **N6.** A call to a name that does not refer to a function or a type, such as a parameter, a namespace or a constant whose value is a literal, is rejected with `name is not a function`. A call to a type builds a value of it (S22).
 - **N7.** A function used as a value, named directly, through a path or through a constant, is rejected with `functions cannot be used as values`. A namespace used as a value is rejected with `unknown name`. A type can be used as a value (T11).
@@ -225,13 +228,26 @@ field                = name ":" type [ "=" expression ]
 
 ### Unused names
 
-- **N18.** Each parameter of a function with a body, and each local constant, must be used or discarded (N19). An unused parameter is rejected with `parameter is unused, discard it with _ =`, at the parameter. An unused local constant is rejected with `local constant is unused, discard it with _ =`, at its `const`. A local constant that a later one with the same name hides before any use is unused (N17). The parameters of external functions are not checked, because they have no body.
-- **N19.** `_ = name` discards a parameter or a local constant of the enclosing function, which marks it as unused on purpose. Errors, at the name after `_ =`:
+- **N18.** Each parameter of a function with a body, each local constant and each variable (N20) must be used or discarded (N19). An unused parameter is rejected with `parameter is unused, discard it with _ =`, at the parameter. An unused local constant is rejected with `local constant is unused, discard it with _ =`, at its `const`, and an unused variable with `variable is unused, discard it with _ =`, at its `var`. Only reading a variable uses it: a variable that is assigned (N21) but never read is unused. A local constant or variable that a later one with the same name hides before any use is unused (N17). The parameters of external functions are not checked, because they have no body.
+- **N19.** `_ = name` discards a parameter, a local constant or a variable of the enclosing function, which marks it as unused on purpose. Errors, at the name after `_ =`:
 
   | Situation | Error |
   |---|---|
-  | The name is not a parameter or a local constant | `only parameters and local constants can be discarded` |
+  | The name is not a parameter, a local constant or a variable | `only parameters, local constants and variables can be discarded` |
   | The name is also used, or discarded a second time | `discarded name is used` |
+
+### Variables
+
+- **N20.** `var name: Type = value` declares a variable: a local whose value can change (N21). The type is optional, as for a local constant. A variable follows the rules of local constants for where it can be used, for shadowing (N17) and for its value (N15), except that a variable is never an alias: a function or a namespace as its value is rejected as N7 describes. Errors, at the value unless stated otherwise:
+
+  | Situation | Error |
+  |---|---|
+  | The value has type `void` | `variable cannot have type void` |
+  | The value is a type | `variable cannot hold a type` |
+  | The variable is never assigned, at its `var` | `variable is never assigned, declare it with const` |
+
+- **N21.** `target = value` assigns a value to a variable, or to a field reached through a variable: `count = 2`, `point.x = 3`, `line.start.x = 1`. The value must have the type of the target (T10). A struct value is copied. Any other target, such as a local constant, a parameter, a top-level name or a field of a call (`make().x = 1`), is rejected with `only variables and their fields can be assigned`, at the target. Parameters can never be assigned. A name that matches nothing is rejected with `unknown name` (N5).
+- **N22.** `undefined` is a value whose contents are not set yet. It can only be the initial value of a variable with a written type: `var count: i32 = undefined`. Without a written type it is rejected with `value has no known type`, and anywhere else with `undefined can only be the initial value of a variable`, at `undefined`. The compiler does not check that a variable is assigned before it is read: reading an undefined value is the programmer's responsibility.
 
 ## Types
 
@@ -309,7 +325,7 @@ field                = name ":" type [ "=" expression ]
 ### Names in the output
 
 - **G1.** Names are written to the output exactly as they are in the source, except the generated names: C function names (C9) and C struct names (C10). A generated name is `mn_` followed by the module path with `::` replaced by `_`, so it cannot be a name written in the source (N14).
-- **G2.** A function, external function, parameter, local constant or field whose name, as written to the output, the target already defines is rejected with `name is already defined in the target`, at the function's `fn` or `external` keyword, at the local constant's `const`, or at the parameter or field. A local constant is checked with the name it gets in the output (C16). Top-level constants are not checked, because they produce no output (N11), and neither are structs, because their C names are generated (C10), or discarded parameters, because they have no name in the output (C6). A function's name is checked as it is written to the output: `fn int(): noop` becomes `mn_hello_int` (C9) and is accepted, but a parameter named `int` is rejected.
+- **G2.** A function, external function, parameter, local constant, variable or field whose name, as written to the output, the target already defines is rejected with `name is already defined in the target`, at the function's `fn` or `external` keyword, at the local constant's `const` or the variable's `var`, or at the parameter or field. Local constants and variables are checked with the name they get in the output (C16). Top-level constants are not checked, because they produce no output (N11), and neither are structs, because their C names are generated (C10), or discarded parameters, because they have no name in the output (C6). A function's name is checked as it is written to the output: `fn int(): noop` becomes `mn_hello_int` (C9) and is accepted, but a parameter named `int` is rejected.
 - **G3.** C defines the C23 keywords `_Alignas`, `_Alignof`, `_Atomic`, `_BitInt`, `_Bool`, `_Complex`, `_Decimal128`, `_Decimal32`, `_Decimal64`, `_Generic`, `_Imaginary`, `_Noreturn`, `_Static_assert`, `_Thread_local`, `alignas`, `alignof`, `auto`, `bool`, `break`, `case`, `char`, `const`, `constexpr`, `continue`, `default`, `do`, `double`, `else`, `enum`, `extern`, `false`, `float`, `for`, `goto`, `if`, `inline`, `int`, `long`, `nullptr`, `register`, `restrict`, `return`, `short`, `signed`, `sizeof`, `static`, `static_assert`, `struct`, `switch`, `thread_local`, `true`, `typedef`, `typeof`, `typeof_unqual`, `union`, `unsigned`, `void`, `volatile` and `while`, and `asm`, which compilers such as GCC treat as a keyword outside strict C23. It also defines the names that C23 declares in `<stddef.h>` and `<stdint.h>`, which the header includes, such as `size_t`, `int32_t`, `NULL` and `INT32_MAX`. `string` and `MONOLITH_H` are defined by `runtime/monolith.h` itself (C1).
 
 ### C
@@ -368,6 +384,8 @@ field                = name ":" type [ "=" expression ]
 - **C16.** A local constant that is not an alias (N15) becomes a C local constant, and each use writes its name: `const limit: i32 = 5` becomes `const int32_t limit = 5;`.
   - C cannot declare a name two times in one block, and in `const int32_t x = x;` the value already refers to the new `x`. So a local constant that has the name of a parameter or of an earlier local constant gets the next free number: in `fn show(value: i32)`, `const value = value` becomes `const int32_t value_2 = value;`. A number is skipped when a parameter or local constant of the function already has that name in the source.
   - A discarded local constant (N19), or one of a zero-sized type (C11), is not declared. Only the calls in its value run, as a statement: `const point = make_point()` followed by `_ = point` becomes `mn_hello_make_point();`.
+- **C17.** A variable becomes a C local without `const`: `var count = 1i32` becomes `int32_t count = 1;`, and `var count: i32 = undefined` becomes `int32_t count;`. Its name follows C16, and it shares the numbers with the local constants. A discarded variable, or one of a zero-sized type, is not declared, as in C16.
+- **C18.** An assignment is written as in Monolith: `count = 2` becomes `count = 2;`, and `point.x = 3` becomes `point.x = 3;`. When the variable is not declared (C17), or the target has a zero-sized type, only the calls in the value run, as a statement.
 
 ## Compiler
 

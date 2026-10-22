@@ -46,6 +46,8 @@ pub const StatementKind = union(enum) {
     discard: Expression,
     call: Expression,
     constant_declaration: ConstantDeclaration,
+    variable_declaration: VariableDeclaration,
+    assignment: Assignment,
 };
 
 pub const ConstantDeclaration = struct {
@@ -60,6 +62,17 @@ pub const StructDefinition = struct {
     body: Struct,
 };
 
+pub const VariableDeclaration = struct {
+    name: []const u8,
+    type: ?Expression = null,
+    value: Expression,
+};
+
+pub const Assignment = struct {
+    target: Expression,
+    value: Expression,
+};
+
 pub const Expression = struct {
     kind: ExpressionKind,
     type: ?types.Type = null,
@@ -71,6 +84,7 @@ pub const ExpressionKind = union(enum) {
     float_literal: token.NumberLiteral,
     boolean_literal: bool,
     string_literal: []const u8,
+    undefined,
     identifier: Identifier,
     path_expression: PathExpression,
     call: Call,
@@ -105,7 +119,7 @@ pub const Resolution = union(enum) {
     function: Resolution.Function,
     type: types.Type,
     constant: Resolution.Constant,
-    local: *const ConstantDeclaration,
+    local: *const Statement,
 
     pub const Function = struct {
         module: usize,

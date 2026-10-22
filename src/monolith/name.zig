@@ -6,11 +6,13 @@ pub const keywords = std.StaticStringMap(token.TokenKind).initComptime(.{
     .{ "fn", .keyword_fn },
     .{ "external", .keyword_external },
     .{ "const", .keyword_const },
+    .{ "var", .keyword_var },
     .{ "struct", .keyword_struct },
     .{ "noop", .keyword_noop },
     .{ "return", .keyword_return },
     .{ "true", .keyword_true },
     .{ "false", .keyword_false },
+    .{ "undefined", .keyword_undefined },
     .{ "_", .underscore },
 });
 
@@ -37,6 +39,8 @@ test "isName: accepts a name" {
 
 test "isName: rejects keywords and the discard symbol" {
     try std.testing.expect(!isName("const"));
+    try std.testing.expect(!isName("var"));
+    try std.testing.expect(!isName("undefined"));
     try std.testing.expect(!isName("_"));
 }
 
