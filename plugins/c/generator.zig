@@ -10,6 +10,7 @@ pub const Generator = struct {
     program: ast.Program,
     runtime_functions: std.ArrayList([]const u8) = .empty,
     names: []const []const ?[]const u8 = &.{},
+    local_names: []const LocalName = &.{},
     module_index: usize = 0,
     depth: usize = 0,
     in_main: bool = false,
@@ -70,7 +71,7 @@ pub const Generator = struct {
         allocator: std.mem.Allocator,
     ) GenerateError![]const File {
         self.names = try buildCNames(allocator, self.program);
-        try self.checkNames();
+        try self.checkNames(allocator);
         try self.checkStructCycles(allocator);
 
         var files: std.ArrayList(File) = .empty;
@@ -119,7 +120,17 @@ pub const Generator = struct {
         if (!has_main) return;
 
         var arguments: std.ArrayList([]const u8) = .empty;
-        const flags = &.{ "gcc", "-std=c23", "-Wall", "-Wextra", "-pedantic", "-O2", "-flto" };
+        const flags = &.{
+            "gcc",
+            "-std=c23",
+            "-Wall",
+            "-Wextra",
+            "-Wno-unused-parameter",
+            "-Wno-unused-variable",
+            "-pedantic",
+            "-O2",
+            "-flto",
+        };
         try arguments.appendSlice(allocator, flags);
         for (files) |file| {
             if (std.mem.endsWith(u8, file.path, ".c")) try arguments.append(allocator, file.path);
@@ -147,7 +158,10 @@ pub const Generator = struct {
         }
     }
 
-    fn checkNames(self: *Generator) error{NameDefinedInTarget}!void {
+    fn checkNames(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+    ) (std.mem.Allocator.Error || error{NameDefinedInTarget})!void {
         for (self.program.modules, 0..) |module, module_index| {
             self.module_index = module_index;
             for (module.declarations, 0..) |declaration, index| {
@@ -160,8 +174,13 @@ pub const Generator = struct {
                 try self.checkName(name, declaration.location);
                 const body = extractBody(declaration.kind);
                 for (signature.parameters, 0..) |parameter, parameter_index| {
-                    if (isDiscarded(body, parameter_index)) continue;
+                    if (isDiscarded(body, .{ .parameter = parameter_index })) continue;
                     try self.checkName(parameter.name, parameter.location);
+                }
+                if (declaration.kind != .function_definition) continue;
+                const function = declaration.kind.function_definition;
+                for (try buildLocalNames(allocator, function)) |local_name| {
+                    try self.checkName(local_name.name, local_name.location);
                 }
             }
         }
@@ -480,7 +499,7 @@ pub const Generator = struct {
                 .function_declaration, .constant_declaration, .struct_definition => continue,
             };
             try writer.writeByte('\n');
-            try self.generateFunction(writer, function, index);
+            try self.generateFunction(allocator, writer, function, index);
         }
     }
 
@@ -491,9 +510,10 @@ pub const Generator = struct {
         statement: ast.Statement,
     ) std.mem.Allocator.Error!void {
         const expression = switch (statement.kind) {
-            .noop, .constant_declaration => return,
+            .noop => return,
             .@"return" => |value| value orelse return,
             .discard, .call => |expression| expression,
+            .constant_declaration => |constant| constant.value,
         };
         try self.collectReachedModulesOf(allocator, reached, expression);
     }
@@ -571,10 +591,12 @@ pub const Generator = struct {
 
     fn generateFunction(
         self: *Generator,
+        allocator: std.mem.Allocator,
         writer: *std.Io.Writer,
         function: ast.FunctionDefinition,
         index: usize,
-    ) std.Io.Writer.Error!void {
+    ) (std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+        self.local_names = try buildLocalNames(allocator, function);
         self.in_main = self.isEntryPoint(.{ .function_definition = function });
         try self.generateSignature(writer, .{ .function_definition = function }, index);
         try writer.writeByte(' ');
@@ -613,7 +635,9 @@ pub const Generator = struct {
             if (isZeroSized(parameter_type)) continue;
             if (written) try writer.writeAll(", ");
             try self.generateType(writer, parameter_type);
-            if (!isDiscarded(body, index)) try writer.print(" {s}", .{parameter.name});
+            if (!isDiscarded(body, .{ .parameter = index })) {
+                try writer.print(" {s}", .{parameter.name});
+            }
             written = true;
         }
         try writer.writeByte(')');
@@ -624,14 +648,14 @@ pub const Generator = struct {
         writer: *std.Io.Writer,
         block: []const ast.Statement,
     ) std.Io.Writer.Error!void {
-        const empty = for (block) |statement| {
-            if (hasOutput(statement)) break false;
+        const empty = for (block) |*statement| {
+            if (self.hasOutput(statement)) break false;
         } else true;
         if (empty) return writer.writeAll("{}");
 
         try writer.writeAll("{\n");
         self.depth += 1;
-        for (block) |statement| try self.generateStatement(writer, statement);
+        for (block) |*statement| try self.generateStatement(writer, statement);
         self.depth -= 1;
         try self.generateIndentation(writer);
         try writer.writeByte('}');
@@ -640,11 +664,11 @@ pub const Generator = struct {
     fn generateStatement(
         self: *Generator,
         writer: *std.Io.Writer,
-        statement: ast.Statement,
+        statement: *const ast.Statement,
     ) std.Io.Writer.Error!void {
-        if (!hasOutput(statement)) return;
+        if (!self.hasOutput(statement)) return;
         switch (statement.kind) {
-            .noop, .constant_declaration => unreachable,
+            .noop => unreachable,
             .@"return" => |value| {
                 const returned = value orelse {
                     try self.generateIndentation(writer);
@@ -667,7 +691,19 @@ pub const Generator = struct {
             .discard, .call => |expression| {
                 try self.generateExpressionStatement(writer, expression);
             },
+            .constant_declaration => |*constant| try self.generateLocalConstant(writer, constant),
         }
+    }
+
+    fn hasOutput(self: *const Generator, statement: *const ast.Statement) bool {
+        return switch (statement.kind) {
+            .noop => false,
+            .constant_declaration => |*constant| {
+                return self.findLocalName(constant) != null or hasEffects(constant.value);
+            },
+            .discard => |expression| expression.kind != .identifier,
+            .@"return", .call => true,
+        };
     }
 
     fn generateExpressionStatement(
@@ -677,6 +713,23 @@ pub const Generator = struct {
     ) std.Io.Writer.Error!void {
         try self.generateIndentation(writer);
         try self.generateExpression(writer, expression);
+        try writer.writeAll(";\n");
+    }
+
+    fn generateLocalConstant(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        constant: *const ast.ConstantDeclaration,
+    ) std.Io.Writer.Error!void {
+        try self.generateIndentation(writer);
+        const name = self.findLocalName(constant) orelse {
+            try self.generateEffects(writer, constant.value);
+            return writer.writeAll(";\n");
+        };
+        try writer.writeAll("const ");
+        try self.generateType(writer, constant.value.type.?);
+        try writer.print(" {s} = ", .{name});
+        try self.generateExpression(writer, constant.value);
         try writer.writeAll(";\n");
     }
 
@@ -713,7 +766,7 @@ pub const Generator = struct {
                     const kind = module.declarations[constant.declaration].kind;
                     try self.generateExpression(writer, kind.constant_declaration.value);
                 },
-                .local => |constant| try self.generateExpression(writer, constant.value),
+                .local => |constant| try writer.writeAll(self.findLocalName(constant).?),
                 .function, .type => unreachable,
             },
             .path_expression => |path_expression| switch (path_expression.resolution.?) {
@@ -751,6 +804,12 @@ pub const Generator = struct {
         }
     }
 
+    fn findLocalName(self: *const Generator, constant: *const ast.ConstantDeclaration) ?[]const u8 {
+        for (self.local_names) |local_name| {
+            if (local_name.constant == constant) return local_name.name;
+        }
+        return null;
+    }
     fn generateFunctionCall(
         self: *Generator,
         writer: *std.Io.Writer,
@@ -894,6 +953,12 @@ const File = struct {
     contents: []const u8,
 };
 
+const LocalName = struct {
+    constant: *const ast.ConstantDeclaration,
+    name: []const u8,
+    location: token.Location,
+};
+
 fn buildCNames(
     allocator: std.mem.Allocator,
     program: ast.Program,
@@ -966,14 +1031,6 @@ fn hasEffects(expression: ast.Expression) bool {
     };
 }
 
-fn hasOutput(statement: ast.Statement) bool {
-    return switch (statement.kind) {
-        .noop, .constant_declaration => false,
-        .discard => |expression| expression.kind != .identifier,
-        .@"return", .call => true,
-    };
-}
-
 fn extractBody(kind: ast.DeclarationKind) []const ast.Statement {
     return switch (kind) {
         .function_definition => |function| function.body,
@@ -981,15 +1038,65 @@ fn extractBody(kind: ast.DeclarationKind) []const ast.Statement {
     };
 }
 
-fn isDiscarded(body: []const ast.Statement, index: usize) bool {
+fn buildLocalNames(
+    allocator: std.mem.Allocator,
+    function: ast.FunctionDefinition,
+) std.mem.Allocator.Error![]const LocalName {
+    const body = function.body;
+    var written: std.ArrayList([]const u8) = .empty;
+    var taken: std.ArrayList([]const u8) = .empty;
+    for (function.signature.parameters, 0..) |parameter, index| {
+        try written.append(allocator, parameter.name);
+        if (isDiscarded(body, .{ .parameter = index })) continue;
+        if (isZeroSized(ast.extractType(parameter.type))) continue;
+        try taken.append(allocator, parameter.name);
+    }
+    for (body) |statement| {
+        switch (statement.kind) {
+            .constant_declaration => |constant| try written.append(allocator, constant.name),
+            .noop, .@"return", .discard, .call => {},
+        }
+    }
+
+    var local_names: std.ArrayList(LocalName) = .empty;
+    for (body) |*statement| {
+        const constant = switch (statement.kind) {
+            .constant_declaration => |*constant| constant,
+            .noop, .@"return", .discard, .call => continue,
+        };
+        if (!isDeclared(body, constant)) continue;
+        var name = constant.name;
+        var number: usize = 1;
+        while (containsName(taken.items, name) or
+            (number > 1 and containsName(written.items, name)))
+        {
+            number += 1;
+            name = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ constant.name, number });
+        }
+        try taken.append(allocator, name);
+        try local_names.append(allocator, .{
+            .constant = constant,
+            .name = name,
+            .location = statement.location,
+        });
+    }
+    return local_names.items;
+}
+
+fn isDeclared(body: []const ast.Statement, constant: *const ast.ConstantDeclaration) bool {
+    if (ast.isAlias(constant.*)) return false;
+    if (isZeroSized(constant.value.type.?)) return false;
+    return !isDiscarded(body, .{ .local = constant });
+}
+
+fn isDiscarded(body: []const ast.Statement, resolution: ast.Resolution) bool {
     for (body) |statement| {
         const expression = switch (statement.kind) {
             .discard => |expression| expression,
             .noop, .@"return", .call, .constant_declaration => continue,
         };
         if (expression.kind != .identifier) continue;
-        const resolution = expression.kind.identifier.resolution.?;
-        if (resolution == .parameter and resolution.parameter == index) return true;
+        if (std.meta.eql(expression.kind.identifier.resolution.?, resolution)) return true;
     }
     return false;
 }
@@ -1549,6 +1656,36 @@ test "checkNames: accepts a discarded parameter named like the target" {
         "#include \"main.h\"\n\nvoid mn_main_add(int32_t) {}\n",
         files[1].contents,
     );
+}
+
+test "checkNames: rejects local constant names defined in the target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show() i32:\n    const int = 5i32\n    return int" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+
+    try std.testing.expectError(error.NameDefinedInTarget, generator.generateFiles(arena.allocator()));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, generator.failure.?.location.?);
 }
 
 test "checkName: rejects the string type name" {
@@ -2226,6 +2363,204 @@ test "generateStatement: calls a zero-sized value before returning" {
     );
 }
 
+test "hasOutput: writes nothing for discards" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn show(marker: Marker, value: i32):\n    const limit = 5i32\n    _ = limit\n    _ = marker\n    _ = value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nvoid mn_main_show(int32_t) {}\n",
+        files[1].contents,
+    );
+}
+
+test "generateLocalConstant: declares a local constant in C" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn main():\n    const limit: i32 = 5\n    take(limit)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nvoid mn_main_take(int32_t) {}\n\nint main() {\n    const int32_t limit = 5;\n    mn_main_take(limit);\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateLocalConstant: renames a constant that shadows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(value: i32) i32:\n    const value = value\n    const value = value\n    return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_show(int32_t value) {\n    const int32_t value_2 = value;\n    const int32_t value_3 = value_2;\n    return value_3;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateLocalConstant: skips names written in the function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(value: i32) i32:\n    const value = value\n    const value_2 = value\n    return value_2" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_show(int32_t value) {\n    const int32_t value_3 = value;\n    const int32_t value_2 = value_3;\n    return value_2;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateLocalConstant: writes only the calls of a discarded constant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() i32: return 1\nfn main():\n    const value = make()\n    _ = value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_make() {\n    return 1;\n}\n\nint main() {\n    mn_main_make();\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateLocalConstant: writes only the calls of a zero-sized constant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn make() Marker: return Marker()\nfn use(marker: Marker): _ = marker\nfn main():\n    const marker = make()\n    use(marker)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nvoid mn_main_make() {\n    return;\n}\n\nvoid mn_main_use() {}\n\nint main() {\n    mn_main_make();\n    mn_main_use();\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateExpression: converts separators and octal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2420,39 +2755,6 @@ test "generateExpression: writes the value of a constant at its use" {
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\nuint8_t mn_main_mask() {\n    return 0xffu;\n}\n",
-        files[1].contents,
-    );
-}
-
-test "generateExpression: writes the value of a local constant at its use" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    var compiler_directory = std.testing.tmpDir(.{});
-    defer compiler_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    const compiler_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
-    );
-    var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn main():\n    const limit: i32 = 5\n    take(limit)" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-    try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = @import("monolith").TypeChecker.init(program);
-    try type_checker.check();
-    var generator = Generator.init(program);
-    const files = try generator.generateFiles(arena.allocator());
-
-    try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nvoid mn_main_take(int32_t) {}\n\nint main() {\n    mn_main_take(5);\n}\n",
         files[1].contents,
     );
 }
@@ -2756,39 +3058,6 @@ test "isHoisted: leaves out zero-sized fields that call nothing" {
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\nvoid mn_main_use(int32_t) {}\n\nvoid mn_main_pass(mn_main_Holder holder) {\n    mn_main_use(1);\n}\n",
-        files[1].contents,
-    );
-}
-
-test "hasOutput: writes nothing for discards" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    var compiler_directory = std.testing.tmpDir(.{});
-    defer compiler_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    const compiler_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
-    );
-    var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn show(marker: Marker, value: i32):\n    const limit = 5i32\n    _ = limit\n    _ = marker\n    _ = value" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-    try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = @import("monolith").TypeChecker.init(program);
-    try type_checker.check();
-    var generator = Generator.init(program);
-    const files = try generator.generateFiles(arena.allocator());
-
-    try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nvoid mn_main_show(int32_t) {}\n",
         files[1].contents,
     );
 }

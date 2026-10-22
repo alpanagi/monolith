@@ -105,7 +105,7 @@ pub const Resolution = union(enum) {
     function: Resolution.Function,
     type: types.Type,
     constant: Resolution.Constant,
-    local: *ConstantDeclaration,
+    local: *const ConstantDeclaration,
 
     pub const Function = struct {
         module: usize,
@@ -165,8 +165,10 @@ pub fn extractFunctionSignature(declaration: Declaration) FunctionSignature {
 }
 
 pub fn isAlias(constant: ConstantDeclaration) bool {
-    if (constant.type != null) return false;
-    return constant.value.kind == .identifier or constant.value.kind == .path_expression;
+    return switch (constant.value.kind) {
+        inline .identifier, .path_expression => |name| name.resolution == null,
+        else => false,
+    };
 }
 
 pub fn findArgument(arguments: []const Argument, name: []const u8) ?usize {

@@ -121,7 +121,10 @@ pub const TypeChecker = struct {
                 }
             },
             .constant_declaration => |*constant| {
-                if (!ast.isAlias(constant.*)) _ = try self.checkConstantValue(constant);
+                if (ast.isAlias(constant.*)) return;
+                if (try self.checkConstantValue(parameters, constant) == .void) {
+                    return self.fail(constant.value.location, error.VoidConstant);
+                }
             },
         }
     }
@@ -283,7 +286,7 @@ pub const TypeChecker = struct {
             .parameter => |index| ast.extractType(parameters[index].type),
             .type => .type,
             .constant => |constant| self.checkConstant(constant),
-            .local => |constant| self.checkConstantValue(constant),
+            .local => |constant| constant.value.type.?,
             .function => unreachable,
         };
     }
@@ -294,18 +297,19 @@ pub const TypeChecker = struct {
         const caller_module_index = self.module_index;
         self.module_index = constant.module;
         defer self.module_index = caller_module_index;
-        return self.checkConstantValue(declaration);
+        return self.checkConstantValue(&.{}, declaration);
     }
 
     fn checkConstantValue(
         self: *TypeChecker,
+        parameters: []const ast.TypedName,
         constant: *ast.ConstantDeclaration,
     ) TypeError!types.Type {
         const value = &constant.value;
         if (value.type) |value_type| return value_type;
-        const written = constant.type orelse return self.inferType(&.{}, value);
+        const written = constant.type orelse return self.inferType(parameters, value);
         const written_type = ast.extractType(written);
-        try self.checkExpression(&.{}, value, written_type);
+        try self.checkExpression(parameters, value, written_type);
         return written_type;
     }
 
@@ -408,6 +412,7 @@ pub const TypeError = error{
     ArgumentCountMismatch,
     UnusedResult,
     DiscardedVoid,
+    VoidConstant,
     UnknownSuffix,
     UnknownValueType,
     NoFields,
@@ -434,6 +439,7 @@ fn describeError(type_error: TypeError) []const u8 {
         error.ArgumentCountMismatch => "wrong number of arguments",
         error.UnusedResult => "call result is unused, discard it with _ =",
         error.DiscardedVoid => "call returns no value to discard",
+        error.VoidConstant => "constant cannot have type void",
         error.UnknownSuffix => "unknown suffix",
         error.UnknownValueType => "value has no known type",
         error.NoFields => "value has no fields",
@@ -868,6 +874,50 @@ test "checkStatement: checks the value of a local constant at its statement" {
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 24 }, type_checker.failure.?.location.?);
+}
+
+test "checkStatement: rejects a local constant of type void" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn log(): noop\nfn main():\n    const nothing = log()\n    _ = nothing" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.VoidConstant, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 21 }, type_checker.failure.?.location.?);
+}
+
+test "checkStatement: checks a local constant with the parameters of its function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(value: i32) i32:\n    const copy: i32 = value\n    return copy" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+
+    try type_checker.check();
+
+    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(types.Type{ .number = .i32 }, body[0].kind.constant_declaration.value.type);
 }
 
 test "checkExpression: rejects a boolean for an integer type" {

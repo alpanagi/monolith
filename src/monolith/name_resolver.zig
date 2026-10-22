@@ -190,10 +190,38 @@ pub const NameResolver = struct {
         if (isReservedName(module.path, constant.name)) {
             return self.fail(location, error.ReservedName);
         }
-        if (constant.value.kind == .@"struct") {
-            return self.fail(constant.value.location, error.StructInFunction);
+        const value = &constant.value;
+        if (value.kind == .@"struct") return self.fail(value.location, error.StructInFunction);
+        if (constant.type) |*written| {
+            try self.resolveNamesInExpression(.{ .locals = scope.locals }, written);
+            _ = try self.expectType(written.*);
+        } else if (try self.findAlias(scope, value.*)) |target| {
+            return target;
         }
-        return self.resolveConstantValue(scope, location, constant, .{ .local = constant });
+        try self.resolveNamesInExpression(scope, value);
+        return .{ .local = constant };
+    }
+
+    fn findAlias(self: *NameResolver, scope: Scope, value: ast.Expression) ResolveError!?Target {
+        const target: Target = switch (value.kind) {
+            .identifier => |identifier| target: {
+                if (findLocal(scope.locals, identifier.name)) |local| {
+                    local.use.used = true;
+                    break :target local.target;
+                }
+                if (findTypedName(scope.parameters, identifier.name) != null) return null;
+                break :target try self.resolveName(value.location, identifier.name);
+            },
+            .path_expression => |path_expression| target: {
+                const path = path_expression.path;
+                break :target try self.resolvePath(scope, value.location, path);
+            },
+            else => return null,
+        };
+        return switch (target) {
+            .function, .type, .namespace => target,
+            .constant, .local => null,
+        };
     }
 
     fn resolveDiscardedName(
@@ -457,36 +485,24 @@ pub const NameResolver = struct {
         if (self.constant_depth > countConstants(self.loader.modules.items)) {
             return self.fail(declaration.location, error.ConstantRefersToItself);
         }
-        const own: Target = .{ .constant = .{ .module = module_index, .declaration = index } };
-        return self.resolveConstantValue(.{}, declaration.location, constant, own);
-    }
-
-    fn resolveConstantValue(
-        self: *NameResolver,
-        scope: Scope,
-        location: token.Location,
-        constant: *ast.ConstantDeclaration,
-        own: Target,
-    ) ResolveError!Target {
         const value = &constant.value;
+        const own: Target = .{ .constant = .{ .module = module_index, .declaration = index } };
         if (constant.type) |*written| {
-            try self.resolveNamesInExpression(.{ .locals = scope.locals }, written);
+            try self.resolveNamesInExpression(.{}, written);
             _ = try self.expectType(written.*);
-            try self.resolveNamesInExpression(scope, value);
+            try self.resolveNamesInExpression(.{}, value);
             try self.expectEvaluable(value.*);
             return own;
         }
         return switch (value.kind) {
-            .identifier => |identifier| {
-                return self.resolveConstantName(scope, location, value.location, identifier.name);
-            },
+            .identifier => |identifier| self.resolveName(declaration.location, identifier.name),
             .path_expression => |path_expression| {
-                return self.resolvePath(scope, location, path_expression.path);
+                return self.resolvePath(.{}, declaration.location, path_expression.path);
             },
             .integer_literal, .float_literal, .boolean_literal, .string_literal => own,
             .call => {
                 if (!constant.resolved) {
-                    try self.resolveNamesInExpression(scope, value);
+                    try self.resolveNamesInExpression(.{}, value);
                     try self.expectEvaluable(value.*);
                     constant.resolved = true;
                 }
@@ -497,31 +513,15 @@ pub const NameResolver = struct {
         };
     }
 
-    fn resolveConstantName(
-        self: *NameResolver,
-        scope: Scope,
-        location: token.Location,
-        name_location: token.Location,
-        name: []const u8,
-    ) ResolveError!Target {
-        if (findLocal(scope.locals, name)) |local| {
-            local.use.used = true;
-            return local.target;
-        }
-        if (findTypedName(scope.parameters, name) != null) {
-            return self.fail(name_location, error.CannotEvaluate);
-        }
-        return self.resolveName(location, name);
-    }
-
     fn expectEvaluable(self: *NameResolver, expression: ast.Expression) NameError!void {
         switch (expression.kind) {
-            .integer_literal, .float_literal, .boolean_literal, .string_literal => {},
-            inline .identifier, .path_expression => |name| {
-                if (name.resolution.? == .parameter) {
-                    return self.fail(expression.location, error.CannotEvaluate);
-                }
-            },
+            .integer_literal,
+            .float_literal,
+            .boolean_literal,
+            .string_literal,
+            .identifier,
+            .path_expression,
+            => {},
             .call => |call| {
                 if (ast.extractResolution(call.callee) != .type) {
                     return self.fail(expression.location, error.CannotEvaluate);
@@ -663,7 +663,7 @@ const Scope = struct {
 const Local = struct {
     name: []const u8,
     target: Target,
-    constant: *ast.ConstantDeclaration,
+    constant: *const ast.ConstantDeclaration,
     location: token.Location,
     use: Use = .{},
 };
@@ -678,7 +678,7 @@ const Target = union(enum) {
     namespace: Namespace,
     type: types.Type,
     constant: ast.Resolution.Constant,
-    local: *ast.ConstantDeclaration,
+    local: *const ast.ConstantDeclaration,
 };
 
 fn describeError(name_error: NameError) []const u8 {
@@ -1351,6 +1351,87 @@ test "resolveLocalConstant: rejects an anonymous struct" {
 
     try std.testing.expectError(error.StructInFunction, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 19 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveLocalConstant: accepts a parameter as the value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(value: i32) i32:\n    const copy = value\n    return copy" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(0, body[0].kind.constant_declaration.value.kind.identifier.resolution.?.parameter);
+    try std.testing.expectEqual(&body[0].kind.constant_declaration, body[1].kind.@"return".?.kind.identifier.resolution.?.local);
+}
+
+test "resolveLocalConstant: accepts a construction from parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn show(value: i32) Point:\n    const point = Point(x = value)\n    return point" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
+    try std.testing.expectEqual(&body[0].kind.constant_declaration, body[1].kind.@"return".?.kind.identifier.resolution.?.local);
+}
+
+test "findAlias: keeps a function name as an alias" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32) i32: return value\nfn main():\n    const run = take\n    _ = run(1)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
+    try std.testing.expectEqual(0, body[1].kind.discard.kind.call.callee.identifier.resolution.?.function.declaration);
+}
+
+test "findAlias: holds the value of a constant that names a value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const limit = 5i32\nfn show() i32:\n    const copy = limit\n    return copy" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
+    try std.testing.expectEqual(&body[0].kind.constant_declaration, body[1].kind.@"return".?.kind.identifier.resolution.?.local);
 }
 
 test "resolveDiscardedName: discards a parameter" {
@@ -2336,7 +2417,7 @@ test "resolveConstant: rejects a struct that contains itself" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, name_resolver.failure.?.location.?);
 }
 
-test "resolveConstantValue: rejects a written type that is not a type" {
+test "resolveConstant: rejects a written type that is not a type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -2355,7 +2436,7 @@ test "resolveConstantValue: rejects a written type that is not a type" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, name_resolver.failure.?.location.?);
 }
 
-test "resolveConstantValue: rejects a function as a value with a written type" {
+test "resolveConstant: rejects a function as a value with a written type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -2371,25 +2452,6 @@ test "resolveConstantValue: rejects a function as a value with a written type" {
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.FunctionUsedAsValue, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, name_resolver.failure.?.location.?);
-}
-
-test "resolveConstantName: rejects a parameter as the value" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(value: i32):\n    const copy = value" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, name_resolver.failure.?.location.?);
 }
 
@@ -2429,25 +2491,6 @@ test "expectEvaluable: rejects a field access inside a construction" {
 
     try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 26 }, name_resolver.failure.?.location.?);
-}
-
-test "expectEvaluable: rejects a parameter inside a construction" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn show(value: i32):\n    const point = Point(x = value)" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 4, .column = 29 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveStruct: resolves a struct used as a type" {
