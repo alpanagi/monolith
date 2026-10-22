@@ -479,9 +479,28 @@ pub const Parser = struct {
         allocator: std.mem.Allocator,
         offset: *usize,
     ) ParseError!?ast.Expression {
+        if (try self.parseStructLiteral(allocator, offset)) |literal| return literal;
         if (try self.parseCall(allocator, offset)) |call| return call;
         if (try self.parseNameExpression(allocator, offset)) |name| return name;
         return self.parseLiteral(offset);
+    }
+
+    fn parseStructLiteral(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.Expression {
+        var position = offset.*;
+        const dot = self.match(&position, .dot) orelse return null;
+        _ = try self.expect(&position, .left_parenthesis, error.ExpectedLeftParenthesis);
+        const arguments = try self.parseArguments(allocator, &position);
+        _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
+
+        offset.* = position;
+        return .{
+            .kind = .{ .struct_literal = .{ .arguments = arguments } },
+            .location = dot.location,
+        };
     }
 
     fn parseCall(
@@ -1496,6 +1515,31 @@ test "parseExpression: parses a field access on a call" {
     const access = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call.arguments[0].value.kind.field_access;
     try std.testing.expectEqualStrings("x", access.field);
     try std.testing.expectEqualStrings("make", access.value.kind.call.callee.identifier.name);
+}
+
+test "parseStructLiteral: parses the fields of a struct literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn make() Point: return .(x = 1, y = 2)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const value = module.declarations[0].kind.function_definition.body[0].kind.@"return".?;
+    try std.testing.expectEqual(2, value.kind.struct_literal.arguments.len);
+    try std.testing.expectEqualStrings("y", value.kind.struct_literal.arguments[1].name.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, value.location);
+}
+
+test "parseStructLiteral: rejects a dot without a parenthesis" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn make() Point: return .x");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedLeftParenthesis, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, parser.failure.?.location.?);
 }
 
 test "parseCall: parses nested calls" {

@@ -344,6 +344,11 @@ pub const NameResolver = struct {
                     try self.resolveNamesInExpression(scope, &argument.value);
                 }
             },
+            .struct_literal => |literal| {
+                for (literal.arguments) |*argument| {
+                    try self.resolveNamesInExpression(scope, &argument.value);
+                }
+            },
             .field_access => |access| try self.resolveNamesInExpression(scope, access.value),
             .@"struct" => unreachable,
         }
@@ -562,7 +567,7 @@ pub const NameResolver = struct {
                 return self.resolvePath(.{}, declaration.location, path_expression.path);
             },
             .integer_literal, .float_literal, .boolean_literal, .string_literal, .undefined => own,
-            .call => {
+            .call, .struct_literal => {
                 if (!constant.resolved) {
                     try self.resolveNamesInExpression(.{}, value);
                     try self.expectEvaluable(value.*);
@@ -590,6 +595,9 @@ pub const NameResolver = struct {
                     return self.fail(expression.location, error.CannotEvaluate);
                 }
                 for (call.arguments) |argument| try self.expectEvaluable(argument.value);
+            },
+            .struct_literal => |literal| {
+                for (literal.arguments) |argument| try self.expectEvaluable(argument.value);
             },
             .field_access => return self.fail(expression.location, error.CannotEvaluate),
             .@"struct" => unreachable,

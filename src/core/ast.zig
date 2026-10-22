@@ -88,6 +88,7 @@ pub const ExpressionKind = union(enum) {
     identifier: Identifier,
     path_expression: PathExpression,
     call: Call,
+    struct_literal: StructLiteral,
     field_access: FieldAccess,
     @"struct": Struct,
 };
@@ -130,6 +131,10 @@ pub const Resolution = union(enum) {
         module: usize,
         declaration: usize,
     };
+};
+
+pub const StructLiteral = struct {
+    arguments: []Argument,
 };
 
 pub const Argument = struct {

@@ -37,7 +37,9 @@ statement            = "noop" | "return" [ expression ] | "_" "=" ( call | name 
                      | variable | assignment
 expression           = operand { "." name }
 operand              = integer | float | string | "true" | "false" | "undefined" | path | call
+                     | struct_literal
 call                 = path "(" [ arguments ] ")"
+struct_literal       = "." "(" [ arguments ] ")"
 arguments            = argument { "," argument } [ "," ]
 argument             = [ name "=" ] expression
 path                 = name { "::" name }
@@ -166,7 +168,7 @@ field                = name ":" type [ "=" expression ]
 - **S19.** A struct without fields is declared without the `:`: `struct Marker`.
 - **S20.** A struct without a name is an anonymous struct: `struct:` followed by the block of fields, or `struct` without fields. An anonymous struct can only be the value of a top-level constant, which gives it the constant's name: `const Point = struct:` declares the same struct as `struct Point:`. Inside a function, it is rejected with `structs cannot be defined inside functions`, at `struct`.
 - **S21.** A field of a struct value is read with `.` and the field's name, after any expression: `point.x`, `line.start.x`, `make().x`. A `.` that is not followed by a name is rejected with `expected an identifier`.
-- **S22.** A struct value is built by calling its struct with one argument for each field, written as the field's name, `=` and the value: `Point(x = 0, y = 0)`. The fields can be given in any order, and a field with a default value (S23) can be left out. A struct without fields is built with `Marker()`. The value of a named argument is required: `Point(x = )` is rejected with `expected an expression`.
+- **S22.** A struct value is built by calling its struct with one argument for each field, written as the field's name, `=` and the value: `Point(x = 0, y = 0)`. The fields can be given in any order, and a field with a default value (S23) can be left out. A struct without fields is built with `Marker()`. The value of a named argument is required: `Point(x = )` is rejected with `expected an expression`. A struct literal builds a struct value without naming its struct, which comes from where the value is used (T17): `.(x = 0, y = 0)`. A `.` that is not followed by `(` is rejected with `expected '('`.
 - **S23.** A field or a parameter can have a default value, written after its type: `x: i32 = 0`, `fn draw(width: i32 = 1)`. A `=` without a value is rejected with `expected an expression`.
 
 ## Modules
@@ -302,6 +304,7 @@ field                = name ":" type [ "=" expression ]
   | A field without a default value is not given | `missing field` | the call |
 
 - **T16.** A default value (S23) must have the type of its field or parameter (T10), and it must be known at compile time, like a constant's value (N10). A call to a function or a field access in it is rejected with `cannot be evaluated at compile time`. The default values of a struct are checked only when the struct is used (N12), and their errors are reported in the module of the struct.
+- **T17.** A struct literal (S22) takes the type its context expects, as a number literal without a suffix does (T5): the parameter's type for an argument, the field's type for a field's value or default, the function's return type for a returned value, the written type of a constant or variable, or the target's type in an assignment. It follows the rules of a struct value of that type (T15). A struct literal never creates a type. Without an expected type, as in `const point = .(x = 1)`, it is rejected with `value has no known type`, and an expected type that is not a struct is rejected with `type is not a struct`, at the literal.
 
 ## Functions
 
@@ -379,7 +382,7 @@ field                = name ":" type [ "=" expression ]
 - **C11.** A zero-sized type is a struct whose fields all have zero-sized types, such as a struct without fields. It has no definition in C. Fields, parameters and arguments of a zero-sized type are left out, and a function that returns one returns `void`. The calls in a zero-sized argument run before the call that receives it: `use(make(marker), 1)` becomes `(mn_hello_make(), mn_hello_use(1))`, and `use(holder().marker, 1)` becomes `(mn_hello_holder(), mn_hello_use(1))`. The calls in a returned zero-sized value run before the `return;`. A zero-sized value without calls, such as `holder.marker`, writes nothing.
 - **C12.** Modules whose structs contain each other's structs, directly or through other modules, are rejected with `modules contain each other's structs`, at the field.
 - **C13.** A field access is written as in Monolith: `line.start.x` stays `line.start.x`, and `make().x` becomes `mn_hello_make().x`.
-- **C14.** A struct value becomes a compound literal that names each field, in the order written: `Point(y = 2, x = 1)` becomes `(mn_hello_Point){ .y = 2, .x = 1 }`. Fields of a zero-sized type are left out (C11). Fields left out with a default value are written with that value, after the given fields, in the order they are defined: `Point(y = 1)` becomes `(mn_hello_Point){ .y = 1, .x = 0 }`. A constant that holds a struct value writes it at each use (N11).
+- **C14.** A struct value becomes a compound literal that names each field, in the order written: `Point(y = 2, x = 1)` becomes `(mn_hello_Point){ .y = 2, .x = 1 }`. Fields of a zero-sized type are left out (C11). Fields left out with a default value are written with that value, after the given fields, in the order they are defined: `Point(y = 1)` becomes `(mn_hello_Point){ .y = 1, .x = 0 }`. A struct literal is written the same way, with the struct it takes (T17): `.(y = 1)` where a `Point` is expected becomes `(mn_hello_Point){ .y = 1, .x = 0 }`. A constant that holds a struct value writes it at each use (N11).
 - **C15.** A call writes the default value of each parameter it leaves out: `draw(2)` becomes `mn_hello_draw(2, 1)`.
 - **C16.** A local constant that is not an alias (N15) becomes a C local constant, and each use writes its name: `const limit: i32 = 5` becomes `const int32_t limit = 5;`.
   - C cannot declare a name two times in one block, and in `const int32_t x = x;` the value already refers to the new `x`. So a local constant that has the name of a parameter or of an earlier local constant gets the next free number: in `fn show(value: i32)`, `const value = value` becomes `const int32_t value_2 = value;`. A number is skipped when a parameter or local constant of the function already has that name in the source.
