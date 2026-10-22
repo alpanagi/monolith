@@ -1,3 +1,4 @@
+const std = @import("std");
 const token = @import("token.zig");
 const types = @import("types.zig");
 
@@ -128,6 +129,7 @@ pub const Struct = struct {
 pub const TypedName = struct {
     name: []const u8,
     type: Expression,
+    default: ?Expression = null,
     location: token.Location,
 };
 
@@ -142,4 +144,20 @@ pub fn extractResolution(name: Name) Resolution {
     return switch (name) {
         inline else => |named| named.resolution.?,
     };
+}
+
+pub fn extractFunctionSignature(declaration: Declaration) FunctionSignature {
+    return switch (declaration.kind) {
+        .function_definition => |function| function.signature,
+        .function_declaration => |function_declaration| function_declaration,
+        .constant_declaration => unreachable,
+    };
+}
+
+pub fn findArgument(arguments: []const Argument, name: []const u8) ?usize {
+    for (arguments, 0..) |argument, index| {
+        const argument_name = argument.name orelse continue;
+        if (std.mem.eql(u8, argument_name, name)) return index;
+    }
+    return null;
 }

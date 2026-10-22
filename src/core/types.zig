@@ -1,4 +1,5 @@
 const std = @import("std");
+const ast = @import("ast.zig");
 const token = @import("token.zig");
 
 pub const Type = union(enum) {
@@ -32,6 +33,7 @@ pub const Struct = struct {
 pub const Field = struct {
     name: []const u8,
     type: Type,
+    default: ?*ast.Expression = null,
     location: token.Location,
 };
 

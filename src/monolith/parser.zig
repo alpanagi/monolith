@@ -323,9 +323,20 @@ pub const Parser = struct {
         const name_type = (try self.parseExpression(allocator, &position)) orelse {
             return self.fail(position, error.ExpectedType);
         };
+        var default: ?ast.Expression = null;
+        if (self.match(&position, .equals) != null) {
+            default = (try self.parseExpression(allocator, &position)) orelse {
+                return self.fail(position, error.ExpectedExpression);
+            };
+        }
 
         offset.* = position;
-        return .{ .name = name.kind.identifier, .type = name_type, .location = name.location };
+        return .{
+            .name = name.kind.identifier,
+            .type = name_type,
+            .default = default,
+            .location = name.location,
+        };
     }
 
     fn expectBlock(self: *Parser, offset: usize) ParseError!usize {
@@ -1095,6 +1106,31 @@ test "parseTypedName: rejects a missing type" {
 
     try std.testing.expectError(error.ExpectedType, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, parser.failure.?.location.?);
+}
+
+test "parseTypedName: parses a default value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("const Point = struct:\n    x: i32 = 0\nfn draw(width: i32 = 1): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const field = module.declarations[0].kind.constant_declaration.value.kind.@"struct".fields[0];
+    try std.testing.expectEqualStrings("0", field.default.?.kind.integer_literal.text);
+    const parameter = module.declarations[1].kind.function_definition.signature.parameters[0];
+    try std.testing.expectEqualStrings("1", parameter.default.?.kind.integer_literal.text);
+}
+
+test "parseTypedName: rejects an equals sign without a value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn draw(width: i32 = ): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 22 }, parser.failure.?.location.?);
 }
 
 test "expectBlock: rejects empty block" {

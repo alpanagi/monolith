@@ -74,6 +74,13 @@ pub const NameResolver = struct {
             error.DuplicateParameter,
             error.VoidParameter,
         );
+        var defaulted = false;
+        for (signature.parameters) |parameter| {
+            if (parameter.default != null) defaulted = true;
+            if (defaulted and parameter.default == null) {
+                return self.fail(parameter.location, error.DefaultsNotLast);
+            }
+        }
         try self.resolveNamesInExpression(&.{}, &signature.return_type);
         _ = try self.expectType(signature.return_type);
     }
@@ -97,6 +104,10 @@ pub const NameResolver = struct {
             try self.resolveNamesInExpression(&.{}, &typed_name.type);
             if (try self.expectType(typed_name.type) == .void) {
                 return self.fail(typed_name.type.location, void_error);
+            }
+            if (typed_name.default) |*default| {
+                try self.resolveNamesInExpression(&.{}, default);
+                try self.expectEvaluable(default.*);
             }
         }
     }
@@ -407,10 +418,11 @@ pub const NameResolver = struct {
     ) ResolveError![]const types.Field {
         try self.resolveTypedNames(fields, error.DuplicateField, error.VoidField);
         const resolved = try self.arena.allocator().alloc(types.Field, fields.len);
-        for (fields, resolved) |field, *resolved_field| {
+        for (fields, resolved) |*field, *resolved_field| {
             resolved_field.* = .{
                 .name = field.name,
                 .type = ast.extractType(field.type),
+                .default = if (field.default) |*default| default else null,
                 .location = field.location,
             };
         }
@@ -483,6 +495,7 @@ pub const NameError = error{
     TypeMismatch,
     VoidParameter,
     VoidField,
+    DefaultsNotLast,
 };
 
 const Target = union(enum) {
@@ -509,6 +522,7 @@ fn describeError(name_error: NameError) []const u8 {
         error.TypeMismatch => "value does not match the expected type",
         error.VoidParameter => "parameter cannot have type void",
         error.VoidField => "field cannot have type void",
+        error.DefaultsNotLast => "parameters with default values must come last",
     };
 }
 
@@ -794,6 +808,25 @@ test "resolveFunctionTypes: rejects a return type that is not a type" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 10 }, name_resolver.failure.?.location.?);
 }
 
+test "resolveFunctionTypes: rejects a parameter without a default after one with a default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn draw(width: i32 = 1, height: i32): noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.DefaultsNotLast, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, name_resolver.failure.?.location.?);
+}
+
 test "resolveTypedNames: rejects a duplicate parameter" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -899,6 +932,25 @@ test "resolveTypedNames: rejects a void parameter" {
 
     try std.testing.expectError(error.VoidParameter, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 15 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveTypedNames: rejects a default that cannot be evaluated at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn zero() i32: return 0\nfn draw(width: i32 = zero()): noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 22 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveNamesInExpression: rejects an unknown argument" {
@@ -1956,6 +2008,26 @@ test "resolveFields: rejects a type name as a field name" {
 
     try std.testing.expectError(error.ReservedName, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveFields: resolves the defaults of fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const width = 5i32\nconst Box = struct:\n    size: i32 = width\nfn show(box: Box): noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const default = type_registry.entries.items[0].@"struct".fields[0].default.?;
+    try std.testing.expectEqual(ast.Resolution{ .constant = .{ .module = 0, .declaration = 0 } }, default.kind.identifier.resolution.?);
 }
 
 test "loadRoot: reports the reserved name monolith at the path" {

@@ -513,8 +513,21 @@ pub const Generator = struct {
             else => return,
         };
         switch (ast.extractResolution(call.callee)) {
-            .function => |function| try self.collectCalledFunction(allocator, reached, function),
-            .type => {},
+            .function => |function| {
+                try self.collectCalledFunction(allocator, reached, function);
+                const declarations = self.program.modules[function.module].declarations;
+                const signature = ast.extractFunctionSignature(declarations[function.declaration]);
+                for (signature.parameters[call.arguments.len..]) |parameter| {
+                    try self.collectReachedModulesOf(allocator, reached, parameter.default.?);
+                }
+            },
+            .type => |value_type| {
+                for (value_type.@"struct".fields) |field| {
+                    const default = field.default orelse continue;
+                    if (ast.findArgument(call.arguments, field.name) != null) continue;
+                    try self.collectReachedModulesOf(allocator, reached, default.*);
+                }
+            },
             .parameter, .constant => unreachable,
         }
         for (call.arguments) |argument| {
@@ -749,6 +762,15 @@ pub const Generator = struct {
             try self.generateExpression(writer, argument.value);
             written = true;
         }
+        const declarations = self.program.modules[function.module].declarations;
+        const signature = ast.extractFunctionSignature(declarations[function.declaration]);
+        for (signature.parameters[call.arguments.len..]) |parameter| {
+            const default = parameter.default.?;
+            if (isZeroSized(default.type.?)) continue;
+            if (written) try writer.writeAll(", ");
+            try self.generateExpression(writer, default);
+            written = true;
+        }
         try writer.writeByte(')');
     }
 
@@ -767,6 +789,15 @@ pub const Generator = struct {
             if (written) try writer.writeAll(", ");
             try writer.print(".{s} = ", .{argument.name.?});
             try self.generateExpression(writer, argument.value);
+            written = true;
+        }
+        for (value_type.@"struct".fields) |field| {
+            const default = field.default orelse continue;
+            if (ast.findArgument(call.arguments, field.name) != null) continue;
+            if (isZeroSized(field.type)) continue;
+            if (written) try writer.writeAll(", ");
+            try writer.print(".{s} = ", .{field.name});
+            try self.generateExpression(writer, default.*);
             written = true;
         }
         try writer.writeAll(" }");
@@ -1780,6 +1811,35 @@ test "collectReachedModulesOf: records the runtime functions that a field access
     try std.testing.expectEqualStrings("mn_runtime_clock_now", generator.runtime_functions.items[0]);
 }
 
+test "collectReachedModulesOf: includes the headers of the structs that defaults build" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "geometry.mn", .data = "const Size = struct:\n    width: i32" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "fn draw(size: geometry::Size = geometry::Size(width = 1)): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): shapes::draw()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n#include \"shapes.h\"\n#include \"geometry.h\"\n\nint main() {\n    mn_shapes_draw((mn_geometry_Size){ .width = 1 });\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateFunction: generates main as the entry point" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2314,6 +2374,33 @@ test "generateExpression: writes a constructed constant at each use" {
     );
 }
 
+test "generateFunctionCall: writes the defaults of left out parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn draw(width: i32, height: i32 = 1, label: String = \"box\"): noop\nfn main():\n    draw(2)\n    draw(2, 5)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nvoid mn_main_draw(int32_t width, int32_t height, string label) {}\n\nint main() {\n    mn_main_draw(2, 1, (string){ \"box\", 3 });\n    mn_main_draw(2, 5, (string){ \"box\", 3 });\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateConstruction: writes a compound literal for each struct" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2364,6 +2451,33 @@ test "generateConstruction: leaves out zero-sized fields" {
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\nmn_main_Holder mn_main_make() {\n    return (mn_main_Holder){ .value = 1 };\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateConstruction: writes the defaults of left out fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Point = struct:\n    x: i32 = 0\n    y: i32 = 7\nfn make() Point: return Point(y = 1)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nmn_main_Point mn_main_make() {\n    return (mn_main_Point){ .y = 1, .x = 0 };\n}\n",
         files[1].contents,
     );
 }

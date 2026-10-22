@@ -29,7 +29,7 @@ function             = function_declaration ":" block
 external_function    = "external" function_declaration
 function_declaration = "fn" name "(" [ parameters ] ")" [ type ]
 parameters           = parameter { "," parameter } [ "," ]
-parameter            = name ":" type
+parameter            = name ":" type [ "=" expression ]
 type                 = expression
 block                = statement | indented_block
 indented_block       = newline statement { newline statement }
@@ -43,7 +43,7 @@ path                 = name { "::" name }
 constant             = "const" name "=" ( expression | struct )
 struct               = "struct" [ ":" fields ]
 fields               = newline field { newline field }
-field                = name ":" type
+field                = name ":" type [ "=" expression ]
 ```
 
 ## Lexical structure
@@ -160,7 +160,8 @@ field                = name ":" type
 
 - **S18.** A struct without fields is written `struct`, without the `:`: `const Marker = struct`.
 - **S19.** A field of a struct value is read with `.` and the field's name, after any expression: `point.x`, `line.start.x`, `make().x`. A `.` that is not followed by a name is rejected with `expected an identifier`.
-- **S20.** A struct value is built by calling its struct with one argument for each field, written as the field's name, `=` and the value: `Point(x = 0, y = 0)`. The fields can be given in any order. A struct without fields is built with `Marker()`. The value of a named argument is required: `Point(x = )` is rejected with `expected an expression`.
+- **S20.** A struct value is built by calling its struct with one argument for each field, written as the field's name, `=` and the value: `Point(x = 0, y = 0)`. The fields can be given in any order, and a field with a default value (S21) can be left out. A struct without fields is built with `Marker()`. The value of a named argument is required: `Point(x = )` is rejected with `expected an expression`.
+- **S21.** A field or a parameter can have a default value, written after its type: `x: i32 = 0`, `fn draw(width: i32 = 1)`. A `=` without a value is rejected with `expected an expression`.
 
 ## Modules
 
@@ -261,11 +262,13 @@ field                = name ":" type
   | An argument has no field name: `Point(1, y = 2)` | `expected a field name` | the argument |
   | The struct has no field with that name | `unknown field` | the argument |
   | A field is given twice | `field is already given` | the second argument |
-  | A field is not given | `missing field` | the call |
+  | A field without a default value is not given | `missing field` | the call |
+
+- **T16.** A default value (S21) must have the type of its field or parameter (T10), and it must be known at compile time, like a constant's value (N10). A call to a function or a field access in it is rejected with `cannot be evaluated at compile time`. The default values of a struct are checked only when the struct is used (N12), and their errors are reported in the module of the struct.
 
 ## Functions
 
-- **F1.** A call passes exactly as many arguments as the function has parameters. Otherwise it is rejected with `wrong number of arguments`. The arguments of a function have no names: `add(value = 1)` is rejected with `function arguments have no names`, at the argument.
+- **F1.** A call passes at least one argument for each parameter without a default value, and at most one for each parameter. Otherwise it is rejected with `wrong number of arguments`. Arguments match parameters in order, so only the last parameters can be left out, and each one left out takes its default value. A parameter without a default value after one with a default value is rejected with `parameters with default values must come last`, at that parameter. The arguments of a function have no names: `add(value = 1)` is rejected with `function arguments have no names`, at the argument.
 - **F2.** Each argument must have the type of its parameter (T10).
 - **F3.** A `void` function returns with `return` without a value. `return` with a value in a `void` function is rejected with `void function cannot return a value`.
 - **F4.** A function with a return type returns with `return` and a value. `return` without a value is rejected with `missing return value`.
@@ -339,7 +342,8 @@ field                = name ":" type
 - **C11.** A zero-sized type is a struct whose fields all have zero-sized types, such as a struct without fields. It has no definition in C. Fields, parameters and arguments of a zero-sized type are left out, and a function that returns one returns `void`. The calls in a zero-sized argument run before the call that receives it: `use(make(marker), 1)` becomes `(mn_hello_make(), mn_hello_use(1))`, and `use(holder().marker, 1)` becomes `(mn_hello_holder(), mn_hello_use(1))`. The calls in a returned zero-sized value run before the `return;`. A zero-sized value without calls, such as `holder.marker`, writes nothing.
 - **C12.** Modules whose structs contain each other's structs, directly or through other modules, are rejected with `modules contain each other's structs`, at the field.
 - **C13.** A field access is written as in Monolith: `line.start.x` stays `line.start.x`, and `make().x` becomes `mn_hello_make().x`.
-- **C14.** A struct value becomes a compound literal that names each field, in the order written: `Point(y = 2, x = 1)` becomes `(mn_hello_Point){ .y = 2, .x = 1 }`. Fields of a zero-sized type are left out (C11). A constant that holds a struct value writes it at each use (N11).
+- **C14.** A struct value becomes a compound literal that names each field, in the order written: `Point(y = 2, x = 1)` becomes `(mn_hello_Point){ .y = 2, .x = 1 }`. Fields of a zero-sized type are left out (C11). Fields left out with a default value are written with that value, after the given fields, in the order they are defined: `Point(y = 1)` becomes `(mn_hello_Point){ .y = 1, .x = 0 }`. A constant that holds a struct value writes it at each use (N11).
+- **C15.** A call writes the default value of each parameter it leaves out: `draw(2)` becomes `mn_hello_draw(2, 1)`.
 
 ## Compiler
 
