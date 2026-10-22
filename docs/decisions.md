@@ -1,7 +1,7 @@
 ## Direction
 
 - **Transpile to readable source.** Monolith compiles to source code in other languages, not machine code, and the output must stay readable.
-- **Host code only through external functions.** Monolith code reaches code of the target only through external functions (S15), so the rest of the language is not tied to any environment.
+- **Host code only through external functions.** Monolith code reaches code of the target only through external functions (S16), so the rest of the language is not tied to any environment.
 - **No borrow checker.** Keeping references valid is the programmer's responsibility, as in Zig. A borrow checker restricts programs and bloats them, especially performance-focused ones.
 
 ## Memory and errors
@@ -26,8 +26,7 @@
 
 ## Functions
 
-- **Results must be used or discarded explicitly.** A silently dropped result is a common bug, so a call that returns a value needs `_ =` to stand alone.
-- **Only calls can be discarded.** Discarding a literal or a `void` call has no meaning.
+- **Unused values are rejected.** Return values, parameters and locals must be used or discarded with `_ =`, as in Zig. A silently dropped value is a common bug.
 - **Parameters can shadow functions.** As in Rust.
 - **`main` is optional.** A module does not need one, so libraries are possible.
 - **No limit on nesting depth.** Like Zig, Rust, GCC and Clang, the compiler does not guard against deeply nested source.

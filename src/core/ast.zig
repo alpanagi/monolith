@@ -45,10 +45,12 @@ pub const StatementKind = union(enum) {
     @"return": ?Expression,
     discard: Expression,
     call: Expression,
+    constant_declaration: ConstantDeclaration,
 };
 
 pub const ConstantDeclaration = struct {
     name: []const u8,
+    type: ?Expression = null,
     value: Expression,
     resolved: bool = false,
 };
@@ -103,6 +105,7 @@ pub const Resolution = union(enum) {
     function: Resolution.Function,
     type: types.Type,
     constant: Resolution.Constant,
+    local: *ConstantDeclaration,
 
     pub const Function = struct {
         module: usize,
@@ -159,6 +162,11 @@ pub fn extractFunctionSignature(declaration: Declaration) FunctionSignature {
         .function_declaration => |function_declaration| function_declaration,
         .constant_declaration, .struct_definition => unreachable,
     };
+}
+
+pub fn isAlias(constant: ConstantDeclaration) bool {
+    if (constant.type != null) return false;
+    return constant.value.kind == .identifier or constant.value.kind == .path_expression;
 }
 
 pub fn findArgument(arguments: []const Argument, name: []const u8) ?usize {

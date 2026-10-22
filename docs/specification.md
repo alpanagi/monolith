@@ -33,14 +33,14 @@ parameter            = name ":" type [ "=" expression ]
 type                 = expression
 block                = statement | indented_block
 indented_block       = newline statement { newline statement }
-statement            = "noop" | "return" [ expression ] | "_" "=" call | call
+statement            = "noop" | "return" [ expression ] | "_" "=" ( call | name ) | call | constant
 expression           = operand { "." name }
 operand              = integer | float | string | "true" | "false" | path | call
 call                 = path "(" [ arguments ] ")"
 arguments            = argument { "," argument } [ "," ]
 argument             = [ name "=" ] expression
 path                 = name { "::" name }
-constant             = "const" name "=" ( expression | anonymous_struct )
+constant             = "const" name ( [ ":" type ] "=" expression | "=" anonymous_struct )
 anonymous_struct     = "struct" [ ":" fields ]
 struct               = "struct" name [ ":" fields ]
 fields               = newline field { newline field }
@@ -109,7 +109,7 @@ field                = name ":" type [ "=" expression ]
 
 ### Top level
 
-- **S1.** A source file is a module: a sequence of declarations at indentation 0, in any order, separated by any number of blank lines. A declaration is a function, an external function, a constant (N10) or a struct (S17).
+- **S1.** A source file is a module: a sequence of declarations at indentation 0, in any order, separated by any number of blank lines. A declaration is a function, an external function, a constant (N10) or a struct (S18).
 - **S2.** Anything other than a declaration at top level is rejected with `unexpected token`. An indented line at top level is rejected with `unexpected indentation`.
 
 ### Functions
@@ -136,22 +136,23 @@ field                = name ":" type [ "=" expression ]
 
 - **S9.** `noop` does nothing.
 - **S10.** `return` ends the function. Its value, if any, is on the same line.
-- **S11.** `_ = add(1, 2)` calls a function and discards its result. Anything other than a call to a function after `_ =`, such as `_ = 5`, `_ = make().x` or the struct value `_ = Point(x = 1)`, is rejected with `expected a call`.
+- **S11.** `_ = add(1, 2)` calls a function and discards its result, and `_ = value` discards a parameter or a local constant (N19). Anything other than a call or a name after `_ =`, such as `_ = 5` or `_ = make().x`, is rejected with `expected a call or a name`. A struct value, `_ = Point(x = 1)`, is rejected with `expected a call`.
 - **S12.** A call on its own, such as `log(1)`, is a statement. A name, a literal or a field access on its own is rejected with `expected a statement`.
-- **S13.** Each statement is on its own line, except for the single statement of an inline block.
+- **S13.** A constant (N10) is also a statement. Inside a function, it declares a local constant (N15).
+- **S14.** Each statement is on its own line, except for the single statement of an inline block.
 
 ### Expressions
 
-- **S14.** A trailing `,` after the last argument is allowed: `add(1, 2,)`.
+- **S15.** A trailing `,` after the last argument is allowed: `add(1, 2,)`.
 
 ### External functions
 
-- **S15.** An external function is a function declaration that the program calls but does not define: `external fn write(text: String)`. Its definition is written in the target's code. The standard library's external functions are defined by the target's runtime (D2). Every external function is called by its exact name (C8).
-- **S16.** An external function has no body. A `:` after its declaration is rejected with `external functions have no body`.
+- **S16.** An external function is a function declaration that the program calls but does not define: `external fn write(text: String)`. Its definition is written in the target's code. The standard library's external functions are defined by the target's runtime (D2). Every external function is called by its exact name (C8).
+- **S17.** An external function has no body. A `:` after its declaration is rejected with `external functions have no body`.
 
 ### Structs
 
-- **S17.** A struct is a type made of fields. It is declared with `struct`, its name and `:`, followed by an indented block with one field on each line. A field is a name and a type, `x: i32`. A line of the block that is not a field is rejected with `expected a field`.
+- **S18.** A struct is a type made of fields. It is declared with `struct`, its name and `:`, followed by an indented block with one field on each line. A field is a name and a type, `x: i32`. A line of the block that is not a field is rejected with `expected a field`.
 
   ```monolith
   struct Point:
@@ -159,11 +160,11 @@ field                = name ":" type [ "=" expression ]
       y: i32
   ```
 
-- **S18.** A struct without fields is declared without the `:`: `struct Marker`.
-- **S19.** A struct without a name is an anonymous struct: `struct:` followed by the block of fields, or `struct` without fields. An anonymous struct can only be the value of a constant, which gives it the constant's name: `const Point = struct:` declares the same struct as `struct Point:`.
-- **S20.** A field of a struct value is read with `.` and the field's name, after any expression: `point.x`, `line.start.x`, `make().x`. A `.` that is not followed by a name is rejected with `expected an identifier`.
-- **S21.** A struct value is built by calling its struct with one argument for each field, written as the field's name, `=` and the value: `Point(x = 0, y = 0)`. The fields can be given in any order, and a field with a default value (S22) can be left out. A struct without fields is built with `Marker()`. The value of a named argument is required: `Point(x = )` is rejected with `expected an expression`.
-- **S22.** A field or a parameter can have a default value, written after its type: `x: i32 = 0`, `fn draw(width: i32 = 1)`. A `=` without a value is rejected with `expected an expression`.
+- **S19.** A struct without fields is declared without the `:`: `struct Marker`.
+- **S20.** A struct without a name is an anonymous struct: `struct:` followed by the block of fields, or `struct` without fields. An anonymous struct can only be the value of a top-level constant, which gives it the constant's name: `const Point = struct:` declares the same struct as `struct Point:`. Inside a function, it is rejected with `structs cannot be defined inside functions`, at `struct`.
+- **S21.** A field of a struct value is read with `.` and the field's name, after any expression: `point.x`, `line.start.x`, `make().x`. A `.` that is not followed by a name is rejected with `expected an identifier`.
+- **S22.** A struct value is built by calling its struct with one argument for each field, written as the field's name, `=` and the value: `Point(x = 0, y = 0)`. The fields can be given in any order, and a field with a default value (S23) can be left out. A struct without fields is built with `Marker()`. The value of a named argument is required: `Point(x = )` is rejected with `expected an expression`.
+- **S23.** A field or a parameter can have a default value, written after its type: `x: i32 = 0`, `fn draw(width: i32 = 1)`. A `=` without a value is rejected with `expected an expression`.
 
 ## Modules
 
@@ -171,7 +172,7 @@ field                = name ":" type [ "=" expression ]
 - **M2.** Every module's file name, without `.mn`, and every directory name in a module path must be a valid name (L6, L10). Paths can only spell valid names, so only the main file's name is checked (K2).
 - **M3.** Every path is a namespace. A namespace is a module when a file has its path (M1), and it contains the namespaces whose paths continue its path: `std::io` contains `std::io::stdout`. A namespace can be both: with `utils.mn` and `utils/math.mn`, `utils` is a module and contains `utils::math`. A path reaches namespaces directly: `std::io::stdout::write("hello\n")` calls `write` in the module `std::io::stdout`.
 - **M4.** A path that starts with `std` refers to the standard library, which comes with the compiler (K5). Every other path is a namespace of the program, relative to the directory of the main file, from every module.
-- **M5.** The first name of a path that continues with `::` is looked up only among namespaces: first the module's constants that name a namespace, then `std`, then the program's namespaces (M4).
+- **M5.** The first name of a path that continues with `::` is looked up first among the local constants (N15) and parameters of the enclosing function, which hide any namespace with their name. A local constant that names a namespace reaches it. Any other local constant, and any parameter, is rejected with `name has no members`. Otherwise the name is looked up only among namespaces: first the module's constants that name a namespace, then `std`, then the program's namespaces (M4).
 - **M6.** The namespaces a namespace contains are reached through it: `std::io::stdout::write("hello\n")`. A namespace that is a module and contains namespaces reaches both its module's functions and its namespaces: `utils::add()` and `utils::math::add()`.
 - **M7.** Each module is loaded once, however often it is reached, and modules can reach each other. Loading starts with the main module, and a module is read when resolving a module that is already loaded reaches it. Nothing else is read.
 - **M8.** Every declaration of a module can be used by the other modules through a path, external functions and constants included.
@@ -184,25 +185,27 @@ field                = name ":" type [ "=" expression ]
 - **N1.** Function, constant and struct names are unique within a module, external functions included. A second declaration with the name of a function, constant or struct is rejected at its `fn`, `external`, `const` or `struct`: a function with `function is already defined`, a constant with `constant is already defined`, and a struct with `struct is already defined`.
 - **N2.** Parameter names are unique within a parameter list, and field names within a struct. A repeated name is rejected with `parameter is already defined` or `field is already defined`, at the second parameter or field.
 - **N3.** A function can call functions defined before or after it.
-- **N4.** A name is looked up first among the parameters of the enclosing function, then among the module's functions, constants and structs, then among the built-in types (T1), then among `std` and the program's namespaces (M4). A name in a type (T11) is not looked up among the parameters.
+- **N4.** A name is looked up first among the local constants declared before it in the enclosing function (N15), then among the parameters of the enclosing function, then among the module's functions, constants and structs, then among the built-in types (T1), then among `std` and the program's namespaces (M4). A name in a type (T11) is not looked up among the parameters, but it is looked up among the local constants.
 - **N5.** A name that matches none of them is rejected with `unknown name`.
-- **N6.** A call to a name that does not refer to a function or a type, such as a parameter, a namespace or a constant whose value is a literal, is rejected with `name is not a function`. A call to a type builds a value of it (S21).
+- **N6.** A call to a name that does not refer to a function or a type, such as a parameter, a namespace or a constant whose value is a literal, is rejected with `name is not a function`. A call to a type builds a value of it (S22).
 - **N7.** A function used as a value, named directly, through a path or through a constant, is rejected with `functions cannot be used as values`. A namespace used as a value is rejected with `unknown name`. A type can be used as a value (T11).
-- **N8.** A path is resolved one name at a time. The first name is looked up as M5 describes. Each following name before a `::` goes through a namespace (M6): a constant of its module that names a namespace comes first, then the namespaces it contains. The last name is a declaration of the module reached, or a namespace it contains. A function and a namespace can have the same name: with `fn math()` in `utils.mn` and the module `utils::math`, `utils::math()` calls the function and `utils::math::add()` calls into the module. A parameter does not hide a namespace before a `::`: with a parameter `utils`, `utils::add()` still calls into the module `utils`.
+- **N8.** A path is resolved one name at a time. The first name is looked up as M5 describes. Each following name before a `::` goes through a namespace (M6): a constant of its module that names a namespace comes first, then the namespaces it contains. The last name is a declaration of the module reached, or a namespace it contains. A function and a namespace can have the same name: with `fn math()` in `utils.mn` and the module `utils::math`, `utils::math()` calls the function and `utils::math::add()` calls into the module. A parameter or a local constant hides a namespace with its name before a `::` (M5): with a parameter `utils`, `utils::add()` is rejected with `name has no members`, even when the module `utils` exists.
 - **N9.** Errors in a path, at the path:
 
   | Situation | Error |
   |---|---|
   | The first name does not exist | `unknown name` |
-  | A `::` follows a parameter, a declaration or a built-in type, and no namespace has its name | `name has no members` |
+  | A `::` follows a parameter, or a local constant that does not name a namespace | `name has no members` |
+  | A `::` follows a declaration or a built-in type, and no namespace has its name | `name has no members` |
   | A name before a `::` is none of the namespaces that its namespace contains (M9) | `module not found` |
   | The module reached does not declare the last name | `unknown name` |
   | The last name of a call is a namespace | `name is not a function` |
 
 ### Constants
 
-- **N10.** `const name = expression` declares a constant. Its value is evaluated at compile time, and can be a function, a type, a namespace, a literal, a struct value (S21) or an anonymous struct (S19). `const stdout = std::io::stdout` lets `stdout::write(...)` reach the module, `const write = mn_runtime_stdout_write` lets `write(...)` call the function, `const Integer = i32` lets `Integer` be used as a type, and `const limit = 5i32` lets `limit` be used as a value of type `i32`.
-  - A number literal as the value has a suffix, which gives its type (T5): `const limit = 5i32`. Otherwise it is rejected with `value has no known type`, at the literal.
+- **N10.** `const name = expression` declares a constant. Its value is evaluated at compile time, and can be a function, a type, a namespace, a literal, a struct value (S22) or an anonymous struct (S20). `const stdout = std::io::stdout` lets `stdout::write(...)` reach the module, `const write = mn_runtime_stdout_write` lets `write(...)` call the function, `const Integer = i32` lets `Integer` be used as a type, and `const limit = 5i32` lets `limit` be used as a value of type `i32`.
+  - A constant can have a written type: `const limit: i32 = 5`. Its value must then have that type (T10), and a number literal without a suffix takes it (T5). With a written type, the value is used as a value, so a function or a namespace as the value is rejected as N7 describes. An anonymous struct cannot have a written type: `const Point: Shape = struct:` is rejected with `expected an expression`, at `struct`.
+  - A number literal as the value has a suffix or a written type, which gives its type (T5): `const limit = 5i32`. Otherwise it is rejected with `value has no known type`, at the literal.
   - Errors in a literal value are reported at the literal, in the module of the constant.
   - A struct value as the value must be known at compile time: each field's value is a literal, a constant or another struct value. `const origin = Point(x = 0, y = 0)` lets `origin` be used as a value of type `Point`.
   - A call to a function or a field access, as the value or inside a struct value, is rejected with `cannot be evaluated at compile time`, at the call or the field access.
@@ -213,6 +216,22 @@ field                = name ":" type [ "=" expression ]
 ### Reserved names
 
 - **N14.** A function, external function, parameter, constant, struct or field whose name starts with `mn_` is rejected with `name is reserved`, at its `fn`, `external`, `const` or `struct`, or at the parameter or field. The modules of the standard library may use these names, because they declare the runtime's functions (D2). A function, external function, parameter, constant, struct or field named like a built-in type (T1) is rejected with `name is reserved` in every module, the standard library included.
+
+### Local constants
+
+- **N15.** A constant declared inside a function (S13) is a local constant. It follows the rules of constants (N10, N11): its value is known at compile time, and it produces no output. It can be used from the statement after it to the end of the function. The names in its value are resolved, and its value is checked, where it is declared.
+- **N16.** A parameter in a local constant's value is rejected with `cannot be evaluated at compile time`, at the parameter.
+- **N17.** A local constant can have the name of a parameter, of an earlier local constant or of any declaration. From the next statement on, the name refers to the new local constant: after `const limit = 1i32` and `const limit = 2i32`, `limit` is `2i32`. Its own value still refers to what the name meant before it.
+
+### Unused names
+
+- **N18.** Each parameter of a function with a body, and each local constant, must be used or discarded (N19). An unused parameter is rejected with `parameter is unused, discard it with _ =`, at the parameter. An unused local constant is rejected with `local constant is unused, discard it with _ =`, at its `const`. A local constant that a later one with the same name hides before any use is unused (N17). The parameters of external functions are not checked, because they have no body.
+- **N19.** `_ = name` discards a parameter or a local constant of the enclosing function, which marks it as unused on purpose. Errors, at the name after `_ =`:
+
+  | Situation | Error |
+  |---|---|
+  | The name is not a parameter or a local constant | `only parameters and local constants can be discarded` |
+  | The name is also used, or discarded a second time | `discarded name is used` |
 
 ## Types
 
@@ -237,7 +256,7 @@ field                = name ":" type [ "=" expression ]
 ### Types of expressions
 
 - **T4.** `true` and `false` have type `Bool`, and a string literal has type `String`.
-- **T5.** A number literal with a suffix has the suffix's type, and the suffix must be the name of a number type. Any other suffix is rejected with `unknown suffix`, at the literal: `5Bool`. A number literal without a suffix takes the type its context expects: the function's return type for a returned value, or the parameter's type for an argument.
+- **T5.** A number literal with a suffix has the suffix's type, and the suffix must be the name of a number type. Any other suffix is rejected with `unknown suffix`, at the literal: `5Bool`. A number literal without a suffix takes the type its context expects: the function's return type for a returned value, the parameter's type for an argument, or the written type of a constant (N10).
 - **T6.** An integer literal can only have an integer type, and a float literal only a float type. `return 2` in an `f64` function is rejected: write `2.0`. This includes suffixes: `1f64` and `2.5u8` are rejected with `value does not match the expected type`.
 - **T7.** An integer literal must not exceed its type's maximum, and a float literal must not overflow its type to infinity. Otherwise it is rejected with `literal out of range for its type`. A float literal too small for its type becomes 0 and is accepted.
 - **T8.** A name that refers to a parameter has the type of the parameter. A name that refers to a type has the type of types (T11). A name that refers to a constant has the type of its value (N10).
@@ -256,7 +275,7 @@ field                = name ":" type [ "=" expression ]
   - A value whose type is not a struct is rejected with `value has no fields`: `value.x` with `value: i32`.
   - A name that is not a field of the struct is rejected with `unknown field`.
   - A number literal without a suffix before the `.` has no type to take, and is rejected with `value has no known type`, at the literal: `5.x`.
-- **T15.** A struct value (S21) has the type of its struct, and each field's value must have the field's type (T10). Errors:
+- **T15.** A struct value (S22) has the type of its struct, and each field's value must have the field's type (T10). Errors:
 
   | Situation | Error | At |
   |---|---|---|
@@ -266,7 +285,7 @@ field                = name ":" type [ "=" expression ]
   | A field is given twice | `field is already given` | the second argument |
   | A field without a default value is not given | `missing field` | the call |
 
-- **T16.** A default value (S22) must have the type of its field or parameter (T10), and it must be known at compile time, like a constant's value (N10). A call to a function or a field access in it is rejected with `cannot be evaluated at compile time`. The default values of a struct are checked only when the struct is used (N12), and their errors are reported in the module of the struct.
+- **T16.** A default value (S23) must have the type of its field or parameter (T10), and it must be known at compile time, like a constant's value (N10). A call to a function or a field access in it is rejected with `cannot be evaluated at compile time`. The default values of a struct are checked only when the struct is used (N12), and their errors are reported in the module of the struct.
 
 ## Functions
 
@@ -290,7 +309,7 @@ field                = name ":" type [ "=" expression ]
 ### Names in the output
 
 - **G1.** Names are written to the output exactly as they are in the source, except the generated names: C function names (C9) and C struct names (C10). A generated name is `mn_` followed by the module path with `::` replaced by `_`, so it cannot be a name written in the source (N14).
-- **G2.** A function, external function, parameter or field whose name, as written to the output, the target already defines is rejected with `name is already defined in the target`, at the function's `fn` or `external` keyword or at the parameter or field. Constants are not checked, because they produce no output (N11), and neither are structs, because their C names are generated (C10). A function's name is checked as it is written to the output: `fn int(): noop` becomes `mn_hello_int` (C9) and is accepted, but a parameter named `int` is rejected.
+- **G2.** A function, external function, parameter or field whose name, as written to the output, the target already defines is rejected with `name is already defined in the target`, at the function's `fn` or `external` keyword or at the parameter or field. Constants are not checked, because they produce no output (N11), and neither are structs, because their C names are generated (C10), or discarded parameters, because they have no name in the output (C6). A function's name is checked as it is written to the output: `fn int(): noop` becomes `mn_hello_int` (C9) and is accepted, but a parameter named `int` is rejected.
 - **G3.** C defines the C23 keywords `_Alignas`, `_Alignof`, `_Atomic`, `_BitInt`, `_Bool`, `_Complex`, `_Decimal128`, `_Decimal32`, `_Decimal64`, `_Generic`, `_Imaginary`, `_Noreturn`, `_Static_assert`, `_Thread_local`, `alignas`, `alignof`, `auto`, `bool`, `break`, `case`, `char`, `const`, `constexpr`, `continue`, `default`, `do`, `double`, `else`, `enum`, `extern`, `false`, `float`, `for`, `goto`, `if`, `inline`, `int`, `long`, `nullptr`, `register`, `restrict`, `return`, `short`, `signed`, `sizeof`, `static`, `static_assert`, `struct`, `switch`, `thread_local`, `true`, `typedef`, `typeof`, `typeof_unqual`, `union`, `unsigned`, `void`, `volatile` and `while`, and `asm`, which compilers such as GCC treat as a keyword outside strict C23. It also defines the names that C23 declares in `<stddef.h>` and `<stdint.h>`, which the header includes, such as `size_t`, `int32_t`, `NULL` and `INT32_MAX`. `string` and `MONOLITH_H` are defined by `runtime/monolith.h` itself (C1).
 
 ### C
@@ -328,7 +347,7 @@ field                = name ":" type [ "=" expression ]
   | a struct | its C name (C10) |
 
 - **C5.** Number literals keep their base. `_` becomes `'`, `0o` becomes `0`, the suffix is removed, and literals of unsigned types end with `u`: `0o7_5_5` returned from a `u16` function becomes `07'5'5u`.
-- **C6.** `_ = add(1, 2)` becomes the plain call, `mn_hello_add(1, 2);` (C9).
+- **C6.** `_ = add(1, 2)` becomes the plain call, `mn_hello_add(1, 2);` (C9). `_ = value` writes nothing. A discarded parameter has no name in the output: `fn show(value: i32): _ = value` becomes `void mn_hello_show(int32_t)` in the header and in the definition.
 - **C7.** A string literal becomes a `string` holding the literal as written and its length in bytes, counting each escape as one byte: `"line\n"` becomes `(string){ "line\n", 5 }`.
 - **C8.** An external function keeps exactly the name written in the source, so its definition, linked into the program, uses that name: `external fn stdout_write(text: String)` becomes `void stdout_write(string text);`. The runtime defines the standard library's external functions this way (D2).
 - **C9.** C has one namespace for all files, so a function's C name is its module's generated name (G1), followed by `_` and its name: `greeting` in `hello.mn` becomes `mn_hello_greeting`, and `add` in `utils::math` becomes `mn_utils_math_add`. The main module's `main` stays `main`.
@@ -384,7 +403,9 @@ field                = name ":" type [ "=" expression ]
 ```monolith
 const stdout = std::io::stdout
 
-fn add(left: i32, right: i32) i32: return left
+fn add(left: i32, right: i32) i32:
+    _ = right
+    return left
 
 fn flag() Bool:
     return true
@@ -406,7 +427,7 @@ No `std/io/stdout.c` is written, because `std::io::stdout` only declares an exte
 
 #include "runtime/monolith.h"
 
-int32_t mn_hello_add(int32_t left, int32_t right);
+int32_t mn_hello_add(int32_t left, int32_t);
 bool mn_hello_flag();
 string mn_hello_greeting();
 ```
@@ -417,7 +438,7 @@ string mn_hello_greeting();
 #include "hello.h"
 #include "std/io/stdout.h"
 
-int32_t mn_hello_add(int32_t left, int32_t right) {
+int32_t mn_hello_add(int32_t left, int32_t) {
     return left;
 }
 
@@ -457,7 +478,9 @@ fn main(): _ = utils::math::add(1, 2)
 `utils/math.mn`:
 
 ```monolith
-fn add(left: i32, right: i32) i32: return left
+fn add(left: i32, right: i32) i32:
+    _ = right
+    return left
 ```
 
 `hello.c` and `utils/math.c`:
@@ -474,7 +497,7 @@ int main() {
 ```c
 #include "math.h"
 
-int32_t mn_utils_math_add(int32_t left, int32_t right) {
+int32_t mn_utils_math_add(int32_t left, int32_t) {
     return left;
 }
 ```
@@ -492,7 +515,7 @@ struct Line:
     start: Point
     end: Point
 
-fn length(line: Line) i32: return 0
+fn length(line: Line) i32: return line.start.x
 ```
 
 `hello.h`:
@@ -537,11 +560,11 @@ fn main(): one()
 → `2:12: error: call result is unused, discard it with _ =` (F6)
 
 ```monolith
-fn add(left: i32, right: i32) i32: return left
-fn main(): _ = add(1)
+fn take(value: i32): _ = value
+fn main(): take()
 ```
 
-→ `2:16: error: wrong number of arguments` (F1)
+→ `2:12: error: wrong number of arguments` (F1)
 
 ```monolith
 fn twice(add: i32): add(add)
@@ -573,7 +596,7 @@ fn name() String: return "a\qb"
 external fn log(): noop
 ```
 
-→ `1:18: error: external functions have no body` (S16)
+→ `1:18: error: external functions have no body` (S17)
 
 ```monolith
 fn mn_write(): noop
