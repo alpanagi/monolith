@@ -22,6 +22,7 @@ pub const NumberType = enum {
     u16,
     u32,
     u64,
+    usize,
     f32,
     f64,
 };
@@ -147,6 +148,7 @@ test "Registry.addSlice: gives a slice type one record for each element and muta
 
 test "findBuiltInType: finds number types, Bool, String and void" {
     try std.testing.expectEqual(Type{ .number = .u8 }, findBuiltInType("u8").?);
+    try std.testing.expectEqual(Type{ .number = .usize }, findBuiltInType("usize").?);
     try std.testing.expectEqual(Type.boolean, findBuiltInType("Bool").?);
     try std.testing.expectEqual(Type.string, findBuiltInType("String").?);
     try std.testing.expectEqual(Type.void, findBuiltInType("void").?);

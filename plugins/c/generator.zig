@@ -973,7 +973,7 @@ pub const Generator = struct {
                 }
                 for (text) |byte| try writer.writeByte(if (byte == '_') '\'' else byte);
                 switch (expression.type.?.number) {
-                    .u8, .u16, .u32, .u64 => try writer.writeByte('u'),
+                    .u8, .u16, .u32, .u64, .usize => try writer.writeByte('u'),
                     else => {},
                 }
             },
@@ -1213,6 +1213,7 @@ pub const Generator = struct {
                 .u16 => "uint16_t",
                 .u32 => "uint32_t",
                 .u64 => "uint64_t",
+                .usize => "size_t",
                 .f32 => "float",
                 .f64 => "double",
             },
@@ -4554,6 +4555,39 @@ test "generateType: maps floating point types" {
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\nfloat mn_main_half() {\n    return 0.5;\n}\n\ndouble mn_main_whole() {\n    return 1.0;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateType: maps usize to size_t" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count() usize: return 3" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nsize_t mn_main_count() {\n    return 3u;\n}\n",
         files[1].contents,
     );
 }

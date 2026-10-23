@@ -656,7 +656,7 @@ fn computeIntegerMaximum(number: types.NumberType) ?u64 {
         .u8 => std.math.maxInt(u8),
         .u16 => std.math.maxInt(u16),
         .u32 => std.math.maxInt(u32),
-        .u64 => std.math.maxInt(u64),
+        .u64, .usize => std.math.maxInt(u64),
         .f32, .f64 => null,
     };
 }
@@ -1464,6 +1464,7 @@ test "checkExpression: accepts the maximum of each integer type" {
         \\fn six() u16: return 65535
         \\fn seven() u32: return 4294967295
         \\fn eight() u64: return 18446744073709551615
+        \\fn nine() usize: return 18446744073709551615
         ,
     });
     try loader.loadMainModule(&arena, std.testing.io, "main");
@@ -1486,6 +1487,7 @@ test "checkExpression: rejects one past the maximum of each integer type" {
         "fn value() u16: return 65536",
         "fn value() u32: return 4294967296",
         "fn value() u64: return 18446744073709551616",
+        "fn value() usize: return 18446744073709551616",
     };
     for (sources) |source| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

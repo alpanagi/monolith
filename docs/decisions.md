@@ -14,7 +14,7 @@
 - **Overflow is left to the target.** Defining it in the language would make Monolith describe platform details.
 - **Types must be representable exactly.** A type whose values would change on a target cannot exist there, because it would change what the program means.
 - **No arbitrary-width integers.** Types such as Zig's `u7` add casts everywhere and masking in the output.
-- **Named types are capitalized.** Types that state a size in bits stay lowercase (`i32`, `f64`), and all other types start with a capital letter (`Bool`, `String`), so `String` looks like any other named type.
+- **Named types are capitalized.** Number types stay lowercase, because their names state their size in bits or as the size of a pointer (`i32`, `f64`, `usize`), and all other types start with a capital letter (`Bool`, `String`), so `String` looks like any other named type.
 - **No integer literals for float types.** A float is written with its decimal point: `2.`, not `2`.
 - **Tiny floats are accepted.** A float literal that rounds to zero is not an error, as in Zig and Rust.
 
@@ -23,6 +23,7 @@
 - **No leading zeros.** `007` is rejected.
 - **Float suffixes need a decimal point.** `1.0f64` instead of `1f64`, so a suffix never turns an integer into a float.
 - **Trailing commas are allowed.** A trailing comma can mark a list to be formatted over multiple lines.
+- **Names are snake case.** Functions, variables, constants, parameters, fields and modules use snake case, as in Rust, not camel case as Zig's functions do. Types use Pascal case.
 
 ## Functions
 

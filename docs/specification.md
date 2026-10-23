@@ -70,7 +70,7 @@ field                = name ":" type [ "=" expression ]
 
 - **L6.** A word starts with a letter or `_` and continues with letters, digits and `_`.
 - **L7.** These words are keywords: `fn`, `external`, `const`, `var`, `struct`, `noop`, `return`, `while`, `true`, `false`, `undefined`.
-- **L8.** The built-in types (T1) are named `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `Bool`, `String` and `void`. The names that state a size in bits, and `void`, are lowercase. The others start with a capital letter. Type names are names, not keywords.
+- **L8.** The built-in types (T1) are named `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `usize`, `f32`, `f64`, `Bool`, `String` and `void`. The names of number types, which state their size in bits or as the size of a pointer, and `void`, are lowercase. The others start with a capital letter. Type names are names, not keywords.
 - **L9.** A lone `_` is the discard symbol. It is not a name.
 - **L10.** Every other word is a name. Keywords and `_` cannot be used as names. The built-in type names and names that start with `mn_` are reserved (N14).
 
@@ -288,6 +288,7 @@ field                = name ":" type [ "=" expression ]
   |---|---|
   | `i8`, `i16`, `i32`, `i64` | signed integers of 8, 16, 32 and 64 bits |
   | `u8`, `u16`, `u32`, `u64` | unsigned integers of 8, 16, 32 and 64 bits |
+  | `usize` | an unsigned integer with the size of a pointer, for lengths and counts; its literals can be as large as for `u64` |
   | `f32`, `f64` | 32-bit and 64-bit floating point numbers |
   | `Bool` | `true` and `false` |
   | `String` | text, stored as bytes in any encoding |
@@ -410,6 +411,7 @@ field                = name ":" type [ "=" expression ]
   |---|---|
   | `i8` to `i64` | `int8_t` to `int64_t` |
   | `u8` to `u64` | `uint8_t` to `uint64_t` |
+  | `usize` | `size_t` |
   | `f32`, `f64` | `float`, `double` |
   | `Bool` | `bool` |
   | `String` | `string` |
@@ -506,6 +508,15 @@ field                = name ":" type [ "=" expression ]
 
 - **D2.** The runtime is a library of the target that does not depend on the standard library. A runtime function is named like a generated name (G1): `mn_`, then the path of the file that defines it, with `/` replaced by `_`, then `_` and its name. `mn_runtime_stdout_write` is `write` in `runtime/stdout.c`. The compiler finds the file by following the name's parts as folders until a file exists, so a function name can contain `_`. Its functions are linked by name (C8). The standard library declares them as external functions and names them with constants (D1), so a call such as `stdout::write(...)` calls the runtime function directly. Only the runtime files whose functions the program calls are copied into the output (K3).
 - **D3.** `mn_runtime_stdout_write` writes the text exactly as given.
+- **D4.** `std::io::stdin` provides `read(buffer: []u8) usize`, which reads bytes from the standard input into the buffer and returns how many it read:
+
+  ```monolith
+  external fn mn_runtime_stdin_read(buffer: []u8) usize
+
+  const read = mn_runtime_stdin_read
+  ```
+
+  It waits until input is available, reads at most the buffer's length, and returns what has arrived. On a terminal, that is one line, with its `\n`, after the user presses Enter. Bytes that do not fit stay for the next call. It returns 0 at the end of the input, and also when reading fails.
 
 ## Examples
 
