@@ -11,6 +11,7 @@ pub const Type = union(enum) {
     @"struct": Struct,
     array: *const Array,
     slice: *const Slice,
+    implementer,
 };
 
 pub const NumberType = enum {

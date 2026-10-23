@@ -20,7 +20,9 @@ pub const TypeChecker = struct {
         for (self.program.types.entries.items) |value_type| {
             switch (value_type) {
                 .@"struct" => |struct_type| try self.checkFieldDefaults(struct_type),
-                .number, .boolean, .string, .void, .type, .array, .slice => unreachable,
+                .number, .boolean, .string, .void, .type, .array, .slice, .implementer => {
+                    unreachable;
+                },
             }
         }
         for (self.program.modules, 0..) |module, index| {
@@ -35,7 +37,12 @@ pub const TypeChecker = struct {
                         try self.checkParameterDefaults(signature.parameters);
                         try self.checkExternalFunction(signature, declaration.location);
                     },
-                    .constant_declaration, .struct_definition => {},
+                    .constant_declaration,
+                    .struct_definition,
+                    .trait_definition,
+                    .implementation,
+                    .import,
+                    => {},
                 }
             }
         }
@@ -61,7 +68,7 @@ pub const TypeChecker = struct {
 
     fn checkFunction(self: *TypeChecker, function: ast.FunctionDefinition) TypeError!void {
         const signature = function.signature;
-        if (std.mem.eql(u8, signature.name, "main")) {
+        if (ast.isMain(signature)) {
             if (ast.extractType(signature.return_type) != .void) {
                 return self.fail(signature.return_type.location, error.MainHasReturnType);
             }
@@ -85,7 +92,7 @@ pub const TypeChecker = struct {
         signature: ast.FunctionSignature,
         location: token.Location,
     ) TypeError!void {
-        if (std.mem.eql(u8, signature.name, "main")) {
+        if (ast.isMain(signature)) {
             return self.fail(location, error.MainIsExternal);
         }
     }
@@ -111,7 +118,8 @@ pub const TypeChecker = struct {
             },
             .discard => |*expression| {
                 if (expression.kind == .identifier) return;
-                if (ast.extractResolution(expression.kind.call.callee) == .type) {
+                const call = expression.kind == .call;
+                if (call and ast.extractResolution(expression.kind.call.callee) == .type) {
                     return self.fail(expression.location, error.ExpectedCall);
                 }
                 if (try self.checkCall(parameters, expression) == .void) {
@@ -182,7 +190,7 @@ pub const TypeChecker = struct {
                     return self.fail(expression.location, error.TypeMismatch);
                 }
             },
-            .call => {
+            .call, .method_call => {
                 if (!isConvertible(try self.checkCall(parameters, expression), expected)) {
                     return self.fail(expression.location, error.TypeMismatch);
                 }
@@ -197,6 +205,7 @@ pub const TypeChecker = struct {
                     .number, .boolean, .string, .void, .type, .@"struct", .slice => {
                         return self.fail(expression.location, error.NotAnArray);
                     },
+                    .implementer => unreachable,
                 };
                 if (literal.elements.len != array.length) {
                     return self.fail(expression.location, error.WrongLength);
@@ -229,6 +238,7 @@ pub const TypeChecker = struct {
         parameters: []const ast.TypedName,
         expression: *ast.Expression,
     ) TypeError!types.Type {
+        if (expression.kind == .method_call) try self.resolveMethodCall(parameters, expression);
         const call = expression.kind.call;
         const value_type = switch (ast.extractResolution(call.callee)) {
             .function => |function| try self.checkFunctionCall(parameters, expression, function),
@@ -244,6 +254,37 @@ pub const TypeChecker = struct {
         return value_type;
     }
 
+    fn resolveMethodCall(
+        self: *TypeChecker,
+        parameters: []const ast.TypedName,
+        expression: *ast.Expression,
+    ) TypeError!void {
+        const method_call = expression.kind.method_call;
+        const receiver = try self.inferType(parameters, method_call.receiver);
+        const modules = self.program.modules;
+        const name = method_call.name;
+        const function = switch (ast.findMethod(modules, self.module_index, receiver, name)) {
+            .found => |function| function,
+            .missing => return self.fail(method_call.name_location, error.UnknownMethod),
+            .ambiguous => return self.fail(method_call.name_location, error.AmbiguousMethod),
+        };
+        const declaration = modules[function.module].declarations[function.declaration];
+        if (!ast.hasSelf(ast.extractFunctionSignature(declaration))) {
+            return self.fail(method_call.name_location, error.NoSelf);
+        }
+        const allocator = self.arena.allocator();
+        const arguments = try allocator.alloc(ast.Argument, method_call.arguments.len + 1);
+        arguments[0] = .{
+            .name = null,
+            .value = method_call.receiver.*,
+            .location = method_call.receiver.location,
+        };
+        @memcpy(arguments[1..], method_call.arguments);
+        const callee: ast.Identifier = .{ .name = name, .resolution = .{ .function = function } };
+        const call: ast.Call = .{ .callee = .{ .identifier = callee }, .arguments = arguments };
+        expression.kind = .{ .call = call };
+    }
+
     fn checkFunctionCall(
         self: *TypeChecker,
         parameters: []const ast.TypedName,
@@ -253,7 +294,7 @@ pub const TypeChecker = struct {
         const call = expression.kind.call;
         const declarations = self.program.modules[function.module].declarations;
         const callee = ast.extractFunctionSignature(declarations[function.declaration]);
-        if (std.mem.eql(u8, callee.name, "main")) {
+        if (ast.isMain(callee)) {
             return self.fail(expression.location, error.MainCalled);
         }
         const required = for (callee.parameters, 0..) |parameter, index| {
@@ -283,6 +324,7 @@ pub const TypeChecker = struct {
             .number, .boolean, .string, .void, .type, .array, .slice => {
                 return self.fail(location, error.NotAStruct);
             },
+            .implementer => unreachable,
         };
         for (arguments, 0..) |*argument, index| {
             const name = argument.name orelse {
@@ -315,6 +357,7 @@ pub const TypeChecker = struct {
             .number, .boolean, .string, .void, .type, .array, .slice => {
                 return self.fail(access.field_location, error.NoFields);
             },
+            .implementer => unreachable,
         };
         const field = findField(struct_type.fields, access.field) orelse {
             return self.fail(access.field_location, error.UnknownField);
@@ -341,7 +384,7 @@ pub const TypeChecker = struct {
                 expression.type = value_type;
                 return value_type;
             },
-            .call => return self.checkCall(parameters, expression),
+            .call, .method_call => return self.checkCall(parameters, expression),
             .struct_literal => return self.fail(expression.location, error.UnknownValueType),
             .array_literal => |literal| {
                 const location = expression.location;
@@ -390,6 +433,7 @@ pub const TypeChecker = struct {
             .number, .boolean, .string, .void, .type, .@"struct", .slice => {
                 return self.fail(value.location, error.NotAnArray);
             },
+            .implementer => unreachable,
         };
         const allocator = self.arena.allocator();
         const constant = !isWritable(value.*);
@@ -455,6 +499,7 @@ pub const TypeChecker = struct {
             .identifier,
             .path_expression,
             .call,
+            .method_call,
             .struct_literal,
             .array_type,
             .array_literal,
@@ -505,6 +550,7 @@ pub const TypeChecker = struct {
             .identifier,
             .path_expression,
             .call,
+            .method_call,
             .struct_literal,
             .array_type,
             .array_literal,
@@ -527,6 +573,7 @@ pub const TypeChecker = struct {
             .boolean, .string, .void, .type, .@"struct", .array, .slice => {
                 return self.fail(location, error.TypeMismatch);
             },
+            .implementer => unreachable,
         };
         const suffix = literal.suffix orelse return number;
         const suffix_type = types.findNumberType(suffix) orelse {
@@ -568,6 +615,9 @@ pub const TypeError = error{
     WrongLength,
     MixedElements,
     VoidElement,
+    UnknownMethod,
+    AmbiguousMethod,
+    NoSelf,
     UnknownSuffix,
     UnknownValueType,
     NoFields,
@@ -603,6 +653,9 @@ fn describeError(type_error: TypeError) []const u8 {
         error.WrongLength => "number of elements does not match the length of the array",
         error.MixedElements => "elements of an array literal have different types",
         error.VoidElement => "array elements cannot have type void",
+        error.UnknownMethod => "unknown method",
+        error.AmbiguousMethod => "method is found in more than one place",
+        error.NoSelf => "the first parameter is not Self",
         error.UnknownSuffix => "unknown suffix",
         error.UnknownValueType => "value has no known type",
         error.NoFields => "value has no fields",
@@ -682,7 +735,7 @@ test "TypeChecker.check: sets the type of each returned value" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() u8: return 255\nfn two() f32: return 2.5\nfn three() Bool: return true\nfn four() i64: return 1_i64\nfn main(): return" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> u8: return 255\nfn two() -> f32: return 2.5\nfn three() -> Bool: return true\nfn four() -> i64: return 1_i64\nfn main(): return" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -713,7 +766,7 @@ test "TypeChecker.check: sets the type of calls, arguments and names" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn add(left: i32, right: i32) i32:\n    _ = right\n    return left\nfn main(): _ = add(1, 2)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn add(left: i32, right: i32) -> i32:\n    _ = right\n    return left\nfn main(): _ = add(1, 2)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -812,7 +865,7 @@ test "checkFunction: rejects a return type on main" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main() i32: return 1" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main() -> i32: return 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -821,7 +874,7 @@ test "checkFunction: rejects a return type on main" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.MainHasReturnType, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 11 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, type_checker.failure.?.location.?);
 }
 
 test "checkFunction: rejects parameters on main" {
@@ -868,7 +921,7 @@ test "checkFunction: rejects a missing return" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() i32: noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() -> i32: noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -877,7 +930,27 @@ test "checkFunction: rejects a missing return" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.MissingReturn, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, type_checker.failure.?.location.?);
+}
+
+test "checkFunction: treats a method named main as a method" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    fn main(self: Self) -> i32:\n        _ = self\n        return 1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try type_checker.check();
 }
 
 test "checkExternalFunction: rejects an external main" {
@@ -918,7 +991,7 @@ test "checkFunction: accepts a function that ends with an endless loop" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first() i32:\n    while true:\n        return 1\nfn main(): _ = first()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first() -> i32:\n    while true:\n        return 1\nfn main(): _ = first()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -938,7 +1011,7 @@ test "checkFunction: rejects a function that ends with a loop that can end" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(running: Bool) i32:\n    while running:\n        return 1" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(running: Bool) -> i32:\n    while running:\n        return 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -946,7 +1019,7 @@ test "checkFunction: rejects a function that ends with a loop that can end" {
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.MissingReturn, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, type_checker.failure.?.location.?);
 }
 
 test "checkStatement: rejects a missing return value" {
@@ -965,7 +1038,7 @@ test "checkStatement: rejects a missing return value" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() i32: return" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() -> i32: return" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -974,7 +1047,7 @@ test "checkStatement: rejects a missing return value" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.MissingReturnValue, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 21 }, type_checker.failure.?.location.?);
 }
 
 test "checkStatement: rejects a value in a void function" {
@@ -1021,7 +1094,7 @@ test "checkStatement: rejects an unused result" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() i32: return 1\nfn main(): one()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> i32: return 1\nfn main(): one()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1135,7 +1208,7 @@ test "checkStatement: checks a local constant with the parameters of its functio
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(value: i32) i32:\n    const copy: i32 = value\n    return copy" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(value: i32) -> i32:\n    const copy: i32 = value\n    return copy" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1158,7 +1231,7 @@ test "checkStatement: rejects an assignment of another type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show() i32:\n    var count = 1i32\n    count = true\n    return count" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show() -> i32:\n    var count = 1i32\n    count = true\n    return count" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1263,7 +1336,7 @@ test "checkInitialValue: gives undefined the written type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show() i32:\n    var count: i32 = undefined\n    count = 5\n    return count" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show() -> i32:\n    var count: i32 = undefined\n    count = 5\n    return count" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1286,7 +1359,7 @@ test "checkInitialValue: rejects undefined without a written type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show() i32:\n    var count = undefined\n    count = 5i32\n    return count" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show() -> i32:\n    var count = undefined\n    count = 5i32\n    return count" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1313,7 +1386,7 @@ test "checkExpression: rejects a boolean for an integer type" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() i32: return true" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() -> i32: return true" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1322,7 +1395,7 @@ test "checkExpression: rejects a boolean for an integer type" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: rejects an integer literal for a float type" {
@@ -1341,7 +1414,7 @@ test "checkExpression: rejects an integer literal for a float type" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn ratio() f64: return 2" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn ratio() -> f64: return 2" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1350,7 +1423,7 @@ test "checkExpression: rejects an integer literal for a float type" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 27 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: rejects a float literal for an integer type" {
@@ -1369,7 +1442,7 @@ test "checkExpression: rejects a float literal for an integer type" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() i32: return 2.5" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() -> i32: return 2.5" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1378,7 +1451,7 @@ test "checkExpression: rejects a float literal for an integer type" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: rejects a suffix of another type" {
@@ -1397,7 +1470,7 @@ test "checkExpression: rejects a suffix of another type" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() i32: return 5u8" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() -> i32: return 5u8" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1406,7 +1479,7 @@ test "checkExpression: rejects a suffix of another type" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: rejects a float suffix of another type" {
@@ -1425,7 +1498,7 @@ test "checkExpression: rejects a float suffix of another type" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn ratio() f64: return 2.5f32" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn ratio() -> f64: return 2.5f32" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1434,7 +1507,7 @@ test "checkExpression: rejects a float suffix of another type" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 27 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: accepts the maximum of each integer type" {
@@ -1456,15 +1529,15 @@ test "checkExpression: accepts the maximum of each integer type" {
     try program_directory.dir.writeFile(std.testing.io, .{
         .sub_path = "main.mn",
         .data =
-        \\fn one() i8: return 127
-        \\fn two() i16: return 32767
-        \\fn three() i32: return 2147483647
-        \\fn four() i64: return 9223372036854775807
-        \\fn five() u8: return 255
-        \\fn six() u16: return 65535
-        \\fn seven() u32: return 4294967295
-        \\fn eight() u64: return 18446744073709551615
-        \\fn nine() usize: return 18446744073709551615
+        \\fn one() -> i8: return 127
+        \\fn two() -> i16: return 32767
+        \\fn three() -> i32: return 2147483647
+        \\fn four() -> i64: return 9223372036854775807
+        \\fn five() -> u8: return 255
+        \\fn six() -> u16: return 65535
+        \\fn seven() -> u32: return 4294967295
+        \\fn eight() -> u64: return 18446744073709551615
+        \\fn nine() -> usize: return 18446744073709551615
         ,
     });
     try loader.loadMainModule(&arena, std.testing.io, "main");
@@ -1479,15 +1552,15 @@ test "checkExpression: accepts the maximum of each integer type" {
 
 test "checkExpression: rejects one past the maximum of each integer type" {
     const sources = [_][]const u8{
-        "fn value() i8: return 128",
-        "fn value() i16: return 32768",
-        "fn value() i32: return 2147483648",
-        "fn value() i64: return 9223372036854775808",
-        "fn value() u8: return 256",
-        "fn value() u16: return 65536",
-        "fn value() u32: return 4294967296",
-        "fn value() u64: return 18446744073709551616",
-        "fn value() usize: return 18446744073709551616",
+        "fn value() -> i8: return 128",
+        "fn value() -> i16: return 32768",
+        "fn value() -> i32: return 2147483648",
+        "fn value() -> i64: return 9223372036854775808",
+        "fn value() -> u8: return 256",
+        "fn value() -> u16: return 65536",
+        "fn value() -> u32: return 4294967296",
+        "fn value() -> u64: return 18446744073709551616",
+        "fn value() -> usize: return 18446744073709551616",
     };
     for (sources) |source| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1526,7 +1599,7 @@ test "checkExpression: rejects a suffixed literal out of range" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn small() u8: return 300u8" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn small() -> u8: return 300u8" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1535,7 +1608,7 @@ test "checkExpression: rejects a suffixed literal out of range" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: rejects an integer beyond 64 bits" {
@@ -1554,7 +1627,7 @@ test "checkExpression: rejects an integer beyond 64 bits" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn big() u64: return 18446744073709551616" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn big() -> u64: return 18446744073709551616" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1563,7 +1636,7 @@ test "checkExpression: rejects an integer beyond 64 bits" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 22 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: rejects a float out of range" {
@@ -1582,7 +1655,7 @@ test "checkExpression: rejects a float out of range" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn huge() f32: return 1e39" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn huge() -> f32: return 1e39" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1591,7 +1664,7 @@ test "checkExpression: rejects a float out of range" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: rejects a type as a value" {
@@ -1604,7 +1677,7 @@ test "checkExpression: rejects a type as a value" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() i32: return i32\nfn main(): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> i32: return i32\nfn main(): noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1613,7 +1686,7 @@ test "checkExpression: rejects a type as a value" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 22 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?.location.?);
     try std.testing.expectEqualStrings("value does not match the expected type", type_checker.failure.?.message);
 }
 
@@ -1633,7 +1706,7 @@ test "checkExpression: rejects a parameter of another type" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn same(value: i32) u8: return value" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn same(value: i32) -> u8: return value" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1642,7 +1715,7 @@ test "checkExpression: rejects a parameter of another type" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 32 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 35 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: rejects a call of another type" {
@@ -1661,7 +1734,7 @@ test "checkExpression: rejects a call of another type" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() u8: return 1\nfn two() i32: return one()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> u8: return 1\nfn two() -> i32: return one()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1670,7 +1743,7 @@ test "checkExpression: rejects a call of another type" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 22 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 25 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: rejects a void call as a value" {
@@ -1689,7 +1762,7 @@ test "checkExpression: rejects a void call as a value" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn log(): noop\nfn two() i32: return log()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn log(): noop\nfn two() -> i32: return log()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1698,7 +1771,7 @@ test "checkExpression: rejects a void call as a value" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 22 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 25 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: gives a string literal the String type" {
@@ -1717,7 +1790,7 @@ test "checkExpression: gives a string literal the String type" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() String: return \"hello\"" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() -> String: return \"hello\"" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1745,7 +1818,7 @@ test "checkExpression: rejects a string for an integer type" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() i32: return \"42\"" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn answer() -> i32: return \"42\"" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1754,7 +1827,7 @@ test "checkExpression: rejects a string for an integer type" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: rejects an integer for String" {
@@ -1773,7 +1846,7 @@ test "checkExpression: rejects an integer for String" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn name() String: return 1" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn name() -> String: return 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1782,7 +1855,7 @@ test "checkExpression: rejects an integer for String" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 29 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: rejects undefined as a returned value" {
@@ -1795,7 +1868,7 @@ test "checkExpression: rejects undefined as a returned value" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show() i32: return undefined" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show() -> i32: return undefined" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1803,7 +1876,7 @@ test "checkExpression: rejects undefined as a returned value" {
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.UnexpectedUndefined, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: rejects undefined as the value of a local constant" {
@@ -1816,7 +1889,7 @@ test "checkExpression: rejects undefined as the value of a local constant" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show() i32:\n    const count: i32 = undefined\n    return count" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show() -> i32:\n    const count: i32 = undefined\n    return count" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1837,7 +1910,7 @@ test "checkExpression: gives a struct literal the expected type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn make() Point: return .(x = 1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn make() -> Point: return .(x = 1)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1860,7 +1933,7 @@ test "checkExpression: rejects a struct literal for a type that is not a struct"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() i32: return .(x = 1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> i32: return .(x = 1)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1868,7 +1941,7 @@ test "checkExpression: rejects a struct literal for a type that is not a struct"
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.NotAStruct, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: checks the fields of a struct literal" {
@@ -1881,7 +1954,7 @@ test "checkExpression: checks the fields of a struct literal" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn make() Point: return .(x = true)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn make() -> Point: return .(x = true)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1889,7 +1962,7 @@ test "checkExpression: checks the fields of a struct literal" {
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 31 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 34 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: gives an array literal the expected type" {
@@ -1902,7 +1975,7 @@ test "checkExpression: gives an array literal the expected type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() [2]i32: return [1, 2]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> [2]i32: return [1, 2]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1926,7 +1999,7 @@ test "checkExpression: rejects an array literal of another length" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() [2]i32: return [1]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> [2]i32: return [1]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1934,7 +2007,7 @@ test "checkExpression: rejects an array literal of another length" {
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.WrongLength, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 29 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: rejects an array literal for a type that is not an array" {
@@ -1947,7 +2020,7 @@ test "checkExpression: rejects an array literal for a type that is not an array"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() i32: return [1]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> i32: return [1]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1955,7 +2028,7 @@ test "checkExpression: rejects an array literal for a type that is not an array"
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.NotAnArray, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: checks the elements of an array literal" {
@@ -1968,7 +2041,7 @@ test "checkExpression: checks the elements of an array literal" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() [2]i32: return [1, true]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> [2]i32: return [1, true]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1976,7 +2049,7 @@ test "checkExpression: checks the elements of an array literal" {
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 30 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 33 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: converts a mutable slice to a constant slice" {
@@ -2122,7 +2195,7 @@ test "checkCall: rejects a wrong number of arguments" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn add(left: i32, right: i32) i32:\n    _ = right\n    return left\nfn main(): _ = add(1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn add(left: i32, right: i32) -> i32:\n    _ = right\n    return left\nfn main(): _ = add(1)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2188,6 +2261,201 @@ test "checkCall: checks literal arguments against their parameter" {
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, type_checker.failure.?.location.?);
+}
+
+test "resolveMethodCall: calls a method with its receiver as the first argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    points: i32\n    fn get(self: Self) -> i32: return self.points\nfn show(card: Card) -> i32: return card.get()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    const body = loader.modules.items[0].declarations[2].kind.function_definition.body;
+    const call = body[0].kind.@"return".?.kind.call;
+    try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 1 } }, call.callee.identifier.resolution.?);
+    try std.testing.expectEqualStrings("card", call.arguments[0].value.kind.identifier.name);
+}
+
+test "resolveMethodCall: checks the arguments after the receiver" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    fn add(self: Self, count: i32) -> i32:\n        _ = self\n        return count\nfn show(card: Card) -> i32: return card.add(true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.TypeMismatch, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 45 }, type_checker.failure.?.location.?);
+}
+
+test "resolveMethodCall: rejects an unknown method" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card\nfn show(card: Card): card.missing()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnknownMethod, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 27 }, type_checker.failure.?.location.?);
+}
+
+test "resolveMethodCall: rejects a function without a Self parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    fn new() -> Card: return Card()\nfn show(card: Card) -> Card: return card.new()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.NoSelf, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 42 }, type_checker.failure.?.location.?);
+}
+
+test "resolveMethodCall: rejects a function whose first parameter names the struct" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    fn show(card: Card) -> Card: return card\nfn take(card: Card) -> Card: return card.show()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.NoSelf, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 42 }, type_checker.failure.?.location.?);
+}
+
+test "resolveMethodCall: calls a function of a trait of the file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\nfn show(square: Square) -> i32: return square.area()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    const body = loader.modules.items[0].declarations[4].kind.function_definition.body;
+    const callee = body[0].kind.@"return".?.kind.call.callee.identifier;
+    try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 3 } }, callee.resolution.?);
+}
+
+test "resolveMethodCall: rejects a function of a trait that is not imported" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Square:\n    side: i32\nimpl shapes::Shape for Square:\n    fn area(self: Self) -> i32: return self.side\nfn show(square: Square) -> i32: return square.area()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnknownMethod, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 47 }, type_checker.failure.?.location.?);
+}
+
+test "resolveMethodCall: calls a function of an imported trait" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes::Shape\nstruct Square:\n    side: i32\nimpl shapes::Shape for Square:\n    fn area(self: Self) -> i32: return self.side\nfn show(square: Square) -> i32: return square.area()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try type_checker.check();
+}
+
+test "resolveMethodCall: rejects a method that a struct and a trait both have" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\nstruct Square:\n    side: i32\n    fn area(self: Self) -> i32: return self.side\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\nfn show(square: Square) -> i32: return square.area()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.AmbiguousMethod, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 8, .column = 47 }, type_checker.failure.?.location.?);
 }
 
 test "checkFunctionCall: rejects a named argument" {
@@ -2265,7 +2533,7 @@ test "checkConstruction: gives a construction its struct" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nfn make() Point: return Point(y = 2, x = 1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nfn make() -> Point: return Point(y = 2, x = 1)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2289,7 +2557,7 @@ test "checkConstruction: rejects a type that is not a struct" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() i32: return i32(x = 1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> i32: return i32(x = 1)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2298,7 +2566,7 @@ test "checkConstruction: rejects a type that is not a struct" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.NotAStruct, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
 }
 
 test "checkConstruction: rejects an argument without a field name" {
@@ -2311,7 +2579,7 @@ test "checkConstruction: rejects an argument without a field name" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nfn make() Point: return Point(1, y = 2)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nfn make() -> Point: return Point(1, y = 2)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2320,7 +2588,7 @@ test "checkConstruction: rejects an argument without a field name" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.MissingFieldName, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 4, .column = 31 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 34 }, type_checker.failure.?.location.?);
 }
 
 test "checkConstruction: rejects an unknown field" {
@@ -2333,7 +2601,7 @@ test "checkConstruction: rejects an unknown field" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nfn make() Point: return Point(x = 1, z = 2)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nfn make() -> Point: return Point(x = 1, z = 2)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2342,7 +2610,7 @@ test "checkConstruction: rejects an unknown field" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.UnknownField, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 4, .column = 38 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 41 }, type_checker.failure.?.location.?);
 }
 
 test "checkConstruction: rejects a field given twice" {
@@ -2355,7 +2623,7 @@ test "checkConstruction: rejects a field given twice" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nfn make() Point: return Point(x = 1, x = 2, y = 3)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nfn make() -> Point: return Point(x = 1, x = 2, y = 3)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2364,7 +2632,7 @@ test "checkConstruction: rejects a field given twice" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.RepeatedField, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 4, .column = 38 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 41 }, type_checker.failure.?.location.?);
 }
 
 test "checkConstruction: rejects a missing field" {
@@ -2377,7 +2645,7 @@ test "checkConstruction: rejects a missing field" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nfn make() Point: return Point(x = 1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nfn make() -> Point: return Point(x = 1)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2386,7 +2654,7 @@ test "checkConstruction: rejects a missing field" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.MissingField, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 4, .column = 25 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 28 }, type_checker.failure.?.location.?);
 }
 
 test "checkConstruction: rejects a value of another type than its field" {
@@ -2399,7 +2667,7 @@ test "checkConstruction: rejects a value of another type than its field" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nfn make() Point: return Point(x = true, y = 2)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nfn make() -> Point: return Point(x = true, y = 2)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2408,7 +2676,7 @@ test "checkConstruction: rejects a value of another type than its field" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 4, .column = 35 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 38 }, type_checker.failure.?.location.?);
 }
 
 test "checkConstruction: accepts leaving out fields with defaults" {
@@ -2421,7 +2689,7 @@ test "checkConstruction: accepts leaving out fields with defaults" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32 = 0\n    y: i32\nfn make() Point: return Point(y = 1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32 = 0\n    y: i32\nfn make() -> Point: return Point(y = 1)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2442,7 +2710,7 @@ test "checkFieldAccess: gives each access the type of its field" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nstruct Line:\n    start: Point\nfn read(line: Line) i32: return line.start.x" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nstruct Line:\n    start: Point\nfn read(line: Line) -> i32: return line.start.x" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2467,7 +2735,7 @@ test "checkFieldAccess: rejects a field the struct does not have" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nstruct Line:\n    start: Point\nfn read(point: Point) i32: return point.y" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nstruct Line:\n    start: Point\nfn read(point: Point) -> i32: return point.y" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2476,7 +2744,7 @@ test "checkFieldAccess: rejects a field the struct does not have" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.UnknownField, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 5, .column = 41 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 44 }, type_checker.failure.?.location.?);
 }
 
 test "checkFieldAccess: rejects fields of a value that is not a struct" {
@@ -2489,7 +2757,7 @@ test "checkFieldAccess: rejects fields of a value that is not a struct" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(value: i32) i32: return value.x" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(value: i32) -> i32: return value.x" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2498,7 +2766,7 @@ test "checkFieldAccess: rejects fields of a value that is not a struct" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.NoFields, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 39 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 42 }, type_checker.failure.?.location.?);
 }
 
 test "checkFieldAccess: rejects a field of another type than expected" {
@@ -2511,7 +2779,7 @@ test "checkFieldAccess: rejects a field of another type than expected" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nstruct Line:\n    start: Point\nfn read(point: Point) Bool: return point.x" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nstruct Line:\n    start: Point\nfn read(point: Point) -> Bool: return point.x" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2520,7 +2788,7 @@ test "checkFieldAccess: rejects a field of another type than expected" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 5, .column = 36 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 39 }, type_checker.failure.?.location.?);
 }
 
 test "checkFieldAccess: rejects a field of a field that is not a struct" {
@@ -2533,7 +2801,7 @@ test "checkFieldAccess: rejects a field of a field that is not a struct" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn read(point: Point) i32: return point.x.y" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn read(point: Point) -> i32: return point.x.y" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2542,7 +2810,7 @@ test "checkFieldAccess: rejects a field of a field that is not a struct" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.NoFields, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 43 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 46 }, type_checker.failure.?.location.?);
 }
 
 test "inferType: gives a call its return type" {
@@ -2555,7 +2823,7 @@ test "inferType: gives a call its return type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nstruct Line:\n    start: Point\nexternal fn make() Line\nfn read() i32: return make().start.x" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nstruct Line:\n    start: Point\nexternal fn make() -> Line\nfn read() -> i32: return make().start.x" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2579,7 +2847,7 @@ test "inferType: rejects a literal without a known type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read() i32: return 5.x" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read() -> i32: return 5.x" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2588,7 +2856,7 @@ test "inferType: rejects a literal without a known type" {
     var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.UnknownValueType, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
 }
 
 test "inferType: rejects a struct literal without an expected type" {
@@ -2841,7 +3109,7 @@ test "checkConstant: gives each use the type of the value" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() u64: return limit\nfn two() u64: return limit\nconst limit = 7u64\nfn main(): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> u64: return limit\nfn two() -> u64: return limit\nconst limit = 7u64\nfn main(): noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2865,7 +3133,7 @@ test "checkConstant: rejects a value of another type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() i32: return limit\nconst limit = true\nfn main(): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> i32: return limit\nconst limit = true\nfn main(): noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2873,7 +3141,7 @@ test "checkConstant: rejects a value of another type" {
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 22 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?.location.?);
 }
 
 test "checkConstant: checks the value in the module of the constant" {
@@ -2887,7 +3155,7 @@ test "checkConstant: checks the value in the module of the constant" {
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "limits.mn", .data = "const maximum = 300u8" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() u8: return limits::maximum\nfn main(): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> u8: return limits::maximum\nfn main(): noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2909,7 +3177,7 @@ test "checkConstant: checks a constant that constructs a struct" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nconst origin = Point(x = 0, y = 0)\nfn make() Point: return origin" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nconst origin = Point(x = 0, y = 0)\nfn make() -> Point: return origin" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2933,7 +3201,7 @@ test "checkConstant: reports errors in the module of the constant" {
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Point:\n    x: i32\nconst origin = Point(x = true)" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() shapes::Point: return shapes::origin" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> shapes::Point: return shapes::origin" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3020,7 +3288,7 @@ test "checkConstantValue: checks the written type of a top-level constant" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const limit: u8 = 300\nfn show() u8: return limit" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const limit: u8 = 300\nfn show() -> u8: return limit" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3041,7 +3309,7 @@ test "computeLiteralType: rejects a number without a suffix" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() i32: return limit\nconst limit = 5\nfn main(): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> i32: return limit\nconst limit = 5\nfn main(): noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3062,7 +3330,7 @@ test "computeLiteralType: rejects an unknown suffix" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() i32: return limit\nconst limit = 5Bool\nfn main(): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> i32: return limit\nconst limit = 5Bool\nfn main(): noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3083,7 +3351,7 @@ test "expectNumber: rejects an unknown suffix" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn value() u8: return 5Bool" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn value() -> u8: return 5Bool" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3091,7 +3359,7 @@ test "expectNumber: rejects an unknown suffix" {
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.UnknownSuffix, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
 }
 
 test "expectNumber: rejects a float suffix on an integer" {
@@ -3104,7 +3372,7 @@ test "expectNumber: rejects a float suffix on an integer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn value() f64: return 1f64" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn value() -> f64: return 1f64" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3112,7 +3380,7 @@ test "expectNumber: rejects a float suffix on an integer" {
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 27 }, type_checker.failure.?.location.?);
 }
 
 test "expectNumber: rejects an integer suffix on a float" {
@@ -3125,7 +3393,7 @@ test "expectNumber: rejects an integer suffix on a float" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn value() u8: return 2.5u8" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn value() -> u8: return 2.5u8" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3133,5 +3401,5 @@ test "expectNumber: rejects an integer suffix on a float" {
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
 }

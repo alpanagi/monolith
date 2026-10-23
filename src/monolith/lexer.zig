@@ -32,6 +32,7 @@ pub const Lexer = struct {
         const lexers = [_]*const fn (*Lexer, std.mem.Allocator) LexError!bool{
             lexIndentation,
             lexWhitespace,
+            lexComment,
             lexWord,
             lexNumber,
             lexString,
@@ -98,7 +99,7 @@ fn lexIndentation(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
     const depth = position - start;
     const row = state.location.row + 1;
 
-    if (state.nesting == 0) {
+    if (state.nesting == 0 and state.peek(position) != '#') {
         try state.tokens.append(allocator, .{
             .kind = token.TokenKind{ .indent = depth },
             .location = .{ .row = row, .column = 1 },
@@ -114,6 +115,19 @@ fn lexWhitespace(state: *Lexer, _: std.mem.Allocator) LexError!bool {
     if (state.source[position] != ' ') return false;
 
     while (state.peek(position) == ' ') position += 1;
+    state.location.column += position - state.offset;
+    state.offset = position;
+    return true;
+}
+
+fn lexComment(state: *Lexer, _: std.mem.Allocator) LexError!bool {
+    if (state.source[state.offset] != '#') return false;
+
+    var position = state.offset + 1;
+    while (state.peek(position)) |byte| {
+        if (byte == '\n' or byte == '\r') break;
+        position += 1;
+    }
     state.location.column += position - state.offset;
     state.offset = position;
     return true;
@@ -240,6 +254,15 @@ fn lexSymbols(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
     if (state.source[state.offset] == '.' and state.peek(state.offset + 1) == '.') {
         try state.tokens.append(allocator, .{
             .kind = .dot_dot,
+            .location = state.location,
+        });
+        state.location.column += 2;
+        state.offset += 2;
+        return true;
+    }
+    if (state.source[state.offset] == '-' and state.peek(state.offset + 1) == '>') {
+        try state.tokens.append(allocator, .{
+            .kind = .arrow,
             .location = state.location,
         });
         state.location.column += 2;
@@ -469,6 +492,51 @@ test "lexIndentation: ignores line breaks inside brackets and parentheses" {
     try std.testing.expect(lexer.tokens.items[9].kind == .right_parenthesis);
     try std.testing.expectEqual(0, lexer.tokens.items[10].kind.indent);
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, lexer.tokens.items[6].location);
+}
+
+test "lexIndentation: leaves out a line that holds only a comment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("fn main():\n    # first\n# second\n    noop");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(9, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[5].kind == .colon);
+    try std.testing.expectEqual(4, lexer.tokens.items[6].kind.indent);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 1 }, lexer.tokens.items[6].location);
+    try std.testing.expect(lexer.tokens.items[7].kind == .keyword_noop);
+}
+
+test "lexComment: ends a comment at the end of the line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("noop # done\r\nnoop");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(5, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_noop);
+    try std.testing.expectEqual(0, lexer.tokens.items[2].kind.indent);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, lexer.tokens.items[2].location);
+    try std.testing.expect(lexer.tokens.items[3].kind == .keyword_noop);
+}
+
+test "lexComment: keeps any byte other than a line end in a comment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("noop #\ta\x01\xc3\xa9\"\nnoop");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(5, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[3].kind == .keyword_noop);
+}
+
+test "lexComment: rejects a carriage return on its own in a comment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("noop # a\rb");
+
+    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 9 }, lexer.failure.?.location.?);
 }
 
 test "lexWord: distinguishes keyword from identifier" {
@@ -810,6 +878,15 @@ test "lexString: keeps any other byte as text" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, lexer.tokens.items[2].location);
 }
 
+test "lexString: keeps a number sign as text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"a # b\"");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqualStrings("a # b", lexer.tokens.items[1].kind.string_literal);
+}
+
 test "lexSymbols: lexes adjacent symbols" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -856,4 +933,24 @@ test "lexSymbols: lexes two dots as one symbol" {
 
     try std.testing.expect(lexer.tokens.items[2].kind == .dot_dot);
     try std.testing.expect(lexer.tokens.items[3].kind == .right_bracket);
+}
+
+test "lexSymbols: lexes a dash and a greater-than sign as one symbol" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init(") -> i32");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[2].kind == .arrow);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.tokens.items[2].location);
+    try std.testing.expectEqualStrings("i32", lexer.tokens.items[3].kind.identifier);
+}
+
+test "lexSymbols: rejects a dash without a greater-than sign" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init(") - i32");
+
+    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.failure.?.location.?);
 }

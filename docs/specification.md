@@ -20,22 +20,24 @@ The grammar uses this notation:
 | `[ a ]` | `a`, optionally |
 | `{ a }` | `a`, repeated zero or more times |
 
-`name`, `integer`, `float`, `string` and `newline` are defined in the Lexical structure chapter (L2, L6, L12 to L16, L18 to L21). The indentation of lines is described in S6 to S8, and applies to `fields` as to `indented_block`.
+`name`, `integer`, `float`, `string` and `newline` are defined in the Lexical structure chapter (L2, L6, L12 to L16, L18 to L21). The indentation of lines is described in S6 to S8, and applies to `members` as to `indented_block`.
 
 ```
 module               = { declaration }
-declaration          = function | external_function | constant | struct
+declaration          = function | external_function | constant | struct | trait | implementation
+                     | import
 function             = function_declaration ":" block
 external_function    = "external" function_declaration
-function_declaration = "fn" name "(" [ parameters ] ")" [ type ]
+function_declaration = "fn" name "(" [ parameters ] ")" [ "->" type ]
 parameters           = parameter { "," parameter } [ "," ]
-parameter            = name ":" type [ "=" expression ]
+parameter            = ( name | "_" ) ":" type [ "=" expression ]
 type                 = expression
 block                = statement | indented_block
 indented_block       = newline statement { newline statement }
-statement            = "noop" | "return" [ expression ] | "_" "=" ( call | name ) | call | constant
-                     | variable | assignment | while
-expression           = operand { "." name | "[" ".." "]" }
+statement            = "noop" | "return" [ expression ] | "_" "=" ( call | method_call | name ) | call
+                     | method_call | constant | variable | assignment | while
+expression           = operand { "." name [ "(" [ arguments ] ")" ] | "[" ".." "]" }
+method_call          = expression "." name "(" [ arguments ] ")"
 operand              = integer | float | string | "true" | "false" | "undefined" | path | call
                      | struct_literal | array_type | array_literal | slice_type
 call                 = path "(" [ arguments ] ")"
@@ -50,33 +52,37 @@ constant             = "const" name ( [ ":" type ] "=" expression | "=" anonymou
 variable             = "var" name [ ":" type ] "=" expression
 assignment           = expression "=" expression
 while                = "while" expression ":" block
-anonymous_struct     = "struct" [ ":" fields ]
-struct               = "struct" name [ ":" fields ]
-fields               = newline field { newline field }
+anonymous_struct     = "struct" [ ":" members ]
+struct               = "struct" name [ ":" members ]
+members              = newline member { newline member }
+member               = field | function
 field                = name ":" type [ "=" expression ]
+trait                = "trait" name [ ":" newline function_declaration { newline function_declaration } ]
+implementation       = "impl" path "for" type [ ":" newline function { newline function } ]
+import               = "import" path
 ```
 
 ## Lexical structure
 
 ### Characters and lines
 
-- **L1.** Source files are ASCII outside string literals, which can contain any bytes (L19). Any character not described in this chapter is rejected with `unexpected character`.
+- **L1.** Source files are ASCII outside string literals and comments, which can contain any bytes (L19, L22). Any character not described in this chapter is rejected with `unexpected character`.
 - **L2.** A line ends with a line feed (`\n`) or a carriage return followed by a line feed (`\r\n`). A carriage return on its own is rejected with `unexpected character`.
-- **L3.** Spaces separate tokens. Outside string literals, tabs are rejected with `tabs are not allowed, use spaces`.
+- **L3.** Spaces separate tokens. Outside string literals and comments, tabs are rejected with `tabs are not allowed, use spaces`.
 - **L4.** The first line of a file cannot start with a space. It is rejected with `unexpected character` at 1:1.
 - **L5.** The number of spaces at the start of a line is its indentation. A line containing only spaces is blank and is ignored, whatever its indentation. Between `(` and its `)`, and between `[` and its `]`, line ends and indentation are ignored, so a list of arguments or elements can continue on the following lines.
 
 ### Words
 
 - **L6.** A word starts with a letter or `_` and continues with letters, digits and `_`.
-- **L7.** These words are keywords: `fn`, `external`, `const`, `var`, `struct`, `noop`, `return`, `while`, `true`, `false`, `undefined`.
+- **L7.** These words are keywords: `fn`, `external`, `const`, `var`, `struct`, `trait`, `impl`, `for`, `import`, `noop`, `return`, `while`, `true`, `false`, `undefined`.
 - **L8.** The built-in types (T1) are named `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `usize`, `f32`, `f64`, `Bool`, `String` and `void`. The names of number types, which state their size in bits or as the size of a pointer, and `void`, are lowercase. The others start with a capital letter. Type names are names, not keywords.
-- **L9.** A lone `_` is the discard symbol. It is not a name.
+- **L9.** A lone `_` is the discard symbol. It is not a name. A parameter written `_` (N19) is discarded.
 - **L10.** Every other word is a name. Keywords and `_` cannot be used as names. The built-in type names and names that start with `mn_` are reserved (N14).
 
 ### Symbols
 
-- **L11.** The symbols are `(`, `)`, `[`, `]`, `:`, `::`, `,`, `.`, `..` and `=`. Two `:` with nothing between them are the symbol `::`, and two `.` with nothing between them are the symbol `..`.
+- **L11.** The symbols are `(`, `)`, `[`, `]`, `:`, `::`, `,`, `.`, `..`, `=` and `->`. Two `:` with nothing between them are the symbol `::`, and two `.` with nothing between them are the symbol `..`. A `-` that is not followed by `>` is rejected with `unexpected character`.
 
 ### Number literals
 
@@ -114,6 +120,10 @@ field                = name ":" type [ "=" expression ]
 - **L20.** A `\` followed by any other character is rejected with `unknown escape sequence`, at the `\`.
 - **L21.** A string literal that reaches a line feed, a carriage return or the end of the file without a closing `"` is rejected with `unterminated string`, at its opening `"`.
 
+### Comments
+
+- **L22.** `#` outside a string literal starts a comment, which ends at the end of the line: `noop # nothing to do`. A comment contains any bytes other than line feeds and carriage returns, and a carriage return on its own in a comment is rejected as in L2. A line that holds only a comment, after any number of spaces, is left out: it does not end or start a block, whatever its indentation, and it can come right after a `:` (S8). There are no block comments.
+
 ## Program structure
 
 ### Top level
@@ -123,9 +133,9 @@ field                = name ":" type [ "=" expression ]
 
 ### Functions
 
-- **S3.** A function is a function declaration, made of its name, parameters and return type, followed by a block (the `function` rule): `fn add(left: i32, right: i32) i32:`.
+- **S3.** A function is a function declaration, made of its name, parameters and return type after `->`, followed by a block (the `function` rule): `fn add(left: i32, right: i32) -> i32:`. A return type without `->` is rejected with `expected '->'`, at the type.
 - **S4.** A trailing `,` after the last parameter is allowed.
-- **S5.** A missing return type is the return type `void`. `fn main():` and `fn main() void:` are the same.
+- **S5.** A missing return type is the return type `void`. `fn main():` and `fn main() -> void:` are the same.
 
 ### Blocks
 
@@ -146,8 +156,8 @@ field                = name ":" type [ "=" expression ]
 
 - **S9.** `noop` does nothing.
 - **S10.** `return` ends the function. Its value, if any, is on the same line.
-- **S11.** `_ = add(1, 2)` calls a function and discards its result, and `_ = value` discards a parameter or a local constant (N19). Anything other than a call or a name after `_ =`, such as `_ = 5` or `_ = make().x`, is rejected with `expected a call or a name`. A struct value, `_ = Point(x = 1)`, is rejected with `expected a call`.
-- **S12.** A call on its own, such as `log(1)`, is a statement. A name, a literal or a field access on its own is rejected with `expected a statement`.
+- **S11.** `_ = add(1, 2)` calls a function and discards its result, as does `_ = card.count()` (S30), and `_ = value` discards a parameter or a local constant (N19). Anything other than a call or a name after `_ =`, such as `_ = 5` or `_ = make().x`, is rejected with `expected a call or a name`. A struct value, `_ = Point(x = 1)`, is rejected with `expected a call`.
+- **S12.** A call on its own, such as `log(1)` or `card.flip()` (S30), is a statement. A name, a literal or a field access on its own is rejected with `expected a statement`.
 - **S13.** A constant (N10) is also a statement. Inside a function, it declares a local constant (N15). `var` declares a variable (N20), and `target = value` assigns to one (N21). A target that is not a name or a field access, such as `make() = 1`, is rejected with `expected a name or a field access before '='`, at the target.
 - **S14.** Each statement is on its own line, except for the single statement of an inline block.
 
@@ -162,7 +172,7 @@ field                = name ":" type [ "=" expression ]
 
 ### Structs
 
-- **S18.** A struct is a type made of fields. It is declared with `struct`, its name and `:`, followed by an indented block with one field on each line. A field is a name and a type, `x: i32`. A line of the block that is not a field is rejected with `expected a field`.
+- **S18.** A struct is a type made of fields. It is declared with `struct`, its name and `:`, followed by an indented block with one field on each line. A field is a name and a type, `x: i32`. The block can also hold functions (S29). A line of the block that is neither a field nor a function is rejected with `expected a field or a function`.
 
   ```monolith
   struct Point:
@@ -190,6 +200,35 @@ field                = name ":" type [ "=" expression ]
 - **S27.** A slice type is written `[]T` or `[]const T`: elements of type `T` that the slice does not hold, as in `[]u8` or `[]const Card`. A slice refers to elements that are stored somewhere else, and their number is known only when the program runs. Through a `[]T` the elements can be changed, and through a `[]const T` they can only be read.
 - **S28.** `value[..]` gives a slice of all the elements of an array: `buffer[..]`. A missing `]` is rejected with `expected ']'`.
 
+### Methods
+
+- **S29.** A function declared in the block of a struct belongs to the struct. Fields and functions can be in any order:
+
+  ```monolith
+  struct Card:
+      question: String
+
+      fn new(question: String) -> Card: return Card(question = question)
+      fn show(self: Self) -> String: return self.question
+  ```
+
+  A function of a struct whose first parameter has the written type `Self` (T26) is a method. `self` is an ordinary name, and the parameter can have any name. A first parameter whose type is written another way is not a method, even if it has the struct's type: `fn show(card: Card)` in `struct Card`.
+
+- **S30.** A method is called with a value, `.`, its name and its arguments: `card.show()`. Every function of a struct can also be called through a path: `Card::new("question")`, and `Card::show(card)` with the value as the first argument.
+
+### Traits
+
+- **S31.** A trait is a named set of function declarations: `trait`, its name and `:`, followed by an indented block with one function declaration on each line. A trait without functions is declared without the `:`. Functions of a trait have no body. A function whose first parameter has the type `Self` is a method of the trait, and other functions, such as `fn new() -> Self`, are called through the type (N26). A function with a body is rejected with `functions of a trait have no body`, at the `:`:
+
+  ```monolith
+  trait Shape:
+      fn area(self: Self) -> i32
+      fn new() -> Self
+  ```
+
+- **S32.** An implementation gives the functions of a trait for one type: `impl`, the trait, `for`, the type and `:`, followed by an indented block of functions. Any type can be written, slices included: `impl Shape for []const u8:`. An implementation of a trait without functions is written without the `:`. A missing `for` is rejected with `expected 'for'`.
+- **S33.** `import` and the path of a trait bring the trait into scope (N28) and bind its name in the file: after `import shapes::Shape`, `impl Shape for Square:` names the trait. An import with the name of another declaration of the file is rejected with `trait is already defined`.
+
 ## Modules
 
 - **M1.** Every source file is a module. The file given to the compiler is the main module. A module's path is the path of its file, with directories separated by `::` and without `.mn`: `utils/math.mn` is the module `utils::math`, and the main file `hello.mn` is the module `hello`.
@@ -207,7 +246,7 @@ field                = name ":" type [ "=" expression ]
 ## Names
 
 - **N1.** Function, constant and struct names are unique within a module, external functions included. A second declaration with the name of a function, constant or struct is rejected at its `fn`, `external`, `const` or `struct`: a function with `function is already defined`, a constant with `constant is already defined`, and a struct with `struct is already defined`.
-- **N2.** Parameter names are unique within a parameter list, and field names within a struct. A repeated name is rejected with `parameter is already defined` or `field is already defined`, at the second parameter or field.
+- **N2.** Parameter names are unique within a parameter list, and field names within a struct. A repeated name is rejected with `parameter is already defined` or `field is already defined`, at the second parameter or field. A parameter list can have more than one `_` parameter (N19).
 - **N3.** A function can call functions defined before or after it.
 - **N4.** A name is looked up first among the local constants (N15) and variables (N20) declared before it in the enclosing function, then among the parameters of the enclosing function, then among the module's functions, constants and structs, then among the built-in types (T1), then among `std` and the program's namespaces (M4). A name in a type (T11) is not looked up among the parameters, but it is looked up among the local constants and variables.
 - **N5.** A name that matches none of them is rejected with `unknown name`.
@@ -239,7 +278,7 @@ field                = name ":" type [ "=" expression ]
 
 ### Reserved names
 
-- **N14.** A function, external function, parameter, constant, struct or field whose name starts with `mn_` is rejected with `name is reserved`, at its `fn`, `external`, `const` or `struct`, or at the parameter or field. The modules of the standard library may use these names, because they declare the runtime's functions (D2). A function, external function, parameter, constant, struct or field named like a built-in type (T1) is rejected with `name is reserved` in every module, the standard library included.
+- **N14.** A function, external function, parameter, constant, struct or field whose name starts with `mn_` is rejected with `name is reserved`, at its `fn`, `external`, `const` or `struct`, or at the parameter or field. The modules of the standard library may use these names, because they declare the runtime's functions (D2). A function, external function, parameter, constant, struct or field named like a built-in type (T1) or `Self` (T26) is rejected with `name is reserved` in every module, the standard library included.
 
 ### Local constants
 
@@ -250,7 +289,7 @@ field                = name ":" type [ "=" expression ]
 ### Unused names
 
 - **N18.** Each parameter of a function with a body, each local constant and each variable (N20) must be used or discarded (N19). An unused parameter is rejected with `parameter is unused, discard it with _ =`, at the parameter. An unused local constant is rejected with `local constant is unused, discard it with _ =`, at its `const`, and an unused variable with `variable is unused, discard it with _ =`, at its `var`. Only reading a variable uses it: a variable that is assigned (N21) but never read is unused. A local constant or variable that a later one with the same name hides before any use is unused (N17). The parameters of external functions are not checked, because they have no body.
-- **N19.** `_ = name` discards a parameter, a local constant or a variable of the enclosing function, which marks it as unused on purpose. Errors, at the name after `_ =`:
+- **N19.** `_ = name` discards a parameter, a local constant or a variable of the enclosing function, which marks it as unused on purpose. A parameter written `_` with its type, `fn text(_: Self) -> String:`, is discarded without a statement: it takes an argument as any parameter does, and has no name in the body. Errors of `_ = name`, at the name after `_ =`:
 
   | Situation | Error |
   |---|---|
@@ -277,6 +316,26 @@ field                = name ":" type [ "=" expression ]
 ### Slices
 
 - **N24.** Only an array that is stored in a name can be sliced (S28): a variable, a local or top-level constant, a parameter, or a field reached through one of them, such as `deck.cards[..]`. Any other value, such as a call (`make()[..]`) or a literal (`[1, 2][..]`), is rejected with `only variables, constants, parameters and their fields can be sliced`, at the value. A slice of a variable counts as an assignment to it (N20), because the elements can be changed through the slice.
+
+### Methods
+
+- **N25.** A function of a struct (S29) is not a name of its module, so it can have the name of a declaration of the module: a struct's `fn new()` and a top-level `fn new()` can be in one file. Two functions with the same name in one struct are rejected with `function is already defined`, and a function with the name of a field of its struct with `method has the name of a field`.
+- **N26.** A call `value.name(...)` or `Type::name(...)` finds the function named `name` in the struct that is the value's type, or that the path names, and in the implementations of the traits in scope (N28) for that type. `Self::name(...)` names the type that `Self` is (T26). A function of a trait without a `Self` parameter is called this way: `Square::new()`. A missing function is rejected with `unknown method`, and more than one with `method is found in more than one place`, at the name of the call.
+
+### Traits
+
+- **N27.** A trait is a name of its module, as a struct is. Two traits with the same name are rejected with `trait is already defined`. A trait is not a value or a type: `fn show(shape: Shape)` is rejected with `a trait cannot be used here`. Any file can implement any trait for any type (S32), and the functions of an implementation must be exactly the functions of the trait, with the same parameter and return types, where `Self` in the trait is the type after `for`. A method of the trait (S31) must be a method in the implementation too, with a first parameter written `Self`. Errors:
+
+  | Situation | Error |
+  |---|---|
+  | The name after `impl` is not a trait, at the name | `not a trait` |
+  | A function that the trait does not have, at `fn` | `function is not in the trait` |
+  | A function whose parameters or return type differ from the trait, at `fn` | `function does not match the trait` |
+  | A function of the trait is missing, at `impl` | `implementation is missing a function of the trait` |
+  | Two functions with the same name, at the second `fn` | `function is already defined` |
+  | A second implementation of the same trait for the same type in the program, at the second `impl` | `trait is already implemented for this type` |
+
+- **N28.** The traits in scope in a file are the traits it declares and the traits it imports (S33). Only they make functions callable with `.` or through a type (N26). A path through a trait, such as `Shape::area(square)`, is rejected with `a trait cannot be used here`, at the path.
 
 ## Types
 
@@ -358,6 +417,11 @@ field                = name ":" type [ "=" expression ]
 - **T23.** A slice of an array (S28) has the element type of the array. A slice of a variable, or of a field reached through a variable, has the type `[]T`. A slice of a constant or a parameter has the type `[]const T`, because their elements cannot be changed. Only arrays can be sliced: any other type is rejected with `type is not an array`, at the value.
 - **T24.** A `[]T` is accepted where a `[]const T` is expected. A `[]const T` where a `[]T` is expected is rejected with `value does not match the expected type`.
 
+### Methods
+
+- **T25.** A call `value.name(arguments)` (S30) calls the method that the value's type finds (N26), with the value as its first argument and the rules for function calls (F1, F2) for the other arguments. A function whose first parameter is not written `Self` (S29) called with a `.` is rejected with `the first parameter is not Self`, at its name. A method is found by the exact type of the value: a `[]u8` does not find a function implemented for `[]const u8`.
+- **T26.** `Self` is a type in the functions of a struct, where it is the struct, in the functions of an implementation, where it is the type after `for`, and in the functions of a trait, where it stands for the type of each implementation (N27). Anywhere else, the fields of a struct included, it is rejected with `unknown name`.
+
 ## Functions
 
 - **F1.** A call passes at least one argument for each parameter without a default value, and at most one for each parameter. Otherwise it is rejected with `wrong number of arguments`. Arguments match parameters in order, so only the last parameters can be left out, and each one left out takes its default value. A parameter without a default value after one with a default value is rejected with `parameters with default values must come last`, at that parameter. The arguments of a function have no names: `add(value = 1)` is rejected with `function arguments have no names`, at the argument.
@@ -370,7 +434,7 @@ field                = name ":" type [ "=" expression ]
 
 ### The main function
 
-- **F8.** The main module's `main` is the program's entry point. A module does not need one. Any module may define `main`, but only the main module's `main` is the entry point.
+- **F8.** The main module's `main` is the program's entry point. A module does not need one. Any module may define `main`, but only the main module's `main` is the entry point. A function named `main` in a struct (S29) is not a `main`, and F9 to F11 do not apply to it.
 - **F9.** Every `main` has no parameters and returns `void`. Otherwise it is rejected with `main cannot have parameters` or `main cannot have a return type`.
 - **F10.** No `main` can be called. A call to it is rejected with `main cannot be called`.
 - **F11.** `main` cannot be an external function. An external `main` is rejected with `main cannot be external`.
@@ -421,7 +485,7 @@ field                = name ":" type [ "=" expression ]
   | a slice | its C name (C22) |
 
 - **C5.** Number literals keep their base. `_` becomes `'`, `0o` becomes `0`, the suffix is removed, and literals of unsigned types end with `u`: `0o7_5_5` returned from a `u16` function becomes `07'5'5u`.
-- **C6.** `_ = add(1, 2)` becomes the plain call, `mn_hello_add(1, 2);` (C9). `_ = value` writes nothing. A discarded parameter has no name in the output: `fn show(value: i32): _ = value` becomes `void mn_hello_show(int32_t)` in the header and in the definition.
+- **C6.** `_ = add(1, 2)` becomes the plain call, `mn_hello_add(1, 2);` (C9). `_ = value` writes nothing. A discarded parameter has no name in the output: `fn show(value: i32): _ = value` and `fn show(_: i32): noop` become `void mn_hello_show(int32_t)` in the header and in the definition.
 - **C7.** A string literal becomes a `string` holding the literal as written and its length in bytes, counting each escape as one byte: `"line\n"` becomes `(string){ "line\n", 5 }`.
 - **C8.** An external function keeps exactly the name written in the source, so its definition, linked into the program, uses that name: `external fn stdout_write(text: String)` becomes `void stdout_write(string text);`. The runtime defines the standard library's external functions this way (D2).
 - **C9.** C has one namespace for all files, so a function's C name is its module's generated name (G1), followed by `_` and its name: `greeting` in `hello.mn` becomes `mn_hello_greeting`, and `add` in `utils::math` becomes `mn_utils_math_add`. The main module's `main` stays `main`.
@@ -481,6 +545,10 @@ field                = name ":" type [ "=" expression ]
 
   A slice of an array becomes a compound literal with the array's `items` and its length: `buffer[..]` of a `[4]u8` becomes `(mn_slice_u8){ .items = buffer.items, .length = 4 }`. Local and stored constants are `const` in C (C16, C20), so for a slice of one the pointer is converted: `(mn_slice_i32){ .items = (int32_t *)values.items, .length = 2 }`. A slice of a zero-sized array has only its length: `(mn_slice_hello_Marker){ .length = 2 }`.
 
+- **C23.** A function of a struct is written like a function (C9), with the struct's name and `_` before its own name: `show` in `struct Card` in `hello.mn` becomes `mn_hello_Card_show`. A method call becomes a call with the value as its first argument: `card.show()` becomes `mn_hello_Card_show(card)`.
+
+- **C24.** A function of an implementation is written like a function of a struct (C23), with the trait's name after the type's name: `area` in `impl Shape for Square` in `hello.mn` becomes `mn_hello_Square_Shape_area`. A struct of another file is written with its module path: `mn_hello_shapes_Square_Shape_area`. Other types are written with their Monolith names, an array as `array_`, its length and its element, and a slice as `slice_` and its element: `impl Shape for []const u8` gives `mn_hello_slice_u8_Shape_area`. Traits, implementations and imports themselves have no output.
+
 ## Compiler
 
 - **K1.** The compiler is invoked as `monolith <file.mn>`, where the file name ends with `.mn` and has a name before it. Any other arguments print `usage: monolith <file.mn>`.
@@ -508,10 +576,10 @@ field                = name ":" type [ "=" expression ]
 
 - **D2.** The runtime is a library of the target that does not depend on the standard library. A runtime function is named like a generated name (G1): `mn_`, then the path of the file that defines it, with `/` replaced by `_`, then `_` and its name. `mn_runtime_stdout_write` is `write` in `runtime/stdout.c`. The compiler finds the file by following the name's parts as folders until a file exists, so a function name can contain `_`. Its functions are linked by name (C8). The standard library declares them as external functions and names them with constants (D1), so a call such as `stdout::write(...)` calls the runtime function directly. Only the runtime files whose functions the program calls are copied into the output (K3).
 - **D3.** `mn_runtime_stdout_write` writes the text exactly as given.
-- **D4.** `std::io::stdin` provides `read(buffer: []u8) usize`, which reads bytes from the standard input into the buffer and returns how many it read:
+- **D4.** `std::io::stdin` provides `read(buffer: []u8) -> usize`, which reads bytes from the standard input into the buffer and returns how many it read:
 
   ```monolith
-  external fn mn_runtime_stdin_read(buffer: []u8) usize
+  external fn mn_runtime_stdin_read(buffer: []u8) -> usize
 
   const read = mn_runtime_stdin_read
   ```
@@ -527,14 +595,14 @@ field                = name ":" type [ "=" expression ]
 ```monolith
 const stdout = std::io::stdout
 
-fn add(left: i32, right: i32) i32:
+fn add(left: i32, right: i32) -> i32:
     _ = right
     return left
 
-fn flag() Bool:
+fn flag() -> Bool:
     return true
 
-fn greeting() String: return "hello\n"
+fn greeting() -> String: return "hello\n"
 
 fn main():
     _ = add(1, 2)
@@ -602,7 +670,7 @@ fn main(): _ = utils::math::add(1, 2)
 `utils/math.mn`:
 
 ```monolith
-fn add(left: i32, right: i32) i32:
+fn add(left: i32, right: i32) -> i32:
     _ = right
     return left
 ```
@@ -639,7 +707,7 @@ struct Line:
     start: Point
     end: Point
 
-fn length(line: Line) i32: return line.start.x
+fn length(line: Line) -> i32: return line.start.x
 ```
 
 `hello.h`:
@@ -665,19 +733,19 @@ int32_t mn_hello_length(mn_hello_Line line);
 ### Invalid programs
 
 ```monolith
-fn small() u8: return 300
+fn small() -> u8: return 300
 ```
 
 → `1:23: error: literal out of range for its type` (T7)
 
 ```monolith
-fn ratio() f64: return 2
+fn ratio() -> f64: return 2
 ```
 
 → `1:24: error: value does not match the expected type` (T6)
 
 ```monolith
-fn one() i32: return 1
+fn one() -> i32: return 1
 fn main(): one()
 ```
 
@@ -705,13 +773,13 @@ fn main():
 → `3:1: error: indentation does not match any outer level` (S8)
 
 ```monolith
-fn value() u8: return 007
+fn value() -> u8: return 007
 ```
 
 → `1:24: error: unexpected character` (L13)
 
 ```monolith
-fn name() String: return "a\qb"
+fn name() -> String: return "a\qb"
 ```
 
 → `1:28: error: unknown escape sequence` (L20)
@@ -741,7 +809,7 @@ fn main(): one()
 const limit = 5
 
 fn main(): _ = one()
-fn one() i32: return limit
+fn one() -> i32: return limit
 ```
 
 → `1:15: error: value has no known type` (N10)
