@@ -11,6 +11,7 @@ pub const TokenKind = union(enum) {
     keyword_struct,
     keyword_noop,
     keyword_return,
+    keyword_while,
     keyword_true,
     keyword_false,
     keyword_undefined,

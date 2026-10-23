@@ -75,7 +75,9 @@ pub const TypeChecker = struct {
         const return_type = signature.return_type;
         if (ast.extractType(return_type) == .void) return;
         const last = function.body[function.body.len - 1];
-        if (last.kind != .@"return") return self.fail(return_type.location, error.MissingReturn);
+        if (last.kind != .@"return" and !isEndless(last)) {
+            return self.fail(return_type.location, error.MissingReturn);
+        }
     }
 
     fn checkExternalFunction(
@@ -137,6 +139,12 @@ pub const TypeChecker = struct {
             .assignment => |*assignment| {
                 const target_type = try self.inferType(parameters, &assignment.target);
                 try self.checkExpression(parameters, &assignment.value, target_type);
+            },
+            .@"while" => |*loop| {
+                try self.checkExpression(parameters, &loop.condition, .boolean);
+                for (loop.body) |*body_statement| {
+                    try self.checkStatement(signature, body_statement);
+                }
             },
         }
     }
@@ -377,7 +385,7 @@ pub const TypeChecker = struct {
             .local => |statement| switch (statement.kind) {
                 .constant_declaration => |constant| constant.value.type.?,
                 .variable_declaration => |variable| variable.value.type.?,
-                .noop, .@"return", .discard, .call, .assignment => unreachable,
+                .noop, .@"return", .discard, .call, .assignment, .@"while" => unreachable,
             },
             .function => unreachable,
         };
@@ -577,6 +585,12 @@ fn describeError(type_error: TypeError) []const u8 {
         error.MissingField => "missing field",
         error.ExpectedCall => "expected a call",
     };
+}
+
+fn isEndless(statement: ast.Statement) bool {
+    if (statement.kind != .@"while") return false;
+    const condition = statement.kind.@"while".condition;
+    return condition.kind == .boolean_literal and condition.kind.boolean_literal;
 }
 
 fn findField(fields: []const types.Field, name: []const u8) ?types.Field {
@@ -847,6 +861,47 @@ test "checkExternalFunction: rejects an external main" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, type_checker.failure.?.location.?);
 }
 
+test "checkFunction: accepts a function that ends with an endless loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first() i32:\n    while true:\n        return 1\nfn main(): _ = first()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try type_checker.check();
+}
+
+test "checkFunction: rejects a function that ends with a loop that can end" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(running: Bool) i32:\n    while running:\n        return 1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.MissingReturn, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?.location.?);
+}
+
 test "checkStatement: rejects a missing return value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1107,6 +1162,48 @@ test "checkStatement: rejects a variable that holds a type" {
 
     try std.testing.expectError(error.TypeVariable, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 16 }, type_checker.failure.?.location.?);
+}
+
+test "checkStatement: rejects a while condition that is not a Bool" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): while 1i32: noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.TypeMismatch, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, type_checker.failure.?.location.?);
+}
+
+test "checkStatement: checks the statements of a while body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): while true: return 1i32" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnexpectedReturnValue, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 31 }, type_checker.failure.?.location.?);
 }
 
 test "checkInitialValue: gives undefined the written type" {

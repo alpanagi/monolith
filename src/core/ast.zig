@@ -48,6 +48,7 @@ pub const StatementKind = union(enum) {
     constant_declaration: ConstantDeclaration,
     variable_declaration: VariableDeclaration,
     assignment: Assignment,
+    @"while": While,
 };
 
 pub const ConstantDeclaration = struct {
@@ -71,6 +72,11 @@ pub const VariableDeclaration = struct {
 pub const Assignment = struct {
     target: Expression,
     value: Expression,
+};
+
+pub const While = struct {
+    condition: Expression,
+    body: []Statement,
 };
 
 pub const Expression = struct {

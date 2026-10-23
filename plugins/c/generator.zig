@@ -593,6 +593,13 @@ pub const Generator = struct {
             .constant_declaration => |constant| constant.value,
             .variable_declaration => |variable| variable.value,
             .assignment => |assignment| assignment.value,
+            .@"while" => |loop| {
+                try self.collectReachedModulesOf(allocator, reached, loop.condition);
+                for (loop.body) |body_statement| {
+                    try self.collectReachedModules(allocator, reached, body_statement);
+                }
+                return;
+            },
         };
         try self.collectReachedModulesOf(allocator, reached, expression);
     }
@@ -828,6 +835,7 @@ pub const Generator = struct {
                 try self.generateLocal(writer, statement);
             },
             .assignment => |assignment| try self.generateAssignment(writer, assignment),
+            .@"while" => |loop| try self.generateWhile(writer, loop),
         }
     }
 
@@ -842,7 +850,7 @@ pub const Generator = struct {
                 return self.hasTarget(assignment.target) or hasEffects(assignment.value);
             },
             .discard => |expression| expression.kind != .identifier,
-            .@"return", .call => true,
+            .@"return", .call, .@"while" => true,
         };
     }
 
@@ -896,6 +904,19 @@ pub const Generator = struct {
         try writer.writeAll(" = ");
         try self.generateExpression(writer, assignment.value);
         try writer.writeAll(";\n");
+    }
+
+    fn generateWhile(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        loop: ast.While,
+    ) std.Io.Writer.Error!void {
+        try self.generateIndentation(writer);
+        try writer.writeAll("while (");
+        try self.generateExpression(writer, loop.condition);
+        try writer.writeAll(") ");
+        try self.generateBlock(writer, loop.body);
+        try writer.writeByte('\n');
     }
 
     fn generateIndentation(self: *Generator, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -1377,13 +1398,15 @@ fn buildLocalNames(
         if (isZeroSized(ast.extractType(parameter.type))) continue;
         try taken.append(allocator, parameter.name);
     }
-    for (body) |statement| {
-        const local = extractLocal(statement) orelse continue;
+    var statements: std.ArrayList(*const ast.Statement) = .empty;
+    try collectStatements(allocator, &statements, body);
+    for (statements.items) |statement| {
+        const local = extractLocal(statement.*) orelse continue;
         try written.append(allocator, local.name);
     }
 
     var local_names: std.ArrayList(LocalName) = .empty;
-    for (body) |*statement| {
+    for (statements.items) |statement| {
         if (!isDeclared(body, statement)) continue;
         const source_name = extractLocal(statement.*).?.name;
         var name = source_name;
@@ -1404,11 +1427,24 @@ fn buildLocalNames(
     return local_names.items;
 }
 
+fn collectStatements(
+    allocator: std.mem.Allocator,
+    statements: *std.ArrayList(*const ast.Statement),
+    body: []const ast.Statement,
+) std.mem.Allocator.Error!void {
+    for (body) |*statement| {
+        try statements.append(allocator, statement);
+        if (statement.kind == .@"while") {
+            try collectStatements(allocator, statements, statement.kind.@"while".body);
+        }
+    }
+}
+
 fn extractLocal(statement: ast.Statement) ?Local {
     return switch (statement.kind) {
         .constant_declaration => |constant| .{ .name = constant.name, .value = constant.value },
         .variable_declaration => |variable| .{ .name = variable.name, .value = variable.value },
-        .noop, .@"return", .discard, .call, .assignment => null,
+        .noop, .@"return", .discard, .call, .assignment, .@"while" => null,
     };
 }
 
@@ -1431,6 +1467,10 @@ fn isDiscarded(body: []const ast.Statement, resolution: ast.Resolution) bool {
             .variable_declaration,
             .assignment,
             => continue,
+            .@"while" => |loop| {
+                if (isDiscarded(loop.body, resolution)) return true;
+                continue;
+            },
         };
         if (expression.kind != .identifier) continue;
         if (std.meta.eql(expression.kind.identifier.resolution.?, resolution)) return true;
@@ -2427,6 +2467,40 @@ test "generateArrayDefinition: defines an array type before the struct that hold
     );
 }
 
+test "collectReachedModules: includes the headers that a loop reaches" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "fn draw(): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): while false: shapes::draw()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n#include \"shapes.h\"\n\nint main() {\n    while (false) {\n        mn_shapes_draw();\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
 test "collectReachedModulesOf: records the runtime functions that a field access calls" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2647,6 +2721,39 @@ test "generateParameters: leaves out the names of discarded parameters" {
 
     try std.testing.expectEqualStrings(
         "#pragma once\n\n#include \"runtime/monolith.h\"\n\nint32_t mn_main_show(int32_t left, int32_t);\n",
+        files[0].contents,
+    );
+}
+
+test "generateParameters: leaves out the name of a parameter discarded in a loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(value: i32):\n    while false:\n        _ = value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\nvoid mn_main_show(int32_t);\n",
         files[0].contents,
     );
 }
@@ -3173,6 +3280,39 @@ test "generateLocal: numbers a variable that shadows a local constant" {
     );
 }
 
+test "generateLocal: numbers a local in a loop that shadows an outer local" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn main():\n    const value = 1i32\n    while false:\n        const value = 2i32\n        take(value)\n    take(value)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nvoid mn_main_take(int32_t) {}\n\nint main() {\n    const int32_t value = 1;\n    while (false) {\n        const int32_t value_2 = 2;\n        mn_main_take(value_2);\n    }\n    mn_main_take(value);\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateAssignment: assigns a field" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3268,6 +3408,39 @@ test "generateAssignment: assigns a nested field" {
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\nmn_main_Line mn_main_show() {\n    mn_main_Line line = (mn_main_Line){ .start = (mn_main_Point){ .x = 1 } };\n    line.start.x = 2;\n    return line;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateWhile: writes the condition and the body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn main():\n    var running = true\n    while running:\n        step()\n        running = false" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nvoid mn_main_step() {}\n\nint main() {\n    bool running = true;\n    while (running) {\n        mn_main_step();\n        running = false;\n    }\n}\n",
         files[1].contents,
     );
 }

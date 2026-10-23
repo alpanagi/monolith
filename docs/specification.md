@@ -34,7 +34,7 @@ type                 = expression
 block                = statement | indented_block
 indented_block       = newline statement { newline statement }
 statement            = "noop" | "return" [ expression ] | "_" "=" ( call | name ) | call | constant
-                     | variable | assignment
+                     | variable | assignment | while
 expression           = operand { "." name }
 operand              = integer | float | string | "true" | "false" | "undefined" | path | call
                      | struct_literal | array_type | array_literal
@@ -48,6 +48,7 @@ path                 = name { "::" name }
 constant             = "const" name ( [ ":" type ] "=" expression | "=" anonymous_struct )
 variable             = "var" name [ ":" type ] "=" expression
 assignment           = expression "=" expression
+while                = "while" expression ":" block
 anonymous_struct     = "struct" [ ":" fields ]
 struct               = "struct" name [ ":" fields ]
 fields               = newline field { newline field }
@@ -67,7 +68,7 @@ field                = name ":" type [ "=" expression ]
 ### Words
 
 - **L6.** A word starts with a letter or `_` and continues with letters, digits and `_`.
-- **L7.** These words are keywords: `fn`, `external`, `const`, `var`, `struct`, `noop`, `return`, `true`, `false`, `undefined`.
+- **L7.** These words are keywords: `fn`, `external`, `const`, `var`, `struct`, `noop`, `return`, `while`, `true`, `false`, `undefined`.
 - **L8.** The built-in types (T1) are named `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `Bool`, `String` and `void`. The names that state a size in bits, and `void`, are lowercase. The others start with a capital letter. Type names are names, not keywords.
 - **L9.** A lone `_` is the discard symbol. It is not a name.
 - **L10.** Every other word is a name. Keywords and `_` cannot be used as names. The built-in type names and names that start with `mn_` are reserved (N14).
@@ -128,16 +129,17 @@ field                = name ":" type [ "=" expression ]
 ### Blocks
 
 - **S6.** A block is either inline or indented.
-  - An inline block is a single statement on the same line as the `:`.
-  - An indented block starts on the next line. Its first line sets the block's indentation, which must be greater than 0. Every following line of the block has exactly that indentation.
-- **S7.** An indented block ends at the first line indented at 0, or at the end of the file.
+  - An inline block is a single statement on the same line as the `:`. It has the indentation of that line.
+  - An indented block starts on the next line. Its first line sets the block's indentation, which must be greater than the indentation of the block that contains the `:`. The top level has indentation 0. Every following line of the block has exactly that indentation.
+  - A block can hold statements with blocks of their own, such as `while` (S26).
+- **S7.** An indented block ends at the first line indented less than the block, or at the end of the file. That line continues the enclosing block that has its indentation.
 - **S8.** Errors in indented blocks:
 
   | Situation | Error |
   |---|---|
-  | No indented line follows the `:` | `expected an indented block` |
+  | No line follows the `:` that is indented more than the block that contains the `:` | `expected an indented block` |
   | A line is indented more than the block | `unexpected indentation` |
-  | A line is indented less than the block but more than 0 | `indentation does not match any outer level` |
+  | A line is indented less than the block, and no enclosing block has its indentation | `indentation does not match any outer level` |
 
 ### Statements
 
@@ -177,6 +179,10 @@ field                = name ":" type [ "=" expression ]
 
 - **S24.** An array type is written `[N]T`: `N` elements of type `T`, as in `[2]Card` or `[3][2]i32`. `N` is an integer literal without a suffix. Any other length, such as `[size]i32` or `[2u8]i32`, is rejected with `array length must be an integer literal without a suffix`, and more than one value between the brackets is rejected with `expected one array length`. The length can be left out with `_` when the array type is the written type of a constant or a variable whose value is an array literal: in `const cards: [_]Card = [a, b]`, the length is 2, the number of elements. Anywhere else, `[_]` is rejected with `array length can only be left out with an array literal value`, at its `[`. Only the outermost length can be left out: in `[2][_]i32`, the `_` is rejected.
 - **S25.** An array literal lists its elements between brackets: `[1, 2, 3]`. A trailing `,` is allowed, and the elements can continue on the following lines (L5). A missing `]` is rejected with `expected ']'`. Brackets that a type follows directly are an array type (S24); all other brackets are an array literal.
+
+### Loops
+
+- **S26.** `while`, a condition, `:` and a block run the block for as long as the condition is true: `while running: step()`. The condition is evaluated before each run of the block, so the block can run zero times. A `while` without a condition is rejected with `expected an expression`, and a `while` without the `:` with `expected ':'`.
 
 ## Modules
 
@@ -258,6 +264,10 @@ field                = name ":" type [ "=" expression ]
 - **N21.** `target = value` assigns a value to a variable, or to a field reached through a variable: `count = 2`, `point.x = 3`, `line.start.x = 1`. The value must have the type of the target (T10). A struct value is copied. Any other target, such as a local constant, a parameter, a top-level name or a field of a call (`make().x = 1`), is rejected with `only variables and their fields can be assigned`, at the target. Parameters can never be assigned. A name that matches nothing is rejected with `unknown name` (N5).
 - **N22.** `undefined` is a value whose contents are not set yet. It can only be the initial value of a variable with a written type: `var count: i32 = undefined`. Without a written type it is rejected with `value has no known type`, and anywhere else with `undefined can only be the initial value of a variable`, at `undefined`. The compiler does not check that a variable is assigned before it is read: reading an undefined value is the programmer's responsibility.
 
+### Blocks
+
+- **N23.** A local constant or a variable declared in the block of a `while` (S26) exists from its statement to the end of that block. After the block, its name means again what it meant before the block. Inside the block, the rules of local constants and variables (N15 to N22) apply. Uses, discards and assignments count wherever they are in the function, also inside nested blocks: a variable that is assigned only inside a loop is assigned (N20). The compiler does not check if a block runs.
+
 ## Types
 
 ### Built-in types
@@ -327,13 +337,17 @@ field                = name ":" type [ "=" expression ]
   | The expected type is not an array | `type is not an array` |
   | The number of elements differs from the array's length | `number of elements does not match the length of the array` |
 
+### Loops
+
+- **T21.** The condition of a `while` (S26) must have type `Bool` (T10). Any other type is rejected with `value does not match the expected type`, at the condition.
+
 ## Functions
 
 - **F1.** A call passes at least one argument for each parameter without a default value, and at most one for each parameter. Otherwise it is rejected with `wrong number of arguments`. Arguments match parameters in order, so only the last parameters can be left out, and each one left out takes its default value. A parameter without a default value after one with a default value is rejected with `parameters with default values must come last`, at that parameter. The arguments of a function have no names: `add(value = 1)` is rejected with `function arguments have no names`, at the argument.
 - **F2.** Each argument must have the type of its parameter (T10).
 - **F3.** A `void` function returns with `return` without a value. `return` with a value in a `void` function is rejected with `void function cannot return a value`.
 - **F4.** A function with a return type returns with `return` and a value. `return` without a value is rejected with `missing return value`.
-- **F5.** The last statement of a function with a return type must be `return`. Otherwise the function is rejected with `function must end with a return`, at its return type.
+- **F5.** The last statement of a function with a return type must be `return`, or a `while` whose condition is the literal `true`, which never ends. Otherwise the function is rejected with `function must end with a return`, at its return type.
 - **F6.** A call statement must call a `void` function. A call to any other function on its own is rejected with `call result is unused, discard it with _ =`.
 - **F7.** `_ =` must call a function that returns a value. Discarding a call to a `void` function is rejected with `call returns no value to discard`.
 
@@ -424,6 +438,15 @@ field                = name ":" type [ "=" expression ]
 
   An array literal becomes a compound literal: `[1, 2]` where a `[2]i32` is expected becomes `(mn_array_2_i32){ .items = { 1, 2 } }`.
 - **C20.** A top-level constant whose value is a struct or an array, and that is not zero-sized (C11), is stored once. Its C name is built as for a function (C9): `cards` in `hello` becomes `mn_hello_cards`. Its module's `.c` file defines it, and its header declares it with `extern const`. Every use writes its name. Its value is written as an initializer, without compound literals, and the constants it uses are written by their values: `const origin: Point = .(x = 0)` becomes `const mn_hello_Point mn_hello_origin = { .x = 0 };`. A constant is only stored when something uses it (N12).
+- **C21.** A `while` is written as in Monolith, with its block in braces:
+
+  ```c
+  while (running) {
+      mn_hello_step();
+  }
+  ```
+
+  A block without output becomes `{}`: `while true: noop` becomes `while (true) {}`. The locals declared in the block follow C16, and their C names are unique in the whole function: a local in a loop that has the name of an outer local gets the next free number.
 
 ## Compiler
 

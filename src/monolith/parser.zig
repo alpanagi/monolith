@@ -94,7 +94,7 @@ pub const Parser = struct {
             return null;
         };
         _ = try self.expect(&position, .colon, error.ExpectedColon);
-        const body = try self.parseBlock(allocator, &position);
+        const body = try self.parseBlock(allocator, &position, 0);
 
         offset.* = position;
         return .{ .signature = signature, .body = body };
@@ -162,23 +162,25 @@ pub const Parser = struct {
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
+        outer: usize,
     ) ParseError![]ast.Statement {
         if (self.tokens[offset.*].kind == .indent) {
-            return self.parseIndentedBlock(allocator, offset);
+            return self.parseIndentedBlock(allocator, offset, outer);
         }
-        return self.parseInlineBlock(allocator, offset);
+        return self.parseInlineBlock(allocator, offset, outer);
     }
 
     fn parseIndentedBlock(
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
+        outer: usize,
     ) ParseError![]ast.Statement {
         var position = offset.*;
-        const depth = try self.expectBlock(position);
+        const depth = try self.expectBlock(position, outer);
         var statements: std.ArrayList(ast.Statement) = .empty;
-        while (try self.matchBlockLine(&position, depth)) {
-            const statement = (try self.parseStatement(allocator, &position)) orelse {
+        while (try self.matchBlockLine(&position, depth, outer)) {
+            const statement = (try self.parseStatement(allocator, &position, depth)) orelse {
                 return self.fail(position, error.ExpectedStatement);
             };
             try statements.append(allocator, statement);
@@ -192,8 +194,9 @@ pub const Parser = struct {
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
+        outer: usize,
     ) ParseError![]ast.Statement {
-        const statement = (try self.parseStatement(allocator, offset)) orelse {
+        const statement = (try self.parseStatement(allocator, offset, outer)) orelse {
             return self.fail(offset.*, error.ExpectedStatement);
         };
         return allocator.dupe(ast.Statement, &.{statement});
@@ -203,12 +206,14 @@ pub const Parser = struct {
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
+        depth: usize,
     ) ParseError!?ast.Statement {
         const location = self.tokens[offset.*].location;
         if (self.match(offset, .keyword_noop) != null) {
             return .{ .kind = .noop, .location = location };
         }
         if (try self.parseReturn(allocator, offset)) |statement| return statement;
+        if (try self.parseWhile(allocator, offset, depth)) |statement| return statement;
         if (try self.parseDiscard(allocator, offset)) |statement| return statement;
         if (try self.parseConstantDeclaration(allocator, offset)) |constant| {
             return .{ .kind = .{ .constant_declaration = constant }, .location = location };
@@ -237,6 +242,25 @@ pub const Parser = struct {
 
         offset.* = position;
         return .{ .kind = .{ .@"return" = value }, .location = keyword.location };
+    }
+
+    fn parseWhile(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        depth: usize,
+    ) ParseError!?ast.Statement {
+        var position = offset.*;
+        const keyword = self.match(&position, .keyword_while) orelse return null;
+        const condition = (try self.parseExpression(allocator, &position)) orelse {
+            return self.fail(position, error.ExpectedExpression);
+        };
+        _ = try self.expect(&position, .colon, error.ExpectedColon);
+        const body = try self.parseBlock(allocator, &position, depth);
+
+        offset.* = position;
+        const loop: ast.While = .{ .condition = condition, .body = body };
+        return .{ .kind = .{ .@"while" = loop }, .location = keyword.location };
     }
 
     fn parseDiscard(
@@ -387,9 +411,9 @@ pub const Parser = struct {
         offset: *usize,
     ) ParseError![]ast.TypedName {
         var position = offset.*;
-        const depth = try self.expectBlock(position);
+        const depth = try self.expectBlock(position, 0);
         var fields: std.ArrayList(ast.TypedName) = .empty;
-        while (try self.matchBlockLine(&position, depth)) {
+        while (try self.matchBlockLine(&position, depth, 0)) {
             const field = (try self.parseTypedName(allocator, &position)) orelse {
                 return self.fail(position, error.ExpectedField);
             };
@@ -427,19 +451,20 @@ pub const Parser = struct {
         };
     }
 
-    fn expectBlock(self: *Parser, offset: usize) ParseError!usize {
+    fn expectBlock(self: *Parser, offset: usize, outer: usize) ParseError!usize {
         const first = self.tokens[offset];
-        if (first.kind != .indent or first.kind.indent == 0 or self.isBlankLine(offset)) {
+        if (first.kind != .indent or first.kind.indent <= outer or self.isBlankLine(offset)) {
             return self.fail(offset, error.ExpectedBlock);
         }
         return first.kind.indent;
     }
 
-    fn matchBlockLine(self: *Parser, offset: *usize, depth: usize) ParseError!bool {
+    fn matchBlockLine(self: *Parser, offset: *usize, depth: usize, outer: usize) ParseError!bool {
         self.skipBlankLines(offset);
         const current = self.tokens[offset.*];
-        if (current.kind != .indent or current.kind.indent == 0) return false;
+        if (current.kind != .indent) return false;
         if (current.kind.indent < depth) {
+            if (current.kind.indent <= outer) return false;
             return self.fail(offset.*, error.InconsistentIndentation);
         }
         if (current.kind.indent > depth) {
@@ -979,6 +1004,22 @@ test "parseIndentedBlock: rejects line that is not a statement" {
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, parser.failure.?.location.?);
 }
 
+test "parseIndentedBlock: ends nested blocks at the depth of an enclosing block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while one:\n        while two:\n            step()\n    done()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(2, body.len);
+    const inner = body[0].kind.@"while".body[0].kind.@"while";
+    try std.testing.expectEqualStrings("two", inner.condition.kind.identifier.name);
+    try std.testing.expectEqual(1, inner.body.len);
+    try std.testing.expect(body[1].kind == .call);
+}
+
 test "parseInlineBlock: rejects line that is not a statement" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1041,6 +1082,45 @@ test "parseReturn: rejects return followed by a non-expression" {
 
     try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
+}
+
+test "parseWhile: parses a condition and an indented body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while running:\n        step()\n        stop()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const statement = module.declarations[0].kind.function_definition.body[0];
+    const loop = statement.kind.@"while";
+    try std.testing.expectEqualStrings("running", loop.condition.kind.identifier.name);
+    try std.testing.expectEqual(2, loop.body.len);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, statement.location);
+}
+
+test "parseWhile: parses an inline body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): while running: step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const loop = module.declarations[0].kind.function_definition.body[0].kind.@"while";
+    try std.testing.expectEqual(1, loop.body.len);
+    try std.testing.expect(loop.body[0].kind == .call);
+}
+
+test "parseWhile: rejects a missing colon" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): while running step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedColon, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, parser.failure.?.location.?);
 }
 
 test "parseDiscard: parses a discarded call" {
@@ -1482,6 +1562,17 @@ test "expectBlock: rejects a blank indented line before the block" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
 }
 
+test "expectBlock: rejects a nested block that is not indented more than its line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while running:\n    step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedBlock, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 1 }, parser.failure.?.location.?);
+}
+
 test "matchBlockLine: rejects line deeper than the first" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1502,6 +1593,17 @@ test "matchBlockLine: rejects a dedent that matches no outer level" {
 
     try std.testing.expectError(error.InconsistentIndentation, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 1 }, parser.failure.?.location.?);
+}
+
+test "matchBlockLine: rejects a dedent between two nested levels" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while running:\n        step()\n      stop()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.InconsistentIndentation, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 1 }, parser.failure.?.location.?);
 }
 
 test "parseExpression: parses each literal kind" {

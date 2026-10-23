@@ -10,6 +10,7 @@ pub const keywords = std.StaticStringMap(token.TokenKind).initComptime(.{
     .{ "struct", .keyword_struct },
     .{ "noop", .keyword_noop },
     .{ "return", .keyword_return },
+    .{ "while", .keyword_while },
     .{ "true", .keyword_true },
     .{ "false", .keyword_false },
     .{ "undefined", .keyword_undefined },

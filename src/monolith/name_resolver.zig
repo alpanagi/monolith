@@ -131,19 +131,28 @@ pub const NameResolver = struct {
         const parameter_uses = try allocator.alloc(Use, parameters.len);
         @memset(parameter_uses, .{});
         var locals: std.ArrayList(Local) = .empty;
-        for (function.body) |*statement| {
-            const scope: Scope = .{
-                .parameters = parameters,
-                .parameter_uses = parameter_uses,
-                .locals = locals.items,
-            };
-            const local = (try self.resolveNamesInStatement(scope, statement)) orelse continue;
-            try locals.append(allocator, local);
-        }
+        const block: Block = .{
+            .parameters = parameters,
+            .parameter_uses = parameter_uses,
+            .locals = &locals,
+        };
+        try self.resolveNamesInBlock(block, function.body);
         for (parameters, parameter_uses) |parameter, use| {
             try self.expectUsed(use, parameter.location, error.UnusedParameter);
         }
-        for (locals.items) |local| {
+    }
+
+    fn resolveNamesInBlock(
+        self: *NameResolver,
+        block: Block,
+        body: []ast.Statement,
+    ) ResolveError!void {
+        const start = block.locals.items.len;
+        for (body) |*statement| {
+            const local = (try self.resolveNamesInStatement(block, statement)) orelse continue;
+            try block.locals.append(self.arena.allocator(), local);
+        }
+        for (block.locals.items[start..]) |local| {
             const mutable = local.statement.kind == .variable_declaration;
             if (mutable and !local.use.assigned) {
                 return self.fail(local.location, error.NeverAssigned);
@@ -154,13 +163,19 @@ pub const NameResolver = struct {
                 error.UnusedLocalConstant;
             try self.expectUsed(local.use, local.location, unused_error);
         }
+        block.locals.shrinkRetainingCapacity(start);
     }
 
     fn resolveNamesInStatement(
         self: *NameResolver,
-        scope: Scope,
+        block: Block,
         statement: *ast.Statement,
     ) ResolveError!?Local {
+        const scope: Scope = .{
+            .parameters = block.parameters,
+            .parameter_uses = block.parameter_uses,
+            .locals = block.locals.items,
+        };
         switch (statement.kind) {
             .noop => {},
             .@"return" => |*value| {
@@ -196,6 +211,10 @@ pub const NameResolver = struct {
             .assignment => |*assignment| {
                 try self.resolveNamesInExpression(scope, &assignment.value);
                 try self.resolveTarget(scope, &assignment.target);
+            },
+            .@"while" => |*loop| {
+                try self.resolveNamesInExpression(scope, &loop.condition);
+                try self.resolveNamesInBlock(block, loop.body);
             },
         }
         return null;
@@ -784,6 +803,12 @@ pub const NameError = error{
     VoidParameter,
     VoidField,
     DefaultsNotLast,
+};
+
+const Block = struct {
+    parameters: []const ast.TypedName,
+    parameter_uses: []Use,
+    locals: *std.ArrayList(Local),
 };
 
 const Scope = struct {
@@ -1396,44 +1421,6 @@ test "resolveNamesInFunction: rejects an unused parameter" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 9 }, name_resolver.failure.?.location.?);
 }
 
-test "resolveNamesInFunction: rejects an unused local constant" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): const limit = 5i32" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.UnusedLocalConstant, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, name_resolver.failure.?.location.?);
-}
-
-test "resolveNamesInFunction: rejects a constant that is shadowed before any use" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show() i32:\n    const value = 1i32\n    const value = 2i32\n    return value" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.UnusedLocalConstant, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, name_resolver.failure.?.location.?);
-}
-
 test "resolveNamesInFunction: allows unused parameters of external functions" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1454,7 +1441,45 @@ test "resolveNamesInFunction: allows unused parameters of external functions" {
     try std.testing.expectEqual(0, call.callee.identifier.resolution.?.function.declaration);
 }
 
-test "resolveNamesInFunction: rejects a variable that is never assigned" {
+test "resolveNamesInBlock: rejects an unused local constant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): const limit = 5i32" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnusedLocalConstant, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveNamesInBlock: rejects a constant that is shadowed before any use" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show() i32:\n    const value = 1i32\n    const value = 2i32\n    return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnusedLocalConstant, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveNamesInBlock: rejects a variable that is never assigned" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -1473,7 +1498,7 @@ test "resolveNamesInFunction: rejects a variable that is never assigned" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, name_resolver.failure.?.location.?);
 }
 
-test "resolveNamesInFunction: rejects a variable that is only assigned" {
+test "resolveNamesInBlock: rejects a variable that is only assigned" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -1490,6 +1515,85 @@ test "resolveNamesInFunction: rejects a variable that is only assigned" {
 
     try std.testing.expectError(error.UnusedVariable, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveNamesInBlock: ends a local at the end of its block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn main():\n    while false:\n        const limit = 5i32\n        take(limit)\n    take(limit)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownName, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 10 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveNamesInBlock: restores an outer local after a block that shadows it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show() i32:\n    const value = 1i32\n    while false:\n        const value = 2i32\n        _ = value\n    return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(&body[0], body[2].kind.@"return".?.kind.identifier.resolution.?.local);
+}
+
+test "resolveNamesInBlock: rejects an unused local in a nested block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): while false: const limit = 5i32" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnusedLocalConstant, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveNamesInBlock: counts an assignment in a nested block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    var running = true\n    while running:\n        running = false" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    const assignment = body[1].kind.@"while".body[0].kind.assignment;
+    try std.testing.expectEqual(&body[0], assignment.target.kind.identifier.resolution.?.local);
 }
 
 test "resolveLocalConstant: rejects a reserved name" {
