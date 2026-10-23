@@ -491,8 +491,12 @@ pub const Parser = struct {
     ) ParseError!?ast.Expression {
         var position = offset.*;
         var expression = (try self.parseOperand(allocator, &position)) orelse return null;
-        while (self.match(&position, .dot) != null) {
-            expression = try self.parseFieldAccess(allocator, &position, expression);
+        while (true) {
+            if (self.match(&position, .dot) != null) {
+                expression = try self.parseFieldAccess(allocator, &position, expression);
+            } else if (try self.parseSlice(allocator, &position, expression)) |slice| {
+                expression = slice;
+            } else break;
         }
 
         offset.* = position;
@@ -551,11 +555,17 @@ pub const Parser = struct {
             if (self.match(&position, .comma) == null) break;
         }
         _ = try self.expect(&position, .right_bracket, error.ExpectedRightBracket);
-        const next = self.tokens[position].kind;
-        if (next != .identifier and next != .left_bracket) {
+        const empty = elements.items.len == 0;
+        const constant = empty and self.match(&position, .keyword_const) != null;
+        if (!constant and !self.isTypeStart(position)) {
             offset.* = position;
             const literal: ast.ArrayLiteral = .{ .elements = elements.items };
             return .{ .kind = .{ .array_literal = literal }, .location = bracket.location };
+        }
+        if (empty) {
+            const slice_type = try self.parseSliceType(allocator, &position, constant);
+            offset.* = position;
+            return .{ .kind = .{ .slice_type = slice_type }, .location = bracket.location };
         }
         if (elements.items.len != 1) return self.fail(offset.* + 1, error.ExpectedArrayLength);
         const length = try allocator.create(ast.Expression);
@@ -577,6 +587,27 @@ pub const Parser = struct {
             return self.fail(offset.*, error.ExpectedType);
         };
         return .{ .length = length, .element = element };
+    }
+
+    fn isTypeStart(self: *Parser, offset: usize) bool {
+        return switch (self.tokens[offset].kind) {
+            .identifier => true,
+            .left_bracket => self.tokens[offset + 1].kind != .dot_dot,
+            else => false,
+        };
+    }
+
+    fn parseSliceType(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        constant: bool,
+    ) ParseError!ast.SliceType {
+        const element = try allocator.create(ast.Expression);
+        element.* = (try self.parseOperand(allocator, offset)) orelse {
+            return self.fail(offset.*, error.ExpectedType);
+        };
+        return .{ .constant = constant, .element = element };
     }
 
     fn parseCall(
@@ -710,6 +741,23 @@ pub const Parser = struct {
             .field_location = field.location,
         };
         return .{ .kind = .{ .field_access = access }, .location = value.location };
+    }
+
+    fn parseSlice(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        value: ast.Expression,
+    ) ParseError!?ast.Expression {
+        var position = offset.*;
+        _ = self.match(&position, .left_bracket) orelse return null;
+        _ = self.match(&position, .dot_dot) orelse return null;
+        _ = try self.expect(&position, .right_bracket, error.ExpectedRightBracket);
+        const sliced = try allocator.create(ast.Expression);
+        sliced.* = value;
+
+        offset.* = position;
+        return .{ .kind = .{ .slice = .{ .value = sliced } }, .location = value.location };
     }
 
     fn expect(
@@ -1761,6 +1809,47 @@ test "parseBrackets: rejects a missing closing bracket" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 29 }, parser.failure.?.location.?);
 }
 
+test "parseBrackets: parses a slice type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: []u8): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const parameter = module.declarations[0].kind.function_definition.signature.parameters[0];
+    const slice_type = parameter.type.kind.slice_type;
+    try std.testing.expect(!slice_type.constant);
+    try std.testing.expectEqualStrings("u8", slice_type.element.kind.identifier.name);
+}
+
+test "parseBrackets: parses a constant slice type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: []const u8): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const parameter = module.declarations[0].kind.function_definition.signature.parameters[0];
+    const slice_type = parameter.type.kind.slice_type;
+    try std.testing.expect(slice_type.constant);
+    try std.testing.expectEqualStrings("u8", slice_type.element.kind.identifier.name);
+}
+
+test "parseBrackets: parses an array literal followed by a slice" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): take([1, 2][..])");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const call = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call;
+    const slice = call.arguments[0].value.kind.slice;
+    try std.testing.expectEqual(2, slice.value.kind.array_literal.elements.len);
+}
+
 test "parseCall: parses nested calls" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1890,4 +1979,29 @@ test "parseFieldAccess: rejects a dot without a name" {
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 22 }, parser.failure.?.location.?);
+}
+
+test "parseSlice: parses a slice of a whole array" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): take(buffer[..])");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const call = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call;
+    const slice = call.arguments[0].value;
+    try std.testing.expectEqualStrings("buffer", slice.kind.slice.value.kind.identifier.name);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 17 }, slice.location);
+}
+
+test "parseSlice: rejects a missing closing bracket" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): take(buffer[..)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedRightBracket, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, parser.failure.?.location.?);
 }

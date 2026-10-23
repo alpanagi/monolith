@@ -35,13 +35,14 @@ block                = statement | indented_block
 indented_block       = newline statement { newline statement }
 statement            = "noop" | "return" [ expression ] | "_" "=" ( call | name ) | call | constant
                      | variable | assignment | while
-expression           = operand { "." name }
+expression           = operand { "." name | "[" ".." "]" }
 operand              = integer | float | string | "true" | "false" | "undefined" | path | call
-                     | struct_literal | array_type | array_literal
+                     | struct_literal | array_type | array_literal | slice_type
 call                 = path "(" [ arguments ] ")"
 struct_literal       = "." "(" [ arguments ] ")"
 array_type           = "[" ( integer | "_" ) "]" operand
 array_literal        = "[" [ expression { "," expression } [ "," ] ] "]"
+slice_type           = "[" "]" [ "const" ] operand
 arguments            = argument { "," argument } [ "," ]
 argument             = [ name "=" ] expression
 path                 = name { "::" name }
@@ -75,7 +76,7 @@ field                = name ":" type [ "=" expression ]
 
 ### Symbols
 
-- **L11.** The symbols are `(`, `)`, `[`, `]`, `:`, `::`, `,`, `.` and `=`. Two `:` with nothing between them are the symbol `::`.
+- **L11.** The symbols are `(`, `)`, `[`, `]`, `:`, `::`, `,`, `.`, `..` and `=`. Two `:` with nothing between them are the symbol `::`, and two `.` with nothing between them are the symbol `..`.
 
 ### Number literals
 
@@ -184,6 +185,11 @@ field                = name ":" type [ "=" expression ]
 
 - **S26.** `while`, a condition, `:` and a block run the block for as long as the condition is true: `while running: step()`. The condition is evaluated before each run of the block, so the block can run zero times. A `while` without a condition is rejected with `expected an expression`, and a `while` without the `:` with `expected ':'`.
 
+### Slices
+
+- **S27.** A slice type is written `[]T` or `[]const T`: elements of type `T` that the slice does not hold, as in `[]u8` or `[]const Card`. A slice refers to elements that are stored somewhere else, and their number is known only when the program runs. Through a `[]T` the elements can be changed, and through a `[]const T` they can only be read.
+- **S28.** `value[..]` gives a slice of all the elements of an array: `buffer[..]`. A missing `]` is rejected with `expected ']'`.
+
 ## Modules
 
 - **M1.** Every source file is a module. The file given to the compiler is the main module. A module's path is the path of its file, with directories separated by `::` and without `.mn`: `utils/math.mn` is the module `utils::math`, and the main file `hello.mn` is the module `hello`.
@@ -268,6 +274,10 @@ field                = name ":" type [ "=" expression ]
 
 - **N23.** A local constant or a variable declared in the block of a `while` (S26) exists from its statement to the end of that block. After the block, its name means again what it meant before the block. Inside the block, the rules of local constants and variables (N15 to N22) apply. Uses, discards and assignments count wherever they are in the function, also inside nested blocks: a variable that is assigned only inside a loop is assigned (N20). The compiler does not check if a block runs.
 
+### Slices
+
+- **N24.** Only an array that is stored in a name can be sliced (S28): a variable, a local or top-level constant, a parameter, or a field reached through one of them, such as `deck.cards[..]`. Any other value, such as a call (`make()[..]`) or a literal (`[1, 2][..]`), is rejected with `only variables, constants, parameters and their fields can be sliced`, at the value. A slice of a variable counts as an assignment to it (N20), because the elements can be changed through the slice.
+
 ## Types
 
 ### Built-in types
@@ -285,7 +295,7 @@ field                = name ":" type [ "=" expression ]
 
   A parameter of type `void` is rejected with `parameter cannot have type void`, at its type.
 
-- **T2.** There are no implicit conversions between types.
+- **T2.** There are no implicit conversions between types, except from `[]T` to `[]const T` (T24).
 - **T3.** What happens when arithmetic exceeds a type's range is left to the target. It is not defined by Monolith.
 
 ### Types of expressions
@@ -341,6 +351,12 @@ field                = name ":" type [ "=" expression ]
 
 - **T21.** The condition of a `while` (S26) must have type `Bool` (T10). Any other type is rejected with `value does not match the expected type`, at the condition.
 
+### Slices
+
+- **T22.** Slice types with the same element type, both with or both without `const`, are the same type, wherever they are written. The element type must be a type (T11), and an element of type `void` is rejected with `slice elements cannot have type void`, at the element type. A constant can name a slice type: `const Bytes = []const u8`.
+- **T23.** A slice of an array (S28) has the element type of the array. A slice of a variable, or of a field reached through a variable, has the type `[]T`. A slice of a constant or a parameter has the type `[]const T`, because their elements cannot be changed. Only arrays can be sliced: any other type is rejected with `type is not an array`, at the value.
+- **T24.** A `[]T` is accepted where a `[]const T` is expected. A `[]const T` where a `[]T` is expected is rejected with `value does not match the expected type`.
+
 ## Functions
 
 - **F1.** A call passes at least one argument for each parameter without a default value, and at most one for each parameter. Otherwise it is rejected with `wrong number of arguments`. Arguments match parameters in order, so only the last parameters can be left out, and each one left out takes its default value. A parameter without a default value after one with a default value is rejected with `parameters with default values must come last`, at that parameter. The arguments of a function have no names: `add(value = 1)` is rejected with `function arguments have no names`, at the argument.
@@ -362,7 +378,7 @@ field                = name ":" type [ "=" expression ]
 
 ### Names in the output
 
-- **G1.** Names are written to the output exactly as they are in the source, except the generated names: C function names (C9), C struct names (C10), C names of array types (C19) and C names of stored constants (C20). A generated name is `mn_` followed by the module path with `::` replaced by `_`, so it cannot be a name written in the source (N14).
+- **G1.** Names are written to the output exactly as they are in the source, except the generated names: C function names (C9), C struct names (C10), C names of array types (C19), C names of slice types (C22) and C names of stored constants (C20). A generated name is `mn_` followed by the module path with `::` replaced by `_`, so it cannot be a name written in the source (N14).
 - **G2.** A function, external function, parameter, local constant, variable or field whose name, as written to the output, the target already defines is rejected with `name is already defined in the target`, at the function's `fn` or `external` keyword, at the local constant's `const` or the variable's `var`, or at the parameter or field. Local constants and variables are checked with the name they get in the output (C16). Top-level constants are not checked, because they produce no output (N11), and neither are structs, because their C names are generated (C10), or discarded parameters, because they have no name in the output (C6). A function's name is checked as it is written to the output: `fn int(): noop` becomes `mn_hello_int` (C9) and is accepted, but a parameter named `int` is rejected.
 - **G3.** C defines the C23 keywords `_Alignas`, `_Alignof`, `_Atomic`, `_BitInt`, `_Bool`, `_Complex`, `_Decimal128`, `_Decimal32`, `_Decimal64`, `_Generic`, `_Imaginary`, `_Noreturn`, `_Static_assert`, `_Thread_local`, `alignas`, `alignof`, `auto`, `bool`, `break`, `case`, `char`, `const`, `constexpr`, `continue`, `default`, `do`, `double`, `else`, `enum`, `extern`, `false`, `float`, `for`, `goto`, `if`, `inline`, `int`, `long`, `nullptr`, `register`, `restrict`, `return`, `short`, `signed`, `sizeof`, `static`, `static_assert`, `struct`, `switch`, `thread_local`, `true`, `typedef`, `typeof`, `typeof_unqual`, `union`, `unsigned`, `void`, `volatile` and `while`, and `asm`, which compilers such as GCC treat as a keyword outside strict C23. It also defines the names that C23 declares in `<stddef.h>` and `<stdint.h>`, which the header includes, such as `size_t`, `int32_t`, `NULL` and `INT32_MAX`. `string` and `MONOLITH_H` are defined by `runtime/monolith.h` itself (C1).
 
@@ -383,8 +399,8 @@ field                = name ":" type [ "=" expression ]
   ```
 
 - **C2.** Every module becomes a `.h` file, and a module that defines functions or stores constants (C20) also becomes a `.c` file (K3).
-  - The `.h` file starts with `#pragma once`. It includes `runtime/monolith.h`, then the header of every other module whose structs its structs contain. Then it defines the module's structs (C10), each after the array types its fields hold (C19). Then it declares each struct of another module, and each array type it does not define, that its function declarations or stored constants use, with `typedef struct mn_shapes_Line mn_shapes_Line;`. Then it declares its stored constants (C20). Last, it declares the module's functions: first its external functions, then, after a blank line, its other functions. The main module's `main` is not declared.
-  - The `.c` file includes its own header, then the header of every other module that its calls or its uses of stored constants reach, or whose structs its functions use, in the order of their first use. Then it defines the array types its functions and constants use that its header does not define (C19), then its stored constants (C20), and then its functions.
+  - The `.h` file starts with `#pragma once`. It includes `runtime/monolith.h`, then the header of every other module whose structs its structs contain. Then it defines the module's structs (C10), each after the array and slice types its fields hold (C19, C22). Then it declares each struct of another module, and each array or slice type it does not define, that its function declarations or stored constants use, with `typedef struct mn_shapes_Line mn_shapes_Line;`. Then it declares its stored constants (C20). Last, it declares the module's functions: first its external functions, then, after a blank line, its other functions. The main module's `main` is not declared.
+  - The `.c` file includes its own header, then the header of every other module that its calls or its uses of stored constants reach, also through the value of a constant that is not stored, or whose structs its functions use, in the order of their first use. Then it defines the slice types and then the array types that its functions and constants use and its header does not define (C22, C19), then its stored constants (C20), and then its functions.
   - Includes use paths relative to the file: `#include "std/io/stdout.h"`.
   - No function is `static`, so any module can be imported, the main module included.
 - **C3.** The main module's `main` becomes `int main()`. A `return` without a value inside it becomes `return 0;`.
@@ -400,6 +416,7 @@ field                = name ":" type [ "=" expression ]
   | `void` | `void` |
   | a struct | its C name (C10) |
   | an array | its C name (C19) |
+  | a slice | its C name (C22) |
 
 - **C5.** Number literals keep their base. `_` becomes `'`, `0o` becomes `0`, the suffix is removed, and literals of unsigned types end with `u`: `0o7_5_5` returned from a `u16` function becomes `07'5'5u`.
 - **C6.** `_ = add(1, 2)` becomes the plain call, `mn_hello_add(1, 2);` (C9). `_ = value` writes nothing. A discarded parameter has no name in the output: `fn show(value: i32): _ = value` becomes `void mn_hello_show(int32_t)` in the header and in the definition.
@@ -447,6 +464,20 @@ field                = name ":" type [ "=" expression ]
   ```
 
   A block without output becomes `{}`: `while true: noop` becomes `while (true) {}`. The locals declared in the block follow C16, and their C names are unique in the whole function: a local in a loop that has the name of an outer local gets the next free number.
+
+- **C22.** A slice type becomes a struct that holds a pointer to the first element in its field `items`, and the number of elements in its field `length`. `[]T` and `[]const T` become the same C type, because `const` is checked by Monolith (T24). Its C name is `mn_slice_` and the element type as in C19: `[]u8` is `mn_slice_u8`, and `[]const Card` in `hello` is `mn_slice_hello_Card`. Its definition is guarded as in C19. A struct, array or slice element is named by its struct tag, so the slice needs no definition of it, and a zero-sized element (C11) becomes `void`:
+
+  ```c
+  #ifndef mn_slice_hello_Card_defined
+  #define mn_slice_hello_Card_defined
+  typedef struct mn_slice_hello_Card {
+      struct mn_hello_Card *items;
+      size_t length;
+  } mn_slice_hello_Card;
+  #endif
+  ```
+
+  A slice of an array becomes a compound literal with the array's `items` and its length: `buffer[..]` of a `[4]u8` becomes `(mn_slice_u8){ .items = buffer.items, .length = 4 }`. Local and stored constants are `const` in C (C16, C20), so for a slice of one the pointer is converted: `(mn_slice_i32){ .items = (int32_t *)values.items, .length = 2 }`. A slice of a zero-sized array has only its length: `(mn_slice_hello_Marker){ .length = 2 }`.
 
 ## Compiler
 

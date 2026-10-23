@@ -97,6 +97,8 @@ pub const ExpressionKind = union(enum) {
     struct_literal: StructLiteral,
     array_type: ArrayType,
     array_literal: ArrayLiteral,
+    slice_type: SliceType,
+    slice: Slice,
     field_access: FieldAccess,
     @"struct": Struct,
 };
@@ -155,6 +157,16 @@ pub const ArrayLiteral = struct {
     elements: []Expression,
 };
 
+pub const SliceType = struct {
+    constant: bool,
+    element: *Expression,
+    value: ?types.Type = null,
+};
+
+pub const Slice = struct {
+    value: *Expression,
+};
+
 pub const Argument = struct {
     name: ?[]const u8,
     value: Expression,
@@ -184,6 +196,7 @@ pub fn extractType(expression: Expression) types.Type {
     return switch (expression.kind) {
         inline .identifier, .path_expression => |name| name.resolution.?.type,
         .array_type => |array_type| array_type.value.?,
+        .slice_type => |slice_type| slice_type.value.?,
         else => unreachable,
     };
 }
@@ -205,7 +218,7 @@ pub fn extractFunctionSignature(declaration: Declaration) FunctionSignature {
 pub fn isAlias(constant: ConstantDeclaration) bool {
     return switch (constant.value.kind) {
         inline .identifier, .path_expression => |name| name.resolution == null,
-        .array_type => constant.type == null,
+        .array_type, .slice_type => constant.type == null,
         else => false,
     };
 }

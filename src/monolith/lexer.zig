@@ -237,6 +237,15 @@ fn lexSymbols(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
         state.offset += 2;
         return true;
     }
+    if (state.source[state.offset] == '.' and state.peek(state.offset + 1) == '.') {
+        try state.tokens.append(allocator, .{
+            .kind = .dot_dot,
+            .location = state.location,
+        });
+        state.location.column += 2;
+        state.offset += 2;
+        return true;
+    }
     const kind: token.TokenKind = switch (state.source[state.offset]) {
         ':' => .colon,
         '(' => .left_parenthesis,
@@ -837,4 +846,14 @@ test "lexSymbols: lexes brackets" {
 
     try std.testing.expect(lexer.tokens.items[1].kind == .left_bracket);
     try std.testing.expect(lexer.tokens.items[2].kind == .right_bracket);
+}
+
+test "lexSymbols: lexes two dots as one symbol" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("[..]");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[2].kind == .dot_dot);
+    try std.testing.expect(lexer.tokens.items[3].kind == .right_bracket);
 }

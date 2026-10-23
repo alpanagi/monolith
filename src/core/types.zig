@@ -10,6 +10,7 @@ pub const Type = union(enum) {
     type,
     @"struct": Struct,
     array: *const Array,
+    slice: *const Slice,
 };
 
 pub const NumberType = enum {
@@ -43,9 +44,15 @@ pub const Array = struct {
     element: Type,
 };
 
+pub const Slice = struct {
+    element: Type,
+    constant: bool,
+};
+
 pub const Registry = struct {
     entries: std.ArrayList(Type) = .empty,
     arrays: std.ArrayList(*const Array) = .empty,
+    slices: std.ArrayList(*const Slice) = .empty,
 
     pub fn add(
         self: *Registry,
@@ -68,6 +75,21 @@ pub const Registry = struct {
         array.* = .{ .length = length, .element = element };
         try self.arrays.append(allocator, array);
         return array;
+    }
+
+    pub fn addSlice(
+        self: *Registry,
+        allocator: std.mem.Allocator,
+        element: Type,
+        constant: bool,
+    ) std.mem.Allocator.Error!*const Slice {
+        for (self.slices.items) |slice| {
+            if (slice.constant == constant and std.meta.eql(slice.element, element)) return slice;
+        }
+        const slice = try allocator.create(Slice);
+        slice.* = .{ .element = element, .constant = constant };
+        try self.slices.append(allocator, slice);
+        return slice;
     }
 };
 
@@ -108,6 +130,19 @@ test "Registry.addArray: gives an array type one record for each length and elem
 
     try std.testing.expectEqual(first, second);
     try std.testing.expect(first != longer);
+}
+
+test "Registry.addSlice: gives a slice type one record for each element and mutability" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var type_registry: Registry = .{};
+
+    const first = try type_registry.addSlice(arena.allocator(), .boolean, false);
+    const second = try type_registry.addSlice(arena.allocator(), .boolean, false);
+    const constant = try type_registry.addSlice(arena.allocator(), .boolean, true);
+
+    try std.testing.expectEqual(first, second);
+    try std.testing.expect(first != constant);
 }
 
 test "findBuiltInType: finds number types, Bool, String and void" {

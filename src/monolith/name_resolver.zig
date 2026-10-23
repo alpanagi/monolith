@@ -112,6 +112,7 @@ pub const NameResolver = struct {
         const resolution = switch (expression.kind) {
             inline .identifier, .path_expression => |name| name.resolution.?,
             .array_type => |array_type| return array_type.value.?,
+            .slice_type => |slice_type| return slice_type.value.?,
             else => return self.fail(expression.location, error.TypeMismatch),
         };
         return switch (resolution) {
@@ -270,9 +271,9 @@ pub const NameResolver = struct {
                 const path = path_expression.path;
                 break :target try self.resolvePath(scope, value.location, path);
             },
-            .array_type => target: {
+            .array_type, .slice_type => target: {
                 try self.resolveNamesInExpression(scope, value);
-                break :target .{ .type = value.kind.array_type.value.? };
+                break :target .{ .type = ast.extractType(value.*) };
             },
             else => return null,
         };
@@ -387,6 +388,8 @@ pub const NameResolver = struct {
             .array_literal => |literal| {
                 for (literal.elements) |*element| try self.resolveNamesInExpression(scope, element);
             },
+            .slice_type => |*slice_type| try self.resolveSliceType(scope, slice_type),
+            .slice => |slice| try self.resolveSlice(scope, slice.value),
             .field_access => |access| try self.resolveNamesInExpression(scope, access.value),
             .@"struct" => unreachable,
         }
@@ -418,6 +421,33 @@ pub const NameResolver = struct {
         return std.fmt.parseInt(u64, literal.text, 0) catch {
             return self.fail(expression.location, error.InvalidLength);
         };
+    }
+
+    fn resolveSliceType(
+        self: *NameResolver,
+        scope: Scope,
+        slice_type: *ast.SliceType,
+    ) ResolveError!void {
+        try self.resolveNamesInExpression(.{ .locals = scope.locals }, slice_type.element);
+        const element = try self.expectType(slice_type.element.*);
+        if (element == .void) {
+            return self.fail(slice_type.element.location, error.VoidSliceElement);
+        }
+        const allocator = self.arena.allocator();
+        const slice = try self.types.addSlice(allocator, element, slice_type.constant);
+        slice_type.value = .{ .slice = slice };
+    }
+
+    fn resolveSlice(self: *NameResolver, scope: Scope, value: *ast.Expression) ResolveError!void {
+        try self.resolveNamesInExpression(scope, value);
+        const root = findSliceRoot(value.*) orelse {
+            return self.fail(value.location, error.NotSliceable);
+        };
+        if (root.kind != .identifier) return;
+        const identifier = root.kind.identifier;
+        if (identifier.resolution.? != .local) return;
+        const local = findLocal(scope.locals, identifier.name).?;
+        if (local.statement.kind == .variable_declaration) local.use.assigned = true;
     }
 
     fn resolveIdentifier(
@@ -633,11 +663,11 @@ pub const NameResolver = struct {
                 return self.resolvePath(.{}, declaration.location, path_expression.path);
             },
             .integer_literal, .float_literal, .boolean_literal, .string_literal, .undefined => own,
-            .array_type => {
+            .array_type, .slice_type => {
                 try self.resolveNamesInExpression(.{}, value);
-                return .{ .type = value.kind.array_type.value.? };
+                return .{ .type = ast.extractType(value.*) };
             },
-            .call, .struct_literal, .array_literal => {
+            .call, .struct_literal, .array_literal, .slice => {
                 if (!constant.resolved) {
                     try self.resolveNamesInExpression(.{}, value);
                     try self.expectEvaluable(value.*);
@@ -672,7 +702,8 @@ pub const NameResolver = struct {
             .array_literal => |literal| {
                 for (literal.elements) |element| try self.expectEvaluable(element);
             },
-            .array_type => {},
+            .slice => |slice| try self.expectEvaluable(slice.value.*),
+            .array_type, .slice_type => {},
             .field_access => return self.fail(expression.location, error.CannotEvaluate),
             .@"struct" => unreachable,
         }
@@ -790,6 +821,8 @@ pub const NameError = error{
     StructInFunction,
     NotAssignable,
     VoidElement,
+    VoidSliceElement,
+    NotSliceable,
     InvalidLength,
     UnknownLength,
     NeverAssigned,
@@ -857,6 +890,8 @@ fn describeError(name_error: NameError) []const u8 {
         error.StructInFunction => "structs cannot be defined inside functions",
         error.NotAssignable => "only variables and their fields can be assigned",
         error.VoidElement => "array elements cannot have type void",
+        error.VoidSliceElement => "slice elements cannot have type void",
+        error.NotSliceable => "only variables, constants, parameters and their fields can be sliced",
         error.InvalidLength => "array length must be an integer literal without a suffix",
         error.UnknownLength => "array length can only be left out with an array literal value",
         error.NeverAssigned => "variable is never assigned, declare it with const",
@@ -920,6 +955,14 @@ fn findTypedName(typed_names: []const ast.TypedName, name: []const u8) ?usize {
         if (std.mem.eql(u8, typed_name.name, name)) return index;
     }
     return null;
+}
+
+fn findSliceRoot(expression: ast.Expression) ?ast.Expression {
+    return switch (expression.kind) {
+        .identifier, .path_expression => expression,
+        .field_access => |access| findSliceRoot(access.value.*),
+        else => null,
+    };
 }
 
 fn findLocal(locals: []Local, name: []const u8) ?*Local {
@@ -2218,6 +2261,102 @@ test "expectLength: rejects a length with a suffix" {
 
     try std.testing.expectError(error.InvalidLength, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveSliceType: resolves a slice type through a constant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Bytes = []const u8\nfn show(bytes: Bytes): _ = bytes" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const parameters = loader.modules.items[0].declarations[1].kind.function_definition.signature.parameters;
+    const slice = ast.extractType(parameters[0].type).slice;
+    try std.testing.expect(slice.constant);
+    try std.testing.expectEqual(types.Type{ .number = .u8 }, slice.element);
+}
+
+test "resolveSliceType: rejects void elements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(values: []void): _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.VoidSliceElement, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveSlice: rejects a slice of a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() [2]i32: return [1, 2]\nfn main():\n    const values = make()[..]\n    _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NotSliceable, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 20 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveSlice: counts a slice of a variable as an assignment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(bytes: []u8): _ = bytes\nfn main():\n    var buffer: [4]u8 = undefined\n    take(buffer[..])" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try name_resolver.resolve();
+}
+
+test "resolveSlice: counts a slice of a field of a variable as an assignment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Deck:\n    cards: [2]i32\nfn take(cards: []i32): _ = cards\nfn main():\n    var deck: Deck = undefined\n    take(deck.cards[..])" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try name_resolver.resolve();
 }
 
 test "resolveIdentifier: lets a parameter shadow a function" {
