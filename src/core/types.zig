@@ -9,6 +9,7 @@ pub const Type = union(enum) {
     void,
     type,
     @"struct": Struct,
+    array: *const Array,
 };
 
 pub const NumberType = enum {
@@ -37,8 +38,14 @@ pub const Field = struct {
     location: token.Location,
 };
 
+pub const Array = struct {
+    length: u64,
+    element: Type,
+};
+
 pub const Registry = struct {
     entries: std.ArrayList(Type) = .empty,
+    arrays: std.ArrayList(*const Array) = .empty,
 
     pub fn add(
         self: *Registry,
@@ -46,6 +53,21 @@ pub const Registry = struct {
         value_type: Type,
     ) std.mem.Allocator.Error!void {
         try self.entries.append(allocator, value_type);
+    }
+
+    pub fn addArray(
+        self: *Registry,
+        allocator: std.mem.Allocator,
+        length: u64,
+        element: Type,
+    ) std.mem.Allocator.Error!*const Array {
+        for (self.arrays.items) |array| {
+            if (array.length == length and std.meta.eql(array.element, element)) return array;
+        }
+        const array = try allocator.create(Array);
+        array.* = .{ .length = length, .element = element };
+        try self.arrays.append(allocator, array);
+        return array;
     }
 };
 
@@ -73,6 +95,19 @@ test "Registry.add: records each type" {
 
     try std.testing.expectEqualStrings("One", type_registry.entries.items[0].@"struct".name);
     try std.testing.expectEqualStrings("Two", type_registry.entries.items[1].@"struct".name);
+}
+
+test "Registry.addArray: gives an array type one record for each length and element" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var type_registry: Registry = .{};
+
+    const first = try type_registry.addArray(arena.allocator(), 2, .boolean);
+    const second = try type_registry.addArray(arena.allocator(), 2, .boolean);
+    const longer = try type_registry.addArray(arena.allocator(), 3, .boolean);
+
+    try std.testing.expectEqual(first, second);
+    try std.testing.expect(first != longer);
 }
 
 test "findBuiltInType: finds number types, Bool, String and void" {

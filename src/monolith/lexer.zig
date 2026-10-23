@@ -10,6 +10,7 @@ pub const Lexer = struct {
     offset: usize = 0,
     tokens: std.ArrayList(token.Token) = .empty,
     location: token.Location = .{ .row = 1, .column = 1 },
+    nesting: usize = 0,
     failure: ?Failure = null,
 
     pub fn init(source: []const u8) Lexer {
@@ -97,10 +98,12 @@ fn lexIndentation(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
     const depth = position - start;
     const row = state.location.row + 1;
 
-    try state.tokens.append(allocator, .{
-        .kind = token.TokenKind{ .indent = depth },
-        .location = .{ .row = row, .column = 1 },
-    });
+    if (state.nesting == 0) {
+        try state.tokens.append(allocator, .{
+            .kind = token.TokenKind{ .indent = depth },
+            .location = .{ .row = row, .column = 1 },
+        });
+    }
     state.location = .{ .row = row, .column = 1 + depth };
     state.offset = position;
     return true;
@@ -238,11 +241,18 @@ fn lexSymbols(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
         ':' => .colon,
         '(' => .left_parenthesis,
         ')' => .right_parenthesis,
+        '[' => .left_bracket,
+        ']' => .right_bracket,
         ',' => .comma,
         '.' => .dot,
         '=' => .equals,
         else => return false,
     };
+    switch (kind) {
+        .left_parenthesis, .left_bracket => state.nesting += 1,
+        .right_parenthesis, .right_bracket => state.nesting -|= 1,
+        else => {},
+    }
 
     try state.tokens.append(allocator, .{
         .kind = kind,
@@ -432,6 +442,24 @@ test "lexIndentation: handles pure indentation stream" {
     try std.testing.expectEqual(4, lexer.tokens.items[1].kind.indent);
     try std.testing.expect(lexer.tokens.items[2].kind == .indent);
     try std.testing.expectEqual(2, lexer.tokens.items[2].kind.indent);
+}
+
+test "lexIndentation: ignores line breaks inside brackets and parentheses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("f([\n    1,\n    2,\n])\nx");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[2].kind == .left_parenthesis);
+    try std.testing.expect(lexer.tokens.items[3].kind == .left_bracket);
+    try std.testing.expect(lexer.tokens.items[4].kind == .integer_literal);
+    try std.testing.expect(lexer.tokens.items[5].kind == .comma);
+    try std.testing.expect(lexer.tokens.items[6].kind == .integer_literal);
+    try std.testing.expect(lexer.tokens.items[7].kind == .comma);
+    try std.testing.expect(lexer.tokens.items[8].kind == .right_bracket);
+    try std.testing.expect(lexer.tokens.items[9].kind == .right_parenthesis);
+    try std.testing.expectEqual(0, lexer.tokens.items[10].kind.indent);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, lexer.tokens.items[6].location);
 }
 
 test "lexWord: distinguishes keyword from identifier" {
@@ -799,4 +827,14 @@ test "lexSymbols: lexes two colons as one symbol" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 4 }, lexer.tokens.items[2].location);
     try std.testing.expectEqualStrings("stdout", lexer.tokens.items[3].kind.identifier);
     try std.testing.expect(lexer.tokens.items[4].kind == .colon);
+}
+
+test "lexSymbols: lexes brackets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("[]");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .left_bracket);
+    try std.testing.expect(lexer.tokens.items[2].kind == .right_bracket);
 }

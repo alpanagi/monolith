@@ -480,6 +480,7 @@ pub const Parser = struct {
         offset: *usize,
     ) ParseError!?ast.Expression {
         if (try self.parseStructLiteral(allocator, offset)) |literal| return literal;
+        if (try self.parseBrackets(allocator, offset)) |expression| return expression;
         if (try self.parseCall(allocator, offset)) |call| return call;
         if (try self.parseNameExpression(allocator, offset)) |name| return name;
         return self.parseLiteral(offset);
@@ -501,6 +502,56 @@ pub const Parser = struct {
             .kind = .{ .struct_literal = .{ .arguments = arguments } },
             .location = dot.location,
         };
+    }
+
+    fn parseBrackets(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.Expression {
+        var position = offset.*;
+        const bracket = self.match(&position, .left_bracket) orelse return null;
+        if (self.match(&position, .underscore) != null) {
+            _ = try self.expect(&position, .right_bracket, error.ExpectedRightBracket);
+            const array_type = try self.parseArrayType(allocator, &position, null);
+            offset.* = position;
+            return .{ .kind = .{ .array_type = array_type }, .location = bracket.location };
+        }
+        var elements: std.ArrayList(ast.Expression) = .empty;
+        while (self.tokens[position].kind != .right_bracket) {
+            const element = (try self.parseExpression(allocator, &position)) orelse {
+                return self.fail(position, error.ExpectedExpression);
+            };
+            try elements.append(allocator, element);
+            if (self.match(&position, .comma) == null) break;
+        }
+        _ = try self.expect(&position, .right_bracket, error.ExpectedRightBracket);
+        const next = self.tokens[position].kind;
+        if (next != .identifier and next != .left_bracket) {
+            offset.* = position;
+            const literal: ast.ArrayLiteral = .{ .elements = elements.items };
+            return .{ .kind = .{ .array_literal = literal }, .location = bracket.location };
+        }
+        if (elements.items.len != 1) return self.fail(offset.* + 1, error.ExpectedArrayLength);
+        const length = try allocator.create(ast.Expression);
+        length.* = elements.items[0];
+        const array_type = try self.parseArrayType(allocator, &position, length);
+
+        offset.* = position;
+        return .{ .kind = .{ .array_type = array_type }, .location = bracket.location };
+    }
+
+    fn parseArrayType(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        length: ?*ast.Expression,
+    ) ParseError!ast.ArrayType {
+        const element = try allocator.create(ast.Expression);
+        element.* = (try self.parseOperand(allocator, offset)) orelse {
+            return self.fail(offset.*, error.ExpectedType);
+        };
+        return .{ .length = length, .element = element };
     }
 
     fn parseCall(
@@ -676,6 +727,8 @@ pub const ParseError = error{
     ExpectedExpression,
     ExpectedCallOrName,
     ExpectedTarget,
+    ExpectedRightBracket,
+    ExpectedArrayLength,
     ExpectedField,
     ExpectedBlock,
     UnexpectedIndentation,
@@ -698,6 +751,8 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.ExpectedExpression => "expected an expression",
         error.ExpectedCallOrName => "expected a call or a name",
         error.ExpectedTarget => "expected a name or a field access before '='",
+        error.ExpectedRightBracket => "expected ']'",
+        error.ExpectedArrayLength => "expected one array length",
         error.ExpectedField => "expected a field",
         error.ExpectedBlock => "expected an indented block",
         error.UnexpectedIndentation => "unexpected indentation",
@@ -1540,6 +1595,68 @@ test "parseStructLiteral: rejects a dot without a parenthesis" {
 
     try std.testing.expectError(error.ExpectedLeftParenthesis, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, parser.failure.?.location.?);
+}
+
+test "parseBrackets: parses an array type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("const cards: [2]Card = other");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const array_type = module.declarations[0].kind.constant_declaration.type.?.kind.array_type;
+    try std.testing.expectEqualStrings("2", array_type.length.?.kind.integer_literal.text);
+    try std.testing.expectEqualStrings("Card", array_type.element.kind.identifier.name);
+}
+
+test "parseBrackets: parses an array type with a length to infer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("const cards: [_]Card = other");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const array_type = module.declarations[0].kind.constant_declaration.type.?.kind.array_type;
+    try std.testing.expectEqual(null, array_type.length);
+    try std.testing.expectEqualStrings("Card", array_type.element.kind.identifier.name);
+}
+
+test "parseBrackets: parses an array literal over several lines" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("const values: [2]i32 = [\n    1,\n    2,\n]\nfn main(): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const literal = module.declarations[0].kind.constant_declaration.value.kind.array_literal;
+    try std.testing.expectEqual(2, literal.elements.len);
+    try std.testing.expectEqualStrings("2", literal.elements[1].kind.integer_literal.text);
+    try std.testing.expect(module.declarations[1].kind == .function_definition);
+}
+
+test "parseBrackets: rejects an array type with two lengths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn show(values: [1, 2]i32): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedArrayLength, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, parser.failure.?.location.?);
+}
+
+test "parseBrackets: rejects a missing closing bracket" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("const values: [2]i32 = [1, 2");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedRightBracket, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 29 }, parser.failure.?.location.?);
 }
 
 test "parseCall: parses nested calls" {

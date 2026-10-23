@@ -37,9 +37,11 @@ statement            = "noop" | "return" [ expression ] | "_" "=" ( call | name 
                      | variable | assignment
 expression           = operand { "." name }
 operand              = integer | float | string | "true" | "false" | "undefined" | path | call
-                     | struct_literal
+                     | struct_literal | array_type | array_literal
 call                 = path "(" [ arguments ] ")"
 struct_literal       = "." "(" [ arguments ] ")"
+array_type           = "[" ( integer | "_" ) "]" operand
+array_literal        = "[" [ expression { "," expression } [ "," ] ] "]"
 arguments            = argument { "," argument } [ "," ]
 argument             = [ name "=" ] expression
 path                 = name { "::" name }
@@ -60,7 +62,7 @@ field                = name ":" type [ "=" expression ]
 - **L2.** A line ends with a line feed (`\n`) or a carriage return followed by a line feed (`\r\n`). A carriage return on its own is rejected with `unexpected character`.
 - **L3.** Spaces separate tokens. Outside string literals, tabs are rejected with `tabs are not allowed, use spaces`.
 - **L4.** The first line of a file cannot start with a space. It is rejected with `unexpected character` at 1:1.
-- **L5.** The number of spaces at the start of a line is its indentation. A line containing only spaces is blank and is ignored, whatever its indentation.
+- **L5.** The number of spaces at the start of a line is its indentation. A line containing only spaces is blank and is ignored, whatever its indentation. Between `(` and its `)`, and between `[` and its `]`, line ends and indentation are ignored, so a list of arguments or elements can continue on the following lines.
 
 ### Words
 
@@ -72,7 +74,7 @@ field                = name ":" type [ "=" expression ]
 
 ### Symbols
 
-- **L11.** The symbols are `(`, `)`, `:`, `::`, `,`, `.` and `=`. Two `:` with nothing between them are the symbol `::`.
+- **L11.** The symbols are `(`, `)`, `[`, `]`, `:`, `::`, `,`, `.` and `=`. Two `:` with nothing between them are the symbol `::`.
 
 ### Number literals
 
@@ -171,6 +173,11 @@ field                = name ":" type [ "=" expression ]
 - **S22.** A struct value is built by calling its struct with one argument for each field, written as the field's name, `=` and the value: `Point(x = 0, y = 0)`. The fields can be given in any order, and a field with a default value (S23) can be left out. A struct without fields is built with `Marker()`. The value of a named argument is required: `Point(x = )` is rejected with `expected an expression`. A struct literal builds a struct value without naming its struct, which comes from where the value is used (T17): `.(x = 0, y = 0)`. A `.` that is not followed by `(` is rejected with `expected '('`.
 - **S23.** A field or a parameter can have a default value, written after its type: `x: i32 = 0`, `fn draw(width: i32 = 1)`. A `=` without a value is rejected with `expected an expression`.
 
+### Arrays
+
+- **S24.** An array type is written `[N]T`: `N` elements of type `T`, as in `[2]Card` or `[3][2]i32`. `N` is an integer literal without a suffix. Any other length, such as `[size]i32` or `[2u8]i32`, is rejected with `array length must be an integer literal without a suffix`, and more than one value between the brackets is rejected with `expected one array length`. The length can be left out with `_` when the array type is the written type of a constant or a variable whose value is an array literal: in `const cards: [_]Card = [a, b]`, the length is 2, the number of elements. Anywhere else, `[_]` is rejected with `array length can only be left out with an array literal value`, at its `[`. Only the outermost length can be left out: in `[2][_]i32`, the `_` is rejected.
+- **S25.** An array literal lists its elements between brackets: `[1, 2, 3]`. A trailing `,` is allowed, and the elements can continue on the following lines (L5). A missing `]` is rejected with `expected ']'`. Brackets that a type follows directly are an array type (S24); all other brackets are an array literal.
+
 ## Modules
 
 - **M1.** Every source file is a module. The file given to the compiler is the main module. A module's path is the path of its file, with directories separated by `::` and without `.mn`: `utils/math.mn` is the module `utils::math`, and the main file `hello.mn` is the module `hello`.
@@ -214,7 +221,7 @@ field                = name ":" type [ "=" expression ]
   - Errors in a literal value are reported at the literal, in the module of the constant.
   - A struct value as the value must be known at compile time: each field's value is a literal, a constant or another struct value. `const origin = Point(x = 0, y = 0)` lets `origin` be used as a value of type `Point`.
   - A call to a function or a field access, as the value or inside a struct value, is rejected with `cannot be evaluated at compile time`, at the call or the field access.
-- **N11.** A constant means the same as its value, so every rule for that value applies to it. A constant produces no output: each use writes what the constant names, such as the function it calls or its literal. An anonymous struct is the exception, because C defines it (C10).
+- **N11.** A constant means the same as its value, so every rule for that value applies to it. A constant produces no output: each use writes what the constant names, such as the function it calls or its literal. An anonymous struct is the exception, because C defines it (C10), and so is a constant whose value is a struct or an array, which the target stores once (C20).
 - **N12.** A constant or a struct is only resolved and checked when something uses it. An unused constant or struct is not an error, because other modules can use it (M8), and the modules its value or its fields name are not loaded for it (M7).
 - **N13.** A used constant whose value reaches itself, directly or through other constants, is rejected with `constant refers to itself`, at its `const`. A used struct that contains itself, directly or through the fields of other structs, is rejected with `struct contains itself`, at the `struct` or `const` of the first of them that is used.
 
@@ -306,6 +313,20 @@ field                = name ":" type [ "=" expression ]
 - **T16.** A default value (S23) must have the type of its field or parameter (T10), and it must be known at compile time, like a constant's value (N10). A call to a function or a field access in it is rejected with `cannot be evaluated at compile time`. The default values of a struct are checked only when the struct is used (N12), and their errors are reported in the module of the struct.
 - **T17.** A struct literal (S22) takes the type its context expects, as a number literal without a suffix does (T5): the parameter's type for an argument, the field's type for a field's value or default, the function's return type for a returned value, the written type of a constant or variable, or the target's type in an assignment. It follows the rules of a struct value of that type (T15). A struct literal never creates a type. Without an expected type, as in `const point = .(x = 1)`, it is rejected with `value has no known type`, and an expected type that is not a struct is rejected with `type is not a struct`, at the literal.
 
+### Arrays
+
+- **T18.** Array types with the same length and element type are the same type, wherever they are written. The element type must be a type (T11), and an element of type `void` is rejected with `array elements cannot have type void`, at the element type. An array type can be used wherever a type can: as the type of a parameter, a return value, a field, a constant or a variable, or as the element type of another array. A constant can name an array type: `const Pair = [2]i32`.
+- **T19.** Arrays are values. Passing, returning and assigning an array gives an independent copy, as for a struct. An array has no fields (T14).
+- **T20.** An array literal (S25) takes the type its context expects, as a struct literal does (T17), and each element must have the element type (T10). When no type is expected, every element must have a type of its own, and all elements must have the same type: `const values = [1i32, 2i32]` has type `[2]i32`. No element decides the type for the others, so a struct literal or a number without a suffix in such a literal is rejected with `value has no known type`, at that element. Errors, at the literal unless stated otherwise:
+
+  | Situation | Error |
+  |---|---|
+  | No type is expected and the literal is empty: `const values = []` | `value has no known type` |
+  | No type is expected and two elements have different types, at the later element | `elements of an array literal have different types` |
+  | No type is expected and the elements have type `void`, at the first element | `array elements cannot have type void` |
+  | The expected type is not an array | `type is not an array` |
+  | The number of elements differs from the array's length | `number of elements does not match the length of the array` |
+
 ## Functions
 
 - **F1.** A call passes at least one argument for each parameter without a default value, and at most one for each parameter. Otherwise it is rejected with `wrong number of arguments`. Arguments match parameters in order, so only the last parameters can be left out, and each one left out takes its default value. A parameter without a default value after one with a default value is rejected with `parameters with default values must come last`, at that parameter. The arguments of a function have no names: `add(value = 1)` is rejected with `function arguments have no names`, at the argument.
@@ -327,7 +348,7 @@ field                = name ":" type [ "=" expression ]
 
 ### Names in the output
 
-- **G1.** Names are written to the output exactly as they are in the source, except the generated names: C function names (C9) and C struct names (C10). A generated name is `mn_` followed by the module path with `::` replaced by `_`, so it cannot be a name written in the source (N14).
+- **G1.** Names are written to the output exactly as they are in the source, except the generated names: C function names (C9), C struct names (C10), C names of array types (C19) and C names of stored constants (C20). A generated name is `mn_` followed by the module path with `::` replaced by `_`, so it cannot be a name written in the source (N14).
 - **G2.** A function, external function, parameter, local constant, variable or field whose name, as written to the output, the target already defines is rejected with `name is already defined in the target`, at the function's `fn` or `external` keyword, at the local constant's `const` or the variable's `var`, or at the parameter or field. Local constants and variables are checked with the name they get in the output (C16). Top-level constants are not checked, because they produce no output (N11), and neither are structs, because their C names are generated (C10), or discarded parameters, because they have no name in the output (C6). A function's name is checked as it is written to the output: `fn int(): noop` becomes `mn_hello_int` (C9) and is accepted, but a parameter named `int` is rejected.
 - **G3.** C defines the C23 keywords `_Alignas`, `_Alignof`, `_Atomic`, `_BitInt`, `_Bool`, `_Complex`, `_Decimal128`, `_Decimal32`, `_Decimal64`, `_Generic`, `_Imaginary`, `_Noreturn`, `_Static_assert`, `_Thread_local`, `alignas`, `alignof`, `auto`, `bool`, `break`, `case`, `char`, `const`, `constexpr`, `continue`, `default`, `do`, `double`, `else`, `enum`, `extern`, `false`, `float`, `for`, `goto`, `if`, `inline`, `int`, `long`, `nullptr`, `register`, `restrict`, `return`, `short`, `signed`, `sizeof`, `static`, `static_assert`, `struct`, `switch`, `thread_local`, `true`, `typedef`, `typeof`, `typeof_unqual`, `union`, `unsigned`, `void`, `volatile` and `while`, and `asm`, which compilers such as GCC treat as a keyword outside strict C23. It also defines the names that C23 declares in `<stddef.h>` and `<stdint.h>`, which the header includes, such as `size_t`, `int32_t`, `NULL` and `INT32_MAX`. `string` and `MONOLITH_H` are defined by `runtime/monolith.h` itself (C1).
 
@@ -347,9 +368,9 @@ field                = name ":" type [ "=" expression ]
   #endif
   ```
 
-- **C2.** Every module becomes a `.h` file, and a module that defines functions also becomes a `.c` file (K3).
-  - The `.h` file starts with `#pragma once`. It includes `runtime/monolith.h`, then the header of every other module whose structs its structs contain. Then it defines the module's structs (C10). Then it declares each struct of another module that its function declarations use, with `typedef struct mn_shapes_Line mn_shapes_Line;`. Last, it declares the module's functions: first its external functions, then, after a blank line, its other functions. The main module's `main` is not declared.
-  - The `.c` file includes its own header, then the header of every other module that its calls reach or whose structs its functions use, in the order of their first use, and then defines its functions.
+- **C2.** Every module becomes a `.h` file, and a module that defines functions or stores constants (C20) also becomes a `.c` file (K3).
+  - The `.h` file starts with `#pragma once`. It includes `runtime/monolith.h`, then the header of every other module whose structs its structs contain. Then it defines the module's structs (C10), each after the array types its fields hold (C19). Then it declares each struct of another module, and each array type it does not define, that its function declarations or stored constants use, with `typedef struct mn_shapes_Line mn_shapes_Line;`. Then it declares its stored constants (C20). Last, it declares the module's functions: first its external functions, then, after a blank line, its other functions. The main module's `main` is not declared.
+  - The `.c` file includes its own header, then the header of every other module that its calls or its uses of stored constants reach, or whose structs its functions use, in the order of their first use. Then it defines the array types its functions and constants use that its header does not define (C19), then its stored constants (C20), and then its functions.
   - Includes use paths relative to the file: `#include "std/io/stdout.h"`.
   - No function is `static`, so any module can be imported, the main module included.
 - **C3.** The main module's `main` becomes `int main()`. A `return` without a value inside it becomes `return 0;`.
@@ -364,6 +385,7 @@ field                = name ":" type [ "=" expression ]
   | `String` | `string` |
   | `void` | `void` |
   | a struct | its C name (C10) |
+  | an array | its C name (C19) |
 
 - **C5.** Number literals keep their base. `_` becomes `'`, `0o` becomes `0`, the suffix is removed, and literals of unsigned types end with `u`: `0o7_5_5` returned from a `u16` function becomes `07'5'5u`.
 - **C6.** `_ = add(1, 2)` becomes the plain call, `mn_hello_add(1, 2);` (C9). `_ = value` writes nothing. A discarded parameter has no name in the output: `fn show(value: i32): _ = value` becomes `void mn_hello_show(int32_t)` in the header and in the definition.
@@ -379,16 +401,29 @@ field                = name ":" type [ "=" expression ]
   } mn_hello_Point;
   ```
 
-- **C11.** A zero-sized type is a struct whose fields all have zero-sized types, such as a struct without fields. It has no definition in C. Fields, parameters and arguments of a zero-sized type are left out, and a function that returns one returns `void`. The calls in a zero-sized argument run before the call that receives it: `use(make(marker), 1)` becomes `(mn_hello_make(), mn_hello_use(1))`, and `use(holder().marker, 1)` becomes `(mn_hello_holder(), mn_hello_use(1))`. The calls in a returned zero-sized value run before the `return;`. A zero-sized value without calls, such as `holder.marker`, writes nothing.
+- **C11.** A zero-sized type is a struct whose fields all have zero-sized types, such as a struct without fields, or an array whose length is 0 or whose elements have a zero-sized type. It has no definition in C. Fields, parameters and arguments of a zero-sized type are left out, and a function that returns one returns `void`. The calls in a zero-sized argument run before the call that receives it: `use(make(marker), 1)` becomes `(mn_hello_make(), mn_hello_use(1))`, and `use(holder().marker, 1)` becomes `(mn_hello_holder(), mn_hello_use(1))`. The calls in a returned zero-sized value run before the `return;`. A zero-sized value without calls, such as `holder.marker`, writes nothing.
 - **C12.** Modules whose structs contain each other's structs, directly or through other modules, are rejected with `modules contain each other's structs`, at the field.
 - **C13.** A field access is written as in Monolith: `line.start.x` stays `line.start.x`, and `make().x` becomes `mn_hello_make().x`.
-- **C14.** A struct value becomes a compound literal that names each field, in the order written: `Point(y = 2, x = 1)` becomes `(mn_hello_Point){ .y = 2, .x = 1 }`. Fields of a zero-sized type are left out (C11). Fields left out with a default value are written with that value, after the given fields, in the order they are defined: `Point(y = 1)` becomes `(mn_hello_Point){ .y = 1, .x = 0 }`. A struct literal is written the same way, with the struct it takes (T17): `.(y = 1)` where a `Point` is expected becomes `(mn_hello_Point){ .y = 1, .x = 0 }`. A constant that holds a struct value writes it at each use (N11).
+- **C14.** A struct value becomes a compound literal that names each field, in the order written: `Point(y = 2, x = 1)` becomes `(mn_hello_Point){ .y = 2, .x = 1 }`. Fields of a zero-sized type are left out (C11). Fields left out with a default value are written with that value, after the given fields, in the order they are defined: `Point(y = 1)` becomes `(mn_hello_Point){ .y = 1, .x = 0 }`. A struct literal is written the same way, with the struct it takes (T17): `.(y = 1)` where a `Point` is expected becomes `(mn_hello_Point){ .y = 1, .x = 0 }`. A constant that holds a struct value is stored once (C20).
 - **C15.** A call writes the default value of each parameter it leaves out: `draw(2)` becomes `mn_hello_draw(2, 1)`.
 - **C16.** A local constant that is not an alias (N15) becomes a C local constant, and each use writes its name: `const limit: i32 = 5` becomes `const int32_t limit = 5;`.
   - C cannot declare a name two times in one block, and in `const int32_t x = x;` the value already refers to the new `x`. So a local constant that has the name of a parameter or of an earlier local constant gets the next free number: in `fn show(value: i32)`, `const value = value` becomes `const int32_t value_2 = value;`. A number is skipped when a parameter or local constant of the function already has that name in the source.
   - A discarded local constant (N19), or one of a zero-sized type (C11), is not declared. Only the calls in its value run, as a statement: `const point = make_point()` followed by `_ = point` becomes `mn_hello_make_point();`.
 - **C17.** A variable becomes a C local without `const`: `var count = 1i32` becomes `int32_t count = 1;`, and `var count: i32 = undefined` becomes `int32_t count;`. Its name follows C16, and it shares the numbers with the local constants. A discarded variable, or one of a zero-sized type, is not declared, as in C16.
 - **C18.** An assignment is written as in Monolith: `count = 2` becomes `count = 2;`, and `point.x = 3` becomes `point.x = 3;`. When the variable is not declared (C17), or the target has a zero-sized type, only the calls in the value run, as a statement.
+- **C19.** An array type becomes a struct that holds a C array in its field `items`, so that C copies it as a value (T19). Its C name is `mn_array_`, the length, `_`, and the element type as Monolith writes it, with a struct named by its module path and name: `[2]Card` in `hello` is `mn_array_2_hello_Card`, and `[3][2]i32` is `mn_array_3_array_2_i32`. Its definition is guarded, so that any number of files can contain it:
+
+  ```c
+  #ifndef mn_array_2_hello_Card_defined
+  #define mn_array_2_hello_Card_defined
+  typedef struct mn_array_2_hello_Card {
+      mn_hello_Card items[2];
+  } mn_array_2_hello_Card;
+  #endif
+  ```
+
+  An array literal becomes a compound literal: `[1, 2]` where a `[2]i32` is expected becomes `(mn_array_2_i32){ .items = { 1, 2 } }`.
+- **C20.** A top-level constant whose value is a struct or an array, and that is not zero-sized (C11), is stored once. Its C name is built as for a function (C9): `cards` in `hello` becomes `mn_hello_cards`. Its module's `.c` file defines it, and its header declares it with `extern const`. Every use writes its name. Its value is written as an initializer, without compound literals, and the constants it uses are written by their values: `const origin: Point = .(x = 0)` becomes `const mn_hello_Point mn_hello_origin = { .x = 0 };`. A constant is only stored when something uses it (N12).
 
 ## Compiler
 
@@ -397,7 +432,7 @@ field                = name ":" type [ "=" expression ]
 - **K3.** The output is written to `build/`, in the directory the compiler runs in. The C files are written to `build/source/`:
   - The main module is written as `<name>.h` and `<name>.c`, where `<name>` is the source file name without `.mn`.
   - Every other module is written at its module path, the standard library's modules included: `utils::math` as `utils/math.h` and `utils/math.c`, and `std::io::stdout` as `std/io/stdout.h`.
-  - A module without functions, the main module included, gets no `.c` file (C2).
+  - A module without functions or stored constants, the main module included, gets no `.c` file (C2).
   - The runtime files whose functions the program calls are copied to `runtime/`, such as `runtime/stdout.c` (D2).
   - `runtime/monolith.h` is always copied (C1).
   - When the main module defines `main`, the compiler also builds the executable `build/<name>` with GCC, from every `.c` file of the output: `gcc -std=c23 -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -pedantic -O2 -flto`. GCC's warnings are shown. Its warnings about unused parameters and variables are turned off, because the compiler checks unused names in the source (N18), and the output leaves out code that does nothing in C, such as discarded local constants (C16). If GCC cannot be run, the compiler stops with `error: cannot run gcc: <reason>`. If GCC fails, it stops with `error: gcc could not build the executable`. GCC runs after the output is written, so the C files stay when it fails.

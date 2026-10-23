@@ -7,19 +7,20 @@ const types = core.types;
 const Failure = core.Failure;
 
 pub const TypeChecker = struct {
+    arena: *std.heap.ArenaAllocator,
     program: ast.Program,
     module_index: usize = 0,
     failure: ?Failure = null,
 
-    pub fn init(program: ast.Program) TypeChecker {
-        return .{ .program = program };
+    pub fn init(arena: *std.heap.ArenaAllocator, program: ast.Program) TypeChecker {
+        return .{ .arena = arena, .program = program };
     }
 
     pub fn check(self: *TypeChecker) TypeError!void {
         for (self.program.types.entries.items) |value_type| {
             switch (value_type) {
                 .@"struct" => |struct_type| try self.checkFieldDefaults(struct_type),
-                .number, .boolean, .string, .void, .type => unreachable,
+                .number, .boolean, .string, .void, .type, .array => unreachable,
             }
         }
         for (self.program.modules, 0..) |module, index| {
@@ -182,6 +183,23 @@ pub const TypeChecker = struct {
                 const location = expression.location;
                 _ = try self.checkConstruction(parameters, location, literal.arguments, expected);
             },
+            .array_literal => |literal| {
+                const array = switch (expected) {
+                    .array => |array| array,
+                    .number, .boolean, .string, .void, .type, .@"struct" => {
+                        return self.fail(expression.location, error.NotAnArray);
+                    },
+                };
+                if (literal.elements.len != array.length) {
+                    return self.fail(expression.location, error.WrongLength);
+                }
+                for (literal.elements) |*element| {
+                    try self.checkExpression(parameters, element, array.element);
+                }
+            },
+            .array_type => {
+                if (expected != .type) return self.fail(expression.location, error.TypeMismatch);
+            },
             .field_access => {
                 const field_type = try self.checkFieldAccess(parameters, expression);
                 if (!std.meta.eql(field_type, expected)) {
@@ -249,7 +267,7 @@ pub const TypeChecker = struct {
     ) TypeError!types.Type {
         const struct_type = switch (value_type) {
             .@"struct" => |struct_type| struct_type,
-            .number, .boolean, .string, .void, .type => {
+            .number, .boolean, .string, .void, .type, .array => {
                 return self.fail(location, error.NotAStruct);
             },
         };
@@ -281,7 +299,7 @@ pub const TypeChecker = struct {
         const access = expression.kind.field_access;
         const struct_type = switch (try self.inferType(parameters, access.value)) {
             .@"struct" => |struct_type| struct_type,
-            .number, .boolean, .string, .void, .type => {
+            .number, .boolean, .string, .void, .type, .array => {
                 return self.fail(access.field_location, error.NoFields);
             },
         };
@@ -312,9 +330,39 @@ pub const TypeChecker = struct {
             },
             .call => return self.checkCall(parameters, expression),
             .struct_literal => return self.fail(expression.location, error.UnknownValueType),
+            .array_literal => |literal| {
+                const location = expression.location;
+                const value_type = try self.inferArrayType(parameters, location, literal);
+                expression.type = value_type;
+                return value_type;
+            },
+            .array_type => {
+                expression.type = .type;
+                return .type;
+            },
             .field_access => return self.checkFieldAccess(parameters, expression),
             .@"struct" => unreachable,
         }
+    }
+
+    fn inferArrayType(
+        self: *TypeChecker,
+        parameters: []const ast.TypedName,
+        location: token.Location,
+        literal: ast.ArrayLiteral,
+    ) TypeError!types.Type {
+        if (literal.elements.len == 0) return self.fail(location, error.UnknownValueType);
+        const first = &literal.elements[0];
+        const element_type = try self.inferType(parameters, first);
+        if (element_type == .void) return self.fail(first.location, error.VoidElement);
+        for (literal.elements[1..]) |*element| {
+            if (!std.meta.eql(try self.inferType(parameters, element), element_type)) {
+                return self.fail(element.location, error.MixedElements);
+            }
+        }
+        const allocator = self.arena.allocator();
+        const length = literal.elements.len;
+        return .{ .array = try self.program.types.addArray(allocator, length, element_type) };
     }
 
     fn computeValueType(
@@ -375,6 +423,8 @@ pub const TypeChecker = struct {
             .path_expression,
             .call,
             .struct_literal,
+            .array_type,
+            .array_literal,
             .field_access,
             .@"struct",
             => unreachable,
@@ -421,6 +471,8 @@ pub const TypeChecker = struct {
             .path_expression,
             .call,
             .struct_literal,
+            .array_type,
+            .array_literal,
             .field_access,
             .@"struct",
             => unreachable,
@@ -435,7 +487,7 @@ pub const TypeChecker = struct {
     ) TypeError!types.NumberType {
         const number = switch (expected) {
             .number => |number| number,
-            .boolean, .string, .void, .type, .@"struct" => {
+            .boolean, .string, .void, .type, .@"struct", .array => {
                 return self.fail(location, error.TypeMismatch);
             },
         };
@@ -458,6 +510,7 @@ pub const TypeChecker = struct {
 };
 
 pub const TypeError = error{
+    OutOfMemory,
     TypeMismatch,
     LiteralOutOfRange,
     MissingReturnValue,
@@ -474,6 +527,10 @@ pub const TypeError = error{
     VoidVariable,
     TypeVariable,
     UnexpectedUndefined,
+    NotAnArray,
+    WrongLength,
+    MixedElements,
+    VoidElement,
     UnknownSuffix,
     UnknownValueType,
     NoFields,
@@ -488,6 +545,7 @@ pub const TypeError = error{
 
 fn describeError(type_error: TypeError) []const u8 {
     return switch (type_error) {
+        error.OutOfMemory => "out of memory",
         error.TypeMismatch => "value does not match the expected type",
         error.LiteralOutOfRange => "literal out of range for its type",
         error.MissingReturnValue => "missing return value",
@@ -504,6 +562,10 @@ fn describeError(type_error: TypeError) []const u8 {
         error.VoidVariable => "variable cannot have type void",
         error.TypeVariable => "variable cannot hold a type",
         error.UnexpectedUndefined => "undefined can only be the initial value of a variable",
+        error.NotAnArray => "type is not an array",
+        error.WrongLength => "number of elements does not match the length of the array",
+        error.MixedElements => "elements of an array literal have different types",
+        error.VoidElement => "array elements cannot have type void",
         error.UnknownSuffix => "unknown suffix",
         error.UnknownValueType => "value has no known type",
         error.NoFields => "value has no fields",
@@ -565,7 +627,7 @@ test "TypeChecker.check: sets the type of each returned value" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
     try type_checker.check();
 
     try std.testing.expectEqual(types.Type{ .number = .u8 }, loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.@"return".?.type);
@@ -596,7 +658,7 @@ test "TypeChecker.check: sets the type of calls, arguments and names" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
     try type_checker.check();
 
     try std.testing.expectEqual(types.Type{ .number = .i32 }, loader.modules.items[0].declarations[0].kind.function_definition.body[1].kind.@"return".?.type);
@@ -621,7 +683,7 @@ test "checkFieldDefaults: rejects a default of another type than its field" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 17 }, type_checker.failure.?.location.?);
@@ -644,7 +706,7 @@ test "checkFieldDefaults: reports errors in the module of the struct" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(loader.modules.items[1].path, type_checker.failure.?.module.?);
@@ -667,7 +729,7 @@ test "checkParameterDefaults: rejects a default of another type than its paramet
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 22 }, type_checker.failure.?.location.?);
@@ -695,7 +757,7 @@ test "checkFunction: rejects a return type on main" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.MainHasReturnType, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 11 }, type_checker.failure.?.location.?);
@@ -723,7 +785,7 @@ test "checkFunction: rejects parameters on main" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.MainHasParameters, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 9 }, type_checker.failure.?.location.?);
@@ -751,7 +813,7 @@ test "checkFunction: rejects a missing return" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.MissingReturn, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, type_checker.failure.?.location.?);
@@ -779,7 +841,7 @@ test "checkExternalFunction: rejects an external main" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.MainIsExternal, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, type_checker.failure.?.location.?);
@@ -807,7 +869,7 @@ test "checkStatement: rejects a missing return value" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.MissingReturnValue, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, type_checker.failure.?.location.?);
@@ -835,7 +897,7 @@ test "checkStatement: rejects a value in a void function" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.UnexpectedReturnValue, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, type_checker.failure.?.location.?);
@@ -863,7 +925,7 @@ test "checkStatement: rejects an unused result" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.UnusedResult, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, type_checker.failure.?.location.?);
@@ -891,7 +953,7 @@ test "checkStatement: rejects discarding a void call" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.DiscardedVoid, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 16 }, type_checker.failure.?.location.?);
@@ -913,7 +975,7 @@ test "checkStatement: rejects a discarded struct value" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.ExpectedCall, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 16 }, type_checker.failure.?.location.?);
@@ -934,7 +996,7 @@ test "checkStatement: checks the value of a local constant at its statement" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 24 }, type_checker.failure.?.location.?);
@@ -955,7 +1017,7 @@ test "checkStatement: rejects a local constant of type void" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.VoidConstant, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 21 }, type_checker.failure.?.location.?);
@@ -976,7 +1038,7 @@ test "checkStatement: checks a local constant with the parameters of its functio
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try type_checker.check();
 
@@ -999,7 +1061,7 @@ test "checkStatement: rejects an assignment of another type" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 13 }, type_checker.failure.?.location.?);
@@ -1020,7 +1082,7 @@ test "checkStatement: rejects a variable of type void" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.VoidVariable, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 19 }, type_checker.failure.?.location.?);
@@ -1041,7 +1103,7 @@ test "checkStatement: rejects a variable that holds a type" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeVariable, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 16 }, type_checker.failure.?.location.?);
@@ -1062,7 +1124,7 @@ test "checkInitialValue: gives undefined the written type" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try type_checker.check();
 
@@ -1085,7 +1147,7 @@ test "checkInitialValue: rejects undefined without a written type" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.UnknownValueType, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 17 }, type_checker.failure.?.location.?);
@@ -1113,7 +1175,7 @@ test "checkExpression: rejects a boolean for an integer type" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?.location.?);
@@ -1141,7 +1203,7 @@ test "checkExpression: rejects an integer literal for a float type" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, type_checker.failure.?.location.?);
@@ -1169,7 +1231,7 @@ test "checkExpression: rejects a float literal for an integer type" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?.location.?);
@@ -1197,7 +1259,7 @@ test "checkExpression: rejects a suffix of another type" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?.location.?);
@@ -1225,7 +1287,7 @@ test "checkExpression: rejects a float suffix of another type" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, type_checker.failure.?.location.?);
@@ -1265,7 +1327,7 @@ test "checkExpression: accepts the maximum of each integer type" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try type_checker.check();
 }
@@ -1296,7 +1358,7 @@ test "checkExpression: rejects one past the maximum of each integer type" {
         var type_registry: types.Registry = .{};
         var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
         try name_resolver.resolve();
-        var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+        var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
         try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
     }
@@ -1324,7 +1386,7 @@ test "checkExpression: rejects a suffixed literal out of range" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
@@ -1352,7 +1414,7 @@ test "checkExpression: rejects an integer beyond 64 bits" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 22 }, type_checker.failure.?.location.?);
@@ -1380,7 +1442,7 @@ test "checkExpression: rejects a float out of range" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
@@ -1402,7 +1464,7 @@ test "checkExpression: rejects a type as a value" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 22 }, type_checker.failure.?.location.?);
@@ -1431,7 +1493,7 @@ test "checkExpression: rejects a parameter of another type" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 32 }, type_checker.failure.?.location.?);
@@ -1459,7 +1521,7 @@ test "checkExpression: rejects a call of another type" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 22 }, type_checker.failure.?.location.?);
@@ -1487,7 +1549,7 @@ test "checkExpression: rejects a void call as a value" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 22 }, type_checker.failure.?.location.?);
@@ -1515,7 +1577,7 @@ test "checkExpression: gives a string literal the String type" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
     try type_checker.check();
 
     try std.testing.expectEqual(types.Type.string, loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.@"return".?.type);
@@ -1543,7 +1605,7 @@ test "checkExpression: rejects a string for an integer type" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?.location.?);
@@ -1571,7 +1633,7 @@ test "checkExpression: rejects an integer for String" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
@@ -1592,7 +1654,7 @@ test "checkExpression: rejects undefined as a returned value" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.UnexpectedUndefined, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
@@ -1613,7 +1675,7 @@ test "checkExpression: rejects undefined as the value of a local constant" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.UnexpectedUndefined, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 24 }, type_checker.failure.?.location.?);
@@ -1634,7 +1696,7 @@ test "checkExpression: gives a struct literal the expected type" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try type_checker.check();
 
@@ -1657,7 +1719,7 @@ test "checkExpression: rejects a struct literal for a type that is not a struct"
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.NotAStruct, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
@@ -1678,10 +1740,97 @@ test "checkExpression: checks the fields of a struct literal" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 31 }, type_checker.failure.?.location.?);
+}
+
+test "checkExpression: gives an array literal the expected type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() [2]i32: return [1, 2]" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try type_checker.check();
+
+    const value = loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.@"return".?;
+    try std.testing.expectEqual(2, value.type.?.array.length);
+    try std.testing.expectEqual(types.Type{ .number = .i32 }, value.kind.array_literal.elements[1].type);
+}
+
+test "checkExpression: rejects an array literal of another length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() [2]i32: return [1]" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.WrongLength, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
+}
+
+test "checkExpression: rejects an array literal for a type that is not an array" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() i32: return [1]" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.NotAnArray, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
+}
+
+test "checkExpression: checks the elements of an array literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() [2]i32: return [1, true]" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.TypeMismatch, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 30 }, type_checker.failure.?.location.?);
 }
 
 test "checkCall: rejects calling main" {
@@ -1706,7 +1855,7 @@ test "checkCall: rejects calling main" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.MainCalled, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, type_checker.failure.?.location.?);
@@ -1734,7 +1883,7 @@ test "checkCall: checks arguments of external functions" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 17 }, type_checker.failure.?.location.?);
@@ -1763,7 +1912,7 @@ test "checkCall: checks arguments against a function of another module" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(loader.modules.items[0].path, type_checker.failure.?.module.?);
@@ -1792,7 +1941,7 @@ test "checkCall: rejects a wrong number of arguments" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.ArgumentCountMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 16 }, type_checker.failure.?.location.?);
@@ -1820,7 +1969,7 @@ test "checkCall: rejects an argument of another type" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 17 }, type_checker.failure.?.location.?);
@@ -1848,7 +1997,7 @@ test "checkCall: checks literal arguments against their parameter" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, type_checker.failure.?.location.?);
@@ -1870,7 +2019,7 @@ test "checkFunctionCall: rejects a named argument" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.NamedArgument, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 16 }, type_checker.failure.?.location.?);
@@ -1892,7 +2041,7 @@ test "checkFunctionCall: accepts leaving out parameters with defaults" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try type_checker.check();
 }
@@ -1913,7 +2062,7 @@ test "checkFunctionCall: rejects fewer arguments than the parameters without def
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.ArgumentCountMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 12 }, type_checker.failure.?.location.?);
@@ -1935,7 +2084,7 @@ test "checkConstruction: gives a construction its struct" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
     try type_checker.check();
 
     const returned = loader.modules.items[0].declarations[1].kind.function_definition.body[0].kind.@"return".?;
@@ -1959,7 +2108,7 @@ test "checkConstruction: rejects a type that is not a struct" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.NotAStruct, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
@@ -1981,7 +2130,7 @@ test "checkConstruction: rejects an argument without a field name" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.MissingFieldName, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 31 }, type_checker.failure.?.location.?);
@@ -2003,7 +2152,7 @@ test "checkConstruction: rejects an unknown field" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.UnknownField, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 38 }, type_checker.failure.?.location.?);
@@ -2025,7 +2174,7 @@ test "checkConstruction: rejects a field given twice" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.RepeatedField, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 38 }, type_checker.failure.?.location.?);
@@ -2047,7 +2196,7 @@ test "checkConstruction: rejects a missing field" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.MissingField, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 25 }, type_checker.failure.?.location.?);
@@ -2069,7 +2218,7 @@ test "checkConstruction: rejects a value of another type than its field" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 35 }, type_checker.failure.?.location.?);
@@ -2091,7 +2240,7 @@ test "checkConstruction: accepts leaving out fields with defaults" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try type_checker.check();
 }
@@ -2112,7 +2261,7 @@ test "checkFieldAccess: gives each access the type of its field" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
     try type_checker.check();
 
     const returned = loader.modules.items[0].declarations[2].kind.function_definition.body[0].kind.@"return".?;
@@ -2137,7 +2286,7 @@ test "checkFieldAccess: rejects a field the struct does not have" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.UnknownField, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 5, .column = 41 }, type_checker.failure.?.location.?);
@@ -2159,7 +2308,7 @@ test "checkFieldAccess: rejects fields of a value that is not a struct" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.NoFields, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 39 }, type_checker.failure.?.location.?);
@@ -2181,7 +2330,7 @@ test "checkFieldAccess: rejects a field of another type than expected" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 5, .column = 36 }, type_checker.failure.?.location.?);
@@ -2203,7 +2352,7 @@ test "checkFieldAccess: rejects a field of a field that is not a struct" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.NoFields, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 43 }, type_checker.failure.?.location.?);
@@ -2225,7 +2374,7 @@ test "inferType: gives a call its return type" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
     try type_checker.check();
 
     const returned = loader.modules.items[0].declarations[3].kind.function_definition.body[0].kind.@"return".?;
@@ -2249,7 +2398,7 @@ test "inferType: rejects a literal without a known type" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.UnknownValueType, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
@@ -2270,10 +2419,118 @@ test "inferType: rejects a struct literal without an expected type" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.UnknownValueType, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 19 }, type_checker.failure.?.location.?);
+}
+
+test "inferArrayType: takes the type of elements that all have the same type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const values = [1i32, 2i32]\n    _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try type_checker.check();
+
+    const value = loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.constant_declaration.value;
+    try std.testing.expectEqual(2, value.type.?.array.length);
+    try std.testing.expectEqual(types.Type{ .number = .i32 }, value.type.?.array.element);
+}
+
+test "inferArrayType: rejects an element without a type of its own" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn main():\n    const points = [Point(x = 1), .(x = 2)]\n    _ = points" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnknownValueType, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 35 }, type_checker.failure.?.location.?);
+}
+
+test "inferArrayType: rejects elements of different types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const values = [1i32, 2u8]\n    _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.MixedElements, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 27 }, type_checker.failure.?.location.?);
+}
+
+test "inferArrayType: rejects elements of type void" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(): return\nfn main():\n    const values = [show(), show()]\n    _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.VoidElement, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 21 }, type_checker.failure.?.location.?);
+}
+
+test "inferArrayType: rejects an empty array literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const values = []\n    _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnknownValueType, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 20 }, type_checker.failure.?.location.?);
 }
 
 test "checkConstant: gives each use the type of the value" {
@@ -2291,7 +2548,7 @@ test "checkConstant: gives each use the type of the value" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
     try type_checker.check();
 
     const declarations = loader.modules.items[0].declarations;
@@ -2315,7 +2572,7 @@ test "checkConstant: rejects a value of another type" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 22 }, type_checker.failure.?.location.?);
@@ -2337,7 +2594,7 @@ test "checkConstant: checks the value in the module of the constant" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
     try std.testing.expectEqual(loader.modules.items[1].path, type_checker.failure.?.module.?);
@@ -2360,7 +2617,7 @@ test "checkConstant: checks a constant that constructs a struct" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
     try type_checker.check();
 
     const value = loader.modules.items[0].declarations[1].kind.constant_declaration.value;
@@ -2384,7 +2641,7 @@ test "checkConstant: reports errors in the module of the constant" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(&arena, program);
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(loader.modules.items[1].path, type_checker.failure.?.module.?);
@@ -2406,7 +2663,7 @@ test "checkConstantValue: gives a literal the written type" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
     try type_checker.check();
 
     const constant = loader.modules.items[0].declarations[1].kind.function_definition.body[0].kind.constant_declaration;
@@ -2428,7 +2685,7 @@ test "checkConstantValue: rejects a value of another type than the written type"
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 24 }, type_checker.failure.?.location.?);
@@ -2449,7 +2706,7 @@ test "checkConstantValue: rejects a number without a suffix or a written type" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.UnknownValueType, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 19 }, type_checker.failure.?.location.?);
@@ -2470,7 +2727,7 @@ test "checkConstantValue: checks the written type of a top-level constant" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, type_checker.failure.?.location.?);
@@ -2491,7 +2748,7 @@ test "computeLiteralType: rejects a number without a suffix" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.UnknownValueType, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 15 }, type_checker.failure.?.location.?);
@@ -2512,7 +2769,7 @@ test "computeLiteralType: rejects an unknown suffix" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.UnknownSuffix, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 15 }, type_checker.failure.?.location.?);
@@ -2533,7 +2790,7 @@ test "expectNumber: rejects an unknown suffix" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.UnknownSuffix, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
@@ -2554,7 +2811,7 @@ test "expectNumber: rejects a float suffix on an integer" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, type_checker.failure.?.location.?);
@@ -2575,7 +2832,7 @@ test "expectNumber: rejects an integer suffix on a float" {
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
-    var type_checker = TypeChecker.init(.{ .modules = loader.modules.items, .types = &type_registry });
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);

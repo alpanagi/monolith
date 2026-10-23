@@ -4,7 +4,7 @@ const types = @import("types.zig");
 
 pub const Program = struct {
     modules: []Module,
-    types: *const types.Registry,
+    types: *types.Registry,
 };
 
 pub const Module = struct {
@@ -89,6 +89,8 @@ pub const ExpressionKind = union(enum) {
     path_expression: PathExpression,
     call: Call,
     struct_literal: StructLiteral,
+    array_type: ArrayType,
+    array_literal: ArrayLiteral,
     field_access: FieldAccess,
     @"struct": Struct,
 };
@@ -137,6 +139,16 @@ pub const StructLiteral = struct {
     arguments: []Argument,
 };
 
+pub const ArrayType = struct {
+    length: ?*Expression,
+    element: *Expression,
+    value: ?types.Type = null,
+};
+
+pub const ArrayLiteral = struct {
+    elements: []Expression,
+};
+
 pub const Argument = struct {
     name: ?[]const u8,
     value: Expression,
@@ -165,6 +177,7 @@ pub const TypedName = struct {
 pub fn extractType(expression: Expression) types.Type {
     return switch (expression.kind) {
         inline .identifier, .path_expression => |name| name.resolution.?.type,
+        .array_type => |array_type| array_type.value.?,
         else => unreachable,
     };
 }
@@ -186,6 +199,7 @@ pub fn extractFunctionSignature(declaration: Declaration) FunctionSignature {
 pub fn isAlias(constant: ConstantDeclaration) bool {
     return switch (constant.value.kind) {
         inline .identifier, .path_expression => |name| name.resolution == null,
+        .array_type => constant.type == null,
         else => false,
     };
 }

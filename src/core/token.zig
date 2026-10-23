@@ -17,6 +17,8 @@ pub const TokenKind = union(enum) {
     underscore,
     left_parenthesis,
     right_parenthesis,
+    left_bracket,
+    right_bracket,
     colon,
     double_colon,
     comma,

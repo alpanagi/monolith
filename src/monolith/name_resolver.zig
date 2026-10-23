@@ -111,6 +111,7 @@ pub const NameResolver = struct {
     fn expectType(self: *NameResolver, expression: ast.Expression) NameError!types.Type {
         const resolution = switch (expression.kind) {
             inline .identifier, .path_expression => |name| name.resolution.?,
+            .array_type => |array_type| return array_type.value.?,
             else => return self.fail(expression.location, error.TypeMismatch),
         };
         return switch (resolution) {
@@ -213,8 +214,8 @@ pub const NameResolver = struct {
         const value = &constant.value;
         if (value.kind == .@"struct") return self.fail(value.location, error.StructInFunction);
         if (constant.type) |*written| {
-            try self.resolveWrittenType(scope, written);
-        } else if (try self.findAlias(scope, value.*)) |target| {
+            try self.resolveWrittenType(scope, written, value.*);
+        } else if (try self.findAlias(scope, value)) |target| {
             return target;
         }
         try self.resolveNamesInExpression(scope, value);
@@ -225,12 +226,18 @@ pub const NameResolver = struct {
         self: *NameResolver,
         scope: Scope,
         written_type: *ast.Expression,
+        value: ast.Expression,
     ) ResolveError!void {
+        if (written_type.kind == .array_type and value.kind == .array_literal) {
+            const length = value.kind.array_literal.elements.len;
+            const array_type = &written_type.kind.array_type;
+            return self.resolveArrayType(scope, written_type.location, array_type, length);
+        }
         try self.resolveNamesInExpression(.{ .locals = scope.locals }, written_type);
         _ = try self.expectType(written_type.*);
     }
 
-    fn findAlias(self: *NameResolver, scope: Scope, value: ast.Expression) ResolveError!?Target {
+    fn findAlias(self: *NameResolver, scope: Scope, value: *ast.Expression) ResolveError!?Target {
         const target: Target = switch (value.kind) {
             .identifier => |identifier| target: {
                 if (findLocal(scope.locals, identifier.name)) |local| {
@@ -243,6 +250,10 @@ pub const NameResolver = struct {
             .path_expression => |path_expression| target: {
                 const path = path_expression.path;
                 break :target try self.resolvePath(scope, value.location, path);
+            },
+            .array_type => target: {
+                try self.resolveNamesInExpression(scope, value);
+                break :target .{ .type = value.kind.array_type.value.? };
             },
             else => return null,
         };
@@ -262,7 +273,9 @@ pub const NameResolver = struct {
         if (isReservedName(module.path, variable.name)) {
             return self.fail(location, error.ReservedName);
         }
-        if (variable.type) |*written| try self.resolveWrittenType(scope, written);
+        if (variable.type) |*written| {
+            try self.resolveWrittenType(scope, written, variable.value);
+        }
         try self.resolveNamesInExpression(scope, &variable.value);
     }
 
@@ -349,9 +362,43 @@ pub const NameResolver = struct {
                     try self.resolveNamesInExpression(scope, &argument.value);
                 }
             },
+            .array_type => |*array_type| {
+                try self.resolveArrayType(scope, location, array_type, null);
+            },
+            .array_literal => |literal| {
+                for (literal.elements) |*element| try self.resolveNamesInExpression(scope, element);
+            },
             .field_access => |access| try self.resolveNamesInExpression(scope, access.value),
             .@"struct" => unreachable,
         }
+    }
+
+    fn resolveArrayType(
+        self: *NameResolver,
+        scope: Scope,
+        location: token.Location,
+        array_type: *ast.ArrayType,
+        literal_length: ?u64,
+    ) ResolveError!void {
+        try self.resolveNamesInExpression(.{ .locals = scope.locals }, array_type.element);
+        const element = try self.expectType(array_type.element.*);
+        if (element == .void) return self.fail(array_type.element.location, error.VoidElement);
+        var known_length = literal_length;
+        if (array_type.length) |length| known_length = try self.expectLength(length.*);
+        const length = known_length orelse return self.fail(location, error.UnknownLength);
+        const array = try self.types.addArray(self.arena.allocator(), length, element);
+        array_type.value = .{ .array = array };
+    }
+
+    fn expectLength(self: *NameResolver, expression: ast.Expression) NameError!u64 {
+        const literal = switch (expression.kind) {
+            .integer_literal => |literal| literal,
+            else => return self.fail(expression.location, error.InvalidLength),
+        };
+        if (literal.suffix != null) return self.fail(expression.location, error.InvalidLength);
+        return std.fmt.parseInt(u64, literal.text, 0) catch {
+            return self.fail(expression.location, error.InvalidLength);
+        };
     }
 
     fn resolveIdentifier(
@@ -556,7 +603,7 @@ pub const NameResolver = struct {
         const value = &constant.value;
         const own: Target = .{ .constant = .{ .module = module_index, .declaration = index } };
         if (constant.type) |*written| {
-            try self.resolveWrittenType(.{}, written);
+            try self.resolveWrittenType(.{}, written, value.*);
             try self.resolveNamesInExpression(.{}, value);
             try self.expectEvaluable(value.*);
             return own;
@@ -567,7 +614,11 @@ pub const NameResolver = struct {
                 return self.resolvePath(.{}, declaration.location, path_expression.path);
             },
             .integer_literal, .float_literal, .boolean_literal, .string_literal, .undefined => own,
-            .call, .struct_literal => {
+            .array_type => {
+                try self.resolveNamesInExpression(.{}, value);
+                return .{ .type = value.kind.array_type.value.? };
+            },
+            .call, .struct_literal, .array_literal => {
                 if (!constant.resolved) {
                     try self.resolveNamesInExpression(.{}, value);
                     try self.expectEvaluable(value.*);
@@ -599,6 +650,10 @@ pub const NameResolver = struct {
             .struct_literal => |literal| {
                 for (literal.arguments) |argument| try self.expectEvaluable(argument.value);
             },
+            .array_literal => |literal| {
+                for (literal.elements) |element| try self.expectEvaluable(element);
+            },
+            .array_type => {},
             .field_access => return self.fail(expression.location, error.CannotEvaluate),
             .@"struct" => unreachable,
         }
@@ -715,6 +770,9 @@ pub const NameError = error{
     StructContainsItself,
     StructInFunction,
     NotAssignable,
+    VoidElement,
+    InvalidLength,
+    UnknownLength,
     NeverAssigned,
     UnusedVariable,
     UnusedParameter,
@@ -773,6 +831,9 @@ fn describeError(name_error: NameError) []const u8 {
         error.StructContainsItself => "struct contains itself",
         error.StructInFunction => "structs cannot be defined inside functions",
         error.NotAssignable => "only variables and their fields can be assigned",
+        error.VoidElement => "array elements cannot have type void",
+        error.InvalidLength => "array length must be an integer literal without a suffix",
+        error.UnknownLength => "array length can only be left out with an array literal value",
         error.NeverAssigned => "variable is never assigned, declare it with const",
         error.UnusedVariable => "variable is unused, discard it with _ =",
         error.UnusedParameter => "parameter is unused, discard it with _ =",
@@ -1510,6 +1571,47 @@ test "resolveLocalConstant: accepts a construction from parameters" {
     try std.testing.expectEqual(&body[0], body[1].kind.@"return".?.kind.identifier.resolution.?.local);
 }
 
+test "resolveWrittenType: takes the length of a constant from its array literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const values: [_]i32 = [1, 2, 3]\nfn all() [3]i32: return values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const written = loader.modules.items[0].declarations[0].kind.constant_declaration.type.?;
+    try std.testing.expectEqual(3, ast.extractType(written).array.length);
+}
+
+test "resolveWrittenType: takes the length of a variable from its array literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    var values: [_]i32 = [1, 2]\n    values = [3, 4]\n    _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    const written = body[0].kind.variable_declaration.type.?;
+    try std.testing.expectEqual(2, ast.extractType(written).array.length);
+}
+
 test "findAlias: keeps a function name as an alias" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1856,6 +1958,162 @@ test "resolveNamesInExpression: resolves the value of a field access" {
     const returned = loader.modules.items[0].declarations[1].kind.function_definition.body[0].kind.@"return".?;
     const value = returned.kind.field_access.value.kind.identifier;
     try std.testing.expectEqual(ast.Resolution{ .parameter = 0 }, value.resolution.?);
+}
+
+test "resolveArrayType: gives equal array types one type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(left: [2]i32, right: [2]i32):\n    _ = left\n    _ = right" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const parameters = loader.modules.items[0].declarations[0].kind.function_definition.signature.parameters;
+    const left = ast.extractType(parameters[0].type).array;
+    try std.testing.expectEqual(left, ast.extractType(parameters[1].type).array);
+    try std.testing.expectEqual(2, left.length);
+}
+
+test "resolveArrayType: resolves an array type through a constant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Pair = [2]i32\nfn show(pair: Pair): _ = pair" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const parameters = loader.modules.items[0].declarations[1].kind.function_definition.signature.parameters;
+    try std.testing.expectEqual(types.Type{ .number = .i32 }, ast.extractType(parameters[0].type).array.element);
+}
+
+test "resolveArrayType: rejects void elements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(values: [2]void): _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.VoidElement, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 20 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveArrayType: rejects a length to infer without an array literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(values: [_]i32): _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownLength, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 17 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveArrayType: rejects a length to infer for an undefined variable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    var values: [_]i32 = undefined\n    values = [1]\n    _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownLength, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 17 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveArrayType: rejects a length to infer for the elements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const grid: [2][_]i32 = [[1], [2]]\n    _ = grid" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownLength, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 20 }, name_resolver.failure.?.location.?);
+}
+
+test "expectLength: rejects a length that is not an integer literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const size = 2i32\nfn show(values: [size]i32): _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InvalidLength, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, name_resolver.failure.?.location.?);
+}
+
+test "expectLength: rejects a length with a suffix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(values: [2u8]i32): _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InvalidLength, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveIdentifier: lets a parameter shadow a function" {

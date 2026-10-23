@@ -49,7 +49,7 @@ pub fn main(init: std.process.Init) !u8 {
     };
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
 
-    var type_checker = TypeChecker.init(program);
+    var type_checker = TypeChecker.init(arena, program);
     type_checker.check() catch |type_error| {
         const failure = type_checker.failure orelse return type_error;
         return report(allocator, stderr, &loader, failure);
