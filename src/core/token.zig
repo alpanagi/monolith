@@ -34,6 +34,7 @@ pub const TokenKind = union(enum) {
     identifier: []const u8,
     integer_literal: NumberLiteral,
     float_literal: NumberLiteral,
+    character_literal: []const u8,
     string_literal: []const u8,
     indent: usize,
     eof,

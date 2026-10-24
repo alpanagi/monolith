@@ -112,6 +112,7 @@ pub const ExpressionKind = union(enum) {
     integer_literal: token.NumberLiteral,
     float_literal: token.NumberLiteral,
     boolean_literal: bool,
+    character_literal: []const u8,
     string_literal: []const u8,
     undefined,
     identifier: Identifier,

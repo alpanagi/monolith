@@ -799,6 +799,7 @@ pub const Parser = struct {
             .keyword_true => .{ .boolean_literal = true },
             .keyword_false => .{ .boolean_literal = false },
             .keyword_undefined => .undefined,
+            .character_literal => |text| .{ .character_literal = text },
             .string_literal => |text| .{ .string_literal = text },
             else => return null,
         };
@@ -1977,6 +1978,17 @@ test "parseExpression: parses a string literal" {
     const module = try parser.parse(&arena);
 
     try std.testing.expectEqualStrings("hello", module.declarations[0].kind.function_definition.body[0].kind.@"return".?.kind.string_literal);
+}
+
+test "parseExpression: parses a character literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn letter() -> char: return 'a'");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    try std.testing.expectEqualStrings("a", module.declarations[0].kind.function_definition.body[0].kind.@"return".?.kind.character_literal);
 }
 
 test "parseExpression: parses a parameter reference" {

@@ -5,6 +5,7 @@ const token = @import("token.zig");
 pub const Type = union(enum) {
     number: NumberType,
     boolean,
+    character,
     string,
     void,
     type,
@@ -103,6 +104,7 @@ pub const Registry = struct {
 pub fn findBuiltInType(name: []const u8) ?Type {
     if (findNumberType(name)) |number| return .{ .number = number };
     if (std.mem.eql(u8, name, "bool")) return .boolean;
+    if (std.mem.eql(u8, name, "char")) return .character;
     if (std.mem.eql(u8, name, "string")) return .string;
     if (std.mem.eql(u8, name, "void")) return .void;
     return null;
@@ -152,10 +154,11 @@ test "Registry.addSlice: gives a slice type one record for each element and muta
     try std.testing.expect(first != constant);
 }
 
-test "findBuiltInType: finds number types, bool, string and void" {
+test "findBuiltInType: finds number types, bool, char, string and void" {
     try std.testing.expectEqual(Type{ .number = .u8 }, findBuiltInType("u8").?);
     try std.testing.expectEqual(Type{ .number = .usize }, findBuiltInType("usize").?);
     try std.testing.expectEqual(Type.boolean, findBuiltInType("bool").?);
+    try std.testing.expectEqual(Type.character, findBuiltInType("char").?);
     try std.testing.expectEqual(Type.string, findBuiltInType("string").?);
     try std.testing.expectEqual(Type.void, findBuiltInType("void").?);
 }

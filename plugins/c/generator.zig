@@ -381,7 +381,7 @@ pub const Generator = struct {
             .@"struct" => try self.generateStruct(writer, value_type),
             .array => try self.generateArrayDefinition(writer, value_type),
             .slice => try self.generateSliceDefinition(writer, value_type),
-            .number, .boolean, .string, .void, .type, .implementer => unreachable,
+            .number, .boolean, .character, .string, .void, .type, .implementer => unreachable,
         }
     }
 
@@ -458,7 +458,7 @@ pub const Generator = struct {
             .array, .slice => {
                 if (containsType(forward.definitions, value_type)) return;
             },
-            .number, .boolean, .string, .void, .type, .implementer => return,
+            .number, .boolean, .character, .string, .void, .type, .implementer => return,
         }
         try forward.declared.append(allocator, value_type);
     }
@@ -994,6 +994,7 @@ pub const Generator = struct {
                 });
             },
             .boolean_literal => |value| try writer.writeAll(if (value) "true" else "false"),
+            .character_literal => |text| try writer.print("U'{s}'", .{text}),
             .string_literal => |text| {
                 try writer.print("(string){{ \"{s}\", {d} }}", .{ text, countBytes(text) });
             },
@@ -1203,7 +1204,7 @@ pub const Generator = struct {
     ) std.Io.Writer.Error!void {
         if (form == .expression) return self.generateExpression(writer, expression);
         switch (expression.kind) {
-            .integer_literal, .float_literal, .boolean_literal => {
+            .integer_literal, .float_literal, .boolean_literal, .character_literal => {
                 try self.generateExpression(writer, expression);
             },
             .string_literal => |text| {
@@ -1259,6 +1260,7 @@ pub const Generator = struct {
                 .f128 => "_Float128",
             },
             .boolean => "bool",
+            .character => "uint32_t",
             .string => "string",
             .void => "void",
             .type, .implementer => unreachable,
@@ -1288,6 +1290,7 @@ pub const Generator = struct {
         switch (value_type) {
             .number => |number| try writer.writeAll(@tagName(number)),
             .boolean => try writer.writeAll("bool"),
+            .character => try writer.writeAll("char"),
             .string => try writer.writeAll("string"),
             .@"struct" => |struct_type| {
                 for (self.program.modules[struct_type.module].path) |part| {
@@ -1335,6 +1338,7 @@ pub const Generator = struct {
             .integer_literal,
             .float_literal,
             .boolean_literal,
+            .character_literal,
             .string_literal,
             .undefined,
             .identifier,
@@ -1469,6 +1473,7 @@ fn buildTypeName(
         },
         .number => |number| @tagName(number),
         .boolean => "bool",
+        .character => "char",
         .string => "string",
         .array => |array| {
             const element = try buildTypeName(allocator, program, module_index, array.element);
@@ -1504,7 +1509,7 @@ fn findContainedModule(field_type: types.Type) ?usize {
     return switch (field_type) {
         .@"struct" => |struct_type| struct_type.module,
         .array => |array| findContainedModule(array.element),
-        .number, .boolean, .string, .void, .type, .slice, .implementer => null,
+        .number, .boolean, .character, .string, .void, .type, .slice, .implementer => null,
     };
 }
 
@@ -1530,6 +1535,7 @@ fn hasEffects(expression: ast.Expression) bool {
         .integer_literal,
         .float_literal,
         .boolean_literal,
+        .character_literal,
         .string_literal,
         .undefined,
         .identifier,
@@ -1685,7 +1691,7 @@ fn isZeroSized(value_type: types.Type) bool {
             return true;
         },
         .array => |array| return array.length == 0 or isZeroSized(array.element),
-        .number, .boolean, .string, .void, .type, .slice, .implementer => return false,
+        .number, .boolean, .character, .string, .void, .type, .slice, .implementer => return false,
     }
 }
 
@@ -1704,7 +1710,7 @@ fn isStored(declaration: ast.Declaration) bool {
 fn findStruct(value_type: types.Type) ?types.Struct {
     return switch (value_type) {
         .@"struct" => |struct_type| struct_type,
-        .number, .boolean, .string, .void, .type, .array, .slice, .implementer => null,
+        .number, .boolean, .character, .string, .void, .type, .array, .slice, .implementer => null,
     };
 }
 
@@ -1724,7 +1730,7 @@ fn orderDefinition(
         },
         .array => |array| try orderDefinition(allocator, ordered, module_index, array.element),
         .slice => {},
-        .number, .boolean, .string, .void, .type, .implementer => return,
+        .number, .boolean, .character, .string, .void, .type, .implementer => return,
     }
     try ordered.append(allocator, value_type);
 }
@@ -1814,7 +1820,7 @@ fn isSameCType(one: types.Type, two: types.Type) bool {
         .array => |array| two == .array and array.length == two.array.length and
             isSameCType(array.element, two.array.element),
         .slice => |slice| two == .slice and isSameCType(slice.element, two.slice.element),
-        .number, .boolean, .string, .void, .type, .@"struct", .implementer => {
+        .number, .boolean, .character, .string, .void, .type, .@"struct", .implementer => {
             return std.meta.eql(one, two);
         },
     };
@@ -4005,6 +4011,72 @@ test "generateExpression: writes strings with their length in bytes" {
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\nstring mn_main_greeting() {\n    return (string){ \"line\\n\\\"quoted\\\"\", 13 };\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateExpression: writes a character literal as a 32-bit character" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn letter() -> char: return '\xc3\xa9'" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nuint32_t mn_main_letter() {\n    return U'\xc3\xa9';\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateExpression: keeps the escape of a character literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn letter() -> char: return '\\''" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nuint32_t mn_main_letter() {\n    return U'\\'';\n}\n",
         files[1].contents,
     );
 }

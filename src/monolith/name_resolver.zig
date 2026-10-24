@@ -555,7 +555,7 @@ pub const NameResolver = struct {
     ) ResolveError!void {
         const location = expression.location;
         switch (expression.kind) {
-            .integer_literal, .float_literal, .boolean_literal, .string_literal, .undefined => {},
+            .integer_literal, .float_literal, .boolean_literal, .character_literal, .string_literal, .undefined => {},
             .identifier => |*identifier| try self.resolveIdentifier(scope, location, identifier),
             .path_expression => |*path_expression| {
                 const target = try self.resolvePath(scope, location, path_expression.path);
@@ -943,7 +943,7 @@ pub const NameResolver = struct {
             .path_expression => |path_expression| {
                 return self.resolvePath(.{}, declaration.location, path_expression.path);
             },
-            .integer_literal, .float_literal, .boolean_literal, .string_literal, .undefined => own,
+            .integer_literal, .float_literal, .boolean_literal, .character_literal, .string_literal, .undefined => own,
             .array_type, .slice_type => {
                 try self.resolveNamesInExpression(.{}, value);
                 return .{ .type = ast.extractType(value.*) };
@@ -966,6 +966,7 @@ pub const NameResolver = struct {
             .integer_literal,
             .float_literal,
             .boolean_literal,
+            .character_literal,
             .string_literal,
             .undefined,
             .identifier,
@@ -1321,7 +1322,7 @@ fn matchesType(value_type: types.Type, expected: types.Type, implemented: types.
             matchesType(value_type.array.element, array.element, implemented),
         .slice => |slice| value_type == .slice and value_type.slice.constant == slice.constant and
             matchesType(value_type.slice.element, slice.element, implemented),
-        .number, .boolean, .string, .void, .type, .@"struct" => std.meta.eql(value_type, expected),
+        .number, .boolean, .character, .string, .void, .type, .@"struct" => std.meta.eql(value_type, expected),
     };
 }
 

@@ -20,7 +20,7 @@ pub const TypeChecker = struct {
         for (self.program.types.entries.items) |value_type| {
             switch (value_type) {
                 .@"struct" => |struct_type| try self.checkFieldDefaults(struct_type),
-                .number, .boolean, .string, .void, .type, .array, .slice, .implementer => {
+                .number, .boolean, .character, .string, .void, .type, .array, .slice, .implementer => {
                     unreachable;
                 },
             }
@@ -180,7 +180,7 @@ pub const TypeChecker = struct {
         expected: types.Type,
     ) TypeError!void {
         switch (expression.kind) {
-            .integer_literal, .float_literal, .boolean_literal, .string_literal => {
+            .integer_literal, .float_literal, .boolean_literal, .character_literal, .string_literal => {
                 try self.checkLiteral(expression.*, expected);
             },
             .undefined => return self.fail(expression.location, error.UnexpectedUndefined),
@@ -202,7 +202,7 @@ pub const TypeChecker = struct {
             .array_literal => |literal| {
                 const array = switch (expected) {
                     .array => |array| array,
-                    .number, .boolean, .string, .void, .type, .@"struct", .slice => {
+                    .number, .boolean, .character, .string, .void, .type, .@"struct", .slice => {
                         return self.fail(expression.location, error.NotAnArray);
                     },
                     .implementer => unreachable,
@@ -321,7 +321,7 @@ pub const TypeChecker = struct {
     ) TypeError!types.Type {
         const struct_type = switch (value_type) {
             .@"struct" => |struct_type| struct_type,
-            .number, .boolean, .string, .void, .type, .array, .slice => {
+            .number, .boolean, .character, .string, .void, .type, .array, .slice => {
                 return self.fail(location, error.NotAStruct);
             },
             .implementer => unreachable,
@@ -354,7 +354,7 @@ pub const TypeChecker = struct {
         const access = expression.kind.field_access;
         const struct_type = switch (try self.inferType(parameters, access.value)) {
             .@"struct" => |struct_type| struct_type,
-            .number, .boolean, .string, .void, .type, .array, .slice => {
+            .number, .boolean, .character, .string, .void, .type, .array, .slice => {
                 return self.fail(access.field_location, error.NoFields);
             },
             .implementer => unreachable,
@@ -373,7 +373,7 @@ pub const TypeChecker = struct {
     ) TypeError!types.Type {
         switch (expression.kind) {
             .undefined => return self.fail(expression.location, error.UnexpectedUndefined),
-            .integer_literal, .float_literal, .boolean_literal, .string_literal => {
+            .integer_literal, .float_literal, .boolean_literal, .character_literal, .string_literal => {
                 const value_type = try self.computeLiteralType(expression.*);
                 try self.checkLiteral(expression.*, value_type);
                 expression.type = value_type;
@@ -430,7 +430,7 @@ pub const TypeChecker = struct {
         const value = expression.kind.slice.value;
         const array = switch (try self.inferType(parameters, value)) {
             .array => |array| array,
-            .number, .boolean, .string, .void, .type, .@"struct", .slice => {
+            .number, .boolean, .character, .string, .void, .type, .@"struct", .slice => {
                 return self.fail(value.location, error.NotAnArray);
             },
             .implementer => unreachable,
@@ -494,6 +494,7 @@ pub const TypeChecker = struct {
                 return .{ .number = number };
             },
             .boolean_literal => .boolean,
+            .character_literal => .character,
             .string_literal => .string,
             .undefined,
             .identifier,
@@ -545,6 +546,11 @@ pub const TypeChecker = struct {
                     return self.fail(expression.location, error.TypeMismatch);
                 }
             },
+            .character_literal => {
+                if (expected != .character) {
+                    return self.fail(expression.location, error.TypeMismatch);
+                }
+            },
             .string_literal => {
                 if (expected != .string) return self.fail(expression.location, error.TypeMismatch);
             },
@@ -572,7 +578,7 @@ pub const TypeChecker = struct {
     ) TypeError!types.NumberType {
         const number = switch (expected) {
             .number => |number| number,
-            .boolean, .string, .void, .type, .@"struct", .array, .slice => {
+            .boolean, .character, .string, .void, .type, .@"struct", .array, .slice => {
                 return self.fail(location, error.TypeMismatch);
             },
             .implementer => unreachable,
@@ -1893,6 +1899,90 @@ test "checkExpression: rejects an integer for string" {
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 29 }, type_checker.failure.?.location.?);
+}
+
+test "checkExpression: gives a character literal the char type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn letter() -> char: return 'a'" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = TypeChecker.init(&arena, program);
+    try type_checker.check();
+
+    try std.testing.expectEqual(types.Type.character, loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.@"return".?.type);
+}
+
+test "checkExpression: rejects an integer for char" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn letter() -> char: return 97" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = TypeChecker.init(&arena, program);
+
+    try std.testing.expectError(error.TypeMismatch, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 29 }, type_checker.failure.?.location.?);
+}
+
+test "checkExpression: rejects a character for an integer type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn code() -> u32: return 'a'" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = TypeChecker.init(&arena, program);
+
+    try std.testing.expectError(error.TypeMismatch, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: rejects undefined as a returned value" {
@@ -3334,6 +3424,27 @@ test "checkConstantValue: checks the written type of a top-level constant" {
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, type_checker.failure.?.location.?);
+}
+
+test "computeLiteralType: gives a character literal the char type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> char: return letter\nconst letter = 'a'\nfn main(): noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    try std.testing.expectEqual(types.Type.character, loader.modules.items[0].declarations[1].kind.constant_declaration.value.type);
 }
 
 test "computeLiteralType: rejects a number without a suffix" {
