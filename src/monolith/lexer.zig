@@ -14,6 +14,10 @@ pub const Lexer = struct {
     failure: ?Failure = null,
 
     pub fn init(source: []const u8) Lexer {
+        const byte_order_mark = "\xEF\xBB\xBF";
+        if (std.mem.startsWith(u8, source, byte_order_mark)) {
+            return .{ .source = source[byte_order_mark.len..] };
+        }
         return .{ .source = source };
     }
 
@@ -326,6 +330,16 @@ fn consumeSuffix(state: *Lexer, offset: *usize) ?[]const u8 {
         offset.* += 1;
     }
     return state.source[start..offset.*];
+}
+
+test "Lexer.init: skips a byte order mark at the start" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\xEF\xBB\xBFfn main(): noop");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_fn);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, lexer.tokens.items[1].location);
 }
 
 test "Lexer.lex: lexes a function signature" {
