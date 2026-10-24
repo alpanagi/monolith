@@ -723,12 +723,12 @@ test "lexWord: recognizes a lone underscore" {
 test "lexWord: lexes type names as identifiers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("i32 Bool String");
+    var lexer = Lexer.init("i32 bool string");
     try lexer.lex(&arena);
 
     try std.testing.expectEqualStrings("i32", lexer.tokens.items[1].kind.identifier);
-    try std.testing.expectEqualStrings("Bool", lexer.tokens.items[2].kind.identifier);
-    try std.testing.expectEqualStrings("String", lexer.tokens.items[3].kind.identifier);
+    try std.testing.expectEqualStrings("bool", lexer.tokens.items[2].kind.identifier);
+    try std.testing.expectEqualStrings("string", lexer.tokens.items[3].kind.identifier);
 }
 
 test "lexNumber: lexes an integer literal" {

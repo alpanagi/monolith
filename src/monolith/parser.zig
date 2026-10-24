@@ -1045,7 +1045,7 @@ test "parseTopLevelStatement: parses constants between functions" {
 test "parseFunctionDeclaration: parses an external function" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("external fn stdout_write(text: String)\nfn main(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("external fn stdout_write(text: string)\nfn main(): noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -1715,7 +1715,7 @@ test "parseMembers: rejects a line that is not a field" {
 test "parseMembers: lists a method of a struct as a declaration on the struct" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct Card:\n    question: String\n\n    fn show(self: Self) -> String: return self.question");
+    var lexer = @import("lexer.zig").Lexer.init("struct Card:\n    question: string\n\n    fn show(self: Self) -> string: return self.question");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -1735,7 +1735,7 @@ test "parseMembers: lists a method of a struct as a declaration on the struct" {
 test "parseMembers: parses a field after a method with an indented body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct Card:\n    fn show(self: Self) -> String:\n        return self.question\n    question: String\nfn main(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("struct Card:\n    fn show(self: Self) -> string:\n        return self.question\n    question: string\nfn main(): noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -1955,7 +1955,7 @@ test "matchBlockLine: rejects a dedent between two nested levels" {
 test "parseExpression: parses each literal kind" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn one() -> u8: return 0xff_u8\nfn two() -> f64: return 2.5\nfn three() -> Bool: return true\nfn four() -> Bool: return false");
+    var lexer = @import("lexer.zig").Lexer.init("fn one() -> u8: return 0xff_u8\nfn two() -> f64: return 2.5\nfn three() -> bool: return true\nfn four() -> bool: return false");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -1971,7 +1971,7 @@ test "parseExpression: parses each literal kind" {
 test "parseExpression: parses a string literal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn greeting() -> String: return \"hello\"");
+    var lexer = @import("lexer.zig").Lexer.init("fn greeting() -> string: return \"hello\"");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);

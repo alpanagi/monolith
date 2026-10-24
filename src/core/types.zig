@@ -102,8 +102,8 @@ pub const Registry = struct {
 
 pub fn findBuiltInType(name: []const u8) ?Type {
     if (findNumberType(name)) |number| return .{ .number = number };
-    if (std.mem.eql(u8, name, "Bool")) return .boolean;
-    if (std.mem.eql(u8, name, "String")) return .string;
+    if (std.mem.eql(u8, name, "bool")) return .boolean;
+    if (std.mem.eql(u8, name, "string")) return .string;
     if (std.mem.eql(u8, name, "void")) return .void;
     return null;
 }
@@ -152,21 +152,22 @@ test "Registry.addSlice: gives a slice type one record for each element and muta
     try std.testing.expect(first != constant);
 }
 
-test "findBuiltInType: finds number types, Bool, String and void" {
+test "findBuiltInType: finds number types, bool, string and void" {
     try std.testing.expectEqual(Type{ .number = .u8 }, findBuiltInType("u8").?);
     try std.testing.expectEqual(Type{ .number = .usize }, findBuiltInType("usize").?);
-    try std.testing.expectEqual(Type.boolean, findBuiltInType("Bool").?);
-    try std.testing.expectEqual(Type.string, findBuiltInType("String").?);
+    try std.testing.expectEqual(Type.boolean, findBuiltInType("bool").?);
+    try std.testing.expectEqual(Type.string, findBuiltInType("string").?);
     try std.testing.expectEqual(Type.void, findBuiltInType("void").?);
 }
 
 test "findBuiltInType: finds nothing for other names" {
-    try std.testing.expectEqual(null, findBuiltInType("bool"));
+    try std.testing.expectEqual(null, findBuiltInType("Bool"));
+    try std.testing.expectEqual(null, findBuiltInType("String"));
     try std.testing.expectEqual(null, findBuiltInType("Void"));
     try std.testing.expectEqual(null, findBuiltInType("Integer"));
 }
 
 test "findNumberType: finds only number types" {
     try std.testing.expectEqual(NumberType.f64, findNumberType("f64").?);
-    try std.testing.expectEqual(null, findNumberType("Bool"));
+    try std.testing.expectEqual(null, findNumberType("bool"));
 }

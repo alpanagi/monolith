@@ -739,7 +739,7 @@ test "TypeChecker.check: sets the type of each returned value" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> u8: return 255\nfn two() -> f32: return 2.5\nfn three() -> Bool: return true\nfn four() -> i64: return 1_i64\nfn main(): return" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> u8: return 255\nfn two() -> f32: return 2.5\nfn three() -> bool: return true\nfn four() -> i64: return 1_i64\nfn main(): return" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1015,7 +1015,7 @@ test "checkFunction: rejects a function that ends with a loop that can end" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(running: Bool) -> i32:\n    while running:\n        return 1" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(running: bool) -> i32:\n    while running:\n        return 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1288,7 +1288,7 @@ test "checkStatement: rejects a variable that holds a type" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 16 }, type_checker.failure.?.location.?);
 }
 
-test "checkStatement: rejects a while condition that is not a Bool" {
+test "checkStatement: rejects a while condition that is not a bool" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -1811,7 +1811,7 @@ test "checkExpression: rejects a void call as a value" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 25 }, type_checker.failure.?.location.?);
 }
 
-test "checkExpression: gives a string literal the String type" {
+test "checkExpression: gives a string literal the string type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -1827,7 +1827,7 @@ test "checkExpression: gives a string literal the String type" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() -> String: return \"hello\"" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() -> string: return \"hello\"" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1867,7 +1867,7 @@ test "checkExpression: rejects a string for an integer type" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, type_checker.failure.?.location.?);
 }
 
-test "checkExpression: rejects an integer for String" {
+test "checkExpression: rejects an integer for string" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -1883,7 +1883,7 @@ test "checkExpression: rejects an integer for String" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn name() -> String: return 1" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn name() -> string: return 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2260,7 +2260,7 @@ test "checkCall: rejects an argument of another type" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn flag(value: Bool): _ = value\nfn main(): flag(1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn flag(value: bool): _ = value\nfn main(): flag(1)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2816,7 +2816,7 @@ test "checkFieldAccess: rejects a field of another type than expected" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nstruct Line:\n    start: Point\nfn read(point: Point) -> Bool: return point.x" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nstruct Line:\n    start: Point\nfn read(point: Point) -> bool: return point.x" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);

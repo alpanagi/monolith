@@ -1287,8 +1287,8 @@ pub const Generator = struct {
     ) std.Io.Writer.Error!void {
         switch (value_type) {
             .number => |number| try writer.writeAll(@tagName(number)),
-            .boolean => try writer.writeAll("Bool"),
-            .string => try writer.writeAll("String"),
+            .boolean => try writer.writeAll("bool"),
+            .string => try writer.writeAll("string"),
             .@"struct" => |struct_type| {
                 for (self.program.modules[struct_type.module].path) |part| {
                     try writer.print("{s}_", .{part});
@@ -1468,8 +1468,8 @@ fn buildTypeName(
             return std.mem.concat(allocator, u8, &.{ path, "_", struct_type.name });
         },
         .number => |number| @tagName(number),
-        .boolean => "Bool",
-        .string => "String",
+        .boolean => "bool",
+        .string => "string",
         .array => |array| {
             const element = try buildTypeName(allocator, program, module_index, array.element);
             return std.fmt.allocPrint(allocator, "array_{d}_{s}", .{ array.length, element });
@@ -1832,7 +1832,7 @@ test "Generator.generate: writes the modules and the runtime files they use" {
     var output_directory = std.testing.tmpDir(.{});
     defer output_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: String)\nconst write = mn_runtime_stdout_write" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: string)\nconst write = mn_runtime_stdout_write" });
     try plugin_directory.dir.createDirPath(std.testing.io, "runtime");
     try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/monolith.h", .data = "header" });
     try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/stdout.c", .data = "stdout" });
@@ -1900,7 +1900,7 @@ test "Generator.generate: builds an executable when the main module defines main
     var output_directory = std.testing.tmpDir(.{});
     defer output_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: String)\nconst write = mn_runtime_stdout_write" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: string)\nconst write = mn_runtime_stdout_write" });
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
     const compiler_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &compiler_directory.sub_path });
@@ -2039,7 +2039,7 @@ test "generateFiles: writes the standard library at its module path" {
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: String)\nconst write = mn_runtime_stdout_write" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: string)\nconst write = mn_runtime_stdout_write" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -2617,7 +2617,7 @@ test "generateConstantDeclarations: declares a stored array constant in the head
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: String\nconst cards: [2]Card = [\n    .(question = \"a\"),\n    .(question = \"b\"),\n]\nfn all() -> [2]Card: return cards" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: string\nconst cards: [2]Card = [\n    .(question = \"a\"),\n    .(question = \"b\"),\n]\nfn all() -> [2]Card: return cards" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2683,7 +2683,7 @@ test "generateArrayDefinition: defines an array type before the struct that hold
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: String\nstruct Deck:\n    cards: [2]Card\nfn show(deck: Deck): _ = deck" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: string\nstruct Deck:\n    cards: [2]Card\nfn show(deck: Deck): _ = deck" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2943,7 +2943,7 @@ test "generateSignature: keeps the names of external functions" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn print_(text: String)\nfn main(): print_(\"hi\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn print_(text: string)\nfn main(): print_(\"hi\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3992,7 +3992,7 @@ test "generateExpression: writes strings with their length in bytes" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() -> String: return \"line\\n\\\"quoted\\\"\"" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() -> string: return \"line\\n\\\"quoted\\\"\"" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4601,7 +4601,7 @@ test "generateConstant: stores an array constant" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: String\nconst cards: [2]Card = [\n    .(question = \"a\"),\n    .(question = \"b\"),\n]\nfn all() -> [2]Card: return cards" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: string\nconst cards: [2]Card = [\n    .(question = \"a\"),\n    .(question = \"b\"),\n]\nfn all() -> [2]Card: return cards" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4634,7 +4634,7 @@ test "generateConstant: stores an array constant with a length to infer" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: String\nconst cards: [_]Card = [\n    .(question = \"a\"),\n    .(question = \"b\"),\n]\nfn all() -> [2]Card: return cards" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: string\nconst cards: [_]Card = [\n    .(question = \"a\"),\n    .(question = \"b\"),\n]\nfn all() -> [2]Card: return cards" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4727,7 +4727,7 @@ test "generateFunctionCall: writes the defaults of left out parameters" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn draw(width: i32, height: i32 = 1, label: String = \"box\"):\n    _ = width\n    _ = height\n    _ = label\nfn main():\n    draw(2)\n    draw(2, 5)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn draw(width: i32, height: i32 = 1, label: string = \"box\"):\n    _ = width\n    _ = height\n    _ = label\nfn main():\n    draw(2)\n    draw(2, 5)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
