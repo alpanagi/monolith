@@ -255,7 +255,7 @@ fn lexString(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
         switch (byte) {
             '"' => break,
             '\\' => switch (state.peek(position + 1) orelse 0) {
-                'n', 't', '\\', '"' => position += 2,
+                'n', 't', '\\', '\'', '"' => position += 2,
                 '\n', '\r', 0 => return state.fail(state.offset, error.UnterminatedString),
                 '\t' => return state.fail(position + 1, error.UnexpectedTabInString),
                 0x80...0xFF => {
@@ -992,10 +992,10 @@ test "lexString: lexes a string literal" {
 test "lexString: keeps escapes as written" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("\"a\\nb\\tc\\\\d\\\"e\"");
+    var lexer = Lexer.init("\"a\\nb\\tc\\\\d\\\"e\\'f\"");
     try lexer.lex(&arena);
 
-    try std.testing.expectEqualStrings("a\\nb\\tc\\\\d\\\"e", lexer.tokens.items[1].kind.string_literal);
+    try std.testing.expectEqualStrings("a\\nb\\tc\\\\d\\\"e\\'f", lexer.tokens.items[1].kind.string_literal);
 }
 
 test "lexString: rejects an unknown escape" {
@@ -1101,13 +1101,14 @@ test "lexCharacter: lexes a character literal" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 11 }, lexer.tokens.items[3].location);
 }
 
-test "lexCharacter: keeps an escape as written" {
+test "lexCharacter: keeps escapes as written" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("'\\''");
+    var lexer = Lexer.init("'\\'' '\\\"'");
     try lexer.lex(&arena);
 
     try std.testing.expectEqualStrings("\\'", lexer.tokens.items[1].kind.character_literal);
+    try std.testing.expectEqualStrings("\\\"", lexer.tokens.items[2].kind.character_literal);
 }
 
 test "lexCharacter: keeps a character of several bytes" {
