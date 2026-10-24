@@ -49,7 +49,7 @@ pub const Lexer = struct {
             if (self.source[self.offset] == '\t') {
                 return self.fail(self.offset, error.UnexpectedTab);
             }
-            return self.fail(self.offset, error.UnexpectedCharacter);
+            return self.failUnexpected(self.offset);
         }
 
         try self.tokens.append(allocator, .{
@@ -71,11 +71,20 @@ pub const Lexer = struct {
         };
         return lex_error;
     }
+
+    fn failUnexpected(self: *Lexer, offset: usize) LexError {
+        const byte = self.peek(offset) orelse 0;
+        if (byte >= 0x80 and measureCodePoint(self.source, offset) == null) {
+            return self.fail(offset, error.InvalidCharacter);
+        }
+        return self.fail(offset, error.UnexpectedCharacter);
+    }
 };
 
 pub const LexError = error{
     OutOfMemory,
     UnexpectedCharacter,
+    InvalidCharacter,
     UnexpectedTab,
     InvalidEscape,
     UnterminatedString,
@@ -85,6 +94,7 @@ fn describeError(lex_error: LexError) []const u8 {
     return switch (lex_error) {
         error.OutOfMemory => "out of memory",
         error.UnexpectedCharacter => "unexpected character",
+        error.InvalidCharacter => "invalid UTF-8",
         error.UnexpectedTab => "tabs are not allowed, use spaces",
         error.InvalidEscape => "unknown escape sequence",
         error.UnterminatedString => "unterminated string",
@@ -130,7 +140,11 @@ fn lexComment(state: *Lexer, _: std.mem.Allocator) LexError!bool {
     var position = state.offset + 1;
     while (state.peek(position)) |byte| {
         if (byte == '\n' or byte == '\r') break;
-        position += 1;
+        if (byte >= 0x80) {
+            try consumeCodePoint(state, &position);
+        } else {
+            position += 1;
+        }
     }
     state.location.column += position - state.offset;
     state.offset = position;
@@ -227,9 +241,16 @@ fn lexString(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
             '\\' => switch (state.peek(position + 1) orelse 0) {
                 'n', 't', '\\', '"' => position += 2,
                 '\n', '\r', 0 => return state.fail(state.offset, error.UnterminatedString),
+                0x80...0xFF => {
+                    if (measureCodePoint(state.source, position + 1) == null) {
+                        return state.fail(position + 1, error.InvalidCharacter);
+                    }
+                    return state.fail(position, error.InvalidEscape);
+                },
                 else => return state.fail(position, error.InvalidEscape),
             },
             '\n', '\r' => return state.fail(state.offset, error.UnterminatedString),
+            0x80...0xFF => try consumeCodePoint(state, &position),
             else => position += 1,
         }
     }
@@ -307,7 +328,7 @@ fn isDigit(byte: ?u8, base: u8) bool {
 
 fn consumeDigits(state: *Lexer, offset: *usize, base: u8) LexError!void {
     if (!isDigit(state.peek(offset.*), base)) {
-        return state.fail(offset.*, error.UnexpectedCharacter);
+        return state.failUnexpected(offset.*);
     }
     offset.* += 1;
     while (true) {
@@ -330,6 +351,21 @@ fn consumeSuffix(state: *Lexer, offset: *usize) ?[]const u8 {
         offset.* += 1;
     }
     return state.source[start..offset.*];
+}
+
+fn consumeCodePoint(state: *Lexer, offset: *usize) LexError!void {
+    const length = measureCodePoint(state.source, offset.*) orelse {
+        return state.fail(offset.*, error.InvalidCharacter);
+    };
+    offset.* += length;
+}
+
+fn measureCodePoint(source: []const u8, offset: usize) ?usize {
+    const length = std.unicode.utf8ByteSequenceLength(source[offset]) catch return null;
+    const end = offset + length;
+    if (end > source.len) return null;
+    _ = std.unicode.utf8Decode(source[offset..end]) catch return null;
+    return length;
 }
 
 test "Lexer.init: skips a byte order mark at the start" {
@@ -412,6 +448,23 @@ test "Lexer.lex: tracks position on unexpected character" {
 
     try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 3 }, lexer.failure.?.location.?);
+}
+
+test "Lexer.lex: rejects an invalid byte outside a comment or string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("fn \x80");
+
+    try std.testing.expectError(error.InvalidCharacter, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 4 }, lexer.failure.?.location.?);
+}
+
+test "Lexer.lex: rejects a valid character that is not allowed there" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("fn \xc3\xa9");
+
+    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
 }
 
 test "Lexer.lex: rejects tab characters" {
@@ -534,7 +587,7 @@ test "lexComment: ends a comment at the end of the line" {
     try std.testing.expect(lexer.tokens.items[3].kind == .keyword_noop);
 }
 
-test "lexComment: keeps any byte other than a line end in a comment" {
+test "lexComment: keeps any character other than a line end in a comment" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = Lexer.init("noop #\ta\x01\xc3\xa9\"\nnoop");
@@ -550,6 +603,15 @@ test "lexComment: rejects a carriage return on its own in a comment" {
     var lexer = Lexer.init("noop # a\rb");
 
     try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 9 }, lexer.failure.?.location.?);
+}
+
+test "lexComment: rejects an invalid byte in a comment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("noop # a\xffb");
+
+    try std.testing.expectError(error.InvalidCharacter, lexer.lex(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 9 }, lexer.failure.?.location.?);
 }
 
@@ -796,6 +858,15 @@ test "lexNumber: rejects prefix without digits" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.failure.?.location.?);
 }
 
+test "lexNumber: rejects an invalid byte where a digit is expected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("0x\xff");
+
+    try std.testing.expectError(error.InvalidCharacter, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.failure.?.location.?);
+}
+
 test "lexNumber: rejects digit outside the base" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -855,6 +926,15 @@ test "lexString: rejects an unknown escape" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.failure.?.location.?);
 }
 
+test "lexString: rejects an invalid byte after a backslash" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"a\\\xffb\"");
+
+    try std.testing.expectError(error.InvalidCharacter, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 4 }, lexer.failure.?.location.?);
+}
+
 test "lexString: rejects a string without a closing quote" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -882,14 +962,23 @@ test "lexString: rejects a line break inside a string" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, lexer.failure.?.location.?);
 }
 
-test "lexString: keeps any other byte as text" {
+test "lexString: keeps any other character as text" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("\"a\tb\x01c\xc3\xa9\xff\" x");
+    var lexer = Lexer.init("\"a\tb\x01c\xc3\xa9\" x");
     try lexer.lex(&arena);
 
-    try std.testing.expectEqualStrings("a\tb\x01c\xc3\xa9\xff", lexer.tokens.items[1].kind.string_literal);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, lexer.tokens.items[2].location);
+    try std.testing.expectEqualStrings("a\tb\x01c\xc3\xa9", lexer.tokens.items[1].kind.string_literal);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 11 }, lexer.tokens.items[2].location);
+}
+
+test "lexString: rejects an invalid byte in a string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"ab\xff\"");
+
+    try std.testing.expectError(error.InvalidCharacter, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 4 }, lexer.failure.?.location.?);
 }
 
 test "lexString: keeps a number sign as text" {
@@ -967,4 +1056,13 @@ test "lexSymbols: rejects a dash without a greater-than sign" {
 
     try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.failure.?.location.?);
+}
+
+test "measureCodePoint: rejects a sequence cut off by the end of the file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("# a\xc3");
+
+    try std.testing.expectError(error.InvalidCharacter, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 4 }, lexer.failure.?.location.?);
 }
