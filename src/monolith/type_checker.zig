@@ -522,7 +522,7 @@ pub const TypeChecker = struct {
                 const maximum = computeIntegerMaximum(number) orelse {
                     return self.fail(expression.location, error.TypeMismatch);
                 };
-                const value = std.fmt.parseInt(u64, literal.text, 0) catch {
+                const value = std.fmt.parseInt(u128, literal.text, 0) catch {
                     return self.fail(expression.location, error.LiteralOutOfRange);
                 };
                 if (value > maximum) {
@@ -532,8 +532,10 @@ pub const TypeChecker = struct {
             .float_literal => |literal| {
                 const number = try self.expectNumber(expression.location, literal, expected);
                 const fits = switch (number) {
+                    .f16 => fitsFloat(f16, literal.text),
                     .f32 => fitsFloat(f32, literal.text),
                     .f64 => fitsFloat(f64, literal.text),
+                    .f128 => fitsFloat(f128, literal.text),
                     else => return self.fail(expression.location, error.TypeMismatch),
                 };
                 if (!fits) return self.fail(expression.location, error.LiteralOutOfRange);
@@ -700,17 +702,19 @@ fn isWritable(expression: ast.Expression) bool {
     };
 }
 
-fn computeIntegerMaximum(number: types.NumberType) ?u64 {
+fn computeIntegerMaximum(number: types.NumberType) ?u128 {
     return switch (number) {
         .i8 => std.math.maxInt(i8),
         .i16 => std.math.maxInt(i16),
         .i32 => std.math.maxInt(i32),
-        .i64 => std.math.maxInt(i64),
+        .i64, .isize => std.math.maxInt(i64),
+        .i128 => std.math.maxInt(i128),
         .u8 => std.math.maxInt(u8),
         .u16 => std.math.maxInt(u16),
         .u32 => std.math.maxInt(u32),
         .u64, .usize => std.math.maxInt(u64),
-        .f32, .f64 => null,
+        .u128 => std.math.maxInt(u128),
+        .f16, .f32, .f64, .f128 => null,
     };
 }
 
@@ -1538,6 +1542,9 @@ test "checkExpression: accepts the maximum of each integer type" {
         \\fn seven() -> u32: return 4294967295
         \\fn eight() -> u64: return 18446744073709551615
         \\fn nine() -> usize: return 18446744073709551615
+        \\fn ten() -> i128: return 170141183460469231731687303715884105727
+        \\fn eleven() -> isize: return 9223372036854775807
+        \\fn twelve() -> u128: return 340282366920938463463374607431768211455
         ,
     });
     try loader.loadMainModule(&arena, std.testing.io, "main");
@@ -1561,6 +1568,9 @@ test "checkExpression: rejects one past the maximum of each integer type" {
         "fn value() -> u32: return 4294967296",
         "fn value() -> u64: return 18446744073709551616",
         "fn value() -> usize: return 18446744073709551616",
+        "fn value() -> i128: return 170141183460469231731687303715884105728",
+        "fn value() -> isize: return 9223372036854775808",
+        "fn value() -> u128: return 340282366920938463463374607431768211456",
     };
     for (sources) |source| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1611,34 +1621,6 @@ test "checkExpression: rejects a suffixed literal out of range" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
 }
 
-test "checkExpression: rejects an integer beyond 64 bits" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    var compiler_directory = std.testing.tmpDir(.{});
-    defer compiler_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    const compiler_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn big() -> u64: return 18446744073709551616" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-    try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = TypeChecker.init(&arena, program);
-
-    try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?.location.?);
-}
-
 test "checkExpression: rejects a float out of range" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1665,6 +1647,61 @@ test "checkExpression: rejects a float out of range" {
 
     try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
+}
+
+test "checkExpression: rejects a float out of range for f16" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn huge() -> f16: return 65520.0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = TypeChecker.init(&arena, program);
+
+    try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
+}
+
+test "checkExpression: accepts a float beyond f64 for f128" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn huge() -> f128: return 1e309" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = TypeChecker.init(&arena, program);
+
+    try type_checker.check();
 }
 
 test "checkExpression: rejects a type as a value" {

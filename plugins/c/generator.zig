@@ -199,71 +199,72 @@ pub const Generator = struct {
         location: token.Location,
     ) error{NameDefinedInTarget}!void {
         const reserved_words = std.StaticStringMap(void).initComptime(.{
-            .{"INT16_C"},                   .{"INT16_MAX"},          .{"INT16_MIN"},
-            .{"INT16_WIDTH"},               .{"INT32_C"},            .{"INT32_MAX"},
-            .{"INT32_MIN"},                 .{"INT32_WIDTH"},        .{"INT64_C"},
-            .{"INT64_MAX"},                 .{"INT64_MIN"},          .{"INT64_WIDTH"},
-            .{"INT8_C"},                    .{"INT8_MAX"},           .{"INT8_MIN"},
-            .{"INT8_WIDTH"},                .{"INTMAX_C"},           .{"INTMAX_MAX"},
-            .{"INTMAX_MIN"},                .{"INTMAX_WIDTH"},       .{"INTPTR_MAX"},
-            .{"INTPTR_MIN"},                .{"INTPTR_WIDTH"},       .{"INT_FAST16_MAX"},
-            .{"INT_FAST16_MIN"},            .{"INT_FAST16_WIDTH"},   .{"INT_FAST32_MAX"},
-            .{"INT_FAST32_MIN"},            .{"INT_FAST32_WIDTH"},   .{"INT_FAST64_MAX"},
-            .{"INT_FAST64_MIN"},            .{"INT_FAST64_WIDTH"},   .{"INT_FAST8_MAX"},
-            .{"INT_FAST8_MIN"},             .{"INT_FAST8_WIDTH"},    .{"INT_LEAST16_MAX"},
-            .{"INT_LEAST16_MIN"},           .{"INT_LEAST16_WIDTH"},  .{"INT_LEAST32_MAX"},
-            .{"INT_LEAST32_MIN"},           .{"INT_LEAST32_WIDTH"},  .{"INT_LEAST64_MAX"},
-            .{"INT_LEAST64_MIN"},           .{"INT_LEAST64_WIDTH"},  .{"INT_LEAST8_MAX"},
-            .{"INT_LEAST8_MIN"},            .{"INT_LEAST8_WIDTH"},   .{"MONOLITH_H"},
-            .{"NULL"},                      .{"PTRDIFF_MAX"},        .{"PTRDIFF_MIN"},
-            .{"PTRDIFF_WIDTH"},             .{"SIG_ATOMIC_MAX"},     .{"SIG_ATOMIC_MIN"},
-            .{"SIG_ATOMIC_WIDTH"},          .{"SIZE_MAX"},           .{"SIZE_WIDTH"},
-            .{"UINT16_C"},                  .{"UINT16_MAX"},         .{"UINT16_WIDTH"},
-            .{"UINT32_C"},                  .{"UINT32_MAX"},         .{"UINT32_WIDTH"},
-            .{"UINT64_C"},                  .{"UINT64_MAX"},         .{"UINT64_WIDTH"},
-            .{"UINT8_C"},                   .{"UINT8_MAX"},          .{"UINT8_WIDTH"},
-            .{"UINTMAX_C"},                 .{"UINTMAX_MAX"},        .{"UINTMAX_WIDTH"},
-            .{"UINTPTR_MAX"},               .{"UINTPTR_WIDTH"},      .{"UINT_FAST16_MAX"},
-            .{"UINT_FAST16_WIDTH"},         .{"UINT_FAST32_MAX"},    .{"UINT_FAST32_WIDTH"},
-            .{"UINT_FAST64_MAX"},           .{"UINT_FAST64_WIDTH"},  .{"UINT_FAST8_MAX"},
-            .{"UINT_FAST8_WIDTH"},          .{"UINT_LEAST16_MAX"},   .{"UINT_LEAST16_WIDTH"},
-            .{"UINT_LEAST32_MAX"},          .{"UINT_LEAST32_WIDTH"}, .{"UINT_LEAST64_MAX"},
-            .{"UINT_LEAST64_WIDTH"},        .{"UINT_LEAST8_MAX"},    .{"UINT_LEAST8_WIDTH"},
-            .{"WCHAR_MAX"},                 .{"WCHAR_MIN"},          .{"WCHAR_WIDTH"},
-            .{"WINT_MAX"},                  .{"WINT_MIN"},           .{"WINT_WIDTH"},
-            .{"_Alignas"},                  .{"_Alignof"},           .{"_Atomic"},
-            .{"_BitInt"},                   .{"_Bool"},              .{"_Complex"},
-            .{"_Decimal128"},               .{"_Decimal32"},         .{"_Decimal64"},
-            .{"_Generic"},                  .{"_Imaginary"},         .{"_Noreturn"},
-            .{"_Static_assert"},            .{"_Thread_local"},      .{"__STDC_VERSION_STDDEF_H__"},
-            .{"__STDC_VERSION_STDINT_H__"}, .{"alignas"},            .{"alignof"},
-            .{"asm"},                       .{"auto"},               .{"bool"},
-            .{"break"},                     .{"case"},               .{"char"},
-            .{"const"},                     .{"constexpr"},          .{"continue"},
-            .{"default"},                   .{"do"},                 .{"double"},
-            .{"else"},                      .{"enum"},               .{"extern"},
-            .{"false"},                     .{"float"},              .{"for"},
-            .{"goto"},                      .{"if"},                 .{"inline"},
-            .{"int"},                       .{"int16_t"},            .{"int32_t"},
-            .{"int64_t"},                   .{"int8_t"},             .{"int_fast16_t"},
-            .{"int_fast32_t"},              .{"int_fast64_t"},       .{"int_fast8_t"},
-            .{"int_least16_t"},             .{"int_least32_t"},      .{"int_least64_t"},
-            .{"int_least8_t"},              .{"intmax_t"},           .{"intptr_t"},
-            .{"long"},                      .{"max_align_t"},        .{"nullptr"},
-            .{"nullptr_t"},                 .{"offsetof"},           .{"ptrdiff_t"},
-            .{"register"},                  .{"restrict"},           .{"return"},
-            .{"short"},                     .{"signed"},             .{"size_t"},
-            .{"sizeof"},                    .{"static"},             .{"static_assert"},
-            .{"string"},                    .{"struct"},             .{"switch"},
-            .{"thread_local"},              .{"true"},               .{"typedef"},
-            .{"typeof"},                    .{"typeof_unqual"},      .{"uint16_t"},
-            .{"uint32_t"},                  .{"uint64_t"},           .{"uint8_t"},
-            .{"uint_fast16_t"},             .{"uint_fast32_t"},      .{"uint_fast64_t"},
-            .{"uint_fast8_t"},              .{"uint_least16_t"},     .{"uint_least32_t"},
-            .{"uint_least64_t"},            .{"uint_least8_t"},      .{"uintmax_t"},
-            .{"uintptr_t"},                 .{"union"},              .{"unreachable"},
-            .{"unsigned"},                  .{"void"},               .{"volatile"},
-            .{"wchar_t"},                   .{"while"},
+            .{"INT16_C"},            .{"INT16_MAX"},                 .{"INT16_MIN"},
+            .{"INT16_WIDTH"},        .{"INT32_C"},                   .{"INT32_MAX"},
+            .{"INT32_MIN"},          .{"INT32_WIDTH"},               .{"INT64_C"},
+            .{"INT64_MAX"},          .{"INT64_MIN"},                 .{"INT64_WIDTH"},
+            .{"INT8_C"},             .{"INT8_MAX"},                  .{"INT8_MIN"},
+            .{"INT8_WIDTH"},         .{"INTMAX_C"},                  .{"INTMAX_MAX"},
+            .{"INTMAX_MIN"},         .{"INTMAX_WIDTH"},              .{"INTPTR_MAX"},
+            .{"INTPTR_MIN"},         .{"INTPTR_WIDTH"},              .{"INT_FAST16_MAX"},
+            .{"INT_FAST16_MIN"},     .{"INT_FAST16_WIDTH"},          .{"INT_FAST32_MAX"},
+            .{"INT_FAST32_MIN"},     .{"INT_FAST32_WIDTH"},          .{"INT_FAST64_MAX"},
+            .{"INT_FAST64_MIN"},     .{"INT_FAST64_WIDTH"},          .{"INT_FAST8_MAX"},
+            .{"INT_FAST8_MIN"},      .{"INT_FAST8_WIDTH"},           .{"INT_LEAST16_MAX"},
+            .{"INT_LEAST16_MIN"},    .{"INT_LEAST16_WIDTH"},         .{"INT_LEAST32_MAX"},
+            .{"INT_LEAST32_MIN"},    .{"INT_LEAST32_WIDTH"},         .{"INT_LEAST64_MAX"},
+            .{"INT_LEAST64_MIN"},    .{"INT_LEAST64_WIDTH"},         .{"INT_LEAST8_MAX"},
+            .{"INT_LEAST8_MIN"},     .{"INT_LEAST8_WIDTH"},          .{"MONOLITH_H"},
+            .{"NULL"},               .{"PTRDIFF_MAX"},               .{"PTRDIFF_MIN"},
+            .{"PTRDIFF_WIDTH"},      .{"SIG_ATOMIC_MAX"},            .{"SIG_ATOMIC_MIN"},
+            .{"SIG_ATOMIC_WIDTH"},   .{"SIZE_MAX"},                  .{"SIZE_WIDTH"},
+            .{"UINT16_C"},           .{"UINT16_MAX"},                .{"UINT16_WIDTH"},
+            .{"UINT32_C"},           .{"UINT32_MAX"},                .{"UINT32_WIDTH"},
+            .{"UINT64_C"},           .{"UINT64_MAX"},                .{"UINT64_WIDTH"},
+            .{"UINT8_C"},            .{"UINT8_MAX"},                 .{"UINT8_WIDTH"},
+            .{"UINTMAX_C"},          .{"UINTMAX_MAX"},               .{"UINTMAX_WIDTH"},
+            .{"UINTPTR_MAX"},        .{"UINTPTR_WIDTH"},             .{"UINT_FAST16_MAX"},
+            .{"UINT_FAST16_WIDTH"},  .{"UINT_FAST32_MAX"},           .{"UINT_FAST32_WIDTH"},
+            .{"UINT_FAST64_MAX"},    .{"UINT_FAST64_WIDTH"},         .{"UINT_FAST8_MAX"},
+            .{"UINT_FAST8_WIDTH"},   .{"UINT_LEAST16_MAX"},          .{"UINT_LEAST16_WIDTH"},
+            .{"UINT_LEAST32_MAX"},   .{"UINT_LEAST32_WIDTH"},        .{"UINT_LEAST64_MAX"},
+            .{"UINT_LEAST64_WIDTH"}, .{"UINT_LEAST8_MAX"},           .{"UINT_LEAST8_WIDTH"},
+            .{"WCHAR_MAX"},          .{"WCHAR_MIN"},                 .{"WCHAR_WIDTH"},
+            .{"WINT_MAX"},           .{"WINT_MIN"},                  .{"WINT_WIDTH"},
+            .{"_Alignas"},           .{"_Alignof"},                  .{"_Atomic"},
+            .{"_BitInt"},            .{"_Bool"},                     .{"_Complex"},
+            .{"_Decimal128"},        .{"_Decimal32"},                .{"_Decimal64"},
+            .{"_Float128"},          .{"_Float16"},                  .{"_Generic"},
+            .{"_Imaginary"},         .{"_Noreturn"},                 .{"_Static_assert"},
+            .{"_Thread_local"},      .{"__STDC_VERSION_STDDEF_H__"}, .{"__STDC_VERSION_STDINT_H__"},
+            .{"alignas"},            .{"alignof"},                   .{"asm"},
+            .{"auto"},               .{"bool"},                      .{"break"},
+            .{"case"},               .{"char"},                      .{"const"},
+            .{"constexpr"},          .{"continue"},                  .{"default"},
+            .{"do"},                 .{"double"},                    .{"else"},
+            .{"enum"},               .{"extern"},                    .{"false"},
+            .{"float"},              .{"for"},                       .{"goto"},
+            .{"if"},                 .{"inline"},                    .{"int"},
+            .{"int128_t"},           .{"int16_t"},                   .{"int32_t"},
+            .{"int64_t"},            .{"int8_t"},                    .{"int_fast16_t"},
+            .{"int_fast32_t"},       .{"int_fast64_t"},              .{"int_fast8_t"},
+            .{"int_least16_t"},      .{"int_least32_t"},             .{"int_least64_t"},
+            .{"int_least8_t"},       .{"intmax_t"},                  .{"intptr_t"},
+            .{"long"},               .{"max_align_t"},               .{"nullptr"},
+            .{"nullptr_t"},          .{"offsetof"},                  .{"ptrdiff_t"},
+            .{"register"},           .{"restrict"},                  .{"return"},
+            .{"short"},              .{"signed"},                    .{"size_t"},
+            .{"sizeof"},             .{"static"},                    .{"static_assert"},
+            .{"string"},             .{"struct"},                    .{"switch"},
+            .{"thread_local"},       .{"true"},                      .{"typedef"},
+            .{"typeof"},             .{"typeof_unqual"},             .{"uint128_t"},
+            .{"uint16_t"},           .{"uint32_t"},                  .{"uint64_t"},
+            .{"uint8_t"},            .{"uint_fast16_t"},             .{"uint_fast32_t"},
+            .{"uint_fast64_t"},      .{"uint_fast8_t"},              .{"uint_least16_t"},
+            .{"uint_least32_t"},     .{"uint_least64_t"},            .{"uint_least8_t"},
+            .{"uintmax_t"},          .{"uintptr_t"},                 .{"union"},
+            .{"unreachable"},        .{"unsigned"},                  .{"void"},
+            .{"volatile"},           .{"wchar_t"},                   .{"while"},
         });
 
         if (!reserved_words.has(name)) return;
@@ -974,16 +975,23 @@ pub const Generator = struct {
     ) std.Io.Writer.Error!void {
         switch (expression.kind) {
             .integer_literal, .float_literal => |literal| {
+                const number = expression.type.?.number;
+                if (number == .i128 or number == .u128) {
+                    return self.generateSplitLiteral(writer, literal.text, number);
+                }
                 var text = literal.text;
                 if (std.mem.startsWith(u8, text, "0o")) {
                     try writer.writeByte('0');
                     text = text[2..];
                 }
                 for (text) |byte| try writer.writeByte(if (byte == '_') '\'' else byte);
-                switch (expression.type.?.number) {
-                    .u8, .u16, .u32, .u64, .usize => try writer.writeByte('u'),
-                    else => {},
-                }
+                try writer.writeAll(switch (number) {
+                    .u8, .u16, .u32, .u64, .usize => "u",
+                    .f16 => "f16",
+                    .f128 => "f128",
+                    .i8, .i16, .i32, .i64, .isize, .f32, .f64 => "",
+                    .i128, .u128 => unreachable,
+                });
             },
             .boolean_literal => |value| try writer.writeAll(if (value) "true" else "false"),
             .string_literal => |text| {
@@ -1029,6 +1037,20 @@ pub const Generator = struct {
             },
             .method_call, .array_type, .slice_type, .@"struct" => unreachable,
         }
+    }
+
+    fn generateSplitLiteral(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        text: []const u8,
+        number: types.NumberType,
+    ) std.Io.Writer.Error!void {
+        const value = std.fmt.parseInt(u128, text, 0) catch unreachable;
+        const high: u64 = @truncate(value >> 64);
+        const low: u64 = @truncate(value);
+        try writer.writeAll("((");
+        try self.generateType(writer, .{ .number = number });
+        try writer.print(")0x{x}u << 64 | 0x{x}u)", .{ high, low });
     }
 
     fn generateSlice(
@@ -1223,13 +1245,18 @@ pub const Generator = struct {
                 .i16 => "int16_t",
                 .i32 => "int32_t",
                 .i64 => "int64_t",
+                .i128 => "int128_t",
+                .isize => "ptrdiff_t",
                 .u8 => "uint8_t",
                 .u16 => "uint16_t",
                 .u32 => "uint32_t",
                 .u64 => "uint64_t",
+                .u128 => "uint128_t",
                 .usize => "size_t",
+                .f16 => "_Float16",
                 .f32 => "float",
                 .f64 => "double",
+                .f128 => "_Float128",
             },
             .boolean => "bool",
             .string => "string",
@@ -2362,6 +2389,36 @@ test "checkName: rejects names from the included headers" {
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn add(size_t: i32) -> i32: return size_t" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+
+    try std.testing.expectError(error.NameDefinedInTarget, generator.generateFiles(arena.allocator()));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 8 }, generator.failure.?.location.?);
+}
+
+test "checkName: rejects the 128-bit type names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn add(uint128_t: i32) -> i32: return uint128_t" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3853,6 +3910,39 @@ test "generateExpression: leaves signed literals unmarked" {
     );
 }
 
+test "generateExpression: marks f16 and f128 literals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn half() -> f16: return 0.5\nfn tenth() -> f128: return 0.1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n_Float16 mn_main_half() {\n    return 0.5f16;\n}\n\n_Float128 mn_main_tenth() {\n    return 0.1f128;\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateExpression: marks unsigned arguments" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4266,6 +4356,39 @@ test "generateExpression: writes an array literal whose type comes from its elem
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nmn_array_2_i32 mn_main_first() {\n    const mn_array_2_i32 values = (mn_array_2_i32){ .items = { 1, 2 } };\n    return values;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateSplitLiteral: builds a 128-bit literal from two halves" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn big() -> u128: return 340282366920938463463374607431768211455\nfn small() -> i128: return 1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nuint128_t mn_main_big() {\n    return ((uint128_t)0xffffffffffffffffu << 64 | 0xffffffffffffffffu);\n}\n\nint128_t mn_main_small() {\n    return ((int128_t)0x0u << 64 | 0x1u);\n}\n",
         files[1].contents,
     );
 }
@@ -4797,6 +4920,39 @@ test "generateType: maps usize to size_t" {
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\nsize_t mn_main_count() {\n    return 3u;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateType: maps isize to ptrdiff_t" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count() -> isize: return 3" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nptrdiff_t mn_main_count() {\n    return 3;\n}\n",
         files[1].contents,
     );
 }
