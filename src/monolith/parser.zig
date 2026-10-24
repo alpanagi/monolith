@@ -20,7 +20,6 @@ pub const Parser = struct {
         const allocator = arena.allocator();
 
         while (true) {
-            self.skipBlankLines(&self.offset);
             if (self.tokens[self.offset].kind == .eof) break;
             if (try self.parseTopLevelStatement(allocator, &self.offset)) continue;
             return self.fail(self.offset, error.UnexpectedToken);
@@ -585,14 +584,13 @@ pub const Parser = struct {
 
     fn expectBlock(self: *Parser, offset: usize, outer: usize) ParseError!usize {
         const first = self.tokens[offset];
-        if (first.kind != .indent or first.kind.indent <= outer or self.isBlankLine(offset)) {
+        if (first.kind != .indent or first.kind.indent <= outer) {
             return self.fail(offset, error.ExpectedBlock);
         }
         return first.kind.indent;
     }
 
     fn matchBlockLine(self: *Parser, offset: *usize, depth: usize, outer: usize) ParseError!bool {
-        self.skipBlankLines(offset);
         const current = self.tokens[offset.*];
         if (current.kind != .indent) return false;
         if (current.kind.indent < depth) {
@@ -604,16 +602,6 @@ pub const Parser = struct {
         }
         offset.* += 1;
         return true;
-    }
-
-    fn skipBlankLines(self: *Parser, offset: *usize) void {
-        while (self.isBlankLine(offset.*)) offset.* += 1;
-    }
-
-    fn isBlankLine(self: *Parser, offset: usize) bool {
-        if (self.tokens[offset].kind != .indent) return false;
-        const next = self.tokens[offset + 1].kind;
-        return next == .indent or next == .eof;
     }
 
     fn parseExpression(
@@ -1913,28 +1901,6 @@ test "expectBlock: rejects empty block" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("fn one():\nfn two(): noop");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.ExpectedBlock, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
-}
-
-test "expectBlock: rejects a blank line before the block" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n\n    noop");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.ExpectedBlock, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
-}
-
-test "expectBlock: rejects a blank indented line before the block" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct Point:\n    \n    x: i32");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
