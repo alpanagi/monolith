@@ -119,6 +119,7 @@ pub const ExpressionKind = union(enum) {
     path_expression: PathExpression,
     call: Call,
     method_call: MethodCall,
+    negation: *Expression,
     struct_literal: StructLiteral,
     array_type: ArrayType,
     array_literal: ArrayLiteral,

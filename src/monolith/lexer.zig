@@ -372,6 +372,7 @@ fn lexSymbols(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
         ',' => .comma,
         '.' => .dot,
         '=' => .equals,
+        '-' => .minus,
         else => return false,
     };
     switch (kind) {
@@ -1303,13 +1304,14 @@ test "lexSymbols: lexes a dash and a greater-than sign as one symbol" {
     try std.testing.expectEqualStrings("i32", lexer.tokens.items[3].kind.identifier);
 }
 
-test "lexSymbols: rejects a dash without a greater-than sign" {
+test "lexSymbols: lexes a dash without a greater-than sign as a minus" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = Lexer.init(") - i32");
+    try lexer.lex(&arena);
 
-    try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.failure.?.location.?);
+    try std.testing.expectEqual(token.TokenKind.minus, lexer.tokens.items[2].kind);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.tokens.items[2].location);
 }
 
 test "consumeUnicodeEscape: keeps a unicode escape as written" {

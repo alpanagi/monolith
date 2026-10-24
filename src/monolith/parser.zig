@@ -632,6 +632,7 @@ pub const Parser = struct {
         if (try self.parseBrackets(allocator, offset)) |expression| return expression;
         if (try self.parseCall(allocator, offset)) |call| return call;
         if (try self.parseNameExpression(allocator, offset)) |name| return name;
+        if (try self.parseNegation(allocator, offset)) |negation| return negation;
         return self.parseLiteral(offset);
     }
 
@@ -791,6 +792,25 @@ pub const Parser = struct {
         return path.items;
     }
 
+    fn parseNegation(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.Expression {
+        var position = offset.*;
+        const minus = self.match(&position, .minus) orelse return null;
+        const operand = self.parseLiteral(&position) orelse {
+            return self.fail(position, error.ExpectedNumber);
+        };
+        if (operand.kind != .integer_literal and operand.kind != .float_literal) {
+            return self.fail(position - 1, error.ExpectedNumber);
+        }
+        const stored = try allocator.create(ast.Expression);
+        stored.* = operand;
+        offset.* = position;
+        return .{ .kind = .{ .negation = stored }, .location = minus.location };
+    }
+
     fn parseLiteral(self: *Parser, offset: *usize) ?ast.Expression {
         const current = self.tokens[offset.*];
         const kind: ast.ExpressionKind = switch (current.kind) {
@@ -929,6 +949,7 @@ pub const ParseError = error{
     ExpectedEquals,
     ExpectedStatement,
     ExpectedExpression,
+    ExpectedNumber,
     ExpectedCallOrName,
     ExpectedTarget,
     ExpectedRightBracket,
@@ -968,6 +989,7 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.ExpectedEquals => "expected '='",
         error.ExpectedStatement => "expected a statement",
         error.ExpectedExpression => "expected an expression",
+        error.ExpectedNumber => "expected a number after '-'",
         error.ExpectedCallOrName => "expected a call or a name",
         error.ExpectedTarget => "expected a name or a field access before '='",
         error.ExpectedRightBracket => "expected ']'",
@@ -2228,6 +2250,53 @@ test "parsePath: rejects a separator without a name after it" {
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 21 }, parser.failure.?.location.?);
+}
+
+test "parseNegation: wraps a number literal in a negation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn value() -> i32: return -5");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const value = module.declarations[0].kind.function_definition.body[0].kind.@"return".?;
+    try std.testing.expectEqualStrings("5", value.kind.negation.kind.integer_literal.text);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 27 }, value.location);
+}
+
+test "parseNegation: allows a space before the number" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn value() -> f64: return - 2.5");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const value = module.declarations[0].kind.function_definition.body[0].kind.@"return".?;
+    try std.testing.expectEqualStrings("2.5", value.kind.negation.kind.float_literal.text);
+}
+
+test "parseNegation: rejects a minus before a name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn value() -> i32: return -limit");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedNumber, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, parser.failure.?.location.?);
+}
+
+test "parseNegation: rejects a minus before a literal that is not a number" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn value() -> bool: return -true");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedNumber, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 29 }, parser.failure.?.location.?);
 }
 
 test "parseArguments: accepts a trailing comma" {

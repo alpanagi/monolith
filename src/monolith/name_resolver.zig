@@ -573,6 +573,7 @@ pub const NameResolver = struct {
                     try self.resolveNamesInExpression(scope, &argument.value);
                 }
             },
+            .negation => |operand| try self.resolveNamesInExpression(scope, operand),
             .struct_literal => |literal| {
                 for (literal.arguments) |*argument| {
                     try self.resolveNamesInExpression(scope, &argument.value);
@@ -948,7 +949,7 @@ pub const NameResolver = struct {
                 try self.resolveNamesInExpression(.{}, value);
                 return .{ .type = ast.extractType(value.*) };
             },
-            .call, .method_call, .struct_literal, .array_literal, .slice => {
+            .call, .method_call, .negation, .struct_literal, .array_literal, .slice => {
                 if (!constant.resolved) {
                     try self.resolveNamesInExpression(.{}, value);
                     try self.expectEvaluable(value.*);
@@ -981,6 +982,7 @@ pub const NameResolver = struct {
                 }
                 for (call.arguments) |argument| try self.expectEvaluable(argument.value);
             },
+            .negation => |operand| try self.expectEvaluable(operand.*),
             .struct_literal => |literal| {
                 for (literal.arguments) |argument| try self.expectEvaluable(argument.value);
             },
@@ -3073,6 +3075,25 @@ test "expectLength: rejects a length with a suffix" {
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(values: [2u8]i32): _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InvalidLength, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, name_resolver.failure.?.location.?);
+}
+
+test "expectLength: rejects a negative length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(values: [-2]i32): _ = values" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);

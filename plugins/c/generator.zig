@@ -977,7 +977,8 @@ pub const Generator = struct {
             .integer_literal, .float_literal => |literal| {
                 const number = expression.type.?.number;
                 if (number == .i128 or number == .u128) {
-                    return self.generateSplitLiteral(writer, literal.text, number);
+                    const value = std.fmt.parseInt(u128, literal.text, 0) catch unreachable;
+                    return self.generateSplitLiteral(writer, value, number);
                 }
                 var text = literal.text;
                 if (std.mem.startsWith(u8, text, "0o")) {
@@ -1026,6 +1027,16 @@ pub const Generator = struct {
                 }
                 if (hoists) try writer.writeByte(')');
             },
+            .negation => |operand| switch (operand.kind) {
+                .integer_literal => |literal| {
+                    try self.generateNegativeInteger(writer, literal.text, expression.type.?.number);
+                },
+                .float_literal => {
+                    try writer.writeByte('-');
+                    try self.generateExpression(writer, operand.*);
+                },
+                else => unreachable,
+            },
             .struct_literal => |literal| {
                 const hoists = try self.generateHoistedEffects(writer, literal.arguments);
                 try self.generateConstruction(writer, literal.arguments, expression.type.?);
@@ -1046,13 +1057,31 @@ pub const Generator = struct {
         }
     }
 
-    fn generateSplitLiteral(
+    fn generateNegativeInteger(
         self: *Generator,
         writer: *std.Io.Writer,
         text: []const u8,
         number: types.NumberType,
     ) std.Io.Writer.Error!void {
         const value = std.fmt.parseInt(u128, text, 0) catch unreachable;
+        const maximum: u128 = if (number == .i128) std.math.maxInt(i128) else std.math.maxInt(i64);
+        const at_minimum = value > maximum;
+        try writer.writeAll(if (at_minimum) "(-" else "-");
+        const magnitude = if (at_minimum) maximum else value;
+        if (number == .i128) {
+            try self.generateSplitLiteral(writer, magnitude, number);
+        } else {
+            try writer.print("{d}", .{magnitude});
+        }
+        if (at_minimum) try writer.writeAll(" - 1)");
+    }
+
+    fn generateSplitLiteral(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        value: u128,
+        number: types.NumberType,
+    ) std.Io.Writer.Error!void {
         const high: u64 = @truncate(value >> 64);
         const low: u64 = @truncate(value);
         try writer.writeAll("((");
@@ -1210,7 +1239,7 @@ pub const Generator = struct {
     ) std.Io.Writer.Error!void {
         if (form == .expression) return self.generateExpression(writer, expression);
         switch (expression.kind) {
-            .integer_literal, .float_literal, .boolean_literal, .character_literal => {
+            .integer_literal, .float_literal, .boolean_literal, .character_literal, .negation => {
                 try self.generateExpression(writer, expression);
             },
             .string_literal => |text| {
@@ -1341,6 +1370,7 @@ pub const Generator = struct {
                 }
                 return;
             },
+            .negation => |operand| return self.generateEffects(writer, operand.*),
             .slice => |slice| return self.generateEffects(writer, slice.value.*),
             .field_access => |access| return self.generateEffects(writer, access.value.*),
             .integer_literal,
@@ -1548,6 +1578,7 @@ fn hasEffects(expression: ast.Expression) bool {
             }
             return false;
         },
+        .negation => |operand| return hasEffects(operand.*),
         .slice => |slice| return hasEffects(slice.value.*),
         .field_access => |access| return hasEffects(access.value.*),
         .integer_literal,
@@ -4021,6 +4052,39 @@ test "generateExpression: marks f16 and f128 literals" {
     );
 }
 
+test "generateExpression: writes a negative float" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn half() -> f16: return -0.5" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n_Float16 mn_main_half() {\n    return -0.5f16;\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateExpression: marks unsigned arguments" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4500,6 +4564,105 @@ test "generateExpression: writes an array literal whose type comes from its elem
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nmn_array_2_i32 mn_main_first() {\n    const mn_array_2_i32 values = (mn_array_2_i32){ .items = { 1, 2 } };\n    return values;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateNegativeInteger: writes a negative integer in decimal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn value() -> i32: return -0x10" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_value() {\n    return -16;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateNegativeInteger: writes the minimum of a 64-bit type as the negated maximum minus one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> i64: return -9223372036854775808\nfn two() -> isize: return -9223372036854775808" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint64_t mn_main_one() {\n    return (-9223372036854775807 - 1);\n}\n\nptrdiff_t mn_main_two() {\n    return (-9223372036854775807 - 1);\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateNegativeInteger: builds a negative 128-bit integer from two halves" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> i128: return -5\nfn two() -> i128: return -170141183460469231731687303715884105728" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint128_t mn_main_one() {\n    return -((int128_t)0x0u << 64 | 0x5u);\n}\n\nint128_t mn_main_two() {\n    return (-((int128_t)0x7fffffffffffffffu << 64 | 0xffffffffffffffffu) - 1);\n}\n",
         files[1].contents,
     );
 }

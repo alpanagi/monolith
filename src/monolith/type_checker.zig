@@ -183,6 +183,7 @@ pub const TypeChecker = struct {
             .integer_literal, .float_literal, .boolean_literal, .character_literal, .string_literal => {
                 try self.checkLiteral(expression.*, expected);
             },
+            .negation => |operand| try self.checkNegation(expression.location, operand, expected),
             .undefined => return self.fail(expression.location, error.UnexpectedUndefined),
             inline .identifier, .path_expression => |name| {
                 const value_type = try self.computeValueType(parameters, name.resolution.?);
@@ -374,7 +375,7 @@ pub const TypeChecker = struct {
         switch (expression.kind) {
             .undefined => return self.fail(expression.location, error.UnexpectedUndefined),
             .integer_literal, .float_literal, .boolean_literal, .character_literal, .string_literal => {
-                const value_type = try self.computeLiteralType(expression.*);
+                const value_type = try self.computeLiteralType(expression.location, expression.*);
                 try self.checkLiteral(expression.*, value_type);
                 expression.type = value_type;
                 return value_type;
@@ -385,6 +386,12 @@ pub const TypeChecker = struct {
                 return value_type;
             },
             .call, .method_call => return self.checkCall(parameters, expression),
+            .negation => |operand| {
+                const value_type = try self.computeLiteralType(expression.location, operand.*);
+                try self.checkNegation(expression.location, operand, value_type);
+                expression.type = value_type;
+                return value_type;
+            },
             .struct_literal => return self.fail(expression.location, error.UnknownValueType),
             .array_literal => |literal| {
                 const location = expression.location;
@@ -482,14 +489,18 @@ pub const TypeChecker = struct {
         return expected;
     }
 
-    fn computeLiteralType(self: *TypeChecker, expression: ast.Expression) TypeError!types.Type {
+    fn computeLiteralType(
+        self: *TypeChecker,
+        location: token.Location,
+        expression: ast.Expression,
+    ) TypeError!types.Type {
         return switch (expression.kind) {
             .integer_literal, .float_literal => |literal| {
                 const suffix = literal.suffix orelse {
-                    return self.fail(expression.location, error.UnknownValueType);
+                    return self.fail(location, error.UnknownValueType);
                 };
                 const number = types.findNumberType(suffix) orelse {
-                    return self.fail(expression.location, error.UnknownSuffix);
+                    return self.fail(location, error.UnknownSuffix);
                 };
                 return .{ .number = number };
             },
@@ -501,6 +512,7 @@ pub const TypeChecker = struct {
             .path_expression,
             .call,
             .method_call,
+            .negation,
             .struct_literal,
             .array_type,
             .array_literal,
@@ -519,28 +531,9 @@ pub const TypeChecker = struct {
     ) TypeError!void {
         switch (expression.kind) {
             .integer_literal => |literal| {
-                const number = try self.expectNumber(expression.location, literal, expected);
-                const maximum = computeIntegerMaximum(number) orelse {
-                    return self.fail(expression.location, error.TypeMismatch);
-                };
-                const value = std.fmt.parseInt(u128, literal.text, 0) catch {
-                    return self.fail(expression.location, error.LiteralOutOfRange);
-                };
-                if (value > maximum) {
-                    return self.fail(expression.location, error.LiteralOutOfRange);
-                }
+                try self.checkInteger(expression.location, literal, expected, false);
             },
-            .float_literal => |literal| {
-                const number = try self.expectNumber(expression.location, literal, expected);
-                const fits = switch (number) {
-                    .f16 => fitsFloat(f16, literal.text),
-                    .f32 => fitsFloat(f32, literal.text),
-                    .f64 => fitsFloat(f64, literal.text),
-                    .f128 => fitsFloat(f128, literal.text),
-                    else => return self.fail(expression.location, error.TypeMismatch),
-                };
-                if (!fits) return self.fail(expression.location, error.LiteralOutOfRange);
-            },
+            .float_literal => |literal| try self.checkFloat(expression.location, literal, expected),
             .boolean_literal => {
                 if (expected != .boolean) {
                     return self.fail(expression.location, error.TypeMismatch);
@@ -559,6 +552,7 @@ pub const TypeChecker = struct {
             .path_expression,
             .call,
             .method_call,
+            .negation,
             .struct_literal,
             .array_type,
             .array_literal,
@@ -568,6 +562,56 @@ pub const TypeChecker = struct {
             .@"struct",
             => unreachable,
         }
+    }
+
+    fn checkNegation(
+        self: *TypeChecker,
+        location: token.Location,
+        operand: *ast.Expression,
+        expected: types.Type,
+    ) TypeError!void {
+        switch (operand.kind) {
+            .integer_literal => |literal| try self.checkInteger(location, literal, expected, true),
+            .float_literal => |literal| try self.checkFloat(location, literal, expected),
+            else => unreachable,
+        }
+        operand.type = expected;
+    }
+
+    fn checkInteger(
+        self: *TypeChecker,
+        location: token.Location,
+        literal: token.NumberLiteral,
+        expected: types.Type,
+        negative: bool,
+    ) TypeError!void {
+        const number = try self.expectNumber(location, literal, expected);
+        const maximum = computeIntegerMaximum(number) orelse {
+            return self.fail(location, error.TypeMismatch);
+        };
+        if (negative and !isSigned(number)) return self.fail(location, error.NegativeUnsigned);
+        const value = std.fmt.parseInt(u128, literal.text, 0) catch {
+            return self.fail(location, error.LiteralOutOfRange);
+        };
+        const limit = if (negative) maximum + 1 else maximum;
+        if (value > limit) return self.fail(location, error.LiteralOutOfRange);
+    }
+
+    fn checkFloat(
+        self: *TypeChecker,
+        location: token.Location,
+        literal: token.NumberLiteral,
+        expected: types.Type,
+    ) TypeError!void {
+        const number = try self.expectNumber(location, literal, expected);
+        const fits = switch (number) {
+            .f16 => fitsFloat(f16, literal.text),
+            .f32 => fitsFloat(f32, literal.text),
+            .f64 => fitsFloat(f64, literal.text),
+            .f128 => fitsFloat(f128, literal.text),
+            else => return self.fail(location, error.TypeMismatch),
+        };
+        if (!fits) return self.fail(location, error.LiteralOutOfRange);
     }
 
     fn expectNumber(
@@ -605,6 +649,7 @@ pub const TypeError = error{
     OutOfMemory,
     TypeMismatch,
     LiteralOutOfRange,
+    NegativeUnsigned,
     MissingReturnValue,
     UnexpectedReturnValue,
     MissingReturn,
@@ -643,6 +688,7 @@ fn describeError(type_error: TypeError) []const u8 {
         error.OutOfMemory => "out of memory",
         error.TypeMismatch => "value does not match the expected type",
         error.LiteralOutOfRange => "literal out of range for its type",
+        error.NegativeUnsigned => "unsigned types cannot hold negative numbers",
         error.MissingReturnValue => "missing return value",
         error.UnexpectedReturnValue => "void function cannot return a value",
         error.MissingReturn => "function must end with a return",
@@ -721,6 +767,13 @@ fn computeIntegerMaximum(number: types.NumberType) ?u128 {
         .u64, .usize => std.math.maxInt(u64),
         .u128 => std.math.maxInt(u128),
         .f16, .f32, .f64, .f128 => null,
+    };
+}
+
+fn isSigned(number: types.NumberType) bool {
+    return switch (number) {
+        .i8, .i16, .i32, .i64, .i128, .isize, .f16, .f32, .f64, .f128 => true,
+        .u8, .u16, .u32, .u64, .u128, .usize => false,
     };
 }
 
@@ -1599,6 +1652,98 @@ test "checkExpression: rejects one past the maximum of each integer type" {
     }
 }
 
+test "checkExpression: accepts the minimum of each signed integer type" {
+    const sources = [_][]const u8{
+        "fn value() -> i8: return -128",
+        "fn value() -> i16: return -32768",
+        "fn value() -> i32: return -2147483648",
+        "fn value() -> i64: return -9223372036854775808",
+        "fn value() -> i128: return -170141183460469231731687303715884105728",
+        "fn value() -> isize: return -9223372036854775808",
+    };
+    for (sources) |source| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var program_directory = std.testing.tmpDir(.{});
+        defer program_directory.cleanup();
+        const program_path = try std.fs.path.join(
+            arena.allocator(),
+            &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+        );
+        var loader = @import("loader.zig").Loader.init(program_path, program_path);
+        try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = source });
+        try loader.loadMainModule(&arena, std.testing.io, "main");
+        var type_registry: types.Registry = .{};
+        var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+        try name_resolver.resolve();
+        var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+        try type_checker.check();
+    }
+}
+
+test "checkExpression: rejects one below the minimum of each signed integer type" {
+    const sources = [_][]const u8{
+        "fn value() -> i8: return -129",
+        "fn value() -> i16: return -32769",
+        "fn value() -> i32: return -2147483649",
+        "fn value() -> i64: return -9223372036854775809",
+        "fn value() -> i128: return -170141183460469231731687303715884105729",
+        "fn value() -> isize: return -9223372036854775809",
+    };
+    for (sources) |source| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var program_directory = std.testing.tmpDir(.{});
+        defer program_directory.cleanup();
+        const program_path = try std.fs.path.join(
+            arena.allocator(),
+            &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+        );
+        var loader = @import("loader.zig").Loader.init(program_path, program_path);
+        try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = source });
+        try loader.loadMainModule(&arena, std.testing.io, "main");
+        var type_registry: types.Registry = .{};
+        var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+        try name_resolver.resolve();
+        var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+        try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
+    }
+}
+
+test "checkExpression: rejects a negative number for each unsigned type" {
+    const sources = [_][]const u8{
+        "fn value() -> u8: return -1",
+        "fn value() -> u16: return -1",
+        "fn value() -> u32: return -1",
+        "fn value() -> u64: return -1",
+        "fn value() -> u128: return -1",
+        "fn value() -> usize: return -1",
+        "fn value() -> u8: return -0",
+        "fn value() -> u8: return -999999999999999999999999999999999999999999",
+    };
+    for (sources) |source| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var program_directory = std.testing.tmpDir(.{});
+        defer program_directory.cleanup();
+        const program_path = try std.fs.path.join(
+            arena.allocator(),
+            &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+        );
+        var loader = @import("loader.zig").Loader.init(program_path, program_path);
+        try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = source });
+        try loader.loadMainModule(&arena, std.testing.io, "main");
+        var type_registry: types.Registry = .{};
+        var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+        try name_resolver.resolve();
+        var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+        try std.testing.expectError(error.NegativeUnsigned, type_checker.check());
+    }
+}
+
 test "checkExpression: rejects a suffixed literal out of range" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1644,6 +1789,34 @@ test "checkExpression: rejects a float out of range" {
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn huge() -> f32: return 1e39" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = TypeChecker.init(&arena, program);
+
+    try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, type_checker.failure.?.location.?);
+}
+
+test "checkExpression: rejects a negative float out of range" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn huge() -> f32: return -1e39" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2962,6 +3135,72 @@ test "inferType: gives a call its return type" {
     const returned = loader.modules.items[0].declarations[3].kind.function_definition.body[0].kind.@"return".?;
     const call = returned.kind.field_access.value.kind.field_access.value;
     try std.testing.expectEqualStrings("Line", call.type.?.@"struct".name);
+}
+
+test "inferType: gives a negation the type of its suffix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> i8: return low\nconst low = -128i8\nfn main(): noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = TypeChecker.init(&arena, program);
+    try type_checker.check();
+
+    try std.testing.expectEqual(types.Type{ .number = .i8 }, loader.modules.items[0].declarations[1].kind.constant_declaration.value.type);
+}
+
+test "inferType: checks the range of a negation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> i8: return low\nconst low = -129i8\nfn main(): noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = TypeChecker.init(&arena, program);
+
+    try std.testing.expectError(error.LiteralOutOfRange, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 13 }, type_checker.failure.?.location.?);
+}
+
+test "inferType: reports a missing suffix of a negation at the minus" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> i8: return low\nconst low = -5\nfn main(): noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = TypeChecker.init(&arena, program);
+
+    try std.testing.expectError(error.UnknownValueType, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 13 }, type_checker.failure.?.location.?);
 }
 
 test "inferType: rejects a literal without a known type" {
