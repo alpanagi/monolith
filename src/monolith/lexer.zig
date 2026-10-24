@@ -96,6 +96,8 @@ pub const LexError = error{
     UnexpectedTabInString,
     UnexpectedTabInCharacter,
     InvalidEscape,
+    InvalidUnicodeEscape,
+    InvalidScalarValue,
     UnterminatedString,
     UnterminatedCharacter,
     NotOneCharacter,
@@ -110,6 +112,8 @@ fn describeError(lex_error: LexError) []const u8 {
         error.UnexpectedTabInString => "tabs are not allowed in strings, use \\t",
         error.UnexpectedTabInCharacter => "tabs are not allowed in characters, use \\t",
         error.InvalidEscape => "unknown escape sequence",
+        error.InvalidUnicodeEscape => "a Unicode escape takes one to six hexadecimal digits in braces",
+        error.InvalidScalarValue => "a Unicode escape must be a Unicode scalar value",
         error.UnterminatedString => "unterminated string",
         error.UnterminatedCharacter => "unterminated character",
         error.NotOneCharacter => "a character literal holds exactly one character",
@@ -255,7 +259,8 @@ fn lexString(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
         switch (byte) {
             '"' => break,
             '\\' => switch (state.peek(position + 1) orelse 0) {
-                'n', 't', '\\', '\'', '"' => position += 2,
+                'n', 't', 'r', '0', '\\', '\'', '"' => position += 2,
+                'u' => try consumeUnicodeEscape(state, &position),
                 '\n', '\r', 0 => return state.fail(state.offset, error.UnterminatedString),
                 '\t' => return state.fail(position + 1, error.UnexpectedTabInString),
                 0x80...0xFF => {
@@ -294,7 +299,8 @@ fn lexCharacter(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
     switch (first) {
         '\'' => return state.fail(state.offset, error.NotOneCharacter),
         '\\' => switch (state.peek(position + 1) orelse 0) {
-            'n', 't', '\\', '\'', '"' => position += 2,
+            'n', 't', 'r', '0', '\\', '\'', '"' => position += 2,
+            'u' => try consumeUnicodeEscape(state, &position),
             '\n', '\r', 0 => return state.fail(state.offset, error.UnterminatedCharacter),
             '\t' => return state.fail(position + 1, error.UnexpectedTabInCharacter),
             0x80...0xFF => {
@@ -414,6 +420,22 @@ fn consumeSuffix(state: *Lexer, offset: *usize) ?[]const u8 {
         offset.* += 1;
     }
     return state.source[start..offset.*];
+}
+
+fn consumeUnicodeEscape(state: *Lexer, offset: *usize) LexError!void {
+    const start = offset.*;
+    if (state.peek(start + 2) != '{') return state.fail(start, error.InvalidUnicodeEscape);
+    var position = start + 3;
+    while (isDigit(state.peek(position), 16)) position += 1;
+    const digits = state.source[start + 3 .. position];
+    if (digits.len == 0 or digits.len > 6 or state.peek(position) != '}') {
+        return state.fail(start, error.InvalidUnicodeEscape);
+    }
+    const value = std.fmt.parseInt(u24, digits, 16) catch unreachable;
+    if (value > 0x10FFFF or (value >= 0xD800 and value <= 0xDFFF)) {
+        return state.fail(start, error.InvalidScalarValue);
+    }
+    offset.* = position + 1;
 }
 
 fn consumeCodePoint(state: *Lexer, offset: *usize) LexError!void {
@@ -992,10 +1014,10 @@ test "lexString: lexes a string literal" {
 test "lexString: keeps escapes as written" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("\"a\\nb\\tc\\\\d\\\"e\\'f\"");
+    var lexer = Lexer.init("\"a\\nb\\tc\\\\d\\\"e\\'f\\rg\\0h\"");
     try lexer.lex(&arena);
 
-    try std.testing.expectEqualStrings("a\\nb\\tc\\\\d\\\"e\\'f", lexer.tokens.items[1].kind.string_literal);
+    try std.testing.expectEqualStrings("a\\nb\\tc\\\\d\\\"e\\'f\\rg\\0h", lexer.tokens.items[1].kind.string_literal);
 }
 
 test "lexString: rejects an unknown escape" {
@@ -1104,11 +1126,22 @@ test "lexCharacter: lexes a character literal" {
 test "lexCharacter: keeps escapes as written" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("'\\'' '\\\"'");
+    var lexer = Lexer.init("'\\'' '\\\"' '\\r' '\\0'");
     try lexer.lex(&arena);
 
     try std.testing.expectEqualStrings("\\'", lexer.tokens.items[1].kind.character_literal);
     try std.testing.expectEqualStrings("\\\"", lexer.tokens.items[2].kind.character_literal);
+    try std.testing.expectEqualStrings("\\r", lexer.tokens.items[3].kind.character_literal);
+    try std.testing.expectEqualStrings("\\0", lexer.tokens.items[4].kind.character_literal);
+}
+
+test "lexCharacter: keeps a unicode escape as one character" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("'\\u{1F600}'");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqualStrings("\\u{1F600}", lexer.tokens.items[1].kind.character_literal);
 }
 
 test "lexCharacter: keeps a character of several bytes" {
@@ -1277,6 +1310,87 @@ test "lexSymbols: rejects a dash without a greater-than sign" {
 
     try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.failure.?.location.?);
+}
+
+test "consumeUnicodeEscape: keeps a unicode escape as written" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"a\\u{1F600}b\"");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqualStrings("a\\u{1F600}b", lexer.tokens.items[1].kind.string_literal);
+}
+
+test "consumeUnicodeEscape: accepts the largest scalar value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"\\u{10FFFF}\"");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqualStrings("\\u{10FFFF}", lexer.tokens.items[1].kind.string_literal);
+}
+
+test "consumeUnicodeEscape: rejects a unicode escape without braces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"\\u41\"");
+
+    try std.testing.expectError(error.InvalidUnicodeEscape, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.failure.?.location.?);
+}
+
+test "consumeUnicodeEscape: rejects a unicode escape without digits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"\\u{}\"");
+
+    try std.testing.expectError(error.InvalidUnicodeEscape, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.failure.?.location.?);
+}
+
+test "consumeUnicodeEscape: rejects more than six digits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"\\u{0000041}\"");
+
+    try std.testing.expectError(error.InvalidUnicodeEscape, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.failure.?.location.?);
+}
+
+test "consumeUnicodeEscape: rejects an underscore between digits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"\\u{1F_600}\"");
+
+    try std.testing.expectError(error.InvalidUnicodeEscape, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.failure.?.location.?);
+}
+
+test "consumeUnicodeEscape: rejects a unicode escape without a closing brace" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"\\u{41\"");
+
+    try std.testing.expectError(error.InvalidUnicodeEscape, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.failure.?.location.?);
+}
+
+test "consumeUnicodeEscape: rejects a value above the largest scalar value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"\\u{110000}\"");
+
+    try std.testing.expectError(error.InvalidScalarValue, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.failure.?.location.?);
+}
+
+test "consumeUnicodeEscape: rejects a surrogate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"\\u{D800}\"");
+
+    try std.testing.expectError(error.InvalidScalarValue, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.failure.?.location.?);
 }
 
 test "measureCodePoint: rejects a sequence cut off by the end of the file" {

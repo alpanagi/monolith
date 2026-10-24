@@ -994,9 +994,15 @@ pub const Generator = struct {
                 });
             },
             .boolean_literal => |value| try writer.writeAll(if (value) "true" else "false"),
-            .character_literal => |text| try writer.print("U'{s}'", .{text}),
+            .character_literal => |text| {
+                try writer.writeAll("U'");
+                try generateText(writer, text, .character);
+                try writer.writeByte('\'');
+            },
             .string_literal => |text| {
-                try writer.print("(string){{ \"{s}\", {d} }}", .{ text, countBytes(text) });
+                try writer.writeAll("(string){ \"");
+                try generateText(writer, text, .string);
+                try writer.print("\", {d} }}", .{countBytes(text)});
             },
             .undefined => unreachable,
             .identifier => |identifier| switch (identifier.resolution.?) {
@@ -1208,7 +1214,9 @@ pub const Generator = struct {
                 try self.generateExpression(writer, expression);
             },
             .string_literal => |text| {
-                try writer.print("{{ \"{s}\", {d} }}", .{ text, countBytes(text) });
+                try writer.writeAll("{ \"");
+                try generateText(writer, text, .string);
+                try writer.print("\", {d} }}", .{countBytes(text)});
             },
             inline .identifier, .path_expression => |name| {
                 const constant = name.resolution.?.constant;
@@ -1397,6 +1405,16 @@ const Reached = struct {
 const Form = enum {
     expression,
     initializer,
+};
+
+const Literal = enum {
+    string,
+    character,
+};
+
+const UnicodeEscape = struct {
+    value: u21,
+    length: usize,
 };
 
 const LocalName = struct {
@@ -1735,13 +1753,67 @@ fn orderDefinition(
     try ordered.append(allocator, value_type);
 }
 
+fn generateText(
+    writer: *std.Io.Writer,
+    text: []const u8,
+    literal: Literal,
+) std.Io.Writer.Error!void {
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] != '\\') {
+            try writer.writeByte(text[index]);
+            index += 1;
+            continue;
+        }
+        switch (text[index + 1]) {
+            '0' => {
+                try writer.writeAll("\\000");
+                index += 2;
+            },
+            'u' => {
+                const escape = parseUnicodeEscape(text[index..]);
+                switch (literal) {
+                    .string => {
+                        var bytes: [4]u8 = undefined;
+                        const length = std.unicode.utf8Encode(escape.value, &bytes) catch unreachable;
+                        for (bytes[0..length]) |byte| try writer.print("\\{o:0>3}", .{byte});
+                    },
+                    .character => if (escape.value < 0xA0) {
+                        try writer.print("\\{o:0>3}", .{escape.value});
+                    } else {
+                        try writer.print("\\U{X:0>8}", .{escape.value});
+                    },
+                }
+                index += escape.length;
+            },
+            else => {
+                try writer.writeAll(text[index .. index + 2]);
+                index += 2;
+            },
+        }
+    }
+}
+
 fn countBytes(text: []const u8) usize {
     var count: usize = 0;
     var index: usize = 0;
-    while (index < text.len) : (count += 1) {
-        index += if (text[index] == '\\') 2 else 1;
+    while (index < text.len) {
+        if (std.mem.startsWith(u8, text[index..], "\\u")) {
+            const escape = parseUnicodeEscape(text[index..]);
+            count += std.unicode.utf8CodepointSequenceLength(escape.value) catch unreachable;
+            index += escape.length;
+        } else {
+            count += 1;
+            index += if (text[index] == '\\') 2 else 1;
+        }
     }
     return count;
+}
+
+fn parseUnicodeEscape(text: []const u8) UnicodeEscape {
+    const end = std.mem.indexOfScalar(u8, text, '}').?;
+    const value = std.fmt.parseInt(u21, text[3..end], 16) catch unreachable;
+    return .{ .value = value, .length = end + 1 };
 }
 
 fn buildModuleInclude(
@@ -5240,6 +5312,109 @@ test "isHoisted: leaves out zero-sized fields that call nothing" {
         "#include \"main.h\"\n\nvoid mn_main_use(int32_t) {}\n\nvoid mn_main_pass(mn_main_Holder holder) {\n    mn_main_use(1);\n}\n",
         files[1].contents,
     );
+}
+
+test "generateText: writes a NUL escape as three octal digits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() -> string: return \"\\01\"" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nstring mn_main_greeting() {\n    return (string){ \"\\0001\", 2 };\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateText: writes a unicode escape in a string as UTF-8 bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() -> string: return \"\\u{1F600}\"" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nstring mn_main_greeting() {\n    return (string){ \"\\360\\237\\230\\200\", 4 };\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateText: writes a unicode escape in a character as one escape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> char: return '\\u{41}'\nfn two() -> char: return '\\u{1F600}'" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nuint32_t mn_main_one() {\n    return U'\\101';\n}\n\nuint32_t mn_main_two() {\n    return U'\\U0001F600';\n}\n",
+        files[1].contents,
+    );
+}
+
+test "countBytes: counts a unicode escape as its UTF-8 bytes" {
+    try std.testing.expectEqual(4, countBytes("a\\u{e9}\\0"));
 }
 
 test "buildRelativePath: walks into directories" {
