@@ -81,8 +81,12 @@ pub const Lexer = struct {
 
     fn failUnexpected(self: *Lexer, offset: usize) LexError {
         const byte = self.peek(offset) orelse 0;
-        if (byte >= 0x80 and measureCodePoint(self.source, offset) == null) {
+        if (byte < 0x80) return self.fail(offset, error.UnexpectedCharacter);
+        const length = measureCodePoint(self.source, offset) orelse {
             return self.fail(offset, error.InvalidCharacter);
+        };
+        if (isDirectionControl(self.source[offset..][0..length])) {
+            return self.fail(offset, error.UnexpectedDirectionControl);
         }
         return self.fail(offset, error.UnexpectedCharacter);
     }
@@ -95,6 +99,7 @@ pub const LexError = error{
     UnexpectedTab,
     UnexpectedTabInString,
     UnexpectedTabInCharacter,
+    UnexpectedDirectionControl,
     InvalidEscape,
     InvalidUnicodeEscape,
     InvalidScalarValue,
@@ -111,6 +116,7 @@ fn describeError(lex_error: LexError) []const u8 {
         error.UnexpectedTab => "tabs are not allowed, use spaces",
         error.UnexpectedTabInString => "tabs are not allowed in strings, use \\t",
         error.UnexpectedTabInCharacter => "tabs are not allowed in characters, use \\t",
+        error.UnexpectedDirectionControl => "Unicode direction control characters are not allowed",
         error.InvalidEscape => "unknown escape sequence",
         error.InvalidUnicodeEscape => "a Unicode escape takes one to six hexadecimal digits in braces",
         error.InvalidScalarValue => "a Unicode escape must be a Unicode scalar value",
@@ -264,9 +270,8 @@ fn lexString(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
                 '\n', '\r', 0 => return state.fail(state.offset, error.UnterminatedString),
                 '\t' => return state.fail(position + 1, error.UnexpectedTabInString),
                 0x80...0xFF => {
-                    if (measureCodePoint(state.source, position + 1) == null) {
-                        return state.fail(position + 1, error.InvalidCharacter);
-                    }
+                    var escaped = position + 1;
+                    try consumeCodePoint(state, &escaped);
                     return state.fail(position, error.InvalidEscape);
                 },
                 else => return state.fail(position, error.InvalidEscape),
@@ -304,9 +309,8 @@ fn lexCharacter(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
             '\n', '\r', 0 => return state.fail(state.offset, error.UnterminatedCharacter),
             '\t' => return state.fail(position + 1, error.UnexpectedTabInCharacter),
             0x80...0xFF => {
-                if (measureCodePoint(state.source, position + 1) == null) {
-                    return state.fail(position + 1, error.InvalidCharacter);
-                }
+                var escaped = position + 1;
+                try consumeCodePoint(state, &escaped);
                 return state.fail(position, error.InvalidEscape);
             },
             else => return state.fail(position, error.InvalidEscape),
@@ -317,9 +321,14 @@ fn lexCharacter(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
         else => position += 1,
     }
     if (state.peek(position) != '\'') {
-        while (state.peek(position)) |byte| : (position += 1) {
+        while (state.peek(position)) |byte| {
             if (byte == '\'') return state.fail(state.offset, error.NotOneCharacter);
             if (byte == '\n' or byte == '\r') break;
+            if (byte >= 0x80) {
+                try consumeCodePoint(state, &position);
+            } else {
+                position += 1;
+            }
         }
         return state.fail(state.offset, error.UnterminatedCharacter);
     }
@@ -443,6 +452,9 @@ fn consumeCodePoint(state: *Lexer, offset: *usize) LexError!void {
     const length = measureCodePoint(state.source, offset.*) orelse {
         return state.fail(offset.*, error.InvalidCharacter);
     };
+    if (isDirectionControl(state.source[offset.*..][0..length])) {
+        return state.fail(offset.*, error.UnexpectedDirectionControl);
+    }
     offset.* += length;
 }
 
@@ -452,6 +464,11 @@ fn measureCodePoint(source: []const u8, offset: usize) ?usize {
     if (end > source.len) return null;
     _ = std.unicode.utf8Decode(source[offset..end]) catch return null;
     return length;
+}
+
+fn isDirectionControl(sequence: []const u8) bool {
+    const code_point = std.unicode.utf8Decode(sequence) catch unreachable;
+    return (code_point >= 0x202A and code_point <= 0x202E) or (code_point >= 0x2066 and code_point <= 0x2069);
 }
 
 test "Lexer.init: skips a byte order mark at the start" {
@@ -571,6 +588,15 @@ test "Lexer.lex: rejects a valid character that is not allowed there" {
     var lexer = Lexer.init("fn \xc3\xa9");
 
     try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
+}
+
+test "Lexer.lex: rejects a direction control character outside a comment or string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("noop \u{202E}");
+
+    try std.testing.expectError(error.UnexpectedDirectionControl, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 6 }, lexer.failure.?.location.?);
 }
 
 test "Lexer.lex: rejects tab characters" {
@@ -717,6 +743,15 @@ test "lexComment: rejects a tab in a comment" {
 
     try std.testing.expectError(error.UnexpectedTab, lexer.lex(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 9 }, lexer.failure.?.location.?);
+}
+
+test "lexComment: rejects a direction control character in a comment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("# a\u{2066}b");
+
+    try std.testing.expectError(error.UnexpectedDirectionControl, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 4 }, lexer.failure.?.location.?);
 }
 
 test "lexWord: distinguishes keyword from identifier" {
@@ -1048,6 +1083,15 @@ test "lexString: rejects a tab after a backslash" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 4 }, lexer.failure.?.location.?);
 }
 
+test "lexString: rejects a direction control character after a backslash" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"\\\u{202E}\"");
+
+    try std.testing.expectError(error.UnexpectedDirectionControl, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.failure.?.location.?);
+}
+
 test "lexString: rejects a string without a closing quote" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1101,6 +1145,15 @@ test "lexString: rejects an invalid byte in a string" {
 
     try std.testing.expectError(error.InvalidCharacter, lexer.lex(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 4 }, lexer.failure.?.location.?);
+}
+
+test "lexString: rejects a direction control character in a string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("\"a\u{202A}\"");
+
+    try std.testing.expectError(error.UnexpectedDirectionControl, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.failure.?.location.?);
 }
 
 test "lexString: keeps a number sign as text" {
@@ -1227,6 +1280,15 @@ test "lexCharacter: rejects a tab after a backslash" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.failure.?.location.?);
 }
 
+test "lexCharacter: rejects a direction control character after a backslash" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("'\\\u{202C}'");
+
+    try std.testing.expectError(error.UnexpectedDirectionControl, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.failure.?.location.?);
+}
+
 test "lexCharacter: rejects a tab in a character" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1243,6 +1305,24 @@ test "lexCharacter: rejects an invalid byte in a character" {
 
     try std.testing.expectError(error.InvalidCharacter, lexer.lex(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.failure.?.location.?);
+}
+
+test "lexCharacter: rejects a direction control character" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("'\u{2069}'");
+
+    try std.testing.expectError(error.UnexpectedDirectionControl, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.failure.?.location.?);
+}
+
+test "lexCharacter: rejects a direction control character after the first character" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("'a\u{202E}'");
+
+    try std.testing.expectError(error.UnexpectedDirectionControl, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.failure.?.location.?);
 }
 
 test "lexSymbols: lexes adjacent symbols" {
@@ -1402,4 +1482,15 @@ test "measureCodePoint: rejects a sequence cut off by the end of the file" {
 
     try std.testing.expectError(error.InvalidCharacter, lexer.lex(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 4 }, lexer.failure.?.location.?);
+}
+
+test "isDirectionControl: covers exactly the two ranges" {
+    try std.testing.expect(!isDirectionControl("\u{2029}"));
+    try std.testing.expect(isDirectionControl("\u{202A}"));
+    try std.testing.expect(isDirectionControl("\u{202E}"));
+    try std.testing.expect(!isDirectionControl("\u{202F}"));
+    try std.testing.expect(!isDirectionControl("\u{2065}"));
+    try std.testing.expect(isDirectionControl("\u{2066}"));
+    try std.testing.expect(isDirectionControl("\u{2069}"));
+    try std.testing.expect(!isDirectionControl("\u{206A}"));
 }
