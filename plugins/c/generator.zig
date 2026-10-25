@@ -4315,6 +4315,39 @@ test "generateLocal: writes only the calls of a zero-sized constant" {
     );
 }
 
+test "generateLocal: writes only the calls of void constants and variables" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn work(): noop\nfn keep(value: void, number: i32) -> i32:\n    _ = value\n    return number\nstruct Box:\n    nothing: void\n    number: i32\nfn main():\n    const result = work()\n    var other: void = undefined\n    other = work()\n    _ = keep(result, 1)\n    _ = keep(other, 2)\n    const box = Box(nothing = result, number = 3)\n    _ = keep(box.nothing, box.number)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nvoid mn_main_work() {}\n\nint32_t mn_main_keep(int32_t number) {\n    return number;\n}\n\nint main() {\n    mn_main_work();\n    mn_main_work();\n    mn_main_keep(1);\n    mn_main_keep(2);\n    const mn_main_Box box = (mn_main_Box){ .number = 3 };\n    mn_main_keep(box.number);\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateLocal: writes nothing for a local constant that names an array type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
