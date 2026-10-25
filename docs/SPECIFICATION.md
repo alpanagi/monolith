@@ -42,6 +42,7 @@
 - Read-only pointers are marked `const`, e.g. `*const bool`, `*many const i32`. Values cannot be modified through a read-only pointer.
 - Pointer arithmetic and indexing are supported only for multiple value pointers.
 - Pointers are never allowed to be `null` but can be `undefined` (see literals).
+- A pointer never holds address 0.
 
 ### Arrays
 
@@ -61,6 +62,11 @@
 ### Strings
 
 - `string` is a read-only slice of `u8` that always holds valid UTF-8.
+
+### Optionals
+
+- An optional holds either a value or `null`. Its type is the value's type prefixed with `?`, e.g. `?i32`.
+- Optional pointers have the same size as pointers, with `null` stored as address 0.
 
 ## Literals
 
@@ -113,7 +119,7 @@
 
 ### Null
 
-- `null` means no value.
+- `null` is the value of an empty optional.
 
 ### Undefined
 
