@@ -33,7 +33,7 @@
 - Floating point numbers: `f16`, `f32`, `f64`, `f128` as defined for IEEE 754 binary formats.
 - Booleans: `bool` with `true` and `false` as values.
 - Characters: `char`, 4 bytes representing one Unicode scalar value.
-- `void`: represents no result, i.e. the result of a function that returns nothing.
+- `void`: represents no result, i.e. the result of a function that returns nothing. It has no size and can be used anywhere a type can.
 
 ### Pointer Types
 
@@ -47,7 +47,7 @@
 ### Array Types
 
 - An array holds a fixed number of values of the same type. Its type is the length in brackets followed by the element type, e.g. `[4]i32`.
-- The length is a `usize` and must be known at compile time. Constants can be used as the length. A length of 0 is allowed.
+- The length is a `usize` and must be known at compile time. A length of 0 is allowed.
 - Elements are stored next to each other in memory, in order.
 - Nested arrays read left to right, e.g. `[3][4]f32` is 3 arrays of 4 floats.
 - Arrays are values. Assigning or passing an array copies all its elements.
@@ -145,3 +145,14 @@
 - `undefined` can be the initial value of a variable of any type whose value isn't known yet.
 - Reading a variable that is `undefined` before any assignment is a compile-time error.
 - Reading memory that is `undefined` is illegal behaviour.
+
+## Variables and Constants
+
+- Constants are declared with `const` and variables with `var`, followed by the name, an optional type after `:`, and the value after `=`, e.g. `const limit: u32 = 10`.
+- A constant cannot be modified, including its elements and fields. Values it points to can be modified unless the pointer or slice is read-only. A variable can be modified.
+- Without a written type, the type is taken from the value. A value with no type of its own, such as an unsuffixed literal, needs a written type, e.g. `var count = 1` is a compile-time error.
+- A constant whose value is known at compile time can be used where a compile-time value is required, e.g. an array length.
+- Any declaration can shadow a built-in type name. A local declaration can shadow any existing name, including earlier declarations in the same block.
+- Two top-level declarations with the same name in one module are a compile-time error.
+- An unused local constant or variable is a compile-time error.
+- A variable that is never modified is a compile-time error.
