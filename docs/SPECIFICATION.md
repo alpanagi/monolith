@@ -52,6 +52,16 @@
 - Arrays are values. Assigning or passing an array copies all its elements.
 - Arrays support indexing, starting at 0.
 
+### Slices
+
+- A slice is a multiple value pointer and a `usize` length. Its type is the element type prefixed with `[]`, e.g. `[]i32`.
+- Read-only slices are marked `const`, e.g. `[]const i32`. Values cannot be modified through a read-only slice.
+- Slices support indexing, starting at 0.
+
+### Strings
+
+- `string` is a read-only slice of `u8` that always holds valid UTF-8.
+
 ## Literals
 
 ### Primitives
@@ -87,11 +97,6 @@
 - A single Unicode scalar value inside of single quotes, e.g. `'a'`.
 - Characters can be one of the following escapes, `\n`, `\t`, `\\`, `\'`, `\"`, `\r`, `\0`, and `\u{...}`. `\u{...}` takes 1 to 6 hexadecimal digits and must be a Unicode scalar value.
 
-**String**
-
-- Strings are enclosed in double quotes and are always single-line strings.
-- Strings allow for the following escapes, `\n`, `\t`, `\\`, `\'`, `\"`, `\r`, `\0`, and `\u{...}`. `\u{...}` takes 1 to 6 hexadecimal digits and must be a Unicode scalar value.
-
 ### Arrays
 
 - Array literals are written as the array type followed by the elements in braces, separated by commas, e.g. `[3]i32{1, 2, 3}`.
@@ -100,6 +105,11 @@
 - The number of elements must match the array's length. A mismatch is a compile-time error.
 - Array literals can span multiple lines.
 - A comma after the last element is allowed.
+
+### Strings
+
+- Strings are enclosed in double quotes and are always single-line strings.
+- Strings allow for the following escapes, `\n`, `\t`, `\\`, `\'`, `\"`, `\r`, `\0`, and `\u{...}`. `\u{...}` takes 1 to 6 hexadecimal digits and must be a Unicode scalar value.
 
 ### Null
 
