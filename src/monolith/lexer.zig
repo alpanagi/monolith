@@ -107,6 +107,7 @@ pub const LexError = error{
     UnterminatedString,
     UnterminatedCharacter,
     NotOneCharacter,
+    PrefixedFloat,
 };
 
 fn describeError(lex_error: LexError) []const u8 {
@@ -124,6 +125,7 @@ fn describeError(lex_error: LexError) []const u8 {
         error.UnterminatedString => "unterminated string",
         error.UnterminatedCharacter => "unterminated character",
         error.NotOneCharacter => "a character literal holds exactly one character",
+        error.PrefixedFloat => "a float cannot have a base prefix",
     };
 }
 
@@ -241,7 +243,10 @@ fn lexNumber(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
             return state.fail(position, error.UnexpectedCharacter);
         }
     }
-    if (base == 10 and isFloatSuffix(suffix)) is_float = true;
+    if (isFloatSuffix(suffix)) {
+        if (base != 10) return state.fail(state.offset, error.PrefixedFloat);
+        is_float = true;
+    }
 
     const literal = token.NumberLiteral{ .text = text, .suffix = suffix };
     try state.tokens.append(allocator, .{
@@ -377,16 +382,19 @@ fn lexSymbols(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
         ')' => .right_parenthesis,
         '[' => .left_bracket,
         ']' => .right_bracket,
+        '{' => .left_brace,
+        '}' => .right_brace,
         ',' => .comma,
         '.' => .dot,
         '=' => .equals,
         '-' => .minus,
         '*' => .asterisk,
+        '?' => .question_mark,
         else => return false,
     };
     switch (kind) {
-        .left_parenthesis, .left_bracket => state.nesting += 1,
-        .right_parenthesis, .right_bracket => state.nesting -|= 1,
+        .left_parenthesis, .left_bracket, .left_brace => state.nesting += 1,
+        .right_parenthesis, .right_bracket, .right_brace => state.nesting -|= 1,
         else => {},
     }
 
@@ -676,16 +684,31 @@ test "lexIndentation: preserves leading spaces per line" {
 test "lexIndentation: ignores line breaks inside brackets and parentheses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("f([\n    1,\n    2,\n])\nx");
+    var lexer = Lexer.init("f(x[\n    ..\n])\nx");
     try lexer.lex(&arena);
 
     try std.testing.expect(lexer.tokens.items[2].kind == .left_parenthesis);
-    try std.testing.expect(lexer.tokens.items[3].kind == .left_bracket);
+    try std.testing.expect(lexer.tokens.items[4].kind == .left_bracket);
+    try std.testing.expect(lexer.tokens.items[5].kind == .dot_dot);
+    try std.testing.expect(lexer.tokens.items[6].kind == .right_bracket);
+    try std.testing.expect(lexer.tokens.items[7].kind == .right_parenthesis);
+    try std.testing.expectEqual(0, lexer.tokens.items[8].kind.indent);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, lexer.tokens.items[5].location);
+}
+
+test "lexIndentation: ignores line breaks inside braces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("f({\n    1,\n    2,\n})\nx");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[2].kind == .left_parenthesis);
+    try std.testing.expect(lexer.tokens.items[3].kind == .left_brace);
     try std.testing.expect(lexer.tokens.items[4].kind == .integer_literal);
     try std.testing.expect(lexer.tokens.items[5].kind == .comma);
     try std.testing.expect(lexer.tokens.items[6].kind == .integer_literal);
     try std.testing.expect(lexer.tokens.items[7].kind == .comma);
-    try std.testing.expect(lexer.tokens.items[8].kind == .right_bracket);
+    try std.testing.expect(lexer.tokens.items[8].kind == .right_brace);
     try std.testing.expect(lexer.tokens.items[9].kind == .right_parenthesis);
     try std.testing.expectEqual(0, lexer.tokens.items[10].kind.indent);
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, lexer.tokens.items[6].location);
@@ -960,16 +983,33 @@ test "lexNumber: reads a float suffix as a float" {
     try std.testing.expect(lexer.tokens.items[4].kind == .integer_literal);
 }
 
-test "lexNumber: does not read a float suffix in another base as a float" {
+test "lexNumber: rejects a float suffix after a binary prefix" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("0b1f32 0o7f64");
+    var lexer = Lexer.init("x 0b1f32");
+
+    try std.testing.expectError(error.PrefixedFloat, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.failure.?.location.?);
+}
+
+test "lexNumber: rejects a float suffix after an octal prefix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("0o7_f64");
+
+    try std.testing.expectError(error.PrefixedFloat, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, lexer.failure.?.location.?);
+}
+
+test "lexNumber: reads a float suffix after a hexadecimal prefix as digits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("0x5f32");
     try lexer.lex(&arena);
 
     try std.testing.expect(lexer.tokens.items[1].kind == .integer_literal);
-    try std.testing.expectEqualStrings("f32", lexer.tokens.items[1].kind.integer_literal.suffix.?);
-    try std.testing.expect(lexer.tokens.items[2].kind == .integer_literal);
-    try std.testing.expectEqualStrings("f64", lexer.tokens.items[2].kind.integer_literal.suffix.?);
+    try std.testing.expectEqualStrings("0x5f32", lexer.tokens.items[1].kind.integer_literal.text);
+    try std.testing.expectEqual(null, lexer.tokens.items[1].kind.integer_literal.suffix);
 }
 
 test "lexNumber: does not read a point followed by a letter as a float" {
@@ -1228,6 +1268,18 @@ test "lexString: keeps a number sign as text" {
     try std.testing.expectEqualStrings("a # b", lexer.tokens.items[1].kind.string_literal);
 }
 
+test "lexString: keeps the braces of a unicode escape out of the nesting" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("{\"\\u{41}\", '\\u{42}'}\nx");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqualStrings("\\u{41}", lexer.tokens.items[2].kind.string_literal);
+    try std.testing.expectEqualStrings("\\u{42}", lexer.tokens.items[4].kind.character_literal);
+    try std.testing.expect(lexer.tokens.items[5].kind == .right_brace);
+    try std.testing.expectEqual(0, lexer.tokens.items[6].kind.indent);
+}
+
 test "lexCharacter: lexes a character literal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1426,6 +1478,16 @@ test "lexSymbols: lexes brackets" {
     try std.testing.expect(lexer.tokens.items[2].kind == .right_bracket);
 }
 
+test "lexSymbols: lexes braces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("{}");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .left_brace);
+    try std.testing.expect(lexer.tokens.items[2].kind == .right_brace);
+}
+
 test "lexSymbols: lexes two dots as one symbol" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1465,6 +1527,17 @@ test "lexSymbols: lexes an asterisk" {
 
     try std.testing.expect(lexer.tokens.items[1].kind == .asterisk);
     try std.testing.expectEqualStrings("bool", lexer.tokens.items[2].kind.identifier);
+}
+
+test "lexSymbols: lexes a question mark" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("??i32");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .question_mark);
+    try std.testing.expect(lexer.tokens.items[2].kind == .question_mark);
+    try std.testing.expectEqualStrings("i32", lexer.tokens.items[3].kind.identifier);
 }
 
 test "consumeUnicodeEscape: keeps a unicode escape as written" {

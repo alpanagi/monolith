@@ -13,6 +13,9 @@ pub const Type = union(enum) {
     array: *const Array,
     slice: *const Slice,
     pointer: *const Pointer,
+    optional: *const Optional,
+    tuple: *const Tuple,
+    function: *const Function,
     implementer,
 };
 
@@ -64,11 +67,27 @@ pub const Pointer = struct {
     constant: bool,
 };
 
+pub const Optional = struct {
+    child: Type,
+};
+
+pub const Tuple = struct {
+    elements: []const Type,
+};
+
+pub const Function = struct {
+    parameters: []const Type,
+    return_type: Type,
+};
+
 pub const Registry = struct {
     entries: std.ArrayList(Type) = .empty,
     arrays: std.ArrayList(*const Array) = .empty,
     slices: std.ArrayList(*const Slice) = .empty,
     pointers: std.ArrayList(*const Pointer) = .empty,
+    optionals: std.ArrayList(*const Optional) = .empty,
+    tuples: std.ArrayList(*const Tuple) = .empty,
+    functions: std.ArrayList(*const Function) = .empty,
 
     pub fn add(
         self: *Registry,
@@ -121,6 +140,53 @@ pub const Registry = struct {
         try self.pointers.append(allocator, stored);
         return stored;
     }
+
+    pub fn addOptional(
+        self: *Registry,
+        allocator: std.mem.Allocator,
+        child: Type,
+    ) std.mem.Allocator.Error!*const Optional {
+        for (self.optionals.items) |optional| {
+            if (std.meta.eql(optional.child, child)) return optional;
+        }
+        const optional = try allocator.create(Optional);
+        optional.* = .{ .child = child };
+        try self.optionals.append(allocator, optional);
+        return optional;
+    }
+
+    pub fn addTuple(
+        self: *Registry,
+        allocator: std.mem.Allocator,
+        elements: []const Type,
+    ) std.mem.Allocator.Error!*const Tuple {
+        for (self.tuples.items) |tuple| {
+            if (isSameElements(tuple.elements, elements)) return tuple;
+        }
+        const tuple = try allocator.create(Tuple);
+        tuple.* = .{ .elements = try allocator.dupe(Type, elements) };
+        try self.tuples.append(allocator, tuple);
+        return tuple;
+    }
+
+    pub fn addFunction(
+        self: *Registry,
+        allocator: std.mem.Allocator,
+        parameters: []const Type,
+        return_type: Type,
+    ) std.mem.Allocator.Error!*const Function {
+        for (self.functions.items) |function| {
+            if (!std.meta.eql(function.return_type, return_type)) continue;
+            if (isSameElements(function.parameters, parameters)) return function;
+        }
+        const function = try allocator.create(Function);
+        function.* = .{
+            .parameters = try allocator.dupe(Type, parameters),
+            .return_type = return_type,
+        };
+        try self.functions.append(allocator, function);
+        return function;
+    }
 };
 
 pub fn findBuiltInType(name: []const u8) ?Type {
@@ -134,6 +200,14 @@ pub fn findBuiltInType(name: []const u8) ?Type {
 
 pub fn findNumberType(name: []const u8) ?NumberType {
     return std.meta.stringToEnum(NumberType, name);
+}
+
+fn isSameElements(one: []const Type, two: []const Type) bool {
+    if (one.len != two.len) return false;
+    for (one, two) |element_one, element_two| {
+        if (!std.meta.eql(element_one, element_two)) return false;
+    }
+    return true;
 }
 
 test "Registry.add: records each type" {
@@ -190,6 +264,49 @@ test "Registry.addPointer: gives a pointer type one record for each target, coun
     try std.testing.expectEqual(first, second);
     try std.testing.expect(first != many);
     try std.testing.expect(first != constant);
+}
+
+test "Registry.addOptional: gives an optional type one record for each child" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var type_registry: Registry = .{};
+
+    const first = try type_registry.addOptional(arena.allocator(), .boolean);
+    const second = try type_registry.addOptional(arena.allocator(), .boolean);
+    const nested = try type_registry.addOptional(arena.allocator(), .{ .optional = first });
+
+    try std.testing.expectEqual(first, second);
+    try std.testing.expect(first != nested);
+}
+
+test "Registry.addTuple: gives a tuple type one record for each list of elements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var type_registry: Registry = .{};
+
+    const first = try type_registry.addTuple(arena.allocator(), &.{ .boolean, .character });
+    const second = try type_registry.addTuple(arena.allocator(), &.{ .boolean, .character });
+    const reversed = try type_registry.addTuple(arena.allocator(), &.{ .character, .boolean });
+    const longer = try type_registry.addTuple(arena.allocator(), &.{ .boolean, .character, .boolean });
+
+    try std.testing.expectEqual(first, second);
+    try std.testing.expect(first != reversed);
+    try std.testing.expect(first != longer);
+}
+
+test "Registry.addFunction: gives a function type one record for each signature" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var type_registry: Registry = .{};
+
+    const first = try type_registry.addFunction(arena.allocator(), &.{.boolean}, .character);
+    const second = try type_registry.addFunction(arena.allocator(), &.{.boolean}, .character);
+    const other_return = try type_registry.addFunction(arena.allocator(), &.{.boolean}, .boolean);
+    const other_parameters = try type_registry.addFunction(arena.allocator(), &.{}, .character);
+
+    try std.testing.expectEqual(first, second);
+    try std.testing.expect(first != other_return);
+    try std.testing.expect(first != other_parameters);
 }
 
 test "findBuiltInType: finds number types, bool, char, string and void" {

@@ -115,6 +115,7 @@ pub const ExpressionKind = union(enum) {
     character_literal: []const u8,
     string_literal: []const u8,
     undefined,
+    null,
     identifier: Identifier,
     path_expression: PathExpression,
     call: Call,
@@ -122,10 +123,13 @@ pub const ExpressionKind = union(enum) {
     negation: *Expression,
     struct_literal: StructLiteral,
     array_type: ArrayType,
-    array_literal: ArrayLiteral,
+    composite_literal: CompositeLiteral,
     slice_type: SliceType,
     slice: Slice,
     pointer_type: PointerType,
+    optional_type: OptionalType,
+    tuple_type: TupleType,
+    function_type: FunctionType,
     field_access: FieldAccess,
     @"struct": Struct,
 };
@@ -192,7 +196,8 @@ pub const ArrayType = struct {
     value: ?types.Type = null,
 };
 
-pub const ArrayLiteral = struct {
+pub const CompositeLiteral = struct {
+    type: ?*Expression,
     elements: []Expression,
 };
 
@@ -213,6 +218,22 @@ pub const PointerType = struct {
     value: ?types.Type = null,
 };
 
+pub const OptionalType = struct {
+    child: *Expression,
+    value: ?types.Type = null,
+};
+
+pub const TupleType = struct {
+    elements: []Expression,
+    value: ?types.Type = null,
+};
+
+pub const FunctionType = struct {
+    parameters: []Expression,
+    return_type: *Expression,
+    value: ?types.Type = null,
+};
+
 pub const Argument = struct {
     name: ?[]const u8,
     value: Expression,
@@ -226,12 +247,18 @@ pub const FieldAccess = struct {
 };
 
 pub const Struct = struct {
-    fields: []TypedName,
+    fields: []Field,
     value: ?types.Type = null,
     resolving: bool = false,
 };
 
 pub const TypedName = struct {
+    name: []const u8,
+    type: Expression,
+    location: token.Location,
+};
+
+pub const Field = struct {
     name: []const u8,
     type: Expression,
     default: ?Expression = null,
@@ -244,6 +271,9 @@ pub fn extractType(expression: Expression) types.Type {
         .array_type => |array_type| array_type.value.?,
         .slice_type => |slice_type| slice_type.value.?,
         .pointer_type => |pointer_type| pointer_type.value.?,
+        .optional_type => |optional_type| optional_type.value.?,
+        .tuple_type => |tuple_type| tuple_type.value.?,
+        .function_type => |function_type| function_type.value.?,
         else => unreachable,
     };
 }
@@ -382,7 +412,9 @@ pub fn isDiscardedName(name: []const u8) bool {
 pub fn isAlias(constant: ConstantDeclaration) bool {
     return switch (constant.value.kind) {
         inline .identifier, .path_expression => |name| name.resolution == null,
-        .array_type, .slice_type, .pointer_type => constant.type == null,
+        .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type => {
+            return constant.type == null;
+        },
         else => false,
     };
 }
