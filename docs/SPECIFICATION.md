@@ -26,7 +26,7 @@
 
 ## Built-In Types
 
-### Primitives
+### Primitive Types
 
 - Signed integers: `i8`, `i16`, `i32`, `i64`, `i128`, and `isize` which has the target's pointer size.
 - Unsigned integers: `u8`, `u16`, `u32`, `u64`, `u128`, and `usize` which has the target's pointer size.
@@ -35,16 +35,16 @@
 - Characters: `char`, 4 bytes representing one Unicode scalar value.
 - `void`: represents no result, i.e. the result of a function that returns nothing.
 
-### Pointers
+### Pointer Types
 
 - Monolith supports pointers. A pointer's type is the target type prefixed with `*`, e.g. `*bool`.
 - Pointers either point to a single value or multiple. Pointers to multiple values use the `*many` prefix, e.g. `*many bool`.
 - Read-only pointers are marked `const`, e.g. `*const bool`, `*many const i32`. Values cannot be modified through a read-only pointer.
 - Pointer arithmetic and indexing are supported only for multiple value pointers.
-- Pointers are never allowed to be `null` but can be `undefined` (see literals).
+- Pointers are never allowed to be `null` but can be `undefined` (see Null and Undefined).
 - A pointer never holds address 0.
 
-### Arrays
+### Array Types
 
 - An array holds a fixed number of values of the same type. Its type is the length in brackets followed by the element type, e.g. `[4]i32`.
 - The length is a `usize` and must be known at compile time. Constants can be used as the length. A length of 0 is allowed.
@@ -53,31 +53,36 @@
 - Arrays are values. Assigning or passing an array copies all its elements.
 - Arrays support indexing, starting at 0.
 
-### Slices
+### Slice Types
 
 - A slice is a multiple value pointer and a `usize` length. Its type is the element type prefixed with `[]`, e.g. `[]i32`.
 - Read-only slices are marked `const`, e.g. `[]const i32`. Values cannot be modified through a read-only slice.
 - Slices support indexing, starting at 0.
 
-### Strings
+### String Type
 
 - `string` is a read-only slice of `u8` that always holds valid UTF-8.
 
-### Optionals
+### Optional Types
 
 - An optional holds either a value or `null`. Its type is the value's type prefixed with `?`, e.g. `?i32`.
 - Optional pointers have the same size as pointers, with `null` stored as address 0.
 
-### Tuples
+### Tuple Types
 
 - A tuple holds a fixed number of values whose types can differ. Its type lists the element types in parentheses, e.g. `(i32, bool)`.
 - Tuples are structural: two tuple types with the same element types in the same order are the same type.
 - A tuple has at least two elements.
 - Tuples support indexing with an index known at compile time, starting at 0.
 
+### Function Types
+
+- A function type is written like a function signature without parameter names, e.g. `fn(i32, bool) -> i32` (see Functions).
+- A value of a function type points to a function and is never `null`.
+
 ## Literals
 
-### Primitives
+### Primitive Literals
 
 **Integers**
 
@@ -110,7 +115,7 @@
 - A single Unicode scalar value inside of single quotes, e.g. `'a'`.
 - Characters can be one of the following escapes, `\n`, `\t`, `\\`, `\'`, `\"`, `\r`, `\0`, and `\u{...}`. `\u{...}` takes 1 to 6 hexadecimal digits and must be a Unicode scalar value.
 
-### Arrays
+### Array Literals
 
 - Array literals are written as the array type followed by the elements in braces, separated by commas, e.g. `[3]i32{1, 2, 3}`.
 - The type can be left out when it is known from the surrounding code, e.g. `{1, 2, 3}`.
@@ -119,15 +124,17 @@
 - Array literals can span multiple lines.
 - A comma after the last element is allowed.
 
-### Strings
+### String Literals
 
 - Strings are enclosed in double quotes and are always single-line strings.
 - Strings allow for the following escapes, `\n`, `\t`, `\\`, `\'`, `\"`, `\r`, `\0`, and `\u{...}`. `\u{...}` takes 1 to 6 hexadecimal digits and must be a Unicode scalar value.
 
-### Tuples
+### Tuple Literals
 
 - Tuple literals are written as the tuple type followed by the elements in braces, e.g. `(i32, bool){1, true}`.
 - The type can be left out when it is known from the surrounding code, e.g. `{1, true}`.
+- Tuple literals can span multiple lines.
+- A comma after the last element is allowed.
 
 ### Null
 
