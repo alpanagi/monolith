@@ -68,6 +68,13 @@
 - An optional holds either a value or `null`. Its type is the value's type prefixed with `?`, e.g. `?i32`.
 - Optional pointers have the same size as pointers, with `null` stored as address 0.
 
+### Tuples
+
+- A tuple holds a fixed number of values whose types can differ. Its type lists the element types in parentheses, e.g. `(i32, bool)`.
+- Tuples are structural: two tuple types with the same element types in the same order are the same type.
+- A tuple has at least two elements.
+- Tuples support indexing with an index known at compile time, starting at 0.
+
 ## Literals
 
 ### Primitives
@@ -116,6 +123,11 @@
 
 - Strings are enclosed in double quotes and are always single-line strings.
 - Strings allow for the following escapes, `\n`, `\t`, `\\`, `\'`, `\"`, `\r`, `\0`, and `\u{...}`. `\u{...}` takes 1 to 6 hexadecimal digits and must be a Unicode scalar value.
+
+### Tuples
+
+- Tuple literals are written as the tuple type followed by the elements in braces, e.g. `(i32, bool){1, true}`.
+- The type can be left out when it is known from the surrounding code, e.g. `{1, true}`.
 
 ### Null
 
