@@ -12,6 +12,7 @@ pub const Type = union(enum) {
     @"struct": Struct,
     array: *const Array,
     slice: *const Slice,
+    pointer: *const Pointer,
     implementer,
 };
 
@@ -57,10 +58,17 @@ pub const Slice = struct {
     constant: bool,
 };
 
+pub const Pointer = struct {
+    target: Type,
+    many: bool,
+    constant: bool,
+};
+
 pub const Registry = struct {
     entries: std.ArrayList(Type) = .empty,
     arrays: std.ArrayList(*const Array) = .empty,
     slices: std.ArrayList(*const Slice) = .empty,
+    pointers: std.ArrayList(*const Pointer) = .empty,
 
     pub fn add(
         self: *Registry,
@@ -98,6 +106,20 @@ pub const Registry = struct {
         slice.* = .{ .element = element, .constant = constant };
         try self.slices.append(allocator, slice);
         return slice;
+    }
+
+    pub fn addPointer(
+        self: *Registry,
+        allocator: std.mem.Allocator,
+        pointer: Pointer,
+    ) std.mem.Allocator.Error!*const Pointer {
+        for (self.pointers.items) |existing| {
+            if (std.meta.eql(existing.*, pointer)) return existing;
+        }
+        const stored = try allocator.create(Pointer);
+        stored.* = pointer;
+        try self.pointers.append(allocator, stored);
+        return stored;
     }
 };
 
@@ -151,6 +173,22 @@ test "Registry.addSlice: gives a slice type one record for each element and muta
     const constant = try type_registry.addSlice(arena.allocator(), .boolean, true);
 
     try std.testing.expectEqual(first, second);
+    try std.testing.expect(first != constant);
+}
+
+test "Registry.addPointer: gives a pointer type one record for each target, count and mutability" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var type_registry: Registry = .{};
+
+    const pointer: Pointer = .{ .target = .boolean, .many = false, .constant = false };
+    const first = try type_registry.addPointer(arena.allocator(), pointer);
+    const second = try type_registry.addPointer(arena.allocator(), pointer);
+    const many = try type_registry.addPointer(arena.allocator(), .{ .target = .boolean, .many = true, .constant = false });
+    const constant = try type_registry.addPointer(arena.allocator(), .{ .target = .boolean, .many = false, .constant = true });
+
+    try std.testing.expectEqual(first, second);
+    try std.testing.expect(first != many);
     try std.testing.expect(first != constant);
 }
 

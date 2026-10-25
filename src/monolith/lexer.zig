@@ -2,6 +2,7 @@ const std = @import("std");
 const core = @import("core");
 const name = @import("name.zig");
 const token = core.token;
+const types = core.types;
 
 const Failure = core.Failure;
 
@@ -219,13 +220,10 @@ fn lexNumber(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
     try consumeDigits(state, &position, base);
 
     var is_float = false;
-    if (base == 10 and state.peek(position) == '.') {
-        const after_point = state.peek(position + 1) orelse ' ';
-        if (after_point != '.' and after_point != '_' and !std.ascii.isAlphabetic(after_point)) {
-            position += 1;
-            is_float = true;
-            if (isDigit(state.peek(position), 10)) try consumeDigits(state, &position, 10);
-        }
+    if (base == 10 and state.peek(position) == '.' and isDigit(state.peek(position + 1), 10)) {
+        position += 1;
+        is_float = true;
+        try consumeDigits(state, &position, 10);
     }
     if (base == 10 and (state.peek(position) == 'e' or state.peek(position) == 'E')) {
         position += 1;
@@ -243,6 +241,7 @@ fn lexNumber(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
             return state.fail(position, error.UnexpectedCharacter);
         }
     }
+    if (base == 10 and isFloatSuffix(suffix)) is_float = true;
 
     const literal = token.NumberLiteral{ .text = text, .suffix = suffix };
     try state.tokens.append(allocator, .{
@@ -382,6 +381,7 @@ fn lexSymbols(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
         '.' => .dot,
         '=' => .equals,
         '-' => .minus,
+        '*' => .asterisk,
         else => return false,
     };
     switch (kind) {
@@ -430,6 +430,15 @@ fn consumeSuffix(state: *Lexer, offset: *usize) ?[]const u8 {
         offset.* += 1;
     }
     return state.source[start..offset.*];
+}
+
+fn isFloatSuffix(suffix: ?[]const u8) bool {
+    const text = suffix orelse return false;
+    const number = types.findNumberType(text) orelse return false;
+    return switch (number) {
+        .f16, .f32, .f64, .f128 => true,
+        else => false,
+    };
 }
 
 fn consumeUnicodeEscape(state: *Lexer, offset: *usize) LexError!void {
@@ -796,6 +805,16 @@ test "lexWord: recognizes the const keyword" {
     try std.testing.expectEqualStrings("constant", lexer.tokens.items[2].kind.identifier);
 }
 
+test "lexWord: recognizes the many keyword" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("many manyfold");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_many);
+    try std.testing.expectEqualStrings("manyfold", lexer.tokens.items[2].kind.identifier);
+}
+
 test "lexWord: recognizes the struct keyword" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -816,6 +835,16 @@ test "lexWord: recognizes return and boolean keywords" {
     try std.testing.expect(lexer.tokens.items[1].kind == .keyword_return);
     try std.testing.expect(lexer.tokens.items[2].kind == .keyword_true);
     try std.testing.expect(lexer.tokens.items[3].kind == .keyword_false);
+}
+
+test "lexWord: recognizes the null keyword" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("null nullable");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_null);
+    try std.testing.expectEqualStrings("nullable", lexer.tokens.items[2].kind.identifier);
 }
 
 test "lexWord: recognizes a lone underscore" {
@@ -884,22 +913,20 @@ test "lexNumber: lexes base prefixes" {
 test "lexNumber: lexes float literals" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("5. 5.0 1e10 2.5e-3 3E+2 0.5");
+    var lexer = Lexer.init("5.0 1e10 2.5e-3 3E+2 0.5");
     try lexer.lex(&arena);
 
-    try std.testing.expectEqual(8, lexer.tokens.items.len);
+    try std.testing.expectEqual(7, lexer.tokens.items.len);
     try std.testing.expect(lexer.tokens.items[1].kind == .float_literal);
-    try std.testing.expectEqualStrings("5.", lexer.tokens.items[1].kind.float_literal.text);
+    try std.testing.expectEqualStrings("5.0", lexer.tokens.items[1].kind.float_literal.text);
     try std.testing.expect(lexer.tokens.items[2].kind == .float_literal);
-    try std.testing.expectEqualStrings("5.0", lexer.tokens.items[2].kind.float_literal.text);
+    try std.testing.expectEqualStrings("1e10", lexer.tokens.items[2].kind.float_literal.text);
     try std.testing.expect(lexer.tokens.items[3].kind == .float_literal);
-    try std.testing.expectEqualStrings("1e10", lexer.tokens.items[3].kind.float_literal.text);
+    try std.testing.expectEqualStrings("2.5e-3", lexer.tokens.items[3].kind.float_literal.text);
     try std.testing.expect(lexer.tokens.items[4].kind == .float_literal);
-    try std.testing.expectEqualStrings("2.5e-3", lexer.tokens.items[4].kind.float_literal.text);
+    try std.testing.expectEqualStrings("3E+2", lexer.tokens.items[4].kind.float_literal.text);
     try std.testing.expect(lexer.tokens.items[5].kind == .float_literal);
-    try std.testing.expectEqualStrings("3E+2", lexer.tokens.items[5].kind.float_literal.text);
-    try std.testing.expect(lexer.tokens.items[6].kind == .float_literal);
-    try std.testing.expectEqualStrings("0.5", lexer.tokens.items[6].kind.float_literal.text);
+    try std.testing.expectEqualStrings("0.5", lexer.tokens.items[5].kind.float_literal.text);
 }
 
 test "lexNumber: lexes type suffixes" {
@@ -919,6 +946,32 @@ test "lexNumber: lexes type suffixes" {
     try std.testing.expectEqualStrings("f64", lexer.tokens.items[4].kind.float_literal.suffix.?);
 }
 
+test "lexNumber: reads a float suffix as a float" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("5f32 1_000_f128 5u8 5x32");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .float_literal);
+    try std.testing.expectEqualStrings("5", lexer.tokens.items[1].kind.float_literal.text);
+    try std.testing.expect(lexer.tokens.items[2].kind == .float_literal);
+    try std.testing.expectEqualStrings("1_000", lexer.tokens.items[2].kind.float_literal.text);
+    try std.testing.expect(lexer.tokens.items[3].kind == .integer_literal);
+    try std.testing.expect(lexer.tokens.items[4].kind == .integer_literal);
+}
+
+test "lexNumber: does not read a float suffix in another base as a float" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("0b1f32 0o7f64");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .integer_literal);
+    try std.testing.expectEqualStrings("f32", lexer.tokens.items[1].kind.integer_literal.suffix.?);
+    try std.testing.expect(lexer.tokens.items[2].kind == .integer_literal);
+    try std.testing.expectEqualStrings("f64", lexer.tokens.items[2].kind.integer_literal.suffix.?);
+}
+
 test "lexNumber: does not read a point followed by a letter as a float" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -928,6 +981,16 @@ test "lexNumber: does not read a point followed by a letter as a float" {
     try std.testing.expectEqualStrings("5", lexer.tokens.items[1].kind.integer_literal.text);
     try std.testing.expect(lexer.tokens.items[2].kind == .dot);
     try std.testing.expectEqualStrings("a", lexer.tokens.items[3].kind.identifier);
+}
+
+test "lexNumber: does not read a point without a digit after it as a float" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("5. ");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqualStrings("5", lexer.tokens.items[1].kind.integer_literal.text);
+    try std.testing.expect(lexer.tokens.items[2].kind == .dot);
 }
 
 test "lexNumber: accepts a zero on its own" {
@@ -1392,6 +1455,16 @@ test "lexSymbols: lexes a dash without a greater-than sign as a minus" {
 
     try std.testing.expectEqual(token.TokenKind.minus, lexer.tokens.items[2].kind);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.tokens.items[2].location);
+}
+
+test "lexSymbols: lexes an asterisk" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("*bool");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .asterisk);
+    try std.testing.expectEqualStrings("bool", lexer.tokens.items[2].kind.identifier);
 }
 
 test "consumeUnicodeEscape: keeps a unicode escape as written" {

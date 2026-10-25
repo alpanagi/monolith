@@ -630,6 +630,7 @@ pub const Parser = struct {
     ) ParseError!?ast.Expression {
         if (try self.parseStructLiteral(allocator, offset)) |literal| return literal;
         if (try self.parseBrackets(allocator, offset)) |expression| return expression;
+        if (try self.parsePointerType(allocator, offset)) |pointer_type| return pointer_type;
         if (try self.parseCall(allocator, offset)) |call| return call;
         if (try self.parseNameExpression(allocator, offset)) |name| return name;
         if (try self.parseNegation(allocator, offset)) |negation| return negation;
@@ -712,7 +713,7 @@ pub const Parser = struct {
 
     fn isTypeStart(self: *Parser, offset: usize) bool {
         return switch (self.tokens[offset].kind) {
-            .identifier => true,
+            .identifier, .asterisk => true,
             .left_bracket => self.tokens[offset + 1].kind != .dot_dot,
             else => false,
         };
@@ -729,6 +730,29 @@ pub const Parser = struct {
             return self.fail(offset.*, error.ExpectedType);
         };
         return .{ .constant = constant, .element = element };
+    }
+
+    fn parsePointerType(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.Expression {
+        var position = offset.*;
+        const asterisk = self.match(&position, .asterisk) orelse return null;
+        const many = self.match(&position, .keyword_many) != null;
+        const constant = self.match(&position, .keyword_const) != null;
+        const target = try allocator.create(ast.Expression);
+        target.* = (try self.parseOperand(allocator, &position)) orelse {
+            return self.fail(position, error.ExpectedType);
+        };
+        const pointer_type: ast.PointerType = .{
+            .many = many,
+            .constant = constant,
+            .target = target,
+        };
+
+        offset.* = position;
+        return .{ .kind = .{ .pointer_type = pointer_type }, .location = asterisk.location };
     }
 
     fn parseCall(
@@ -1238,6 +1262,17 @@ test "parseReturnType: rejects a slice type without an arrow in a function witho
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("external fn read() []u8");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedArrow, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 20 }, parser.failure.?.location.?);
+}
+
+test "parseReturnType: rejects a pointer type without an arrow" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("external fn read() *u8");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2169,6 +2204,19 @@ test "parseBrackets: parses a constant slice type" {
     try std.testing.expectEqualStrings("u8", slice_type.element.kind.identifier.name);
 }
 
+test "parseBrackets: parses an array of pointers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn show(values: [2]*i32): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const parameter = module.declarations[0].kind.function_definition.signature.parameters[0];
+    const array_type = parameter.type.kind.array_type;
+    try std.testing.expectEqualStrings("i32", array_type.element.kind.pointer_type.target.kind.identifier.name);
+}
+
 test "parseBrackets: parses an array literal followed by a slice" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2180,6 +2228,62 @@ test "parseBrackets: parses an array literal followed by a slice" {
     const call = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call;
     const slice = call.arguments[0].value.kind.slice;
     try std.testing.expectEqual(2, slice.value.kind.array_literal.elements.len);
+}
+
+test "parsePointerType: parses a pointer to a single value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: *bool): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const parameter = module.declarations[0].kind.function_definition.signature.parameters[0];
+    const pointer_type = parameter.type.kind.pointer_type;
+    try std.testing.expect(!pointer_type.many);
+    try std.testing.expect(!pointer_type.constant);
+    try std.testing.expectEqualStrings("bool", pointer_type.target.kind.identifier.name);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parameter.type.location);
+}
+
+test "parsePointerType: parses a read-only pointer to multiple values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn show(values: *many const i32): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const parameter = module.declarations[0].kind.function_definition.signature.parameters[0];
+    const pointer_type = parameter.type.kind.pointer_type;
+    try std.testing.expect(pointer_type.many);
+    try std.testing.expect(pointer_type.constant);
+    try std.testing.expectEqualStrings("i32", pointer_type.target.kind.identifier.name);
+}
+
+test "parsePointerType: parses a pointer to a pointer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: **const u8): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const parameter = module.declarations[0].kind.function_definition.signature.parameters[0];
+    const outer = parameter.type.kind.pointer_type;
+    try std.testing.expect(!outer.constant);
+    try std.testing.expect(outer.target.kind.pointer_type.constant);
+}
+
+test "parsePointerType: rejects a pointer without a target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: *): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedType, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 17 }, parser.failure.?.location.?);
 }
 
 test "parseCall: parses nested calls" {

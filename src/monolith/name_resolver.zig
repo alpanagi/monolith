@@ -302,6 +302,7 @@ pub const NameResolver = struct {
             inline .identifier, .path_expression => |name| name.resolution.?,
             .array_type => |array_type| return array_type.value.?,
             .slice_type => |slice_type| return slice_type.value.?,
+            .pointer_type => |pointer_type| return pointer_type.value.?,
             else => return self.fail(expression.location, error.TypeMismatch),
         };
         return switch (resolution) {
@@ -461,7 +462,7 @@ pub const NameResolver = struct {
                 const path = path_expression.path;
                 break :target try self.resolvePath(scope, value.location, path);
             },
-            .array_type, .slice_type => target: {
+            .array_type, .slice_type, .pointer_type => target: {
                 try self.resolveNamesInExpression(scope, value);
                 break :target .{ .type = ast.extractType(value.*) };
             },
@@ -587,6 +588,7 @@ pub const NameResolver = struct {
             },
             .slice_type => |*slice_type| try self.resolveSliceType(scope, slice_type),
             .slice => |slice| try self.resolveSlice(scope, slice.value),
+            .pointer_type => |*pointer_type| try self.resolvePointerType(scope, pointer_type),
             .field_access => |access| try self.resolveNamesInExpression(scope, access.value),
             .@"struct" => unreachable,
         }
@@ -645,6 +647,22 @@ pub const NameResolver = struct {
         if (identifier.resolution.? != .local) return;
         const local = findLocal(scope.locals, identifier.name).?;
         if (local.statement.kind == .variable_declaration) local.use.assigned = true;
+    }
+
+    fn resolvePointerType(
+        self: *NameResolver,
+        scope: Scope,
+        pointer_type: *ast.PointerType,
+    ) ResolveError!void {
+        try self.resolveNamesInExpression(.{ .locals = scope.locals }, pointer_type.target);
+        const target = try self.expectType(pointer_type.target.*);
+        if (target == .void) return self.fail(pointer_type.target.location, error.VoidPointerTarget);
+        const pointer = try self.types.addPointer(self.arena.allocator(), .{
+            .target = target,
+            .many = pointer_type.many,
+            .constant = pointer_type.constant,
+        });
+        pointer_type.value = .{ .pointer = pointer };
     }
 
     fn resolveIdentifier(
@@ -945,7 +963,7 @@ pub const NameResolver = struct {
                 return self.resolvePath(.{}, declaration.location, path_expression.path);
             },
             .integer_literal, .float_literal, .boolean_literal, .character_literal, .string_literal, .undefined => own,
-            .array_type, .slice_type => {
+            .array_type, .slice_type, .pointer_type => {
                 try self.resolveNamesInExpression(.{}, value);
                 return .{ .type = ast.extractType(value.*) };
             },
@@ -990,7 +1008,7 @@ pub const NameResolver = struct {
                 for (literal.elements) |element| try self.expectEvaluable(element);
             },
             .slice => |slice| try self.expectEvaluable(slice.value.*),
-            .array_type, .slice_type => {},
+            .array_type, .slice_type, .pointer_type => {},
             .method_call, .field_access => {
                 return self.fail(expression.location, error.CannotEvaluate);
             },
@@ -1119,6 +1137,7 @@ pub const NameError = error{
     NotAssignable,
     VoidElement,
     VoidSliceElement,
+    VoidPointerTarget,
     NotSliceable,
     MethodIsField,
     UnknownMethod,
@@ -1212,6 +1231,7 @@ fn describeError(name_error: NameError) []const u8 {
         error.NotAssignable => "only variables and their fields can be assigned",
         error.VoidElement => "array elements cannot have type void",
         error.VoidSliceElement => "slice elements cannot have type void",
+        error.VoidPointerTarget => "pointers cannot point to void",
         error.NotSliceable => "only variables, constants, parameters and their fields can be sliced",
         error.MethodIsField => "method has the name of a field",
         error.UnknownMethod => "unknown method",
@@ -1324,6 +1344,9 @@ fn matchesType(value_type: types.Type, expected: types.Type, implemented: types.
             matchesType(value_type.array.element, array.element, implemented),
         .slice => |slice| value_type == .slice and value_type.slice.constant == slice.constant and
             matchesType(value_type.slice.element, slice.element, implemented),
+        .pointer => |pointer| value_type == .pointer and value_type.pointer.many == pointer.many and
+            value_type.pointer.constant == pointer.constant and
+            matchesType(value_type.pointer.target, pointer.target, implemented),
         .number, .boolean, .character, .string, .void, .type, .@"struct" => std.meta.eql(value_type, expected),
     };
 }
@@ -1699,6 +1722,46 @@ test "resolveImplementation: matches Self of the trait with the implemented type
 
     const merge = loader.modules.items[0].declarations[3].kind.function_definition.signature;
     try std.testing.expectEqualStrings("Square", ast.extractType(merge.return_type).@"struct".name);
+}
+
+test "resolveImplementation: matches Self behind a pointer with the implemented type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn grow(self: Self, other: *const Self)\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn grow(self: Self, other: *const Square):\n        _ = self\n        _ = other" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const grow = loader.modules.items[0].declarations[3].kind.function_definition.signature;
+    const pointer = ast.extractType(grow.parameters[1].type).pointer;
+    try std.testing.expectEqualStrings("Square", pointer.target.@"struct".name);
+}
+
+test "resolveImplementation: rejects a pointer of another mutability than the trait" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn grow(self: Self, other: *const Self)\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn grow(self: Self, other: *Square):\n        _ = self\n        _ = other" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MismatchedTraitFunction, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 5 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveImplementation: rejects the implemented type for a Self parameter of a method" {
@@ -3196,6 +3259,70 @@ test "resolveSlice: counts a slice of a field of a variable as an assignment" {
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
     try name_resolver.resolve();
+}
+
+test "resolvePointerType: resolves the target, count and mutability" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(values: *many const u8): _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const parameters = loader.modules.items[0].declarations[0].kind.function_definition.signature.parameters;
+    const pointer = ast.extractType(parameters[0].type).pointer;
+    try std.testing.expect(pointer.many);
+    try std.testing.expect(pointer.constant);
+    try std.testing.expectEqual(types.Type{ .number = .u8 }, pointer.target);
+}
+
+test "resolvePointerType: resolves a pointer type through a constant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Bytes = *many u8\nfn show(bytes: Bytes): _ = bytes" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const parameters = loader.modules.items[0].declarations[1].kind.function_definition.signature.parameters;
+    const pointer = ast.extractType(parameters[0].type).pointer;
+    try std.testing.expect(pointer.many);
+    try std.testing.expectEqual(types.Type{ .number = .u8 }, pointer.target);
+}
+
+test "resolvePointerType: rejects a pointer to void" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(value: *void): _ = value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.VoidPointerTarget, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 17 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveIdentifier: lets a parameter shadow a function" {

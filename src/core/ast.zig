@@ -125,6 +125,7 @@ pub const ExpressionKind = union(enum) {
     array_literal: ArrayLiteral,
     slice_type: SliceType,
     slice: Slice,
+    pointer_type: PointerType,
     field_access: FieldAccess,
     @"struct": Struct,
 };
@@ -205,6 +206,13 @@ pub const Slice = struct {
     value: *Expression,
 };
 
+pub const PointerType = struct {
+    many: bool,
+    constant: bool,
+    target: *Expression,
+    value: ?types.Type = null,
+};
+
 pub const Argument = struct {
     name: ?[]const u8,
     value: Expression,
@@ -235,6 +243,7 @@ pub fn extractType(expression: Expression) types.Type {
         inline .identifier, .path_expression => |name| name.resolution.?.type,
         .array_type => |array_type| array_type.value.?,
         .slice_type => |slice_type| slice_type.value.?,
+        .pointer_type => |pointer_type| pointer_type.value.?,
         else => unreachable,
     };
 }
@@ -373,7 +382,7 @@ pub fn isDiscardedName(name: []const u8) bool {
 pub fn isAlias(constant: ConstantDeclaration) bool {
     return switch (constant.value.kind) {
         inline .identifier, .path_expression => |name| name.resolution == null,
-        .array_type, .slice_type => constant.type == null,
+        .array_type, .slice_type, .pointer_type => constant.type == null,
         else => false,
     };
 }
