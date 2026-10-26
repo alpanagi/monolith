@@ -22,17 +22,16 @@
 - Identifiers are case-sensitive. By convention only types and type constructors start with a capital letter.
 - The single character `_` is reserved and cannot be used as an identifier by the user.
 - The following identifier names are reserved and cannot be used as identifiers by the user:
-    `const`, `external`, `false`, `fn`, `for`, `impl`, `import`, `many`, `noop`, `null`, `return`, `Self`, `struct`, `trait`, `true`, `undefined`, `var`, `void`, `while`
+    `and`, `const`, `external`, `false`, `fn`, `for`, `impl`, `import`, `many`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `trait`, `true`, `undefined`, `var`, `void`, `while`
 
 ## Built-In Types
 
 ### Primitive Types
 
-- Signed integers: `i8`, `i16`, `i32`, `i64`, `i128`, and `isize` which has the target's pointer size.
+- Signed integers: `i8`, `i16`, `i32`, `i64`, `i128`, and `isize` which has the target's pointer size. They use two's complement.
 - Unsigned integers: `u8`, `u16`, `u32`, `u64`, `u128`, and `usize` which has the target's pointer size.
 - Floating point numbers: `f16`, `f32`, `f64`, `f128` as defined for IEEE 754 binary formats.
 - Booleans: `bool` with `true` and `false` as values.
-- Characters: `char`, 4 bytes representing one Unicode scalar value.
 - `void`: represents no result, i.e. the result of a function that returns nothing. It has no size and can be used anywhere a type can.
 
 ### Pointer Types
@@ -40,8 +39,9 @@
 - Monolith supports pointers. A pointer's type is the target type prefixed with `*`, e.g. `*bool`.
 - Pointers either point to a single value or multiple. Pointers to multiple values use the `*many` prefix, e.g. `*many bool`.
 - Read-only pointers are marked `const`, e.g. `*const bool`, `*many const i32`. Values cannot be modified through a read-only pointer.
+- A pointer converts implicitly to a read-only pointer of the same kind, e.g. `*T` to `*const T`. The reverse is a compile-time error.
 - Pointer arithmetic and indexing are supported only for multiple value pointers.
-- Pointers are never allowed to be `null` but can be `undefined` (see Null and Undefined).
+- Pointers are never allowed to be `null` but can be `undefined` (see Undefined).
 - A pointer never holds address 0.
 
 ### Array Types
@@ -57,11 +57,8 @@
 
 - A slice is a multiple value pointer and a `usize` length. Its type is the element type prefixed with `[]`, e.g. `[]i32`.
 - Read-only slices are marked `const`, e.g. `[]const i32`. Values cannot be modified through a read-only slice.
+- A slice converts implicitly to a read-only slice, e.g. `[]T` to `[]const T`. The reverse is a compile-time error.
 - Slices support indexing, starting at 0.
-
-### String Type
-
-- `string` is a read-only slice of `u8` that always holds valid UTF-8.
 
 ### Optional Types
 
@@ -112,14 +109,16 @@
 
 **Character**
 
-- A single Unicode scalar value inside of single quotes, e.g. `'a'`.
-- Characters can be one of the following escapes, `\n`, `\t`, `\\`, `\'`, `\"`, `\r`, `\0`, and `\u{...}`. `\u{...}` takes 1 to 6 hexadecimal digits and must be a Unicode scalar value.
+- A single ASCII character inside of single quotes, e.g. `'a'`.
+- A character literal is an unsuffixed integer literal holding the value of the character, e.g. `'a'` is 97.
+- Characters can be one of the following escapes, `\n`, `\t`, `\\`, `\'`, `\"`, `\r` and `\0`.
 
 ### Array Literals
 
 - Array literals are written as the array type followed by the elements in braces, separated by commas, e.g. `[3]i32{1, 2, 3}`.
 - The type can be left out when it is known from the surrounding code, e.g. `{1, 2, 3}`.
 - `_` takes the length from the literal, e.g. `[_]i32{1, 2, 3}`.
+- A braced literal can initialize a read-only slice when its elements are known at compile time, e.g. `const primes: []const i32 = {2, 3, 5}`.
 - The number of elements must match the array's length. A mismatch is a compile-time error.
 - Array literals can span multiple lines.
 - A comma after the last element is allowed.
@@ -127,6 +126,7 @@
 ### String Literals
 
 - Strings are enclosed in double quotes and are always single-line strings.
+- A string literal is a `[]const u8` holding its text encoded as UTF-8, including `\u{...}` escapes.
 - Strings allow for the following escapes, `\n`, `\t`, `\\`, `\'`, `\"`, `\r`, `\0`, and `\u{...}`. `\u{...}` takes 1 to 6 hexadecimal digits and must be a Unicode scalar value.
 
 ### Tuple Literals
@@ -144,7 +144,7 @@
 
 - `undefined` can be the initial value of a variable of any type whose value isn't known yet.
 - Reading a variable that is `undefined` before any assignment is a compile-time error.
-- Reading memory that is `undefined` is illegal behaviour.
+- Reading memory that is `undefined` is illegal behavior.
 
 ## Variables and Constants
 
@@ -156,3 +156,88 @@
 - Two top-level declarations with the same name in one module are a compile-time error.
 - An unused local constant or variable is a compile-time error.
 - A variable that is never modified is a compile-time error.
+
+## Expressions
+
+### Operator Precedence
+
+- Operators bind in the following order, from strongest to weakest:
+    1. Postfix: calls, indexing `a[i]`, slicing `a[i..j]`, field access `a.b`, dereference `a.*`, optional unwrap `a.?`
+    2. Prefix: `-`, `!`, `~`, `&`
+    3. `*`, `/`, `%`
+    4. `+`, `-`
+    5. `<<`, `>>`
+    6. `&`
+    7. `^`
+    8. `|`
+    9. `orelse`
+    10. `==`, `!=`, `<`, `<=`, `>`, `>=`
+    11. `and`
+    12. `or`
+- Operators on the same level are left-associative. Operands and arguments are evaluated left to right. Comparisons cannot be chained, e.g. `a < b < c` is a compile-time error.
+- Parentheses group an expression.
+
+### Operand Types
+
+- Unless stated otherwise, both operands of a binary operator must have the same type. Numbers of different types are never mixed implicitly.
+- An unsuffixed literal takes its type from the surrounding code. As an operand, it takes the type the operator requires, e.g. `pointer + 1`, otherwise the type of the other operand, e.g. `count + 1`.
+
+### Arithmetic Operators
+
+- `+`, `-`, `*` and `/` work on integers and floats. `%` works on integers.
+- A prefix `-` negates signed integers and floats. Negating an unsigned integer is a compile-time error.
+- Integer division rounds toward zero. `%` gives the remainder of that division, which is either 0 or has the sign of the left operand, e.g. `-7 % 3` is `-1`.
+- The remainder of the most negative value of a signed type divided by `-1` is 0.
+- Integer overflow and division or remainder by zero are illegal behavior. When the operands are known at compile time, they are compile-time errors.
+- Float operations follow IEEE 754, e.g. dividing a nonzero value by zero gives an infinity, and `0.0 / 0.0` gives NaN.
+
+### Comparison Operators
+
+- `==` and `!=` work on numbers, `bool`, pointers, and arrays whose elements support them. Arrays are equal when all their elements are equal. An optional can be compared with `null`.
+- `<`, `<=`, `>` and `>=` work on numbers and multiple value pointers.
+- A comparison gives a `bool`.
+
+### Logical Operators
+
+- `and`, `or` and `!` work on `bool`.
+- `and` and `or` evaluate their right operand only when needed.
+
+### Bitwise Operators
+
+- `&`, `|`, `^` and `~` work on integers.
+- `<<` and `>>` shift the left operand by the right operand, a `usize`.
+- A shift has the type of its left operand. An unsuffixed literal on the left takes its type from the surrounding code, e.g. `const mask: u32 = 1 << n`.
+- Bits shifted out are discarded. Shifting never overflows.
+- `>>` keeps the sign of signed integers.
+
+### Indexing
+
+- `a[i]` gives the element at index `i` of an array, slice, multiple value pointer or tuple. The index is a `usize`.
+- An index outside the length of an array or slice is illegal behavior. An index known at compile time outside an array's length is a compile-time error.
+- A tuple's index must be known at compile time.
+- Indexing a pointer to an array dereferences it automatically.
+
+### Slicing
+
+- `a[i..j]` gives a slice of the elements from index `i` up to, but not including, `j`. Either bound can be left out to start at 0 or end at the length, e.g. `a[..]`.
+- Arrays, slices and multiple value pointers can be sliced. A multiple value pointer needs an end bound.
+- An array can be sliced only if it is a variable, constant, element or field.
+- Slicing a pointer to an array slices the array.
+- Slicing gives a read-only slice if the elements cannot be modified, e.g. a constant array, a read-only slice or a read-only pointer.
+- A bound outside the length, or a start after the end, is illegal behavior.
+
+### Pointer Operations
+
+- `&value` gives a pointer to a variable, constant, element or field. The pointer is read-only if the value cannot be modified.
+- `pointer.*` gives the value a pointer points to.
+- Reading or writing through a pointer to invalid memory, such as a dangling or `undefined` pointer, is illegal behavior.
+- Field access dereferences a pointer automatically, one level only, e.g. `pointer.field`.
+- Adding a `usize` to a multiple value pointer, or subtracting one from it, moves it by that many elements.
+- Pointer arithmetic that gives address 0 is illegal behavior.
+- Subtracting two multiple value pointers of the same type gives the number of elements between them as an `isize`.
+
+### Optional Operations
+
+- `value.?` gives the value inside an optional. If the optional is `null`, it is illegal behavior.
+- `value orelse fallback` gives the value inside an optional, or `fallback` if the optional is `null`. `fallback` is evaluated only when needed.
+- The fallback can itself be an optional, which makes the result an optional.
