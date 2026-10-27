@@ -119,6 +119,7 @@
 - Array literals are written as the array type followed by the elements in braces, separated by commas, e.g. `[3]i32{1, 2, 3}`.
 - The type can be left out when it is known from the surrounding code, e.g. `{1, 2, 3}`.
 - `_` takes the length from the literal, e.g. `[_]i32{1, 2, 3}`.
+- In the written type of a constant or variable, `_` takes the length from the value, e.g. `const primes: [_]i32 = {2, 3, 5}`. A value without a length, such as `undefined`, is a compile-time error.
 - A braced literal can initialize a read-only slice when its elements are known at compile time, e.g. `const primes: []const i32 = {2, 3, 5}`.
 - The number of elements must match the array's length. A mismatch is a compile-time error.
 - Array literals can span multiple lines.
@@ -242,3 +243,37 @@
 - `value.?` gives the value inside an optional. If the optional is `null`, it is illegal behavior.
 - `value orelse fallback` gives the value inside an optional, or `fallback` if the optional is `null`. `fallback` is evaluated only when needed.
 - The fallback can itself be an optional, which makes the result an optional.
+
+## Statements
+
+### Blocks
+
+- A block is a sequence of statements, one per line, indented deeper than the line that opens it. A block of one statement can follow the `:` on the same line, e.g. `fn one() -> u8: return 1`.
+- A block cannot be empty. `noop` is a statement that does nothing, e.g. `while running(): noop`.
+- A name declared in a block can be used from its declaration to the end of the block.
+
+### Calls
+
+- A call can be a statement. A call whose result is not `void` must be used or discarded.
+
+### Discards
+
+- `_ = value` discards a value. The value must be a call or the name of a parameter, local constant or variable.
+- Discarding a call that returns `void`, or a name that is used elsewhere, is a compile-time error.
+
+### Assignments
+
+- `target = value` assigns a value to a variable, or to a field, element or dereference that can be modified.
+- The target is evaluated before the value, e.g. `locate()` runs before `f()` in `locate().x = f()`.
+- `target op= value` is the same as `target = target op value` for `+`, `-`, `*`, `/`, `%`, `&`, `|`, `^`, `<<` and `>>`, except that the target is evaluated once, e.g. `items[next()] += 1` calls `next` once.
+
+### Return
+
+- `return value` ends the function and gives its result. A function without a return type uses `return` without a value.
+- A function with a return type must end with a `return` or an endless loop.
+- Statements after a `return` in the same block are a compile-time error.
+
+### While
+
+- `while condition:` runs its block as long as the condition is true. The condition is a `bool`, evaluated before each run of the block.
+- `while true` is an endless loop.

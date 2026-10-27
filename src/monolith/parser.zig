@@ -14,6 +14,19 @@ const comparison_operators: []const OperatorToken = &.{
     .{ .greater_than_equals, .greater_than_or_equal },
 };
 
+const compound_operators: []const OperatorToken = &.{
+    .{ .plus_equals, .add },
+    .{ .minus_equals, .subtract },
+    .{ .asterisk_equals, .multiply },
+    .{ .slash_equals, .divide },
+    .{ .percent_equals, .remainder },
+    .{ .ampersand_equals, .bitwise_and },
+    .{ .pipe_equals, .bitwise_or },
+    .{ .caret_equals, .bitwise_exclusive_or },
+    .{ .shift_left_equals, .shift_left },
+    .{ .shift_right_equals, .shift_right },
+};
+
 pub const Parser = struct {
     tokens: []const token.Token,
     offset: usize = 0,
@@ -219,6 +232,10 @@ pub const Parser = struct {
         const depth = try self.expectBlock(position, outer);
         var statements: std.ArrayList(ast.Statement) = .empty;
         while (try self.matchBlockLine(&position, depth, outer)) {
+            const count = statements.items.len;
+            if (count > 0 and statements.items[count - 1].kind == .@"return") {
+                return self.fail(position, error.StatementAfterReturn);
+            }
             const statement = (try self.parseStatement(allocator, &position, depth)) orelse {
                 return self.fail(position, error.ExpectedStatement);
             };
@@ -349,7 +366,13 @@ pub const Parser = struct {
     ) ParseError!?ast.Statement {
         var position = offset.*;
         const target = (try self.parseExpression(allocator, &position)) orelse return null;
-        if (self.match(&position, .equals) == null) return null;
+        const operator_token = self.tokens[position];
+        const operator: ?ast.CompoundOperator = if (findOperator(compound_operators, operator_token.kind)) |found|
+            .{ .operator = found, .location = operator_token.location }
+        else
+            null;
+        if (operator == null and operator_token.kind != .equals) return null;
+        position += 1;
         switch (target.kind) {
             .identifier, .field_access, .index, .dereference => {},
             else => return self.fail(offset.*, error.ExpectedTarget),
@@ -359,7 +382,7 @@ pub const Parser = struct {
         };
 
         offset.* = position;
-        const assignment: ast.Assignment = .{ .target = target, .value = value };
+        const assignment: ast.Assignment = .{ .target = target, .operator = operator, .value = value };
         return .{ .kind = .{ .assignment = assignment }, .location = target.location };
     }
 
@@ -1313,6 +1336,7 @@ pub const ParseError = error{
     UnexpectedIndentation,
     InconsistentIndentation,
     ChainedComparison,
+    StatementAfterReturn,
 };
 
 const OperatorToken = struct {
@@ -1394,7 +1418,7 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.ExpectedExpression => "expected an expression",
         error.ExpectedNumber => "expected a number after '-'",
         error.ExpectedCallOrName => "expected a call or a name",
-        error.ExpectedTarget => "expected a name, a field, an element or a dereference before '='",
+        error.ExpectedTarget => "expression cannot be assigned",
         error.ExpectedRightBracket => "expected ']'",
         error.ExpectedLeftBrace => "expected '{'",
         error.ExpectedRightBrace => "expected '}'",
@@ -1406,6 +1430,7 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.UnexpectedIndentation => "unexpected indentation",
         error.InconsistentIndentation => "indentation does not match any outer level",
         error.ChainedComparison => "comparisons cannot be chained, use and",
+        error.StatementAfterReturn => "statement after a return never runs",
     };
 }
 
@@ -1735,6 +1760,54 @@ test "parseIndentedBlock: ends nested blocks at the depth of an enclosing block"
     try std.testing.expect(body[1].kind == .call);
 }
 
+test "parseIndentedBlock: accepts a return as the last statement of a block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    a = 1\n    return\nfn other(): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(2, body.len);
+    try std.testing.expect(body[1].kind == .@"return");
+}
+
+test "parseIndentedBlock: rejects a statement after a return" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    return\n    a = 1");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.StatementAfterReturn, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, parser.failure.?.location.?);
+}
+
+test "parseIndentedBlock: rejects a statement after a return in a loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while true:\n        return\n        a = 1");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.StatementAfterReturn, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 9 }, parser.failure.?.location.?);
+}
+
+test "parseIndentedBlock: accepts a statement after a loop whose inline block returns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while true: return\n    a = 1");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(2, body.len);
+    try std.testing.expect(body[1].kind == .assignment);
+}
+
 test "parseInlineBlock: rejects line that is not a statement" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1988,6 +2061,33 @@ test "parseAssignment: rejects an unwrap as the target" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("fn main(): maybe.? = 1");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedTarget, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, parser.failure.?.location.?);
+}
+
+test "parseAssignment: parses each compound assignment operator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    a += 1\n    a -= 1\n    a *= 1\n    a /= 1\n    a %= 1\n    a &= 1\n    a |= 1\n    a ^= 1\n    a <<= 1\n    a >>= 1\n");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const operators = [_]ast.BinaryOperator{ .add, .subtract, .multiply, .divide, .remainder, .bitwise_and, .bitwise_or, .bitwise_exclusive_or, .shift_left, .shift_right };
+    for (body, operators) |statement, operator| {
+        try std.testing.expectEqual(operator, statement.kind.assignment.operator.?.operator);
+    }
+    try std.testing.expectEqual(token.Location{ .row = 10, .column = 7 }, body[8].kind.assignment.operator.?.location);
+}
+
+test "parseAssignment: rejects a call as the target of a compound assignment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): make() += 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 

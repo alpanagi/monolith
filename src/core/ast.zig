@@ -101,7 +101,13 @@ pub const Use = struct {
 
 pub const Assignment = struct {
     target: Expression,
+    operator: ?CompoundOperator = null,
     value: Expression,
+};
+
+pub const CompoundOperator = struct {
+    operator: BinaryOperator,
+    location: token.Location,
 };
 
 pub const While = struct {

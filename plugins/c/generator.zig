@@ -912,8 +912,18 @@ pub const Generator = struct {
         var steps: std.ArrayList(Step) = .empty;
         for (statements.items) |statement| {
             if (statement.kind == .assignment) {
-                const written = self.hasTarget(statement.kind.assignment.target);
-                try collectTargetSteps(allocator, &steps, statement, written);
+                const assignment = statement.kind.assignment;
+                const written = self.hasTarget(assignment.target);
+                const compound = assignment.operator != null and assignment.target.kind != .identifier;
+                const address: ?types.Type = if (written and compound) address: {
+                    const pointer = try self.program.types.addPointer(allocator, .{
+                        .target = assignment.target.type.?,
+                        .many = false,
+                        .constant = false,
+                    });
+                    break :address .{ .pointer = pointer };
+                } else null;
+                try collectTargetSteps(allocator, &steps, statement, written, address);
             }
             const expression = findStatementExpression(statement) orelse continue;
             try collectScopeSteps(allocator, &steps, statement, expression);
@@ -1031,7 +1041,7 @@ pub const Generator = struct {
             if (step.statement != statement) continue;
             const number = step.temporary orelse continue;
             try self.generateIndentation(writer);
-            try self.generateType(writer, step.expression.type.?);
+            try self.generateType(writer, step.address orelse step.expression.type.?);
             try writer.print(" mn_temporary_{d};\n", .{number});
         }
     }
@@ -1117,9 +1127,48 @@ pub const Generator = struct {
             }
             return writer.writeAll(";\n");
         }
+        if (assignment.operator) |operator| {
+            return self.generateCompoundAssignment(allocator, reached, writer, assignment, operator);
+        }
         try self.generateTarget(allocator, reached, writer, target);
         try writer.writeAll(" = ");
         try self.generateFullValue(allocator, reached, writer, value, target.type.?);
+        try writer.writeAll(";\n");
+    }
+
+    fn generateCompoundAssignment(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        assignment: *const ast.Assignment,
+        operator: ast.CompoundOperator,
+    ) WriteError!void {
+        const target = &assignment.target;
+        const value = &assignment.value;
+        const sequenced = self.sequenced;
+        defer self.sequenced = sequenced;
+        self.sequenced = self.hasSteps(target);
+        if (self.sequenced) {
+            try self.generateSteps(allocator, reached, writer, target);
+            try writer.writeAll(", ");
+        }
+        if (self.findAddressTemporary(target)) |number| {
+            try writer.print("(*mn_temporary_{d})", .{number});
+        } else {
+            try self.generateExpression(allocator, reached, writer, target.*);
+        }
+        try writer.writeAll(" = ");
+        self.sequenced = self.hasSteps(value);
+        if (self.sequenced) {
+            try writer.writeByte('(');
+            try self.generateSteps(allocator, reached, writer, value);
+            try writer.writeAll(", ");
+        }
+        try self.recordPointerTarget(allocator, reached, target.type.?);
+        const operation: Operation = .{ .operator = operator.operator, .left = target, .right = value };
+        try self.generateBinary(allocator, reached, writer, operation);
+        if (self.sequenced) try writer.writeByte(')');
         try writer.writeAll(";\n");
     }
 
@@ -1247,6 +1296,15 @@ pub const Generator = struct {
             if (step.scope != scope) continue;
             if (written) try writer.writeAll(", ");
             if (step.temporary) |number| try writer.print("mn_temporary_{d} = ", .{number});
+            if (step.address == null) {
+                if (self.findAddressTemporary(step.expression)) |number| {
+                    try writer.print("(*mn_temporary_{d})", .{number});
+                    written = true;
+                    continue;
+                }
+            } else {
+                try writer.writeByte('&');
+            }
             try self.generateExpression(allocator, reached, writer, step.expression.*);
             written = true;
         }
@@ -1259,6 +1317,13 @@ pub const Generator = struct {
         return false;
     }
 
+    fn findAddressTemporary(self: *const Generator, expression: *const ast.Expression) ?usize {
+        for (self.steps) |step| {
+            if (step.expression == expression and step.address != null) return step.temporary.?;
+        }
+        return null;
+    }
+
     fn generateOperand(
         self: *Generator,
         allocator: std.mem.Allocator,
@@ -1267,8 +1332,11 @@ pub const Generator = struct {
         expression: *const ast.Expression,
     ) WriteError!void {
         for (self.steps) |step| {
-            if (step.expression != expression) continue;
+            if (step.expression != expression or step.address != null) continue;
             return writer.print("mn_temporary_{d}", .{step.temporary.?});
+        }
+        if (self.findAddressTemporary(expression)) |number| {
+            return writer.print("(*mn_temporary_{d})", .{number});
         }
         try self.generateExpression(allocator, reached, writer, expression.*);
     }
@@ -1387,7 +1455,12 @@ pub const Generator = struct {
                 try self.recordPointerTarget(allocator, reached, binary.left.type.?);
                 try self.recordPointerTarget(allocator, reached, binary.right.type.?);
                 if (binary.operator == .@"orelse") return self.generateOrElse(allocator, reached, writer, expression);
-                try self.generateBinary(allocator, reached, writer, binary);
+                const operation: Operation = .{
+                    .operator = binary.operator,
+                    .left = binary.left,
+                    .right = binary.right,
+                };
+                try self.generateBinary(allocator, reached, writer, operation);
             },
             .unary => |unary| try self.generateUnary(allocator, reached, writer, unary),
             .address_of => |operand| {
@@ -1438,32 +1511,34 @@ pub const Generator = struct {
         allocator: std.mem.Allocator,
         reached: *Reached,
         writer: *std.Io.Writer,
-        binary: ast.Binary,
+        operation: Operation,
     ) WriteError!void {
-        const operand_type = binary.left.type.?;
-        switch (binary.operator) {
+        const operand_type = operation.left.type.?;
+        switch (operation.operator) {
             .@"and", .@"or" => {
                 try writer.writeByte('(');
-                try self.generateOperand(allocator, reached, writer, binary.left);
-                try writer.writeAll(if (binary.operator == .@"and") " && " else " || ");
-                try self.generateFullExpression(allocator, reached, writer, binary.right);
+                try self.generateOperand(allocator, reached, writer, operation.left);
+                try writer.writeAll(if (operation.operator == .@"and") " && " else " || ");
+                try self.generateFullExpression(allocator, reached, writer, operation.right);
                 return writer.writeByte(')');
             },
             .@"orelse" => unreachable,
-            .shift_left => return self.generateHelperCall(allocator, reached, writer, "shift_left", binary),
-            .shift_right => return self.generateHelperCall(allocator, reached, writer, "shift_right", binary),
+            .shift_left => return self.generateHelperCall(allocator, reached, writer, "shift_left", operation),
+            .shift_right => return self.generateHelperCall(allocator, reached, writer, "shift_right", operation),
             .remainder => {
                 if (isSignedInteger(operand_type)) {
-                    return self.generateHelperCall(allocator, reached, writer, "remainder", binary);
+                    return self.generateHelperCall(allocator, reached, writer, "remainder", operation);
                 }
             },
             .equal, .not_equal => {
-                if (ast.isNullComparison(binary)) return self.generateNullComparison(allocator, reached, writer, binary);
-                if (operand_type == .array) return self.generateArrayComparison(allocator, reached, writer, binary);
-                if (hasEqualityHelper(operand_type)) return self.generateEqualityCall(allocator, reached, writer, binary);
+                if (operation.left.kind == .null or operation.right.kind == .null) {
+                    return self.generateNullComparison(allocator, reached, writer, operation);
+                }
+                if (operand_type == .array) return self.generateArrayComparison(allocator, reached, writer, operation);
+                if (hasEqualityHelper(operand_type)) return self.generateEqualityCall(allocator, reached, writer, operation);
             },
             .subtract => {
-                if (binary.right.type.? == .pointer) return self.generatePointerDifference(allocator, reached, writer, binary);
+                if (operation.right.type.? == .pointer) return self.generatePointerDifference(allocator, reached, writer, operation);
             },
             .multiply,
             .divide,
@@ -1477,16 +1552,16 @@ pub const Generator = struct {
             .greater_than_or_equal,
             => {},
         }
-        const promoted = isPromoted(operand_type) and !isComparison(binary.operator);
+        const promoted = isPromoted(operand_type) and !isComparison(operation.operator);
         if (promoted) {
             try writer.writeAll("((");
             try self.generateType(writer, operand_type);
             try writer.writeByte(')');
         }
         try writer.writeByte('(');
-        try self.generateOperand(allocator, reached, writer, binary.left);
-        try writer.print(" {s} ", .{operatorSymbol(binary.operator)});
-        try self.generateOperand(allocator, reached, writer, binary.right);
+        try self.generateOperand(allocator, reached, writer, operation.left);
+        try writer.print(" {s} ", .{operatorSymbol(operation.operator)});
+        try self.generateOperand(allocator, reached, writer, operation.right);
         try writer.writeByte(')');
         if (promoted) try writer.writeByte(')');
     }
@@ -1527,10 +1602,10 @@ pub const Generator = struct {
         allocator: std.mem.Allocator,
         reached: *Reached,
         writer: *std.Io.Writer,
-        binary: ast.Binary,
+        operation: Operation,
     ) WriteError!void {
-        const operand = if (binary.left.kind == .null) binary.right else binary.left;
-        const equal = binary.operator == .equal;
+        const operand = if (operation.left.kind == .null) operation.right else operation.left;
+        const equal = operation.operator == .equal;
         if (isPointerOptional(operand.type.?)) {
             try writer.writeByte('(');
             try self.generateOperand(allocator, reached, writer, operand);
@@ -1547,12 +1622,12 @@ pub const Generator = struct {
         reached: *Reached,
         writer: *std.Io.Writer,
         name: []const u8,
-        binary: ast.Binary,
+        operation: Operation,
     ) WriteError!void {
-        try writer.print("mn_{s}_{t}(", .{ name, binary.left.type.?.number });
-        try self.generateOperand(allocator, reached, writer, binary.left);
+        try writer.print("mn_{s}_{t}(", .{ name, operation.left.type.?.number });
+        try self.generateOperand(allocator, reached, writer, operation.left);
         try writer.writeAll(", ");
-        try self.generateOperand(allocator, reached, writer, binary.right);
+        try self.generateOperand(allocator, reached, writer, operation.right);
         try writer.writeByte(')');
     }
 
@@ -1561,14 +1636,14 @@ pub const Generator = struct {
         allocator: std.mem.Allocator,
         reached: *Reached,
         writer: *std.Io.Writer,
-        binary: ast.Binary,
+        operation: Operation,
     ) WriteError!void {
         try writer.writeAll("((");
         try self.generateType(writer, .{ .number = .isize });
         try writer.writeAll(")(");
-        try self.generateOperand(allocator, reached, writer, binary.left);
+        try self.generateOperand(allocator, reached, writer, operation.left);
         try writer.writeAll(" - ");
-        try self.generateOperand(allocator, reached, writer, binary.right);
+        try self.generateOperand(allocator, reached, writer, operation.right);
         try writer.writeAll("))");
     }
 
@@ -1577,14 +1652,14 @@ pub const Generator = struct {
         allocator: std.mem.Allocator,
         reached: *Reached,
         writer: *std.Io.Writer,
-        binary: ast.Binary,
+        operation: Operation,
     ) WriteError!void {
-        const array_type = binary.left.type.?;
-        const equal = binary.operator == .equal;
+        const array_type = operation.left.type.?;
+        const equal = operation.operator == .equal;
         if (isZeroSized(array_type)) {
             const result = if (equal) "true" else "false";
             var written = false;
-            for ([_]*const ast.Expression{ binary.left, binary.right }) |operand| {
+            for ([_]*const ast.Expression{ operation.left, operation.right }) |operand| {
                 if (self.sequenced or !hasEffects(operand.*)) continue;
                 try writer.writeAll(if (written) ", " else "(");
                 try self.generateEffects(allocator, reached, writer, operand.*);
@@ -1593,7 +1668,7 @@ pub const Generator = struct {
             if (!written) return writer.writeAll(result);
             return writer.print(", {s})", .{result});
         }
-        try self.generateEqualityCall(allocator, reached, writer, binary);
+        try self.generateEqualityCall(allocator, reached, writer, operation);
     }
 
     fn generateEqualityCall(
@@ -1601,15 +1676,15 @@ pub const Generator = struct {
         allocator: std.mem.Allocator,
         reached: *Reached,
         writer: *std.Io.Writer,
-        binary: ast.Binary,
+        operation: Operation,
     ) WriteError!void {
-        const equal = binary.operator == .equal;
+        const equal = operation.operator == .equal;
         if (!equal) try writer.writeAll("(!");
-        try self.generateType(writer, binary.left.type.?);
+        try self.generateType(writer, operation.left.type.?);
         try writer.writeAll("_equal(");
-        try self.generateOperand(allocator, reached, writer, binary.left);
+        try self.generateOperand(allocator, reached, writer, operation.left);
         try writer.writeAll(", ");
-        try self.generateOperand(allocator, reached, writer, binary.right);
+        try self.generateOperand(allocator, reached, writer, operation.right);
         try writer.writeByte(')');
         if (!equal) try writer.writeByte(')');
     }
@@ -2445,11 +2520,18 @@ const Local = struct {
     value: ast.Expression,
 };
 
+const Operation = struct {
+    operator: ast.BinaryOperator,
+    left: *const ast.Expression,
+    right: *const ast.Expression,
+};
+
 const Step = struct {
     expression: *const ast.Expression,
     scope: *const ast.Expression,
     statement: *const ast.Statement,
     temporary: ?usize,
+    address: ?types.Type = null,
 };
 
 fn buildCNames(
@@ -2793,15 +2875,33 @@ fn collectTargetSteps(
     steps: *std.ArrayList(Step),
     statement: *const ast.Statement,
     written: bool,
+    address: ?types.Type,
 ) std.mem.Allocator.Error!void {
     const assignment = &statement.kind.assignment;
     const target = &assignment.target;
-    const ordered = written and try containsUnit(allocator, target) and
-        try containsUnit(allocator, &assignment.value);
-    if (ordered or try needsSequence(allocator, target)) {
-        try collectUnitSteps(allocator, steps, statement, target, target, written);
-    }
+    const value_calls = written and try containsUnit(allocator, &assignment.value);
+    const followed = value_calls and address == null;
+    const ordered = followed and try containsUnit(allocator, target);
+    const sequenced = ordered or try needsSequence(allocator, target) or
+        try containsFollowedRead(allocator, target, followed);
+    if (sequenced) try collectUnitSteps(allocator, steps, statement, target, target, written, followed);
     try collectInnerScopeSteps(allocator, steps, statement, target);
+    if (address) |pointer_type| {
+        try steps.append(allocator, .{
+            .expression = target,
+            .scope = target,
+            .statement = statement,
+            .temporary = countTemporaries(steps.items) + 1,
+            .address = pointer_type,
+        });
+    }
+    if (assignment.operator == null or !value_calls) return;
+    try steps.append(allocator, .{
+        .expression = target,
+        .scope = target,
+        .statement = statement,
+        .temporary = countTemporaries(steps.items) + 1,
+    });
 }
 
 fn findStatementExpression(statement: *const ast.Statement) ?*const ast.Expression {
@@ -2824,7 +2924,7 @@ fn collectScopeSteps(
 ) std.mem.Allocator.Error!void {
     if (try needsSequence(allocator, scope)) {
         const consumed = isUnit(scope.*) or !isZeroSized(scope.type.?);
-        try collectUnitSteps(allocator, steps, statement, scope, scope, consumed);
+        try collectUnitSteps(allocator, steps, statement, scope, scope, consumed, false);
     }
     try collectInnerScopeSteps(allocator, steps, statement, scope);
 }
@@ -2835,6 +2935,7 @@ fn needsSequence(
 ) std.mem.Allocator.Error!bool {
     if (try repeatsUnit(allocator, expression)) return true;
     if (repeatsOptional(expression.*)) return true;
+    if (try containsFollowedRead(allocator, expression, false)) return true;
     var branches: usize = 0;
     for (try collectScopeChildren(allocator, expression)) |child| {
         if (try needsSequence(allocator, child)) return true;
@@ -2876,6 +2977,65 @@ fn containsUnit(
     return false;
 }
 
+fn containsFollowedRead(
+    allocator: std.mem.Allocator,
+    expression: *const ast.Expression,
+    followed: bool,
+) std.mem.Allocator.Error!bool {
+    const children = try collectScopeChildren(allocator, expression);
+    for (children, 0..) |child, index| {
+        const unit = isUnit(child.*);
+        const child_followed = followed or try containsAnyUnit(allocator, children[index + 1 ..]);
+        if (!unit and child_followed and isChangingRead(expression.*, child)) return true;
+        const inner_followed = if (unit) false else child_followed;
+        if (try containsFollowedRead(allocator, child, inner_followed)) return true;
+    }
+    return false;
+}
+
+fn containsAnyUnit(
+    allocator: std.mem.Allocator,
+    expressions: []const *const ast.Expression,
+) std.mem.Allocator.Error!bool {
+    for (expressions) |expression| {
+        if (try containsUnit(allocator, expression)) return true;
+    }
+    return false;
+}
+
+fn isChangingRead(parent: ast.Expression, child: *const ast.Expression) bool {
+    if (isZeroSized(child.type.?) or isPlaceOperand(parent, child)) return false;
+    return isMemoryRead(child.*);
+}
+
+fn isPlaceOperand(parent: ast.Expression, child: *const ast.Expression) bool {
+    return switch (parent.kind) {
+        .address_of, .unwrap => true,
+        .field_access => |access| access.value.type.? != .pointer,
+        .index => |indexing| child == indexing.value and isStorage(indexing.value.type.?),
+        .slice => |slice| child == slice.value and slice.value.type.? == .array,
+        else => false,
+    };
+}
+
+fn isMemoryRead(expression: ast.Expression) bool {
+    return switch (expression.kind) {
+        .identifier => |identifier| switch (identifier.resolution.?) {
+            .local => |statement| statement.kind == .variable_declaration,
+            .parameter, .constant, .function, .type => false,
+        },
+        .field_access => |access| access.value.type.? == .pointer or isMemoryRead(access.value.*),
+        .index => |indexing| !isStorage(indexing.value.type.?) or isMemoryRead(indexing.value.*),
+        .dereference => true,
+        .unwrap => |operand| isMemoryRead(operand.*),
+        else => false,
+    };
+}
+
+fn isStorage(value_type: types.Type) bool {
+    return value_type == .array or value_type == .tuple;
+}
+
 fn collectUnitSteps(
     allocator: std.mem.Allocator,
     steps: *std.ArrayList(Step),
@@ -2883,17 +3043,23 @@ fn collectUnitSteps(
     scope: *const ast.Expression,
     expression: *const ast.Expression,
     consumed: bool,
+    followed: bool,
 ) std.mem.Allocator.Error!void {
     const repeated: ?*const ast.Expression = if (repeatsOptional(expression.*))
         expression.kind.binary.left
     else
         null;
-    for (try collectScopeChildren(allocator, expression)) |child| {
+    const children = try collectScopeChildren(allocator, expression);
+    for (children, 0..) |child, index| {
         const unit = isUnit(child.*);
         const kept = child == repeated;
-        try collectUnitSteps(allocator, steps, statement, scope, child, consumed or unit or kept);
-        if (!unit and !kept) continue;
-        const stored = (consumed or kept) and !isZeroSized(child.type.?);
+        const child_followed = followed or try containsAnyUnit(allocator, children[index + 1 ..]);
+        const read = !unit and child_followed and isChangingRead(expression.*, child);
+        const step = unit or kept or read;
+        const inner_followed = if (step) false else child_followed;
+        try collectUnitSteps(allocator, steps, statement, scope, child, consumed or step, inner_followed);
+        if (!step) continue;
+        const stored = (consumed or kept or read) and !isZeroSized(child.type.?);
         try steps.append(allocator, .{
             .expression = child,
             .scope = scope,
@@ -4735,6 +4901,37 @@ test "generateZeroSizedObject: defines the shared zero-sized object only in the 
     );
 }
 
+test "generateConstantDefinition: declares a constant whose length is taken from another constant with the complete array type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const first: [3]i32 = {1, 2, 3}\nconst second: [_]i32 = first\nfn all() -> [3]i32: return second" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_array_3_i32 mn_array_3_i32;\n\nextern const mn_array_3_i32 mn_main_first;\nextern const mn_array_3_i32 mn_main_second;\n\nmn_array_3_i32 mn_main_all();\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_array_3_i32_defined\n#define mn_array_3_i32_defined\ntypedef struct mn_array_3_i32 {\n    int32_t items[3];\n} mn_array_3_i32;\n#endif\n\nconst mn_array_3_i32 mn_main_first = { .items = { 1, 2, 3 } };\nconst mn_array_3_i32 mn_main_second = { .items = { 1, 2, 3 } };\n\nmn_array_3_i32 mn_main_all() {\n    return mn_main_second;\n}\n",
+        files[1].contents,
+    );
+}
+
 test "recordCalledFunction: includes the header of a function called in a loop" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5951,6 +6148,33 @@ test "generateLocal: initializes a slice from a pointer to an array" {
     );
 }
 
+test "generateLocal: declares a local whose length is taken from a call with the complete array type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn make() -> [4]u8\nfn first() -> u8:\n    const values: [_]u8 = make()\n    return values[0]" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_array_4_u8_defined\n#define mn_array_4_u8_defined\ntypedef struct mn_array_4_u8 {\n    uint8_t items[4];\n} mn_array_4_u8;\n#endif\n\nuint8_t mn_main_first() {\n    const mn_array_4_u8 values = make();\n    return values.items[0u];\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateLocal: declares an undefined variable without a value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6263,6 +6487,168 @@ test "generateAssignment: assigns a read-only pointer to an array as a slice" {
     );
 }
 
+test "generateCompoundAssignment: writes a name as the target and as the left operand" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn update(amount: i32) -> i32:\n    var total = 1i32\n    total += amount\n    total %= 3\n    total <<= 2\n    return total" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_update(int32_t amount) {\n    int32_t total = 1;\n    total = (total + amount);\n    total = mn_remainder_i32(total, 3);\n    total = mn_shift_left_i32(total, 2u);\n    return total;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateCompoundAssignment: casts the result of a type narrower than int back to its type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn update() -> u8:\n    var small = 1u8\n    small += 2\n    return small" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nuint8_t mn_main_update() {\n    uint8_t small = 1u;\n    small = ((uint8_t)(small + 2u));\n    return small;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateCompoundAssignment: evaluates a target with a call once and before the value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn next() -> usize\nexternal fn make() -> i32\nfn update(values: *many i32): values[next()] += make()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nvoid mn_main_update(int32_t * values) {\n    int32_t * mn_temporary_1;\n    int32_t mn_temporary_2;\n    mn_temporary_1 = &values[next()], mn_temporary_2 = (*mn_temporary_1), (*mn_temporary_1) = (mn_temporary_2 + make());\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateCompoundAssignment: reads a variable target before a call in the value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn make() -> i32\nfn total() -> i32:\n    var count = 1i32\n    count += make()\n    return count" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_total() {\n    int32_t count = 1;\n    int32_t mn_temporary_1;\n    mn_temporary_1 = count, count = (mn_temporary_1 + make());\n    return count;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateCompoundAssignment: writes a field through a pointer temporary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn update() -> Point:\n    var point = Point(x = 1)\n    point.x *= 2\n    return point" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nmn_main_Point mn_main_update() {\n    mn_main_Point point = (mn_main_Point){ .x = 1 };\n    int32_t * mn_temporary_1;\n    mn_temporary_1 = &point.x, (*mn_temporary_1) = ((*mn_temporary_1) * 2);\n    return point;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateCompoundAssignment: moves a multiple value pointer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn advance(items: *many i32) -> *many i32:\n    var cursor = items\n    cursor += 2\n    cursor -= 1\n    return cursor" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t * mn_main_advance(int32_t * items) {\n    int32_t * cursor = items;\n    cursor = (cursor + 2u);\n    cursor = (cursor - 1u);\n    return cursor;\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateTargetEffects: runs the calls of a zero-sized target before the value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6561,7 +6947,196 @@ test "generateFullExpression: stores calls in indexes in temporaries" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nint32_t mn_main_sum(mn_slice_i32 values) {\n    size_t mn_temporary_1;\n    size_t mn_temporary_2;\n    return (mn_temporary_1 = first(), mn_temporary_2 = second(), (values.items[mn_temporary_1] + values.items[mn_temporary_2]));\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nint32_t mn_main_sum(mn_slice_i32 values) {\n    size_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    size_t mn_temporary_3;\n    return (mn_temporary_1 = first(), mn_temporary_2 = values.items[mn_temporary_1], mn_temporary_3 = second(), (mn_temporary_2 + values.items[mn_temporary_3]));\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFullExpression: reads a variable before a later call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn make() -> i32\nfn total() -> i32:\n    var count = 1i32\n    count = 2\n    return count + make()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_total() {\n    int32_t count = 1;\n    count = 2;\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    return (mn_temporary_1 = count, mn_temporary_2 = make(), (mn_temporary_1 + mn_temporary_2));\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFullExpression: reads a field of a variable before a later call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nexternal fn make() -> i32\nfn total() -> i32:\n    var point = Point(x = 1)\n    point.x = 2\n    return point.x + make()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_total() {\n    mn_main_Point point = (mn_main_Point){ .x = 1 };\n    point.x = 2;\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    return (mn_temporary_1 = point.x, mn_temporary_2 = make(), (mn_temporary_1 + mn_temporary_2));\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFullExpression: reads through a pointer before a later call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn make() -> i32\nfn total(pointer: *i32) -> i32: return pointer.* + make()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_total(int32_t * pointer) {\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    return (mn_temporary_1 = (*pointer), mn_temporary_2 = make(), (mn_temporary_1 + mn_temporary_2));\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFullExpression: reads an argument before a later argument with a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn make() -> i32\nexternal fn add(one: i32, two: i32) -> i32\nfn total() -> i32:\n    var count = 1i32\n    count = 2\n    return add(count, make())" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_total() {\n    int32_t count = 1;\n    count = 2;\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    return (mn_temporary_1 = count, mn_temporary_2 = make(), add(mn_temporary_1, mn_temporary_2));\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFullExpression: reads an element before a later element with a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn make() -> i32\nfn all() -> [2]i32:\n    var count = 1i32\n    count = 2\n    return [2]i32{count, make()}" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nmn_array_2_i32 mn_main_all() {\n    int32_t count = 1;\n    count = 2;\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    return (mn_temporary_1 = count, mn_temporary_2 = make(), (mn_array_2_i32){ .items = { mn_temporary_1, mn_temporary_2 } });\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFullExpression: reads a field value before a later field value with a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nexternal fn make() -> i32\nfn build() -> Point:\n    var count = 1i32\n    count = 2\n    return Point(x = count, y = make())" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nmn_main_Point mn_main_build() {\n    int32_t count = 1;\n    count = 2;\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    return (mn_temporary_1 = count, mn_temporary_2 = make(), (mn_main_Point){ .x = mn_temporary_1, .y = mn_temporary_2 });\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFullExpression: leaves a parameter and a constant before a later call in place" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn make() -> i32\nconst limit = 5i32\nfn total(value: i32) -> i32: return value + limit + make()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_total(int32_t value) {\n    return ((value + 5) + make());\n}\n",
         files[1].contents,
     );
 }

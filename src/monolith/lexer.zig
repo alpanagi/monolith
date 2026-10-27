@@ -6,6 +6,11 @@ const types = core.types;
 
 const Failure = core.Failure;
 
+const three_character_symbols = std.StaticStringMap(token.TokenKind).initComptime(.{
+    .{ "<<=", .shift_left_equals },
+    .{ ">>=", .shift_right_equals },
+});
+
 const two_character_symbols = std.StaticStringMap(token.TokenKind).initComptime(.{
     .{ "::", .double_colon },
     .{ "..", .dot_dot },
@@ -16,6 +21,14 @@ const two_character_symbols = std.StaticStringMap(token.TokenKind).initComptime(
     .{ "<<", .shift_left },
     .{ ">>", .shift_right },
     .{ "->", .arrow },
+    .{ "+=", .plus_equals },
+    .{ "-=", .minus_equals },
+    .{ "*=", .asterisk_equals },
+    .{ "/=", .slash_equals },
+    .{ "%=", .percent_equals },
+    .{ "&=", .ampersand_equals },
+    .{ "|=", .pipe_equals },
+    .{ "^=", .caret_equals },
 });
 
 pub const Lexer = struct {
@@ -374,6 +387,16 @@ fn lexCharacter(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
 }
 
 fn lexSymbols(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
+    const three_end = @min(state.offset + 3, state.source.len);
+    if (three_character_symbols.get(state.source[state.offset..three_end])) |kind| {
+        try state.tokens.append(allocator, .{
+            .kind = kind,
+            .location = state.location,
+        });
+        state.location.column += 3;
+        state.offset += 3;
+        return true;
+    }
     const end = @min(state.offset + 2, state.source.len);
     if (two_character_symbols.get(state.source[state.offset..end])) |kind| {
         try state.tokens.append(allocator, .{
@@ -1718,6 +1741,50 @@ test "lexSymbols: lexes two greater-than signs as one symbol" {
     try std.testing.expect(lexer.tokens.items[2].kind == .shift_right);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 6 }, lexer.tokens.items[3].location);
     try std.testing.expect(lexer.tokens.items[4].kind == .greater_than);
+}
+
+test "lexSymbols: lexes compound assignment symbols" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("a += b -= c *= d /= e %= f &= g |= h ^= i");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(19, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[2].kind == .plus_equals);
+    try std.testing.expect(lexer.tokens.items[4].kind == .minus_equals);
+    try std.testing.expect(lexer.tokens.items[6].kind == .asterisk_equals);
+    try std.testing.expect(lexer.tokens.items[8].kind == .slash_equals);
+    try std.testing.expect(lexer.tokens.items[10].kind == .percent_equals);
+    try std.testing.expect(lexer.tokens.items[12].kind == .ampersand_equals);
+    try std.testing.expect(lexer.tokens.items[14].kind == .pipe_equals);
+    try std.testing.expect(lexer.tokens.items[16].kind == .caret_equals);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 6 }, lexer.tokens.items[3].location);
+}
+
+test "lexSymbols: lexes two less-than signs and an equals sign as one symbol" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("a <<= b << c <= d");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(9, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[2].kind == .shift_left_equals);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 7 }, lexer.tokens.items[3].location);
+    try std.testing.expect(lexer.tokens.items[4].kind == .shift_left);
+    try std.testing.expect(lexer.tokens.items[6].kind == .less_than_equals);
+}
+
+test "lexSymbols: lexes two greater-than signs and an equals sign as one symbol" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("a >>= b >> c >= d");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(9, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[2].kind == .shift_right_equals);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 7 }, lexer.tokens.items[3].location);
+    try std.testing.expect(lexer.tokens.items[4].kind == .shift_right);
+    try std.testing.expect(lexer.tokens.items[6].kind == .greater_than_equals);
 }
 
 test "lexSymbols: lexes a dot and an asterisk as two symbols" {
