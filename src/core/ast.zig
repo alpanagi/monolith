@@ -337,6 +337,11 @@ pub fn extractType(expression: Expression) types.Type {
     };
 }
 
+pub fn extractDeclaredType(written: ?Expression, value: Expression) types.Type {
+    const written_type = written orelse return value.type.?;
+    return extractType(written_type);
+}
+
 pub fn extractResolution(name: Name) Resolution {
     return switch (name) {
         inline else => |named| named.resolution.?,

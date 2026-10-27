@@ -58,6 +58,7 @@
 - A slice is a multiple value pointer and a `usize` length. Its type is the element type prefixed with `[]`, e.g. `[]i32`.
 - Read-only slices are marked `const`, e.g. `[]const i32`. Values cannot be modified through a read-only slice.
 - A slice converts implicitly to a read-only slice, e.g. `[]T` to `[]const T`. The reverse is a compile-time error.
+- A pointer to an array converts implicitly to a slice, with the length taken from the array type, e.g. `*[4]u8` to `[]u8`. A read-only pointer gives a read-only slice.
 - Slices support indexing, starting at 0.
 
 ### Optional Types
