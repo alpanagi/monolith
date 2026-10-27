@@ -90,6 +90,13 @@ pub const VariableDeclaration = struct {
     name: []const u8,
     type: ?Expression = null,
     value: Expression,
+    deferred_use: ?Use = null,
+};
+
+pub const Use = struct {
+    used: bool = false,
+    modified: bool = false,
+    discard: ?token.Location = null,
 };
 
 pub const Assignment = struct {
@@ -112,7 +119,6 @@ pub const ExpressionKind = union(enum) {
     integer_literal: token.NumberLiteral,
     float_literal: token.NumberLiteral,
     boolean_literal: bool,
-    character_literal: []const u8,
     string_literal: []const u8,
     undefined,
     null,
@@ -121,16 +127,22 @@ pub const ExpressionKind = union(enum) {
     call: Call,
     method_call: MethodCall,
     negation: *Expression,
+    binary: Binary,
+    unary: Unary,
+    address_of: *Expression,
     struct_literal: StructLiteral,
     array_type: ArrayType,
     composite_literal: CompositeLiteral,
     slice_type: SliceType,
+    index: Index,
     slice: Slice,
     pointer_type: PointerType,
     optional_type: OptionalType,
     tuple_type: TupleType,
     function_type: FunctionType,
     field_access: FieldAccess,
+    dereference: *Expression,
+    unwrap: *Expression,
     @"struct": Struct,
 };
 
@@ -186,6 +198,46 @@ pub const Resolution = union(enum) {
     };
 };
 
+pub const Binary = struct {
+    operator: BinaryOperator,
+    operator_location: token.Location,
+    left: *Expression,
+    right: *Expression,
+};
+
+pub const BinaryOperator = enum {
+    multiply,
+    divide,
+    remainder,
+    add,
+    subtract,
+    shift_left,
+    shift_right,
+    bitwise_and,
+    bitwise_exclusive_or,
+    bitwise_or,
+    @"orelse",
+    equal,
+    not_equal,
+    less_than,
+    less_than_or_equal,
+    greater_than,
+    greater_than_or_equal,
+    @"and",
+    @"or",
+};
+
+pub const Unary = struct {
+    operator: UnaryOperator,
+    operand: *Expression,
+};
+
+pub const UnaryOperator = enum {
+    negate,
+    not,
+    bitwise_not,
+};
+
 pub const StructLiteral = struct {
     arguments: []Argument,
 };
@@ -207,8 +259,15 @@ pub const SliceType = struct {
     value: ?types.Type = null,
 };
 
+pub const Index = struct {
+    value: *Expression,
+    index: *Expression,
+};
+
 pub const Slice = struct {
     value: *Expression,
+    start: ?*Expression,
+    end: ?*Expression,
 };
 
 pub const PointerType = struct {
@@ -419,10 +478,92 @@ pub fn isAlias(constant: ConstantDeclaration) bool {
     };
 }
 
+pub fn isNullComparison(binary: Binary) bool {
+    if (binary.operator != .equal and binary.operator != .not_equal) return false;
+    return binary.left.kind == .null or binary.right.kind == .null;
+}
+
 pub fn findArgument(arguments: []const Argument, name: []const u8) ?usize {
     for (arguments, 0..) |argument, index| {
         const argument_name = argument.name orelse continue;
         if (std.mem.eql(u8, argument_name, name)) return index;
     }
     return null;
+}
+
+pub fn findConstantRoot(expression: Expression) ?Resolution.Constant {
+    return switch (expression.kind) {
+        inline .identifier, .path_expression => |name| switch (name.resolution.?) {
+            .constant => |constant| constant,
+            .parameter, .function, .type, .local => null,
+        },
+        .field_access => |access| {
+            if (access.value.type.? == .pointer) return null;
+            return findConstantRoot(access.value.*);
+        },
+        .index => |indexing| switch (indexing.value.type.?) {
+            .array, .tuple => findConstantRoot(indexing.value.*),
+            .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .optional, .function, .implementer => {
+                return null;
+            },
+        },
+        else => null,
+    };
+}
+
+test "findConstantRoot: finds the constant that stores a field or an element" {
+    const constant: Resolution.Constant = .{ .module = 0, .declaration = 1 };
+    const location: token.Location = .{ .row = 1, .column = 1 };
+    const field: types.Field = .{ .name = "elements", .type = .boolean, .location = location };
+    const data_type: types.Type = .{ .@"struct" = .{ .module = 0, .name = "Data", .fields = &.{field} } };
+    const tuple: types.Tuple = .{ .elements = &.{ data_type, data_type } };
+    var data: Expression = .{
+        .kind = .{ .identifier = .{ .name = "data", .resolution = .{ .constant = constant } } },
+        .type = .{ .tuple = &tuple },
+        .location = location,
+    };
+    var position: Expression = .{ .kind = .{ .boolean_literal = true }, .type = .boolean, .location = location };
+    var element: Expression = .{
+        .kind = .{ .index = .{ .value = &data, .index = &position } },
+        .type = data_type,
+        .location = location,
+    };
+    const access: Expression = .{
+        .kind = .{ .field_access = .{ .value = &element, .field = "elements", .field_location = location } },
+        .type = .boolean,
+        .location = location,
+    };
+
+    try std.testing.expectEqual(constant, findConstantRoot(access).?);
+}
+
+test "findConstantRoot: finds nothing behind a pointer or a slice" {
+    const constant: Resolution.Constant = .{ .module = 0, .declaration = 1 };
+    const location: token.Location = .{ .row = 1, .column = 1 };
+    const pointer: types.Pointer = .{ .target = .boolean, .many = true, .constant = true };
+    const slice: types.Slice = .{ .element = .boolean, .constant = true };
+    var through_pointer: Expression = .{
+        .kind = .{ .identifier = .{ .name = "data", .resolution = .{ .constant = constant } } },
+        .type = .{ .pointer = &pointer },
+        .location = location,
+    };
+    var through_slice: Expression = .{
+        .kind = .{ .identifier = .{ .name = "data", .resolution = .{ .constant = constant } } },
+        .type = .{ .slice = &slice },
+        .location = location,
+    };
+    var position: Expression = .{ .kind = .{ .boolean_literal = true }, .type = .boolean, .location = location };
+    const access: Expression = .{
+        .kind = .{ .field_access = .{ .value = &through_pointer, .field = "value", .field_location = location } },
+        .type = .boolean,
+        .location = location,
+    };
+    const element: Expression = .{
+        .kind = .{ .index = .{ .value = &through_slice, .index = &position } },
+        .type = .boolean,
+        .location = location,
+    };
+
+    try std.testing.expectEqual(null, findConstantRoot(access));
+    try std.testing.expectEqual(null, findConstantRoot(element));
 }

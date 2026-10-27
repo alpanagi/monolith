@@ -6,6 +6,18 @@ const types = core.types;
 
 const Failure = core.Failure;
 
+const two_character_symbols = std.StaticStringMap(token.TokenKind).initComptime(.{
+    .{ "::", .double_colon },
+    .{ "..", .dot_dot },
+    .{ "==", .equals_equals },
+    .{ "!=", .exclamation_mark_equals },
+    .{ "<=", .less_than_equals },
+    .{ ">=", .greater_than_equals },
+    .{ "<<", .shift_left },
+    .{ ">>", .shift_right },
+    .{ "->", .arrow },
+});
+
 pub const Lexer = struct {
     source: []const u8,
     offset: usize = 0,
@@ -100,10 +112,12 @@ pub const LexError = error{
     UnexpectedTab,
     UnexpectedTabInString,
     UnexpectedTabInCharacter,
+    NonAsciiCharacter,
     UnexpectedDirectionControl,
     InvalidEscape,
     InvalidUnicodeEscape,
     InvalidScalarValue,
+    UnicodeEscapeInCharacter,
     UnterminatedString,
     UnterminatedCharacter,
     NotOneCharacter,
@@ -118,10 +132,12 @@ fn describeError(lex_error: LexError) []const u8 {
         error.UnexpectedTab => "tabs are not allowed, use spaces",
         error.UnexpectedTabInString => "tabs are not allowed in strings, use \\t",
         error.UnexpectedTabInCharacter => "tabs are not allowed in characters, use \\t",
+        error.NonAsciiCharacter => "characters must be ASCII",
         error.UnexpectedDirectionControl => "Unicode direction control characters are not allowed",
         error.InvalidEscape => "unknown escape sequence",
         error.InvalidUnicodeEscape => "a Unicode escape takes one to six hexadecimal digits in braces",
         error.InvalidScalarValue => "a Unicode escape must be a Unicode scalar value",
+        error.UnicodeEscapeInCharacter => "Unicode escapes are not allowed in characters",
         error.UnterminatedString => "unterminated string",
         error.UnterminatedCharacter => "unterminated character",
         error.NotOneCharacter => "a character literal holds exactly one character",
@@ -305,11 +321,15 @@ fn lexCharacter(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
     const first = state.peek(position) orelse {
         return state.fail(state.offset, error.UnterminatedCharacter);
     };
+    var value = first;
     switch (first) {
         '\'' => return state.fail(state.offset, error.NotOneCharacter),
         '\\' => switch (state.peek(position + 1) orelse 0) {
-            'n', 't', 'r', '0', '\\', '\'', '"' => position += 2,
-            'u' => try consumeUnicodeEscape(state, &position),
+            'n', 't', 'r', '0', '\\', '\'', '"' => |escaped| {
+                value = decodeEscape(escaped);
+                position += 2;
+            },
+            'u' => return state.fail(position, error.UnicodeEscapeInCharacter),
             '\n', '\r', 0 => return state.fail(state.offset, error.UnterminatedCharacter),
             '\t' => return state.fail(position + 1, error.UnexpectedTabInCharacter),
             0x80...0xFF => {
@@ -321,7 +341,11 @@ fn lexCharacter(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
         },
         '\n', '\r' => return state.fail(state.offset, error.UnterminatedCharacter),
         '\t' => return state.fail(position, error.UnexpectedTabInCharacter),
-        0x80...0xFF => try consumeCodePoint(state, &position),
+        0x80...0xFF => {
+            var character = position;
+            try consumeCodePoint(state, &character);
+            return state.fail(position, error.NonAsciiCharacter);
+        },
         else => position += 1,
     }
     if (state.peek(position) != '\'') {
@@ -336,11 +360,12 @@ fn lexCharacter(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
         }
         return state.fail(state.offset, error.UnterminatedCharacter);
     }
-    const text = state.source[state.offset + 1 .. position];
     position += 1;
 
+    const text = try std.fmt.allocPrint(allocator, "{d}", .{value});
+    const literal = token.NumberLiteral{ .text = text, .suffix = null };
     try state.tokens.append(allocator, .{
-        .kind = .{ .character_literal = text },
+        .kind = .{ .integer_literal = literal },
         .location = state.location,
     });
     state.location.column += position - state.offset;
@@ -349,27 +374,10 @@ fn lexCharacter(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
 }
 
 fn lexSymbols(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
-    if (state.source[state.offset] == ':' and state.peek(state.offset + 1) == ':') {
+    const end = @min(state.offset + 2, state.source.len);
+    if (two_character_symbols.get(state.source[state.offset..end])) |kind| {
         try state.tokens.append(allocator, .{
-            .kind = .double_colon,
-            .location = state.location,
-        });
-        state.location.column += 2;
-        state.offset += 2;
-        return true;
-    }
-    if (state.source[state.offset] == '.' and state.peek(state.offset + 1) == '.') {
-        try state.tokens.append(allocator, .{
-            .kind = .dot_dot,
-            .location = state.location,
-        });
-        state.location.column += 2;
-        state.offset += 2;
-        return true;
-    }
-    if (state.source[state.offset] == '-' and state.peek(state.offset + 1) == '>') {
-        try state.tokens.append(allocator, .{
-            .kind = .arrow,
+            .kind = kind,
             .location = state.location,
         });
         state.location.column += 2;
@@ -387,8 +395,18 @@ fn lexSymbols(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
         ',' => .comma,
         '.' => .dot,
         '=' => .equals,
+        '!' => .exclamation_mark,
+        '<' => .less_than,
+        '>' => .greater_than,
+        '+' => .plus,
         '-' => .minus,
         '*' => .asterisk,
+        '/' => .slash,
+        '%' => .percent,
+        '&' => .ampersand,
+        '|' => .pipe,
+        '^' => .caret,
+        '~' => .tilde,
         '?' => .question_mark,
         else => return false,
     };
@@ -446,6 +464,16 @@ fn isFloatSuffix(suffix: ?[]const u8) bool {
     return switch (number) {
         .f16, .f32, .f64, .f128 => true,
         else => false,
+    };
+}
+
+fn decodeEscape(escaped: u8) u8 {
+    return switch (escaped) {
+        'n' => '\n',
+        't' => '\t',
+        'r' => '\r',
+        '0' => 0,
+        else => escaped,
     };
 }
 
@@ -860,6 +888,21 @@ test "lexWord: recognizes return and boolean keywords" {
     try std.testing.expect(lexer.tokens.items[3].kind == .keyword_false);
 }
 
+test "lexWord: recognizes the and, or and orelse keywords" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("and or orelse order android orelsewhere");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(8, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_and);
+    try std.testing.expect(lexer.tokens.items[2].kind == .keyword_or);
+    try std.testing.expect(lexer.tokens.items[3].kind == .keyword_orelse);
+    try std.testing.expectEqualStrings("order", lexer.tokens.items[4].kind.identifier);
+    try std.testing.expectEqualStrings("android", lexer.tokens.items[5].kind.identifier);
+    try std.testing.expectEqualStrings("orelsewhere", lexer.tokens.items[6].kind.identifier);
+}
+
 test "lexWord: recognizes the null keyword" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -885,12 +928,12 @@ test "lexWord: recognizes a lone underscore" {
 test "lexWord: lexes type names as identifiers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("i32 bool string");
+    var lexer = Lexer.init("i32 bool usize");
     try lexer.lex(&arena);
 
     try std.testing.expectEqualStrings("i32", lexer.tokens.items[1].kind.identifier);
     try std.testing.expectEqualStrings("bool", lexer.tokens.items[2].kind.identifier);
-    try std.testing.expectEqualStrings("string", lexer.tokens.items[3].kind.identifier);
+    try std.testing.expectEqualStrings("usize", lexer.tokens.items[3].kind.identifier);
 }
 
 test "lexNumber: lexes an integer literal" {
@@ -1271,56 +1314,61 @@ test "lexString: keeps a number sign as text" {
 test "lexString: keeps the braces of a unicode escape out of the nesting" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("{\"\\u{41}\", '\\u{42}'}\nx");
+    var lexer = Lexer.init("{\"\\u{41}\"}\nx");
     try lexer.lex(&arena);
 
     try std.testing.expectEqualStrings("\\u{41}", lexer.tokens.items[2].kind.string_literal);
-    try std.testing.expectEqualStrings("\\u{42}", lexer.tokens.items[4].kind.character_literal);
-    try std.testing.expect(lexer.tokens.items[5].kind == .right_brace);
-    try std.testing.expectEqual(0, lexer.tokens.items[6].kind.indent);
+    try std.testing.expect(lexer.tokens.items[3].kind == .right_brace);
+    try std.testing.expectEqual(0, lexer.tokens.items[4].kind.indent);
 }
 
-test "lexCharacter: lexes a character literal" {
+test "lexCharacter: lexes a character literal as an unsuffixed integer literal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = Lexer.init("return 'a'");
     try lexer.lex(&arena);
 
     try std.testing.expectEqual(4, lexer.tokens.items.len);
-    try std.testing.expectEqualStrings("a", lexer.tokens.items[2].kind.character_literal);
+    try std.testing.expectEqualStrings("97", lexer.tokens.items[2].kind.integer_literal.text);
+    try std.testing.expectEqual(null, lexer.tokens.items[2].kind.integer_literal.suffix);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 8 }, lexer.tokens.items[2].location);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 11 }, lexer.tokens.items[3].location);
 }
 
-test "lexCharacter: keeps escapes as written" {
+test "lexCharacter: gives an escape the value of the character it stands for" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("'\\'' '\\\"' '\\r' '\\0'");
+    var lexer = Lexer.init("'\\n' '\\t' '\\\\' '\\'' '\\\"' '\\r' '\\0'");
     try lexer.lex(&arena);
 
-    try std.testing.expectEqualStrings("\\'", lexer.tokens.items[1].kind.character_literal);
-    try std.testing.expectEqualStrings("\\\"", lexer.tokens.items[2].kind.character_literal);
-    try std.testing.expectEqualStrings("\\r", lexer.tokens.items[3].kind.character_literal);
-    try std.testing.expectEqualStrings("\\0", lexer.tokens.items[4].kind.character_literal);
+    try std.testing.expectEqualStrings("10", lexer.tokens.items[1].kind.integer_literal.text);
+    try std.testing.expectEqualStrings("9", lexer.tokens.items[2].kind.integer_literal.text);
+    try std.testing.expectEqualStrings("92", lexer.tokens.items[3].kind.integer_literal.text);
+    try std.testing.expectEqualStrings("39", lexer.tokens.items[4].kind.integer_literal.text);
+    try std.testing.expectEqualStrings("34", lexer.tokens.items[5].kind.integer_literal.text);
+    try std.testing.expectEqualStrings("13", lexer.tokens.items[6].kind.integer_literal.text);
+    try std.testing.expectEqualStrings("0", lexer.tokens.items[7].kind.integer_literal.text);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 31 }, lexer.tokens.items[7].location);
 }
 
-test "lexCharacter: keeps a unicode escape as one character" {
+test "lexCharacter: rejects a unicode escape" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("'\\u{1F600}'");
-    try lexer.lex(&arena);
+    var lexer = Lexer.init("x '\\u{41}'");
 
-    try std.testing.expectEqualStrings("\\u{1F600}", lexer.tokens.items[1].kind.character_literal);
+    try std.testing.expectError(error.UnicodeEscapeInCharacter, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 4 }, lexer.failure.?.location.?);
+    try std.testing.expectEqualStrings("Unicode escapes are not allowed in characters", lexer.failure.?.message);
 }
 
-test "lexCharacter: keeps a character of several bytes" {
+test "lexCharacter: rejects a character outside ASCII" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("'\xc3\xa9' x");
-    try lexer.lex(&arena);
+    var lexer = Lexer.init("x '\xc3\xa9'");
 
-    try std.testing.expectEqualStrings("\xc3\xa9", lexer.tokens.items[1].kind.character_literal);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 6 }, lexer.tokens.items[2].location);
+    try std.testing.expectError(error.NonAsciiCharacter, lexer.lex(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 4 }, lexer.failure.?.location.?);
+    try std.testing.expectEqualStrings("characters must be ASCII", lexer.failure.?.message);
 }
 
 test "lexCharacter: rejects an empty character literal" {
@@ -1519,6 +1567,17 @@ test "lexSymbols: lexes a dash without a greater-than sign as a minus" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.tokens.items[2].location);
 }
 
+test "lexSymbols: lexes a dash before a digit as a minus" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("-1");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(4, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[1].kind == .minus);
+    try std.testing.expectEqualStrings("1", lexer.tokens.items[2].kind.integer_literal.text);
+}
+
 test "lexSymbols: lexes an asterisk" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1538,6 +1597,149 @@ test "lexSymbols: lexes a question mark" {
     try std.testing.expect(lexer.tokens.items[1].kind == .question_mark);
     try std.testing.expect(lexer.tokens.items[2].kind == .question_mark);
     try std.testing.expectEqualStrings("i32", lexer.tokens.items[3].kind.identifier);
+}
+
+test "lexSymbols: lexes arithmetic symbols" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("+-*/%");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(7, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[1].kind == .plus);
+    try std.testing.expect(lexer.tokens.items[2].kind == .minus);
+    try std.testing.expect(lexer.tokens.items[3].kind == .asterisk);
+    try std.testing.expect(lexer.tokens.items[4].kind == .slash);
+    try std.testing.expect(lexer.tokens.items[5].kind == .percent);
+}
+
+test "lexSymbols: lexes bitwise symbols" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("&|^~");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(6, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[1].kind == .ampersand);
+    try std.testing.expect(lexer.tokens.items[2].kind == .pipe);
+    try std.testing.expect(lexer.tokens.items[3].kind == .caret);
+    try std.testing.expect(lexer.tokens.items[4].kind == .tilde);
+}
+
+test "lexSymbols: lexes an exclamation mark" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("!done");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .exclamation_mark);
+    try std.testing.expectEqualStrings("done", lexer.tokens.items[2].kind.identifier);
+}
+
+test "lexSymbols: lexes less-than and greater-than signs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("< >");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(4, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[1].kind == .less_than);
+    try std.testing.expect(lexer.tokens.items[2].kind == .greater_than);
+}
+
+test "lexSymbols: lexes two equals signs as one symbol" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("a == b = c");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(7, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[2].kind == .equals_equals);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.tokens.items[2].location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 6 }, lexer.tokens.items[3].location);
+    try std.testing.expect(lexer.tokens.items[4].kind == .equals);
+}
+
+test "lexSymbols: lexes an exclamation mark and an equals sign as one symbol" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("a != !b");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(6, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[2].kind == .exclamation_mark_equals);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.tokens.items[2].location);
+    try std.testing.expect(lexer.tokens.items[3].kind == .exclamation_mark);
+}
+
+test "lexSymbols: lexes a less-than sign and an equals sign as one symbol" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("a <= b < c");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(7, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[2].kind == .less_than_equals);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 6 }, lexer.tokens.items[3].location);
+    try std.testing.expect(lexer.tokens.items[4].kind == .less_than);
+}
+
+test "lexSymbols: lexes a greater-than sign and an equals sign as one symbol" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("a >= b > c");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(7, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[2].kind == .greater_than_equals);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 6 }, lexer.tokens.items[3].location);
+    try std.testing.expect(lexer.tokens.items[4].kind == .greater_than);
+}
+
+test "lexSymbols: lexes two less-than signs as one symbol" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("a << b < c");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(7, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[2].kind == .shift_left);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 6 }, lexer.tokens.items[3].location);
+    try std.testing.expect(lexer.tokens.items[4].kind == .less_than);
+}
+
+test "lexSymbols: lexes two greater-than signs as one symbol" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("a >> b > c");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(7, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[2].kind == .shift_right);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 6 }, lexer.tokens.items[3].location);
+    try std.testing.expect(lexer.tokens.items[4].kind == .greater_than);
+}
+
+test "lexSymbols: lexes a dot and an asterisk as two symbols" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("pointer.*");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(5, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[2].kind == .dot);
+    try std.testing.expect(lexer.tokens.items[3].kind == .asterisk);
+}
+
+test "lexSymbols: lexes a dot and a question mark as two symbols" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("value.?");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(5, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[2].kind == .dot);
+    try std.testing.expect(lexer.tokens.items[3].kind == .question_mark);
 }
 
 test "consumeUnicodeEscape: keeps a unicode escape as written" {

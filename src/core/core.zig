@@ -5,5 +5,6 @@ pub const types = @import("types.zig");
 pub const Failure = @import("failure.zig").Failure;
 
 test {
+    _ = @import("ast.zig");
     _ = @import("types.zig");
 }

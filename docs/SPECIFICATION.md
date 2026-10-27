@@ -193,7 +193,7 @@
 
 ### Comparison Operators
 
-- `==` and `!=` work on numbers, `bool`, pointers, and arrays whose elements support them. Arrays are equal when all their elements are equal. An optional can be compared with `null`.
+- `==` and `!=` work on numbers, `bool`, pointers, arrays whose elements support them, and optionals whose values support them. Arrays are equal when all their elements are equal. Optionals are equal when both are `null` or both hold equal values. An optional can be compared with `null`.
 - `<`, `<=`, `>` and `>=` work on numbers and multiple value pointers.
 - A comparison gives a `bool`.
 

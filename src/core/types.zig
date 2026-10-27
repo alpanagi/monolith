@@ -5,8 +5,6 @@ const token = @import("token.zig");
 pub const Type = union(enum) {
     number: NumberType,
     boolean,
-    character,
-    string,
     void,
     type,
     @"struct": Struct,
@@ -192,14 +190,39 @@ pub const Registry = struct {
 pub fn findBuiltInType(name: []const u8) ?Type {
     if (findNumberType(name)) |number| return .{ .number = number };
     if (std.mem.eql(u8, name, "bool")) return .boolean;
-    if (std.mem.eql(u8, name, "char")) return .character;
-    if (std.mem.eql(u8, name, "string")) return .string;
     if (std.mem.eql(u8, name, "void")) return .void;
     return null;
 }
 
 pub fn findNumberType(name: []const u8) ?NumberType {
     return std.meta.stringToEnum(NumberType, name);
+}
+
+pub fn followPointer(value_type: Type) Type {
+    if (value_type != .pointer) return value_type;
+    return value_type.pointer.target;
+}
+
+pub fn isZeroSized(value_type: Type) bool {
+    switch (value_type) {
+        .@"struct" => |struct_type| {
+            for (struct_type.fields) |field| {
+                if (!isZeroSized(field.type)) return false;
+            }
+            return true;
+        },
+        .array => |array| return array.length == 0 or isZeroSized(array.element),
+        .tuple => |tuple| {
+            for (tuple.elements) |element| {
+                if (!isZeroSized(element)) return false;
+            }
+            return true;
+        },
+        .void => return true,
+        .number, .boolean, .type, .slice, .pointer, .optional, .function, .implementer => {
+            return false;
+        },
+    }
 }
 
 fn isSameElements(one: []const Type, two: []const Type) bool {
@@ -284,10 +307,10 @@ test "Registry.addTuple: gives a tuple type one record for each list of elements
     defer arena.deinit();
     var type_registry: Registry = .{};
 
-    const first = try type_registry.addTuple(arena.allocator(), &.{ .boolean, .character });
-    const second = try type_registry.addTuple(arena.allocator(), &.{ .boolean, .character });
-    const reversed = try type_registry.addTuple(arena.allocator(), &.{ .character, .boolean });
-    const longer = try type_registry.addTuple(arena.allocator(), &.{ .boolean, .character, .boolean });
+    const first = try type_registry.addTuple(arena.allocator(), &.{ .boolean, .void });
+    const second = try type_registry.addTuple(arena.allocator(), &.{ .boolean, .void });
+    const reversed = try type_registry.addTuple(arena.allocator(), &.{ .void, .boolean });
+    const longer = try type_registry.addTuple(arena.allocator(), &.{ .boolean, .void, .boolean });
 
     try std.testing.expectEqual(first, second);
     try std.testing.expect(first != reversed);
@@ -299,22 +322,20 @@ test "Registry.addFunction: gives a function type one record for each signature"
     defer arena.deinit();
     var type_registry: Registry = .{};
 
-    const first = try type_registry.addFunction(arena.allocator(), &.{.boolean}, .character);
-    const second = try type_registry.addFunction(arena.allocator(), &.{.boolean}, .character);
+    const first = try type_registry.addFunction(arena.allocator(), &.{.boolean}, .void);
+    const second = try type_registry.addFunction(arena.allocator(), &.{.boolean}, .void);
     const other_return = try type_registry.addFunction(arena.allocator(), &.{.boolean}, .boolean);
-    const other_parameters = try type_registry.addFunction(arena.allocator(), &.{}, .character);
+    const other_parameters = try type_registry.addFunction(arena.allocator(), &.{}, .void);
 
     try std.testing.expectEqual(first, second);
     try std.testing.expect(first != other_return);
     try std.testing.expect(first != other_parameters);
 }
 
-test "findBuiltInType: finds number types, bool, char, string and void" {
+test "findBuiltInType: finds number types, bool and void" {
     try std.testing.expectEqual(Type{ .number = .u8 }, findBuiltInType("u8").?);
     try std.testing.expectEqual(Type{ .number = .usize }, findBuiltInType("usize").?);
     try std.testing.expectEqual(Type.boolean, findBuiltInType("bool").?);
-    try std.testing.expectEqual(Type.character, findBuiltInType("char").?);
-    try std.testing.expectEqual(Type.string, findBuiltInType("string").?);
     try std.testing.expectEqual(Type.void, findBuiltInType("void").?);
 }
 
@@ -323,9 +344,30 @@ test "findBuiltInType: finds nothing for other names" {
     try std.testing.expectEqual(null, findBuiltInType("String"));
     try std.testing.expectEqual(null, findBuiltInType("Void"));
     try std.testing.expectEqual(null, findBuiltInType("Integer"));
+    try std.testing.expectEqual(null, findBuiltInType("char"));
+    try std.testing.expectEqual(null, findBuiltInType("string"));
 }
 
 test "findNumberType: finds only number types" {
     try std.testing.expectEqual(NumberType.f64, findNumberType("f64").?);
     try std.testing.expectEqual(null, findNumberType("bool"));
+}
+
+test "followPointer: follows a single and a multiple value pointer one level" {
+    const single: Pointer = .{ .target = .boolean, .many = false, .constant = false };
+    const many: Pointer = .{ .target = .boolean, .many = true, .constant = true };
+    const nested: Pointer = .{ .target = .{ .pointer = &single }, .many = false, .constant = false };
+
+    try std.testing.expectEqual(Type.boolean, followPointer(.{ .pointer = &single }));
+    try std.testing.expectEqual(Type.boolean, followPointer(.{ .pointer = &many }));
+    try std.testing.expectEqual(Type{ .pointer = &single }, followPointer(.{ .pointer = &nested }));
+    try std.testing.expectEqual(Type.boolean, followPointer(.boolean));
+}
+
+test "isZeroSized: treats an array of void as zero-sized" {
+    const voids: Array = .{ .length = 3, .element = .void };
+    const numbers: Array = .{ .length = 3, .element = .{ .number = .i32 } };
+
+    try std.testing.expect(isZeroSized(.{ .array = &voids }));
+    try std.testing.expect(!isZeroSized(.{ .array = &numbers }));
 }
