@@ -80,6 +80,18 @@
 - A function type is written like a function signature without parameter names, e.g. `fn(i32, bool) -> i32` (see Functions).
 - A value of a function type points to a function and is never `null`.
 
+## Structs
+
+- A struct is a type with named fields. It is declared with `struct`, its name, and its fields in an indented block, each with a name and a type, e.g. `struct Point:` followed by the fields `x: i32` and `y: i32`.
+- A struct without fields has no block, e.g. `struct Marker`.
+- Structs are declared at the top level of a module.
+- Field names must be unique within a struct.
+- A field can have a default value after `=`, e.g. `count: u32 = 0`. The default must be known at compile time.
+- Two structs with the same fields are different types.
+- A struct cannot hold a value of its own type, directly or through other structs, arrays or tuples. A pointer to its own type is allowed, e.g. `next: ?*Node`.
+- Structs are values. Assigning or passing a struct copies all its fields.
+- `value.field` gives a field of a struct.
+
 ## Literals
 
 ### Primitive Literals
@@ -138,6 +150,14 @@
 - The type can be left out when it is known from the surrounding code, e.g. `{1, true}`.
 - Tuple literals can span multiple lines.
 - A comma after the last element is allowed.
+
+### Struct Literals
+
+- Struct literals are written as the struct type followed by the field values in braces, e.g. `Point{x = 1, y = 2}`.
+- The type can be left out when it is known from the surrounding code, e.g. `{x = 1, y = 2}`.
+- Each value is given with its field name. Values without names are a compile-time error, e.g. `Point{1, 2}`.
+- Every field without a default must be given, and each field at most once, in any order.
+- Struct literals can span multiple lines. A comma after the last field is allowed.
 
 ### Null
 

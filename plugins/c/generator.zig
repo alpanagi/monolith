@@ -1432,10 +1432,8 @@ pub const Generator = struct {
                 const hoists = try self.generateHoistedEffects(allocator, reached, writer, call.arguments);
                 switch (ast.extractResolution(call.callee)) {
                     .function => |function| try self.generateFunctionCall(allocator, reached, writer, call, function),
-                    .type => |value_type| {
-                        try self.generateConstruction(allocator, reached, writer, call.arguments, value_type);
-                    },
                     .parameter, .local, .constant => try self.generateValueCall(allocator, reached, writer, call),
+                    .type => unreachable,
                 }
                 if (hoists) try writer.writeByte(')');
             },
@@ -1468,13 +1466,8 @@ pub const Generator = struct {
                 try writer.writeByte('&');
                 try self.generateOperand(allocator, reached, writer, operand);
             },
-            .struct_literal => |literal| {
-                const hoists = try self.generateHoistedEffects(allocator, reached, writer, literal.arguments);
-                try self.generateConstruction(allocator, reached, writer, literal.arguments, expression.type.?);
-                if (hoists) try writer.writeByte(')');
-            },
             .composite_literal => |literal| {
-                const hoists = try self.generateHoistedElementEffects(allocator, reached, writer, literal.elements);
+                const hoists = try self.generateHoistedEffects(allocator, reached, writer, literal.elements);
                 try writer.writeByte('(');
                 try self.generateType(writer, expression.type.?);
                 try writer.writeByte(')');
@@ -1500,7 +1493,7 @@ pub const Generator = struct {
                 try self.generateBase(allocator, reached, writer, operand);
                 try writer.writeAll(".value");
             },
-            .method_call, .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type, .@"struct" => {
+            .method_call, .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type => {
                 unreachable;
             },
         }
@@ -1968,38 +1961,17 @@ pub const Generator = struct {
         allocator: std.mem.Allocator,
         reached: *Reached,
         writer: *std.Io.Writer,
-        arguments: []const ast.Argument,
+        children: []const ast.Argument,
     ) WriteError!bool {
         if (self.sequenced) return false;
-        const hoists = for (arguments) |argument| {
-            if (isHoisted(argument.value)) break true;
+        const hoists = for (children) |child| {
+            if (isHoisted(child.value)) break true;
         } else false;
         if (!hoists) return false;
         try writer.writeByte('(');
-        for (arguments) |argument| {
-            if (!isHoisted(argument.value)) continue;
-            try self.generateEffects(allocator, reached, writer, argument.value);
-            try writer.writeAll(", ");
-        }
-        return true;
-    }
-
-    fn generateHoistedElementEffects(
-        self: *Generator,
-        allocator: std.mem.Allocator,
-        reached: *Reached,
-        writer: *std.Io.Writer,
-        elements: []const ast.Expression,
-    ) WriteError!bool {
-        if (self.sequenced) return false;
-        const hoists = for (elements) |element| {
-            if (isHoisted(element)) break true;
-        } else false;
-        if (!hoists) return false;
-        try writer.writeByte('(');
-        for (elements) |element| {
-            if (!isHoisted(element)) continue;
-            try self.generateEffects(allocator, reached, writer, element);
+        for (children) |child| {
+            if (!isHoisted(child.value)) continue;
+            try self.generateEffects(allocator, reached, writer, child.value);
             try writer.writeAll(", ");
         }
         return true;
@@ -2068,51 +2040,6 @@ pub const Generator = struct {
         try writer.writeByte(')');
     }
 
-    fn generateConstruction(
-        self: *Generator,
-        allocator: std.mem.Allocator,
-        reached: *Reached,
-        writer: *std.Io.Writer,
-        arguments: []const ast.Argument,
-        value_type: types.Type,
-    ) WriteError!void {
-        try writer.writeByte('(');
-        try self.generateType(writer, value_type);
-        try writer.writeByte(')');
-        try self.generateFields(allocator, reached, writer, arguments, value_type, .expression);
-    }
-
-    fn generateFields(
-        self: *Generator,
-        allocator: std.mem.Allocator,
-        reached: *Reached,
-        writer: *std.Io.Writer,
-        arguments: []const ast.Argument,
-        value_type: types.Type,
-        form: Form,
-    ) WriteError!void {
-        try writer.writeAll("{ ");
-        var written = false;
-        for (arguments) |*argument| {
-            if (isZeroSized(argument.value.type.?)) continue;
-            if (written) try writer.writeAll(", ");
-            try writer.print(".{s} = ", .{argument.name.?});
-            const field_type = findFieldType(value_type.@"struct".fields, argument.name.?);
-            try self.generateConvertedValue(allocator, reached, writer, &argument.value, field_type, form);
-            written = true;
-        }
-        for (value_type.@"struct".fields) |field| {
-            const default = field.default orelse continue;
-            if (ast.findArgument(arguments, field.name) != null) continue;
-            if (isZeroSized(field.type)) continue;
-            if (written) try writer.writeAll(", ");
-            try writer.print(".{s} = ", .{field.name});
-            try self.generateValue(allocator, reached, writer, default, form);
-            written = true;
-        }
-        try writer.writeAll(" }");
-    }
-
     fn generateLiteralElements(
         self: *Generator,
         allocator: std.mem.Allocator,
@@ -2123,8 +2050,40 @@ pub const Generator = struct {
     ) WriteError!void {
         const elements = expression.kind.composite_literal.elements;
         const literal_type = expression.type.?;
+        if (literal_type == .@"struct") return self.generateFields(allocator, reached, writer, elements, literal_type, form);
         if (literal_type == .tuple) return self.generateTupleElements(allocator, reached, writer, elements, literal_type, form);
         try self.generateElements(allocator, reached, writer, elements, literal_type.array.element, form);
+    }
+
+    fn generateFields(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        elements: []const ast.Argument,
+        value_type: types.Type,
+        form: Form,
+    ) WriteError!void {
+        try writer.writeAll("{ ");
+        var written = false;
+        for (elements) |*element| {
+            if (isZeroSized(element.value.type.?)) continue;
+            if (written) try writer.writeAll(", ");
+            try writer.print(".{s} = ", .{element.name.?});
+            const field_type = findFieldType(value_type.@"struct".fields, element.name.?);
+            try self.generateConvertedValue(allocator, reached, writer, &element.value, field_type, form);
+            written = true;
+        }
+        for (value_type.@"struct".fields) |field| {
+            const default = field.default orelse continue;
+            if (ast.findArgument(elements, field.name) != null) continue;
+            if (isZeroSized(field.type)) continue;
+            if (written) try writer.writeAll(", ");
+            try writer.print(".{s} = ", .{field.name});
+            try self.generateValue(allocator, reached, writer, default, form);
+            written = true;
+        }
+        try writer.writeAll(" }");
     }
 
     fn generateElements(
@@ -2132,14 +2091,14 @@ pub const Generator = struct {
         allocator: std.mem.Allocator,
         reached: *Reached,
         writer: *std.Io.Writer,
-        elements: []const ast.Expression,
+        elements: []const ast.Argument,
         element_type: types.Type,
         form: Form,
     ) WriteError!void {
         try writer.writeAll("{ .items = { ");
         for (elements, 0..) |*element, index| {
             if (index > 0) try writer.writeAll(", ");
-            try self.generateConvertedValue(allocator, reached, writer, element, element_type, form);
+            try self.generateConvertedValue(allocator, reached, writer, &element.value, element_type, form);
         }
         try writer.writeAll(" } }");
     }
@@ -2149,17 +2108,17 @@ pub const Generator = struct {
         allocator: std.mem.Allocator,
         reached: *Reached,
         writer: *std.Io.Writer,
-        elements: []const ast.Expression,
+        elements: []const ast.Argument,
         tuple_type: types.Type,
         form: Form,
     ) WriteError!void {
         try writer.writeAll("{ ");
         var written = false;
         for (elements, tuple_type.tuple.elements, 0..) |*element, element_type, index| {
-            if (isZeroSized(element.type.?)) continue;
+            if (isZeroSized(element.value.type.?)) continue;
             if (written) try writer.writeAll(", ");
             try writer.print("._{d} = ", .{index});
-            try self.generateConvertedValue(allocator, reached, writer, element, element_type, form);
+            try self.generateConvertedValue(allocator, reached, writer, &element.value, element_type, form);
             written = true;
         }
         try writer.writeAll(" }");
@@ -2189,18 +2148,13 @@ pub const Generator = struct {
                 const declaration = &declarations[constant.declaration];
                 try self.generateValue(allocator, reached, writer, &declaration.kind.constant_declaration.value, form);
             },
-            .call => |call| {
-                try self.generateFields(allocator, reached, writer, call.arguments, expression.type.?, form);
-            },
-            .struct_literal => |literal| {
-                try self.generateFields(allocator, reached, writer, literal.arguments, expression.type.?, form);
-            },
             .composite_literal => try self.generateLiteralElements(allocator, reached, writer, expression.*, form),
             .null => try self.generateNull(writer, expression.type.?, form),
             .slice => try self.generateSlice(allocator, reached, writer, expression.*, form),
             .binary, .unary => try self.generateExpression(allocator, reached, writer, expression.*),
             .undefined,
             .address_of,
+            .call,
             .method_call,
             .array_type,
             .slice_type,
@@ -2212,7 +2166,6 @@ pub const Generator = struct {
             .field_access,
             .dereference,
             .unwrap,
-            .@"struct",
             => unreachable,
         }
     }
@@ -2359,23 +2312,16 @@ pub const Generator = struct {
         writer: *std.Io.Writer,
         expression: ast.Expression,
     ) WriteError!void {
-        const arguments = switch (expression.kind) {
-            .call => |call| arguments: {
-                if (ast.extractResolution(call.callee) != .type) {
-                    return self.generateExpression(allocator, reached, writer, expression);
-                }
-                break :arguments call.arguments;
-            },
-            .struct_literal => |literal| literal.arguments,
+        switch (expression.kind) {
+            .call => return self.generateExpression(allocator, reached, writer, expression),
             .composite_literal => |literal| {
                 var written = false;
                 for (literal.elements) |element| {
-                    if (!hasEffects(element)) continue;
+                    if (!hasEffects(element.value)) continue;
                     if (written) try writer.writeAll(", ");
-                    try self.generateEffects(allocator, reached, writer, element);
+                    try self.generateEffects(allocator, reached, writer, element.value);
                     written = true;
                 }
-                return;
             },
             .negation => |operand| return self.generateEffects(allocator, reached, writer, operand.*),
             .binary => |binary| {
@@ -2390,7 +2336,6 @@ pub const Generator = struct {
                     try self.generateEffects(allocator, reached, writer, operand.*);
                     written = true;
                 }
-                return;
             },
             .unary => |unary| return self.generateEffects(allocator, reached, writer, unary.operand.*),
             .address_of => |operand| return self.generateEffects(allocator, reached, writer, operand.*),
@@ -2417,15 +2362,7 @@ pub const Generator = struct {
             .optional_type,
             .tuple_type,
             .function_type,
-            .@"struct",
             => unreachable,
-        };
-        var written = false;
-        for (arguments) |argument| {
-            if (!hasEffects(argument.value)) continue;
-            if (written) try writer.writeAll(", ");
-            try self.generateEffects(allocator, reached, writer, argument.value);
-            written = true;
         }
     }
 
@@ -2720,15 +2657,11 @@ fn isHoisted(argument: ast.Expression) bool {
 }
 
 fn hasEffects(expression: ast.Expression) bool {
-    const arguments = switch (expression.kind) {
-        .call => |call| arguments: {
-            if (ast.extractResolution(call.callee) != .type) return true;
-            break :arguments call.arguments;
-        },
-        .struct_literal => |literal| literal.arguments,
+    switch (expression.kind) {
+        .call => return true,
         .composite_literal => |literal| {
             for (literal.elements) |element| {
-                if (hasEffects(element)) return true;
+                if (hasEffects(element.value)) return true;
             }
             return false;
         },
@@ -2762,17 +2695,13 @@ fn hasEffects(expression: ast.Expression) bool {
         .tuple_type,
         .function_type,
         => return false,
-        .method_call, .@"struct" => unreachable,
-    };
-    for (arguments) |argument| {
-        if (hasEffects(argument.value)) return true;
+        .method_call => unreachable,
     }
-    return false;
 }
 
 fn isUnit(expression: ast.Expression) bool {
     return switch (expression.kind) {
-        .call => |call| ast.extractResolution(call.callee) != .type,
+        .call => true,
         .binary => |binary| isShortCircuit(binary.operator) and hasEffects(binary.right.*),
         else => false,
     };
@@ -3092,11 +3021,8 @@ fn collectScopeChildren(
         .call => |call| {
             for (call.arguments) |*argument| try children.append(allocator, &argument.value);
         },
-        .struct_literal => |literal| {
-            for (literal.arguments) |*argument| try children.append(allocator, &argument.value);
-        },
         .composite_literal => |literal| {
-            for (literal.elements) |*element| try children.append(allocator, element);
+            for (literal.elements) |*element| try children.append(allocator, &element.value);
         },
         .binary => |binary| {
             try children.append(allocator, binary.left);
@@ -3131,7 +3057,6 @@ fn collectScopeChildren(
         .optional_type,
         .tuple_type,
         .function_type,
-        .@"struct",
         => {},
     }
     return children.items;
@@ -3855,7 +3780,7 @@ test "generateFiles: includes the headers of the structs that constants build" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Point:\n    x: i32\nconst origin = Point(x = 0)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Point:\n    x: i32\nconst origin = Point{x = 0}" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> i32: return shapes::origin.x" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -4459,7 +4384,7 @@ test "generateConstantDeclarations: declares a stored array constant in the head
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []const u8\nconst cards: [2]Card = {\n    .(question = \"a\"),\n    .(question = \"b\"),\n}\nfn all() -> [2]Card: return cards" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []const u8\nconst cards: [2]Card = {\n    {question = \"a\"},\n    {question = \"b\"},\n}\nfn all() -> [2]Card: return cards" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4690,7 +4615,7 @@ test "generateTupleDefinition: leaves out elements of zero-sized types" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn make() -> (Marker, i32): return {Marker(), 2}" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn make() -> (Marker, i32): return {Marker{}, 2}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4880,7 +4805,7 @@ test "generateZeroSizedObject: defines the shared zero-sized object only in the 
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "other.mn", .data = "struct Marker\nfn locate(marker: Marker) -> *const Marker: return &marker" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): _ = other::locate(other::Marker())" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): _ = other::locate(other::Marker{})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5071,8 +4996,8 @@ test "recordType: includes the headers of the structs that defaults build" {
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "geometry.mn", .data = "struct Size:\n    width: i32" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Options:\n    size: geometry::Size = geometry::Size(width = 1)\nfn draw(options: Options): _ = options" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): shapes::draw(shapes::Options())" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Options:\n    size: geometry::Size = geometry::Size{width = 1}\nfn draw(options: Options): _ = options" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): shapes::draw(shapes::Options{})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5978,7 +5903,7 @@ test "generateLocal: writes only the calls of a zero-sized constant" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn make() -> Marker: return Marker()\nfn use(marker: Marker): _ = marker\nfn main():\n    const marker = make()\n    use(marker)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn make() -> Marker: return Marker{}\nfn use(marker: Marker): _ = marker\nfn main():\n    const marker = make()\n    use(marker)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -6011,7 +5936,7 @@ test "generateLocal: writes only the calls of void constants and variables" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn work(): noop\nfn keep(value: void, number: i32) -> i32:\n    _ = value\n    return number\nstruct Box:\n    nothing: void\n    number: i32\nfn main():\n    const result = work()\n    var other: void = undefined\n    other = work()\n    _ = keep(result, 1)\n    _ = keep(other, 2)\n    const box = Box(nothing = result, number = 3)\n    _ = keep(box.nothing, box.number)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn work(): noop\nfn keep(value: void, number: i32) -> i32:\n    _ = value\n    return number\nstruct Box:\n    nothing: void\n    number: i32\nfn main():\n    const result = work()\n    var other: void = undefined\n    other = work()\n    _ = keep(result, 1)\n    _ = keep(other, 2)\n    const box = Box{nothing = result, number = 3}\n    _ = keep(box.nothing, box.number)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -6323,7 +6248,7 @@ test "generateAssignment: assigns a field" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nfn show() -> Point:\n    var point = Point(x = 1, y = 2)\n    point.x = 3\n    return point" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nfn show() -> Point:\n    var point = Point{x = 1, y = 2}\n    point.x = 3\n    return point" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -6389,7 +6314,7 @@ test "generateAssignment: assigns a nested field" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nstruct Line:\n    start: Point\nfn show() -> Line:\n    var line = Line(start = Point(x = 1))\n    line.start.x = 2\n    return line" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nstruct Line:\n    start: Point\nfn show() -> Line:\n    var line = Line{start = Point{x = 1}}\n    line.start.x = 2\n    return line" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -6605,7 +6530,7 @@ test "generateCompoundAssignment: writes a field through a pointer temporary" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn update() -> Point:\n    var point = Point(x = 1)\n    point.x *= 2\n    return point" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn update() -> Point:\n    var point = Point{x = 1}\n    point.x *= 2\n    return point" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -6989,7 +6914,7 @@ test "generateFullExpression: reads a field of a variable before a later call" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nexternal fn make() -> i32\nfn total() -> i32:\n    var point = Point(x = 1)\n    point.x = 2\n    return point.x + make()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nexternal fn make() -> i32\nfn total() -> i32:\n    var point = Point{x = 1}\n    point.x = 2\n    return point.x + make()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7097,7 +7022,7 @@ test "generateFullExpression: reads a field value before a later field value wit
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nexternal fn make() -> i32\nfn build() -> Point:\n    var count = 1i32\n    count = 2\n    return Point(x = count, y = make())" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nexternal fn make() -> i32\nfn build() -> Point:\n    var count = 1i32\n    count = 2\n    return Point{x = count, y = make()}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7110,6 +7035,33 @@ test "generateFullExpression: reads a field value before a later field value wit
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\nmn_main_Point mn_main_build() {\n    int32_t count = 1;\n    count = 2;\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    return (mn_temporary_1 = count, mn_temporary_2 = make(), (mn_main_Point){ .x = mn_temporary_1, .y = mn_temporary_2 });\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFullExpression: stores calls in field values in temporaries in written order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Data:\n    one: i32\n    two: i32\nexternal fn one() -> i32\nexternal fn two() -> i32\nfn make() -> Data: return {two = two(), one = one()}" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nmn_main_Data mn_main_make() {\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    return (mn_temporary_1 = two(), mn_temporary_2 = one(), (mn_main_Data){ .two = mn_temporary_1, .one = mn_temporary_2 });\n}\n",
         files[1].contents,
     );
 }
@@ -7670,7 +7622,7 @@ test "generateExpression: takes the address of a variable, an element and a fiel
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nexternal fn keep(value: *i32)\nfn main():\n    var value = 1i32\n    var values = [2]i32{1, 2}\n    var point = Point(x = 1)\n    var pair = (i32, bool){1, true}\n    keep(&value)\n    keep(&values[1])\n    keep(&point.x)\n    keep(&pair[0])" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nexternal fn keep(value: *i32)\nfn main():\n    var value = 1i32\n    var values = [2]i32{1, 2}\n    var point = Point{x = 1}\n    var pair = (i32, bool){1, true}\n    keep(&value)\n    keep(&values[1])\n    keep(&point.x)\n    keep(&pair[0])" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7838,7 +7790,7 @@ test "generateExpression: writes a struct literal as a compound literal" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32 = 0\nfn draw(point: Point) -> i32: return point.x\nfn main(): _ = draw(.(x = 1))" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32 = 0\nfn draw(point: Point) -> i32: return point.x\nfn main(): _ = draw({x = 1})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7871,7 +7823,7 @@ test "generateExpression: writes a struct literal in a field default" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nstruct Line:\n    start: Point = .(x = 0)\nfn make() -> Line: return Line()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nstruct Line:\n    start: Point = {x = 0}\nfn make() -> Line: return Line{}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7904,7 +7856,7 @@ test "generateExpression: writes a struct literal in an assignment" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn make() -> Point:\n    var point = Point(x = 1)\n    point = .(x = 2)\n    return point" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn make() -> Point:\n    var point = Point{x = 1}\n    point = {x = 2}\n    return point" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7937,7 +7889,7 @@ test "generateExpression: moves zero-sized calls out of a struct literal" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nstruct Holder:\n    marker: Marker\n    value: i32\nfn mark() -> Marker: return Marker()\nfn make() -> Holder: return .(marker = mark(), value = 1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nstruct Holder:\n    marker: Marker\n    value: i32\nfn mark() -> Marker: return Marker{}\nfn make() -> Holder: return {marker = mark(), value = 1}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7970,7 +7922,7 @@ test "generateExpression: leaves out a struct literal of a zero-sized struct" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn use(marker: Marker): _ = marker\nfn main(): use(.())" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn use(marker: Marker): _ = marker\nfn main(): use({})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8520,6 +8472,33 @@ test "generateOrElse: runs the calls of a zero-sized fallback only without a val
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\n#ifndef mn_optional_main_Marker_defined\n#define mn_optional_main_Marker_defined\ntypedef struct mn_optional_main_Marker {\n    bool present;\n} mn_optional_main_Marker;\n#endif\n\nvoid mn_main_run(mn_optional_main_Marker maybe) {\n    (void)(maybe.present ? (void)0 : (void)(make()));\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateOrElse: writes an untyped struct literal fallback as a compound literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Data:\n    value: i32\nfn make(data: ?Data) -> Data: return data orelse {value = 0}" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_optional_main_Data_defined\n#define mn_optional_main_Data_defined\ntypedef struct mn_optional_main_Data {\n    mn_main_Data value;\n    bool present;\n} mn_optional_main_Data;\n#endif\n\nmn_main_Data mn_main_make(mn_optional_main_Data data) {\n    return (data.present ? data.value : (mn_main_Data){ .value = 0 });\n}\n",
         files[1].contents,
     );
 }
@@ -9293,7 +9272,7 @@ test "generateSlice: writes only the length of a zero-sized array" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn take(markers: []const Marker): _ = markers\nfn main():\n    const markers = [2]Marker{Marker(), Marker()}\n    take(markers[..])" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn take(markers: []const Marker): _ = markers\nfn main():\n    const markers = [2]Marker{Marker{}, Marker{}}\n    take(markers[..])" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9617,7 +9596,7 @@ test "generateConstant: writes the name of a stored constant" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nstruct Line:\n    start: Point\n    end: Point\nconst origin = Point(x = 0, y = 0)\nfn make() -> Line: return Line(start = origin, end = origin)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nstruct Line:\n    start: Point\n    end: Point\nconst origin = Point{x = 0, y = 0}\nfn make() -> Line: return Line{start = origin, end = origin}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9650,7 +9629,7 @@ test "generateConstant: stores a struct literal in a constant with a written typ
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nconst origin: Point = .(x = 0)\nfn make() -> Point: return origin" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nconst origin: Point = {x = 0}\nfn make() -> Point: return origin" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9683,7 +9662,7 @@ test "generateConstant: stores an array constant" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []const u8\nconst cards: [2]Card = {\n    .(question = \"a\"),\n    .(question = \"b\"),\n}\nfn all() -> [2]Card: return cards" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []const u8\nconst cards: [2]Card = {\n    {question = \"a\"},\n    {question = \"b\"},\n}\nfn all() -> [2]Card: return cards" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9716,7 +9695,7 @@ test "generateConstant: stores an array constant with a length to infer" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []const u8\nconst cards: [_]Card = {\n    .(question = \"a\"),\n    .(question = \"b\"),\n}\nfn all() -> [2]Card: return cards" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []const u8\nconst cards: [_]Card = {\n    {question = \"a\"},\n    {question = \"b\"},\n}\nfn all() -> [2]Card: return cards" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9836,7 +9815,7 @@ test "generateFunctionCall: leaves out a zero-sized receiver" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker:\n    fn go(self: Self): _ = self\nfn main(): Marker().go()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker:\n    fn go(self: Self): _ = self\nfn main(): Marker{}.go()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9869,7 +9848,7 @@ test "generateValueCall: calls through the function pointer" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn first(value: i32, _: Marker) -> i32: return value\nfn apply(callback: fn(i32, Marker) -> i32) -> i32: return callback(1, Marker())\nfn main():\n    const step: fn(i32, Marker) -> i32 = first\n    _ = step(2, Marker())\n    _ = apply(first)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn first(value: i32, _: Marker) -> i32: return value\nfn apply(callback: fn(i32, Marker) -> i32) -> i32: return callback(1, Marker{})\nfn main():\n    const step: fn(i32, Marker) -> i32 = first\n    _ = step(2, Marker{})\n    _ = apply(first)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9941,7 +9920,7 @@ test "generateValueCall: calls through a constant of another module" {
     );
 }
 
-test "generateConstruction: writes a compound literal for each struct" {
+test "generateValueCall: writes an untyped struct literal argument as a compound literal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -9951,7 +9930,34 @@ test "generateConstruction: writes a compound literal for each struct" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nstruct Line:\n    start: Point\n    end: Point\nfn make() -> Line: return Line(start = Point(x = 0, y = 0), end = Point(y = 2, x = 1))" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Data:\n    value: i32\nfn apply(callback: fn(Data) -> i32) -> i32: return callback({value = 1})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_apply(typeof(int32_t (*)(struct mn_main_Data)) callback) {\n    return callback((mn_main_Data){ .value = 1 });\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFields: writes a compound literal for each struct" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nstruct Line:\n    start: Point\n    end: Point\nfn make() -> Line: return Line{start = Point{x = 0, y = 0}, end = Point{y = 2, x = 1}}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9968,7 +9974,7 @@ test "generateConstruction: writes a compound literal for each struct" {
     );
 }
 
-test "generateConstruction: leaves out zero-sized fields" {
+test "generateFields: leaves out zero-sized fields" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -9978,7 +9984,7 @@ test "generateConstruction: leaves out zero-sized fields" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nstruct Holder:\n    marker: Marker\n    value: i32\nstruct Wrapper:\n    marker: Marker\nfn make() -> Holder: return Holder(marker = Marker(), value = 1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nstruct Holder:\n    marker: Marker\n    value: i32\nstruct Wrapper:\n    marker: Marker\nfn make() -> Holder: return Holder{marker = Marker{}, value = 1}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9995,7 +10001,7 @@ test "generateConstruction: leaves out zero-sized fields" {
     );
 }
 
-test "generateConstruction: writes the defaults of left out fields" {
+test "generateFields: writes the defaults of left out fields" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -10005,7 +10011,7 @@ test "generateConstruction: writes the defaults of left out fields" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32 = 0\n    y: i32 = 7\nfn make() -> Point: return Point(y = 1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32 = 0\n    y: i32 = 7\nfn make() -> Point: return Point{y = 1}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10022,6 +10028,60 @@ test "generateConstruction: writes the defaults of left out fields" {
     );
 }
 
+test "generateFields: writes every default for empty braces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Data:\n    one: i32 = 0\n    two: i32 = 7\nfn make() -> Data: return {}" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nmn_main_Data mn_main_make() {\n    return (mn_main_Data){ .one = 0, .two = 7 };\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFields: writes a compound literal for a field value without a type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct DataOne:\n    one: i32\n    two: i32\nstruct DataTwo:\n    one: DataOne\n    two: DataOne\nfn make() -> DataTwo: return DataTwo{two = DataOne{one = 3, two = 4}, one = {two = 2, one = 1}}" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nmn_main_DataTwo mn_main_make() {\n    return (mn_main_DataTwo){ .two = (mn_main_DataOne){ .one = 3, .two = 4 }, .one = (mn_main_DataOne){ .two = 2, .one = 1 } };\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateFields: converts a pointer to an array in a field to a slice" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -10032,7 +10092,7 @@ test "generateFields: converts a pointer to an array in a field to a slice" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Data:\n    bytes: []u8\nfn wrap(buffer: *[4]u8) -> Data: return Data(bytes = buffer)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Data:\n    bytes: []u8\nfn wrap(buffer: *[4]u8) -> Data: return Data{bytes = buffer}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10092,7 +10152,7 @@ test "generateValue: writes a slice in a stored constant" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const values = [2]i32{1, 2}\nstruct Box:\n    items: []const i32\nconst box = Box(items = values[..])\nfn show() -> Box: return box" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const values = [2]i32{1, 2}\nstruct Box:\n    items: []const i32\nconst box = Box{items = values[..]}\nfn show() -> Box: return box" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10119,7 +10179,7 @@ test "generateValue: writes a slice with bounds in a stored constant" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const values: [3]i32 = {1, 2, 3}\nstruct Holder:\n    items: []const i32\nconst holder: Holder = Holder(items = values[1..2])\nfn read() -> Holder: return holder" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const values: [3]i32 = {1, 2, 3}\nstruct Holder:\n    items: []const i32\nconst holder: Holder = Holder{items = values[1..2]}\nfn read() -> Holder: return holder" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10431,7 +10491,7 @@ test "generateEffects: runs the calls in a zero-sized construction" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nstruct Holder:\n    marker: Marker\n    value: i32\nstruct Wrapper:\n    marker: Marker\nfn mark() -> Marker: return Marker()\nfn use(wrapper: Wrapper, value: i32):\n    _ = wrapper\n    _ = value\nfn main():\n    use(Wrapper(marker = mark()), 1)\n    use(Wrapper(marker = Marker()), 2)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nstruct Holder:\n    marker: Marker\n    value: i32\nstruct Wrapper:\n    marker: Marker\nfn mark() -> Marker: return Marker{}\nfn use(wrapper: Wrapper, value: i32):\n    _ = wrapper\n    _ = value\nfn main():\n    use(Wrapper{marker = mark()}, 1)\n    use(Wrapper{marker = Marker{}}, 2)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);

@@ -65,7 +65,9 @@ pub const ConstantDeclaration = struct {
 
 pub const StructDefinition = struct {
     name: []const u8,
-    body: Struct,
+    fields: []Field,
+    value: ?types.Type = null,
+    resolving: bool = false,
 };
 
 pub const TraitDefinition = struct {
@@ -136,7 +138,6 @@ pub const ExpressionKind = union(enum) {
     binary: Binary,
     unary: Unary,
     address_of: *Expression,
-    struct_literal: StructLiteral,
     array_type: ArrayType,
     composite_literal: CompositeLiteral,
     slice_type: SliceType,
@@ -149,7 +150,6 @@ pub const ExpressionKind = union(enum) {
     field_access: FieldAccess,
     dereference: *Expression,
     unwrap: *Expression,
-    @"struct": Struct,
 };
 
 pub const Call = struct {
@@ -244,10 +244,6 @@ pub const UnaryOperator = enum {
     bitwise_not,
 };
 
-pub const StructLiteral = struct {
-    arguments: []Argument,
-};
-
 pub const ArrayType = struct {
     length: ?*Expression,
     element: *Expression,
@@ -256,7 +252,7 @@ pub const ArrayType = struct {
 
 pub const CompositeLiteral = struct {
     type: ?*Expression,
-    elements: []Expression,
+    elements: []Argument,
 };
 
 pub const SliceType = struct {
@@ -309,12 +305,6 @@ pub const FieldAccess = struct {
     value: *Expression,
     field: []const u8,
     field_location: token.Location,
-};
-
-pub const Struct = struct {
-    fields: []Field,
-    value: ?types.Type = null,
-    resolving: bool = false,
 };
 
 pub const TypedName = struct {
