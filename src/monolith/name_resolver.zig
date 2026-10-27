@@ -319,10 +319,12 @@ pub const NameResolver = struct {
         const parameter_uses = try allocator.alloc(ast.Use, parameters.len);
         @memset(parameter_uses, .{});
         var locals: std.ArrayList(Local) = .empty;
+        var loops: std.ArrayList(Loop) = .empty;
         const block: Block = .{
             .parameters = parameters,
             .parameter_uses = parameter_uses,
             .locals = &locals,
+            .loops = &loops,
         };
         try self.resolveNamesInBlock(block, function.body);
         for (parameters, parameter_uses) |parameter, use| {
@@ -408,12 +410,56 @@ pub const NameResolver = struct {
                     recordReadVariable(scope, findStorageRoot(assignment.target));
                 }
             },
+            .@"if" => |*conditional| {
+                try self.resolveNamesInExpression(scope, &conditional.condition);
+                try self.resolveNamesInBlock(block, conditional.body);
+                if (conditional.else_body) |else_body| try self.resolveNamesInBlock(block, else_body);
+            },
             .@"while" => |*loop| {
                 try self.resolveNamesInExpression(scope, &loop.condition);
-                try self.resolveNamesInBlock(block, loop.body);
+                try self.resolveLoop(block, statement);
+                if (loop.else_body) |else_body| try self.resolveNamesInBlock(block, else_body);
+            },
+            .@"break" => |*jump| {
+                jump.loop = try self.resolveJump(block, statement.location, jump.label, error.BreakOutsideLoop);
+            },
+            .@"continue" => |*jump| {
+                jump.loop = try self.resolveJump(block, statement.location, jump.label, error.ContinueOutsideLoop);
             },
         }
         return null;
+    }
+
+    fn resolveLoop(self: *NameResolver, block: Block, statement: *ast.Statement) ResolveError!void {
+        const loop = statement.kind.@"while";
+        if (loop.label) |label| {
+            const module = self.loader.modules.items[self.module_index];
+            if (isReservedName(module.path, label)) return self.fail(statement.location, error.ReservedName);
+            if (findLoop(block.loops.items, label) != null) {
+                return self.fail(statement.location, error.DuplicateLabel);
+            }
+        }
+        try block.loops.append(self.arena.allocator(), .{ .statement = statement });
+        try self.resolveNamesInBlock(block, loop.body);
+        const resolved = block.loops.pop().?;
+        if (loop.label != null and !resolved.label_used) {
+            return self.fail(statement.location, error.UnusedLabel);
+        }
+    }
+
+    fn resolveJump(
+        self: *NameResolver,
+        block: Block,
+        location: token.Location,
+        label: ?[]const u8,
+        outside_error: NameError,
+    ) NameError!*const ast.Statement {
+        const loops = block.loops.items;
+        if (loops.len == 0) return self.fail(location, outside_error);
+        const name = label orelse return loops[loops.len - 1].statement;
+        const loop = findLoop(loops, name) orelse return self.fail(location, error.UnknownLabel);
+        loop.label_used = true;
+        return loop.statement;
     }
 
     fn resolveLocalConstant(
@@ -756,9 +802,17 @@ pub const NameResolver = struct {
             },
             .local => |statement| switch (statement.kind) {
                 .constant_declaration => |constant| constant,
-                .noop, .@"return", .discard, .call, .variable_declaration, .assignment, .@"while" => {
-                    return self.fail(expression.location, error.InvalidLength);
-                },
+                .noop,
+                .@"return",
+                .discard,
+                .call,
+                .variable_declaration,
+                .assignment,
+                .@"if",
+                .@"while",
+                .@"break",
+                .@"continue",
+                => return self.fail(expression.location, error.InvalidLength),
             },
             .parameter, .function, .type => return self.fail(expression.location, error.InvalidLength),
         };
@@ -1392,6 +1446,11 @@ pub const NameError = error{
     FunctionWithoutPointer,
     ManyFunctionPointer,
     ConstantFunctionPointer,
+    DuplicateLabel,
+    UnusedLabel,
+    UnknownLabel,
+    BreakOutsideLoop,
+    ContinueOutsideLoop,
 };
 
 const ValueForm = enum {
@@ -1410,6 +1469,7 @@ const Block = struct {
     parameters: []const ast.TypedName,
     parameter_uses: []ast.Use,
     locals: *std.ArrayList(Local),
+    loops: *std.ArrayList(Loop),
 };
 
 const Scope = struct {
@@ -1425,6 +1485,11 @@ const Local = struct {
     location: token.Location,
     use: ast.Use = .{},
     deferred: bool = false,
+};
+
+const Loop = struct {
+    statement: *const ast.Statement,
+    label_used: bool = false,
 };
 
 const Target = union(enum) {
@@ -1482,6 +1547,11 @@ fn describeError(name_error: NameError) []const u8 {
         error.FunctionWithoutPointer => "function types need a pointer",
         error.ManyFunctionPointer => "functions need a single value pointer",
         error.ConstantFunctionPointer => "function pointers cannot be const",
+        error.DuplicateLabel => "label is already used by an enclosing loop",
+        error.UnusedLabel => "label is unused",
+        error.UnknownLabel => "label does not name an enclosing loop",
+        error.BreakOutsideLoop => "break outside a loop",
+        error.ContinueOutsideLoop => "continue outside a loop",
     };
 }
 
@@ -1747,6 +1817,14 @@ fn findStorageRoot(expression: ast.Expression) ast.Expression {
         .index => |indexing| findStorageRoot(indexing.value.*),
         else => expression,
     };
+}
+
+fn findLoop(loops: []Loop, label: []const u8) ?*Loop {
+    for (loops) |*loop| {
+        const loop_label = loop.statement.kind.@"while".label orelse continue;
+        if (std.mem.eql(u8, loop_label, label)) return loop;
+    }
+    return null;
 }
 
 fn findLocal(locals: []Local, name: []const u8) ?*Local {
@@ -3398,6 +3476,287 @@ test "resolveNamesInStatement: counts a compound assignment to a field as a use"
 
     const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
     try std.testing.expect(body[0].kind.variable_declaration.deferred_use.?.used);
+}
+
+test "resolveNamesInStatement: resolves the names in the blocks of an if" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn main():\n    const one = 1i32\n    if true:\n        take(one)\n    else:\n        take(one)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
+    const conditional = body[1].kind.@"if";
+    const first = conditional.body[0].kind.call.kind.call.arguments[0].value.kind.identifier;
+    try std.testing.expectEqual(&body[0], first.resolution.?.local);
+    const second = conditional.else_body.?[0].kind.call.kind.call.arguments[0].value.kind.identifier;
+    try std.testing.expectEqual(&body[0], second.resolution.?.local);
+}
+
+test "resolveNamesInStatement: rejects an unused local constant in an else block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    if true: noop\n    else: const unused = 1i32" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnusedLocalConstant, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 11 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveNamesInStatement: counts an assignment in one branch of an if as a modification" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn main():\n    var count = 0i32\n    if true: count = 1\n    take(count)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    try std.testing.expectEqual(null, name_resolver.failure);
+}
+
+test "resolveNamesInStatement: resolves the names in the else block of a loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn main():\n    const one = 1i32\n    while false: noop\n    else: take(one)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
+    const argument = body[1].kind.@"while".else_body.?[0].kind.call.kind.call.arguments[0].value.kind.identifier;
+    try std.testing.expectEqual(&body[0], argument.resolution.?.local);
+}
+
+test "resolveNamesInStatement: resolves a break to the innermost loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    while true:\n        while false: break\n        break" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    const outer = body[0].kind.@"while";
+    try std.testing.expectEqual(&outer.body[0], outer.body[0].kind.@"while".body[0].kind.@"break".loop.?);
+    try std.testing.expectEqual(&body[0], outer.body[1].kind.@"break".loop.?);
+}
+
+test "resolveNamesInStatement: resolves a break in the else block of a loop to the enclosing loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    while true:\n        while false: noop\n        else: break" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    const inner = body[0].kind.@"while".body[0].kind.@"while";
+    try std.testing.expectEqual(&body[0], inner.else_body.?[0].kind.@"break".loop.?);
+}
+
+test "resolveLoop: resolves a labeled break and continue to the labeled loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    outer: while true:\n        while false: continue outer\n        break outer" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    const outer = body[0].kind.@"while";
+    try std.testing.expectEqual(&body[0], outer.body[0].kind.@"while".body[0].kind.@"continue".loop.?);
+    try std.testing.expectEqual(&body[0], outer.body[1].kind.@"break".loop.?);
+}
+
+test "resolveLoop: rejects a label that repeats the label of an enclosing loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    outer: while true:\n        outer: while false: break outer\n        break outer" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.DuplicateLabel, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 9 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveLoop: accepts a label that repeats the label of a loop that does not enclose it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    outer: while false: break outer\n    else:\n        outer: while false: break outer\n    outer: while false: break outer" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    try std.testing.expectEqual(null, name_resolver.failure);
+}
+
+test "resolveLoop: rejects an unused label" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    outer: while false: break" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnusedLabel, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveLoop: rejects a reserved label" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    Self: while false: break Self" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ReservedName, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveJump: rejects a break outside a loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): break" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.BreakOutsideLoop, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveJump: rejects a continue in the else block of a loop without an enclosing loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    while false: noop\n    else: continue" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ContinueOutsideLoop, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 11 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveJump: rejects a label that does not name an enclosing loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    outer: while false: break outer\n    while false: break outer" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownLabel, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 18 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveLocalConstant: rejects a reserved name" {

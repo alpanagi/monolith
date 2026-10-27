@@ -53,7 +53,10 @@ pub const StatementKind = union(enum) {
     constant_declaration: ConstantDeclaration,
     variable_declaration: VariableDeclaration,
     assignment: Assignment,
+    @"if": If,
     @"while": While,
+    @"break": Jump,
+    @"continue": Jump,
 };
 
 pub const ConstantDeclaration = struct {
@@ -112,9 +115,22 @@ pub const CompoundOperator = struct {
     location: token.Location,
 };
 
-pub const While = struct {
+pub const If = struct {
     condition: Expression,
     body: []Statement,
+    else_body: ?[]Statement = null,
+};
+
+pub const While = struct {
+    label: ?[]const u8 = null,
+    condition: Expression,
+    body: []Statement,
+    else_body: ?[]Statement = null,
+};
+
+pub const Jump = struct {
+    label: ?[]const u8 = null,
+    loop: ?*const Statement = null,
 };
 
 pub const Expression = struct {
@@ -465,6 +481,23 @@ fn findOwnFunction(module: Module, receiver: types.Type, name: []const u8) ?usiz
     return null;
 }
 
+pub fn extractBlocks(statement: Statement) [2][]const Statement {
+    return switch (statement.kind) {
+        .@"if" => |conditional| .{ conditional.body, conditional.else_body orelse &.{} },
+        .@"while" => |loop| .{ loop.body, loop.else_body orelse &.{} },
+        .noop,
+        .@"return",
+        .discard,
+        .call,
+        .constant_declaration,
+        .variable_declaration,
+        .assignment,
+        .@"break",
+        .@"continue",
+        => .{ &.{}, &.{} },
+    };
+}
+
 pub fn isDiscardedName(name: []const u8) bool {
     return std.mem.eql(u8, name, "_");
 }
@@ -510,6 +543,40 @@ pub fn findConstantRoot(expression: Expression) ?Resolution.Constant {
         },
         else => null,
     };
+}
+
+test "extractBlocks: finds the body and the else block of a loop" {
+    const location: token.Location = .{ .row = 1, .column = 1 };
+    var body = [_]Statement{.{ .kind = .noop, .location = location }};
+    var else_body = [_]Statement{ .{ .kind = .noop, .location = location }, .{ .kind = .noop, .location = location } };
+    const loop: Statement = .{
+        .kind = .{ .@"while" = .{
+            .condition = .{ .kind = .{ .boolean_literal = true }, .location = location },
+            .body = &body,
+            .else_body = &else_body,
+        } },
+        .location = location,
+    };
+
+    const blocks = extractBlocks(loop);
+    try std.testing.expectEqual(@as([]const Statement, &body), blocks[0]);
+    try std.testing.expectEqual(@as([]const Statement, &else_body), blocks[1]);
+}
+
+test "extractBlocks: finds an empty else block for an if without one" {
+    const location: token.Location = .{ .row = 1, .column = 1 };
+    var body = [_]Statement{.{ .kind = .noop, .location = location }};
+    const conditional: Statement = .{
+        .kind = .{ .@"if" = .{
+            .condition = .{ .kind = .{ .boolean_literal = true }, .location = location },
+            .body = &body,
+        } },
+        .location = location,
+    };
+
+    const blocks = extractBlocks(conditional);
+    try std.testing.expectEqual(@as([]const Statement, &body), blocks[0]);
+    try std.testing.expectEqual(0, blocks[1].len);
 }
 
 test "findConstantRoot: finds the constant that stores a field or an element" {

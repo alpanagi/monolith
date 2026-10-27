@@ -232,10 +232,6 @@ pub const Parser = struct {
         const depth = try self.expectBlock(position, outer);
         var statements: std.ArrayList(ast.Statement) = .empty;
         while (try self.matchBlockLine(&position, depth, outer)) {
-            const count = statements.items.len;
-            if (count > 0 and statements.items[count - 1].kind == .@"return") {
-                return self.fail(position, error.StatementAfterReturn);
-            }
             const statement = (try self.parseStatement(allocator, &position, depth)) orelse {
                 return self.fail(position, error.ExpectedStatement);
             };
@@ -269,7 +265,10 @@ pub const Parser = struct {
             return .{ .kind = .noop, .location = location };
         }
         if (try self.parseReturn(allocator, offset)) |statement| return statement;
-        if (try self.parseWhile(allocator, offset, depth)) |statement| return statement;
+        const else_depth: ?usize = if (self.tokens[offset.* - 1].kind == .indent) depth else null;
+        if (try self.parseIf(allocator, offset, depth, else_depth)) |statement| return statement;
+        if (try self.parseWhile(allocator, offset, depth, else_depth)) |statement| return statement;
+        if (self.parseJump(offset)) |statement| return statement;
         if (try self.parseDiscard(allocator, offset)) |statement| return statement;
         if (try self.parseConstantDeclaration(allocator, offset)) |constant| {
             return .{ .kind = .{ .constant_declaration = constant }, .location = location };
@@ -300,23 +299,105 @@ pub const Parser = struct {
         return .{ .kind = .{ .@"return" = value }, .location = keyword.location };
     }
 
-    fn parseWhile(
+    fn parseIf(
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
         depth: usize,
+        else_depth: ?usize,
     ) ParseError!?ast.Statement {
         var position = offset.*;
-        const keyword = self.match(&position, .keyword_while) orelse return null;
+        const keyword = self.match(&position, .keyword_if) orelse return null;
         const condition = (try self.parseExpression(allocator, &position)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
         _ = try self.expect(&position, .colon, error.ExpectedColon);
         const body = try self.parseBlock(allocator, &position, depth);
+        var else_body: ?[]ast.Statement = null;
+        if (self.matchElse(&position, else_depth)) {
+            if (try self.parseIf(allocator, &position, depth, else_depth)) |chained| {
+                else_body = try allocator.dupe(ast.Statement, &.{chained});
+            } else {
+                else_body = try self.parseElseBlock(allocator, &position, depth);
+            }
+        }
 
         offset.* = position;
-        const loop: ast.While = .{ .condition = condition, .body = body };
-        return .{ .kind = .{ .@"while" = loop }, .location = keyword.location };
+        const conditional: ast.If = .{ .condition = condition, .body = body, .else_body = else_body };
+        return .{ .kind = .{ .@"if" = conditional }, .location = keyword.location };
+    }
+
+    fn parseWhile(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        depth: usize,
+        else_depth: ?usize,
+    ) ParseError!?ast.Statement {
+        var position = offset.*;
+        const location = self.tokens[position].location;
+        const label = self.parseLabel(&position);
+        if (self.match(&position, .keyword_while) == null) return null;
+        const condition = (try self.parseExpression(allocator, &position)) orelse {
+            return self.fail(position, error.ExpectedExpression);
+        };
+        _ = try self.expect(&position, .colon, error.ExpectedColon);
+        const body = try self.parseBlock(allocator, &position, depth);
+        var else_body: ?[]ast.Statement = null;
+        if (self.matchElse(&position, else_depth)) {
+            else_body = try self.parseElseBlock(allocator, &position, depth);
+        }
+
+        offset.* = position;
+        const loop: ast.While = .{
+            .label = label,
+            .condition = condition,
+            .body = body,
+            .else_body = else_body,
+        };
+        return .{ .kind = .{ .@"while" = loop }, .location = location };
+    }
+
+    fn parseLabel(self: *Parser, offset: *usize) ?[]const u8 {
+        const name = self.tokens[offset.*];
+        if (name.kind != .identifier or self.tokens[offset.* + 1].kind != .colon) return null;
+        offset.* += 2;
+        return name.kind.identifier;
+    }
+
+    fn matchElse(self: *Parser, offset: *usize, else_depth: ?usize) bool {
+        const depth = else_depth orelse return false;
+        const indentation = self.tokens[offset.*];
+        if (indentation.kind != .indent or indentation.kind.indent != depth) return false;
+        if (self.tokens[offset.* + 1].kind != .keyword_else) return false;
+        offset.* += 2;
+        return true;
+    }
+
+    fn parseElseBlock(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        depth: usize,
+    ) ParseError![]ast.Statement {
+        _ = try self.expect(offset, .colon, error.ExpectedColon);
+        return self.parseBlock(allocator, offset, depth);
+    }
+
+    fn parseJump(self: *Parser, offset: *usize) ?ast.Statement {
+        var position = offset.*;
+        const keyword = self.tokens[position];
+        if (keyword.kind != .keyword_break and keyword.kind != .keyword_continue) return null;
+        position += 1;
+        const name = self.match(&position, .identifier);
+        const jump: ast.Jump = .{ .label = if (name) |label| label.kind.identifier else null };
+
+        offset.* = position;
+        const kind: ast.StatementKind = if (keyword.kind == .keyword_break)
+            .{ .@"break" = jump }
+        else
+            .{ .@"continue" = jump };
+        return .{ .kind = kind, .location = keyword.location };
     }
 
     fn parseDiscard(
@@ -1293,7 +1374,6 @@ pub const ParseError = error{
     UnexpectedIndentation,
     InconsistentIndentation,
     ChainedComparison,
-    StatementAfterReturn,
 };
 
 const OperatorToken = struct {
@@ -1388,7 +1468,6 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.UnexpectedIndentation => "unexpected indentation",
         error.InconsistentIndentation => "indentation does not match any outer level",
         error.ChainedComparison => "comparisons cannot be chained, use and",
-        error.StatementAfterReturn => "statement after a return never runs",
     };
 }
 
@@ -1731,28 +1810,6 @@ test "parseIndentedBlock: accepts a return as the last statement of a block" {
     try std.testing.expect(body[1].kind == .@"return");
 }
 
-test "parseIndentedBlock: rejects a statement after a return" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    return\n    a = 1");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.StatementAfterReturn, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, parser.failure.?.location.?);
-}
-
-test "parseIndentedBlock: rejects a statement after a return in a loop" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while true:\n        return\n        a = 1");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.StatementAfterReturn, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 4, .column = 9 }, parser.failure.?.location.?);
-}
-
 test "parseIndentedBlock: accepts a statement after a loop whose inline block returns" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1830,6 +1887,84 @@ test "parseReturn: rejects return followed by a non-expression" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
 }
 
+test "parseIf: parses a condition and a body without an else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    if ready:\n        step()\n    done()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(2, body.len);
+    const conditional = body[0].kind.@"if";
+    try std.testing.expectEqualStrings("ready", conditional.condition.kind.identifier.name);
+    try std.testing.expectEqual(1, conditional.body.len);
+    try std.testing.expectEqual(null, conditional.else_body);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, body[0].location);
+    try std.testing.expect(body[1].kind == .call);
+}
+
+test "parseIf: parses an else block on the line after the body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    if ready:\n        step()\n    else:\n        wait()\n        stop()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(1, body.len);
+    const conditional = body[0].kind.@"if";
+    try std.testing.expectEqual(1, conditional.body.len);
+    try std.testing.expectEqual(2, conditional.else_body.?.len);
+}
+
+test "parseIf: parses an else if chain" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    if one:\n        first()\n    else if two:\n        second()\n    else:\n        third()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(1, body.len);
+    const else_body = body[0].kind.@"if".else_body.?;
+    try std.testing.expectEqual(1, else_body.len);
+    const chained = else_body[0].kind.@"if";
+    try std.testing.expectEqualStrings("two", chained.condition.kind.identifier.name);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 10 }, else_body[0].location);
+    try std.testing.expectEqual(1, chained.else_body.?.len);
+    try std.testing.expectEqualStrings("third", chained.else_body.?[0].kind.call.kind.call.callee.identifier.name);
+}
+
+test "parseIf: parses an else after an inline body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    if ready: step()\n    else: wait()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(1, body.len);
+    const conditional = body[0].kind.@"if";
+    try std.testing.expectEqual(1, conditional.body.len);
+    try std.testing.expectEqualStrings("wait", conditional.else_body.?[0].kind.call.kind.call.callee.identifier.name);
+}
+
+test "parseIf: rejects a missing colon" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): if ready step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedColon, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 21 }, parser.failure.?.location.?);
+}
+
 test "parseWhile: parses a condition and an indented body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1867,6 +2002,110 @@ test "parseWhile: rejects a missing colon" {
 
     try std.testing.expectError(error.ExpectedColon, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, parser.failure.?.location.?);
+}
+
+test "parseWhile: parses a label before the loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    outer: while running: step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const statement = module.declarations[0].kind.function_definition.body[0];
+    const loop = statement.kind.@"while";
+    try std.testing.expectEqualStrings("outer", loop.label.?);
+    try std.testing.expectEqualStrings("running", loop.condition.kind.identifier.name);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, statement.location);
+}
+
+test "parseWhile: parses an else block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while running:\n        step()\n    else:\n        stop()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(1, body.len);
+    const loop = body[0].kind.@"while";
+    try std.testing.expectEqual(null, loop.label);
+    try std.testing.expectEqualStrings("stop", loop.else_body.?[0].kind.call.kind.call.callee.identifier.name);
+}
+
+test "parseWhile: rejects an else if" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while running: step()\n    else if done: stop()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedColon, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 10 }, parser.failure.?.location.?);
+}
+
+test "parseLabel: rejects a label before a statement that is not a loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    outer: noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedStatement, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, parser.failure.?.location.?);
+}
+
+test "matchElse: leaves an else at the indentation of an enclosing statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while running:\n        if ready: step()\n    else: stop()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const loop = module.declarations[0].kind.function_definition.body[0].kind.@"while";
+    try std.testing.expectEqual(null, loop.body[0].kind.@"if".else_body);
+    try std.testing.expectEqual(1, loop.else_body.?.len);
+}
+
+test "matchElse: leaves an else after a statement that does not start its line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): if ready: step()\nelse: stop()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.UnexpectedToken, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
+}
+
+test "parseElseBlock: rejects an else without a colon" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    if ready: step()\n    else stop()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedColon, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 10 }, parser.failure.?.location.?);
+}
+
+test "parseJump: parses break and continue with and without a label" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    outer: while running:\n        break\n        break outer\n        continue\n        continue outer");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body[0].kind.@"while".body;
+    try std.testing.expectEqual(4, body.len);
+    try std.testing.expectEqual(null, body[0].kind.@"break".label);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 9 }, body[0].location);
+    try std.testing.expectEqualStrings("outer", body[1].kind.@"break".label.?);
+    try std.testing.expectEqual(null, body[2].kind.@"continue".label);
+    try std.testing.expectEqualStrings("outer", body[3].kind.@"continue".label.?);
 }
 
 test "parseDiscard: parses a discarded call" {

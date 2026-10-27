@@ -22,7 +22,7 @@
 - Identifiers are case-sensitive. By convention only types and type constructors start with a capital letter.
 - The single character `_` is reserved and cannot be used as an identifier by the user.
 - The following identifier names are reserved and cannot be used as identifiers by the user:
-    `and`, `const`, `external`, `false`, `fn`, `for`, `impl`, `import`, `many`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `trait`, `true`, `undefined`, `var`, `void`, `while`
+    `and`, `break`, `const`, `continue`, `else`, `external`, `false`, `fn`, `for`, `if`, `impl`, `import`, `many`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `trait`, `true`, `undefined`, `var`, `void`, `while`
 
 ## Built-In Types
 
@@ -166,7 +166,7 @@
 ### Undefined
 
 - `undefined` can be the initial value of a variable of any type whose value isn't known yet.
-- Reading a variable that is `undefined` before any assignment is a compile-time error.
+- Reading a variable on a path where it has not been assigned is a compile-time error.
 - Reading memory that is `undefined` is illegal behavior.
 
 ## Variables and Constants
@@ -273,6 +273,7 @@
 - A block is a sequence of statements, one per line, indented deeper than the line that opens it. A block of one statement can follow the `:` on the same line, e.g. `fn one() -> u8: return 1`.
 - A block cannot be empty. `noop` is a statement that does nothing, e.g. `while running(): noop`.
 - A name declared in a block can be used from its declaration to the end of the block.
+- A statement that can never run is a compile-time error, e.g. one after a `return`.
 
 ### Calls
 
@@ -292,13 +293,22 @@
 ### Return
 
 - `return value` ends the function and gives its result. A function without a return type uses `return` without a value.
-- A function with a return type must end with a `return` or an endless loop.
-- Statements after a `return` in the same block are a compile-time error.
+- Every path through a function with a return type must end with a `return`. A path that never ends, such as an endless loop, needs none.
+
+### If
+
+- `if condition:` runs its block when the condition is true. The condition is a `bool`.
+- `else:` runs its block when the condition is false. It is on the line after the `if` block, at the same indentation as `if`.
+- `else if condition:` checks another condition when the previous ones are false, e.g. `if a:` followed by `else if b:` and `else:`.
 
 ### While
 
 - `while condition:` runs its block as long as the condition is true. The condition is a `bool`, evaluated before each run of the block.
-- `while true` is an endless loop.
+- `else:` runs its block when the condition is false, but not when the loop is left with `break` or `return`. It is on the line after the `while` block, at the same indentation as `while`. Its block is not part of the loop, so `break` and `continue` in it act on an enclosing loop.
+- `break` leaves the innermost loop. `continue` ends the current run of its block and evaluates the condition again.
+- A loop can have a label before `while`, e.g. `outer: while running:`. `break outer` and `continue outer` act on that loop instead of the innermost one.
+- A label cannot repeat the label of an enclosing loop. An unused label is a compile-time error.
+- `break` and `continue` outside a loop are a compile-time error.
 
 ## Functions
 

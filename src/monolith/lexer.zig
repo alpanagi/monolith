@@ -926,6 +926,21 @@ test "lexWord: recognizes the and, or and orelse keywords" {
     try std.testing.expectEqualStrings("orelsewhere", lexer.tokens.items[6].kind.identifier);
 }
 
+test "lexWord: recognizes the control flow keywords" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("if else while break continue iffy");
+    try lexer.lex(&arena);
+
+    try std.testing.expectEqual(8, lexer.tokens.items.len);
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_if);
+    try std.testing.expect(lexer.tokens.items[2].kind == .keyword_else);
+    try std.testing.expect(lexer.tokens.items[3].kind == .keyword_while);
+    try std.testing.expect(lexer.tokens.items[4].kind == .keyword_break);
+    try std.testing.expect(lexer.tokens.items[5].kind == .keyword_continue);
+    try std.testing.expectEqualStrings("iffy", lexer.tokens.items[6].kind.identifier);
+}
+
 test "lexWord: recognizes the null keyword" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

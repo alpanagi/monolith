@@ -74,21 +74,74 @@ pub const TypeChecker = struct {
             }
         }
 
-        for (function.body) |*statement| try self.checkStatement(signature, statement);
+        try self.checkBlock(signature, function.body);
+        var trace: Trace = .{};
+        const flow = try self.traceBlock(&trace, function.body, .unassigned);
         try self.checkDeferredUses(function.body);
         try self.checkUndefinedReads(function.body);
 
         const return_type = signature.return_type;
         if (ast.extractType(return_type) == .void) return;
-        const last = function.body[function.body.len - 1];
-        if (last.kind != .@"return" and !isEndless(last)) {
-            return self.fail(return_type.location, error.MissingReturn);
+        if (flow != .ended) return self.fail(return_type.location, error.MissingReturn);
+    }
+
+    fn traceBlock(
+        self: *TypeChecker,
+        trace: *Trace,
+        statements: []const ast.Statement,
+        entry: Flow,
+    ) TypeError!Flow {
+        var flow = entry;
+        for (statements) |*statement| {
+            if (flow == .ended) return self.fail(statement.location, error.UnreachableStatement);
+            flow = try self.traceStatement(trace, statement, flow);
+        }
+        return flow;
+    }
+
+    fn traceStatement(
+        self: *TypeChecker,
+        trace: *Trace,
+        statement: *const ast.Statement,
+        entry: Flow,
+    ) TypeError!Flow {
+        const use: Use = if (trace.variable) |variable| findStatementUse(variable, statement.*) else .none;
+        const flow: Flow = switch (use) {
+            .none => entry,
+            .read => |location| flow: {
+                if (entry == .unassigned) return self.fail(location, error.UndefinedRead);
+                break :flow entry;
+            },
+            .passed => .assigned,
+        };
+        switch (statement.kind) {
+            .noop, .discard, .call, .constant_declaration, .variable_declaration, .assignment => return flow,
+            .@"return", .@"continue" => return .ended,
+            .@"break" => |jump| {
+                for (trace.exits.items) |*exit| {
+                    if (exit.loop == jump.loop.?) exit.flow = mergeFlows(exit.flow, flow);
+                }
+                return .ended;
+            },
+            .@"if" => |conditional| {
+                const body = try self.traceBlock(trace, conditional.body, flow);
+                const else_body = conditional.else_body orelse return mergeFlows(body, flow);
+                return mergeFlows(body, try self.traceBlock(trace, else_body, flow));
+            },
+            .@"while" => |loop| {
+                try trace.exits.append(self.arena.allocator(), .{ .loop = statement });
+                _ = try self.traceBlock(trace, loop.body, flow);
+                const exit = trace.exits.pop().?.flow;
+                const finished: Flow = if (isEndless(statement.*)) .ended else flow;
+                const else_body = loop.else_body orelse return mergeFlows(finished, exit);
+                return mergeFlows(try self.traceBlock(trace, else_body, finished), exit);
+            },
         }
     }
 
     fn checkDeferredUses(self: *TypeChecker, body: []const ast.Statement) TypeError!void {
         for (body) |statement| {
-            if (statement.kind == .@"while") try self.checkDeferredUses(statement.kind.@"while".body);
+            for (ast.extractBlocks(statement)) |block| try self.checkDeferredUses(block);
         }
         for (body, 0..) |*statement, index| {
             if (statement.kind != .variable_declaration) continue;
@@ -105,14 +158,10 @@ pub const TypeChecker = struct {
 
     fn checkUndefinedReads(self: *TypeChecker, body: []const ast.Statement) TypeError!void {
         for (body, 0..) |*statement, index| {
-            switch (statement.kind) {
-                .variable_declaration => |variable| {
-                    if (variable.value.kind != .undefined) continue;
-                    try self.checkUndefinedVariable(statement, body[index + 1 ..]);
-                },
-                .@"while" => |loop| try self.checkUndefinedReads(loop.body),
-                .noop, .@"return", .discard, .call, .constant_declaration, .assignment => {},
-            }
+            for (ast.extractBlocks(statement.*)) |block| try self.checkUndefinedReads(block);
+            if (statement.kind != .variable_declaration) continue;
+            if (statement.kind.variable_declaration.value.kind != .undefined) continue;
+            try self.checkUndefinedVariable(statement, body[index + 1 ..]);
         }
     }
 
@@ -121,37 +170,8 @@ pub const TypeChecker = struct {
         variable: *const ast.Statement,
         statements: []const ast.Statement,
     ) TypeError!void {
-        for (statements) |statement| {
-            const use: Use = switch (statement.kind) {
-                .noop => .none,
-                .@"while" => return,
-                .@"return" => |value| if (value) |expression| findUse(variable, expression) else .none,
-                .discard => |expression| use: {
-                    if (expression.kind == .identifier) break :use .none;
-                    break :use findUse(variable, expression);
-                },
-                .call => |expression| findUse(variable, expression),
-                .constant_declaration => |constant| findUse(variable, constant.value),
-                .variable_declaration => |declaration| findUse(variable, declaration.value),
-                .assignment => |assignment| use: {
-                    if (assignment.operator != null) {
-                        const target_use = findUse(variable, assignment.target);
-                        if (target_use != .none) break :use target_use;
-                    }
-                    const use = findUse(variable, assignment.value);
-                    if (use != .none) break :use use;
-                    const target_use = findTargetUse(variable, assignment.target);
-                    if (target_use != .none) break :use target_use;
-                    if (isRootedAt(assignment.target, variable)) return;
-                    break :use .none;
-                },
-            };
-            switch (use) {
-                .none => {},
-                .read => |location| return self.fail(location, error.UndefinedRead),
-                .passed => return,
-            }
-        }
+        var trace: Trace = .{ .variable = variable };
+        _ = try self.traceBlock(&trace, statements, .unassigned);
     }
 
     fn checkExternalFunction(
@@ -370,13 +390,26 @@ pub const TypeChecker = struct {
                     return self.fail(operator.location, error.TypeMismatch);
                 }
             },
+            .@"if" => |*conditional| {
+                try self.checkExpression(parameters, &conditional.condition, .boolean);
+                try self.checkBlock(signature, conditional.body);
+                if (conditional.else_body) |else_body| try self.checkBlock(signature, else_body);
+            },
             .@"while" => |*loop| {
                 try self.checkExpression(parameters, &loop.condition, .boolean);
-                for (loop.body) |*body_statement| {
-                    try self.checkStatement(signature, body_statement);
-                }
+                try self.checkBlock(signature, loop.body);
+                if (loop.else_body) |else_body| try self.checkBlock(signature, else_body);
             },
+            .@"break", .@"continue" => {},
         }
+    }
+
+    fn checkBlock(
+        self: *TypeChecker,
+        signature: ast.FunctionSignature,
+        statements: []ast.Statement,
+    ) TypeError!void {
+        for (statements) |*statement| try self.checkStatement(signature, statement);
     }
 
     fn checkInitialValue(
@@ -1097,7 +1130,16 @@ pub const TypeChecker = struct {
             .local => |statement| switch (statement.kind) {
                 .constant_declaration => |constant| ast.extractDeclaredType(constant.type, constant.value),
                 .variable_declaration => |variable| ast.extractDeclaredType(variable.type, variable.value),
-                .noop, .@"return", .discard, .call, .assignment, .@"while" => unreachable,
+                .noop,
+                .@"return",
+                .discard,
+                .call,
+                .assignment,
+                .@"if",
+                .@"while",
+                .@"break",
+                .@"continue",
+                => unreachable,
             },
             .function => self.fail(location, error.FunctionUsedAsValue),
         };
@@ -1358,6 +1400,7 @@ pub const TypeError = error{
     TypeVariable,
     UnexpectedUndefined,
     UndefinedRead,
+    UnreachableStatement,
     UnexpectedNull,
     NotSliceable,
     SlicedTemporary,
@@ -1411,7 +1454,7 @@ fn describeError(type_error: TypeError) []const u8 {
         error.NegativeUnsigned => "unsigned types cannot hold negative numbers",
         error.MissingReturnValue => "missing return value",
         error.UnexpectedReturnValue => "void function cannot return a value",
-        error.MissingReturn => "function must end with a return",
+        error.MissingReturn => "every path must end with a return",
         error.MainHasReturnType => "main cannot have a return type",
         error.MainHasParameters => "main cannot have parameters",
         error.MainCalled => "main cannot be called",
@@ -1422,6 +1465,7 @@ fn describeError(type_error: TypeError) []const u8 {
         error.TypeVariable => "variable cannot hold a type",
         error.UnexpectedUndefined => "undefined can only be the initial value of a variable",
         error.UndefinedRead => "variable is read before it is assigned",
+        error.UnreachableStatement => "statement never runs",
         error.UnexpectedNull => "null can only be the value of an optional",
         error.NotSliceable => "only arrays, slices and multiple value pointers can be sliced",
         error.SlicedTemporary => "only arrays that are variables, constants, elements or fields can be sliced",
@@ -1474,11 +1518,59 @@ const Address = struct {
     location: token.Location,
 };
 
+const Trace = struct {
+    variable: ?*const ast.Statement = null,
+    exits: std.ArrayList(Exit) = .empty,
+};
+
+const Exit = struct {
+    loop: *const ast.Statement,
+    flow: Flow = .ended,
+};
+
+const Flow = enum {
+    ended,
+    unassigned,
+    assigned,
+};
+
 const Use = union(enum) {
     none,
     read: token.Location,
     passed,
 };
+
+fn mergeFlows(one: Flow, two: Flow) Flow {
+    if (one == .ended) return two;
+    if (two == .ended) return one;
+    if (one == .unassigned or two == .unassigned) return .unassigned;
+    return .assigned;
+}
+
+fn findStatementUse(variable: *const ast.Statement, statement: ast.Statement) Use {
+    return switch (statement.kind) {
+        .noop, .@"break", .@"continue" => .none,
+        .@"return" => |value| if (value) |expression| findUse(variable, expression) else .none,
+        .discard => |expression| if (expression.kind == .identifier) .none else findUse(variable, expression),
+        .call => |expression| findUse(variable, expression),
+        .constant_declaration => |constant| findUse(variable, constant.value),
+        .variable_declaration => |declaration| findUse(variable, declaration.value),
+        .assignment => |assignment| use: {
+            if (assignment.operator != null) {
+                const target_use = findUse(variable, assignment.target);
+                if (target_use != .none) break :use target_use;
+            }
+            const use = findUse(variable, assignment.value);
+            if (use != .none) break :use use;
+            const target_use = findTargetUse(variable, assignment.target);
+            if (target_use != .none) break :use target_use;
+            if (isRootedAt(assignment.target, variable)) break :use .passed;
+            break :use .none;
+        },
+        .@"if" => |conditional| findUse(variable, conditional.condition),
+        .@"while" => |loop| findUse(variable, loop.condition),
+    };
+}
 
 fn isEndless(statement: ast.Statement) bool {
     if (statement.kind != .@"while") return false;
@@ -1781,8 +1873,18 @@ fn recordTargetUses(
                     use.used = true;
                 }
             },
-            .@"while" => |loop| recordTargetUses(use, variable, loop.body),
-            .noop, .@"return", .discard, .call, .constant_declaration, .variable_declaration => {},
+            .@"if", .@"while" => {
+                for (ast.extractBlocks(statement)) |block| recordTargetUses(use, variable, block);
+            },
+            .noop,
+            .@"return",
+            .discard,
+            .call,
+            .constant_declaration,
+            .variable_declaration,
+            .@"break",
+            .@"continue",
+            => {},
         }
     }
 }
@@ -2163,6 +2265,384 @@ test "checkFunction: treats a method named main as a method" {
     try type_checker.check();
 }
 
+test "checkFunction: accepts a function whose every branch returns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(one: bool, two: bool) -> i32:\n    if one:\n        return 1\n    else if two:\n        return 2\n    else:\n        return 3\nfn main(): _ = pick(true, false)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    try std.testing.expectEqual(null, type_checker.failure);
+}
+
+test "checkFunction: rejects a function with a branch that does not return" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(one: bool) -> i32:\n    if one: return 1\nfn main(): _ = pick(true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.MissingReturn, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, type_checker.failure.?.location.?);
+}
+
+test "checkFunction: rejects an endless loop that a break leaves" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first() -> i32:\n    while true: break\nfn main(): _ = first()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.MissingReturn, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 15 }, type_checker.failure.?.location.?);
+}
+
+test "checkFunction: accepts an endless loop that only an inner loop breaks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(running: bool) -> i32:\n    while true:\n        while running: break\nfn main(): _ = first(true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    try std.testing.expectEqual(null, type_checker.failure);
+}
+
+test "checkFunction: rejects an endless loop that a labeled break of an inner loop leaves" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(running: bool) -> i32:\n    outer: while true:\n        while running: break outer\nfn main(): _ = first(true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.MissingReturn, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, type_checker.failure.?.location.?);
+}
+
+test "checkFunction: accepts a loop whose else block returns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(running: bool) -> i32:\n    while running: noop\n    else: return 1\nfn main(): _ = first(true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    try std.testing.expectEqual(null, type_checker.failure);
+}
+
+test "checkFunction: rejects a break that skips the else block that returns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(running: bool) -> i32:\n    while running: break\n    else: return 1\nfn main(): _ = first(true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.MissingReturn, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, type_checker.failure.?.location.?);
+}
+
+test "traceBlock: rejects a statement after a return" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn main():\n    return\n    step()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableStatement, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 5 }, type_checker.failure.?.location.?);
+}
+
+test "traceBlock: rejects a statement after a return in a loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn main():\n    while true:\n        return\n        step()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableStatement, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 9 }, type_checker.failure.?.location.?);
+}
+
+test "traceBlock: rejects a statement after a break" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn main():\n    while true:\n        break\n        step()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableStatement, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 9 }, type_checker.failure.?.location.?);
+}
+
+test "traceBlock: rejects a statement after a continue" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn main():\n    while true:\n        continue\n        step()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableStatement, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 9 }, type_checker.failure.?.location.?);
+}
+
+test "traceStatement: rejects a statement after an if whose every block ends the path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn main():\n    if true: return\n    else: return\n    step()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableStatement, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 5 }, type_checker.failure.?.location.?);
+}
+
+test "traceStatement: accepts a statement after an if without an else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn main():\n    if true: return\n    step()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    try std.testing.expectEqual(null, type_checker.failure);
+}
+
+test "traceStatement: rejects a statement after a loop that never ends" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn main():\n    while true: step()\n    step()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableStatement, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 5 }, type_checker.failure.?.location.?);
+}
+
+test "traceStatement: accepts a statement after an endless loop that a break leaves" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn main():\n    while true: break\n    step()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    try std.testing.expectEqual(null, type_checker.failure);
+}
+
+test "traceStatement: rejects the else block of a loop that never ends" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn main():\n    while true: break\n    else: step()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableStatement, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 11 }, type_checker.failure.?.location.?);
+}
+
+test "traceStatement: accepts a statement after a loop whose body returns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn run(running: bool):\n    while running: return\n    step()\nfn main(): run(true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    try std.testing.expectEqual(null, type_checker.failure);
+}
+
+test "traceStatement: rejects a statement after a loop whose else block returns and that has no break" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn run(running: bool):\n    while running: noop\n    else: return\n    step()\nfn main(): run(true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableStatement, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 5 }, type_checker.failure.?.location.?);
+}
+
 test "checkDeferredUses: rejects a variable whose field is only assigned" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2373,6 +2853,48 @@ test "checkDeferredUses: rejects discarding a variable that is written through" 
     try std.testing.expectEqual(token.Location{ .row = 9, .column = 9 }, type_checker.failure.?.location.?);
 }
 
+test "checkDeferredUses: rejects a variable whose field is only assigned in an else block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn main():\n    var point = Point{x = 1}\n    if false: noop\n    else: point.x = 2" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnusedVariable, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 5 }, type_checker.failure.?.location.?);
+}
+
+test "checkDeferredUses: checks a variable declared in the else block of a loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn main():\n    while false: noop\n    else:\n        var point = Point{x = 1}\n        point.x = 2" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnusedVariable, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 9 }, type_checker.failure.?.location.?);
+}
+
 test "checkUndefinedReads: checks a variable declared inside a loop" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2392,6 +2914,27 @@ test "checkUndefinedReads: checks a variable declared inside a loop" {
 
     try std.testing.expectError(error.UndefinedRead, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 22 }, type_checker.failure.?.location.?);
+}
+
+test "checkUndefinedReads: checks a variable declared in an else block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    if true: noop\n    else:\n        var count: i32 = undefined\n        const copy = count\n        count = copy" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UndefinedRead, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 22 }, type_checker.failure.?.location.?);
 }
 
 test "checkUndefinedVariable: rejects a read right after the declaration" {
@@ -2730,7 +3273,7 @@ test "checkUndefinedVariable: rejects passing the variable to a construction" {
     try std.testing.expectEqual(token.Location{ .row = 5, .column = 29 }, type_checker.failure.?.location.?);
 }
 
-test "checkUndefinedVariable: ends the check at a loop" {
+test "checkUndefinedVariable: rejects a read after a loop that does not assign the variable" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -2746,9 +3289,9 @@ test "checkUndefinedVariable: ends the check at a loop" {
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
-    try type_checker.check();
 
-    try std.testing.expectEqual(null, type_checker.failure);
+    try std.testing.expectError(error.UndefinedRead, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 18 }, type_checker.failure.?.location.?);
 }
 
 test "checkUndefinedVariable: ends the check at a slice" {
@@ -2875,6 +3418,216 @@ test "checkUndefinedVariable: rejects a read in an operand" {
 
     try std.testing.expectError(error.UndefinedRead, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 23 }, type_checker.failure.?.location.?);
+}
+
+test "checkUndefinedVariable: rejects a read after an if that assigns the variable in one branch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    var count: i32 = undefined\n    if true: count = 1\n    const copy = count\n    count = copy" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UndefinedRead, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 18 }, type_checker.failure.?.location.?);
+}
+
+test "checkUndefinedVariable: accepts a read after an if that assigns the variable in every branch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    var count: i32 = undefined\n    if true: count = 1\n    else: count = 2\n    const copy = count\n    count = copy" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    try std.testing.expectEqual(null, type_checker.failure);
+}
+
+test "checkUndefinedVariable: accepts a read after an if whose other branch ends the path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    var count: i32 = undefined\n    if true: count = 1\n    else: return\n    const copy = count\n    count = copy" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    try std.testing.expectEqual(null, type_checker.failure);
+}
+
+test "checkUndefinedVariable: rejects a read in an if condition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    var ready: bool = undefined\n    if ready: noop\n    ready = true" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UndefinedRead, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 8 }, type_checker.failure.?.location.?);
+}
+
+test "checkUndefinedVariable: rejects a read in a loop body before the assignment in the body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    var count: i32 = undefined\n    while true:\n        const copy = count\n        count = copy" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UndefinedRead, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 22 }, type_checker.failure.?.location.?);
+}
+
+test "checkUndefinedVariable: rejects a read after a loop that assigns the variable in its body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn run(running: bool):\n    var count: i32 = undefined\n    while running: count = 1\n    const copy = count\n    count = copy\nfn main(): run(true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UndefinedRead, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 18 }, type_checker.failure.?.location.?);
+}
+
+test "checkUndefinedVariable: accepts a read after an endless loop that assigns the variable before its break" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    var count: i32 = undefined\n    while true:\n        count = 1\n        break\n    const copy = count\n    count = copy" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    try std.testing.expectEqual(null, type_checker.failure);
+}
+
+test "checkUndefinedVariable: rejects a read after a break that leaves before the assignment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn run(early: bool):\n    var count: i32 = undefined\n    while true:\n        if early: break\n        count = 1\n        break\n    const copy = count\n    count = copy\nfn main(): run(true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UndefinedRead, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 7, .column = 18 }, type_checker.failure.?.location.?);
+}
+
+test "checkUndefinedVariable: rejects a read after a labeled break that leaves before the assignment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn run(early: bool):\n    var count: i32 = undefined\n    outer: while true:\n        while early: break outer\n        count = 1\n        break\n    const copy = count\n    count = copy\nfn main(): run(true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UndefinedRead, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 7, .column = 18 }, type_checker.failure.?.location.?);
+}
+
+test "checkUndefinedVariable: accepts a read after a loop whose else block assigns the variable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn run(running: bool):\n    var count: i32 = undefined\n    while running: noop\n    else: count = 1\n    const copy = count\n    count = copy\nfn main(): run(true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    try std.testing.expectEqual(null, type_checker.failure);
 }
 
 test "checkExternalFunction: rejects an external main" {
@@ -4029,6 +4782,69 @@ test "checkStatement: checks the statements of a while body" {
 
     try std.testing.expectError(error.UnexpectedReturnValue, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 31 }, type_checker.failure.?.location.?);
+}
+
+test "checkStatement: rejects an if condition that is not a bool" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): if 1i32: noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.TypeMismatch, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 15 }, type_checker.failure.?.location.?);
+}
+
+test "checkStatement: checks the statements of an else block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    if true: noop\n    else: return 1i32" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnexpectedReturnValue, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 18 }, type_checker.failure.?.location.?);
+}
+
+test "checkStatement: checks the statements of the else block of a loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    while false: noop\n    else: return 1i32" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnexpectedReturnValue, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 18 }, type_checker.failure.?.location.?);
 }
 
 test "checkStatement: gives a struct literal in an assignment the type of the target" {
