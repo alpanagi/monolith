@@ -77,8 +77,8 @@
 
 ### Function Types
 
-- A function type is written like a function signature without parameter names, e.g. `fn(i32, bool) -> i32` (see Functions).
-- A value of a function type points to a function and is never `null`.
+- A function type is written like a function signature without parameter names, e.g. `fn(i32, bool) -> i32` (see Functions). Functions exist only at compile time.
+- A pointer to a function is written without `const`, e.g. `*fn(i32, bool) -> i32`, since a function cannot be modified.
 
 ## Structs
 
@@ -177,6 +177,7 @@
 - A constant whose value is known at compile time can be used where a compile-time value is required, e.g. an array length.
 - Any declaration can shadow a built-in type name. A local declaration can shadow any existing name, including earlier declarations in the same block.
 - Two top-level declarations with the same name in one module are a compile-time error.
+- Top-level declarations can be used anywhere in their module, before or after they are declared.
 - An unused local constant or variable is a compile-time error.
 - A variable that is never modified is a compile-time error.
 
@@ -251,7 +252,7 @@
 
 ### Pointer Operations
 
-- `&value` gives a pointer to a variable, constant, element or field. The pointer is read-only if the value cannot be modified.
+- `&value` gives a pointer to a variable, constant, element, field or function. The pointer is read-only if the value cannot be modified.
 - `pointer.*` gives the value a pointer points to.
 - Reading or writing through a pointer to invalid memory, such as a dangling or `undefined` pointer, is illegal behavior.
 - Field access dereferences a pointer automatically, one level only, e.g. `pointer.field`.
@@ -298,3 +299,16 @@
 
 - `while condition:` runs its block as long as the condition is true. The condition is a `bool`, evaluated before each run of the block.
 - `while true` is an endless loop.
+
+## Functions
+
+- A function is declared with `fn`, its name, its parameters in parentheses, an optional return type after `->`, and its body after `:`, e.g. `fn add(a: i32, b: i32) -> i32: return a + b`.
+- A function without a return type returns `void`.
+- Each parameter has a name and a type. Parameter names must be unique.
+- Parameters cannot be modified, including their elements and fields.
+- A parameter named `_` has no name, and the body cannot refer to it.
+- An unused parameter is a compile-time error.
+- Arguments are given in the order of the parameters.
+- `&name` gives a pointer to a function, e.g. to pass it as an argument. A pointer to a function is called like a function.
+- `external fn` declares a function defined outside the program, without a body, e.g. `external fn write(text: []const u8)`.
+- The program starts at `main`. It has no parameters and no return type, and cannot be called, used as a value or be external.
