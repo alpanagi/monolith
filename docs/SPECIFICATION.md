@@ -48,6 +48,8 @@
 
 - An array holds a fixed number of values of the same type. Its type is the length in brackets followed by the element type, e.g. `[4]i32`.
 - The length is a `usize` and must be known at compile time. A length of 0 is allowed.
+- In the written type of a constant or variable, `_` takes the length from the value, e.g. `const primes: [_]i32 = {2, 3, 5}`. A value without a length, such as `undefined`, is a compile-time error.
+- Only the outermost length can be left out, e.g. `[_][2]i32`.
 - Elements are stored next to each other in memory, in order.
 - Nested arrays read left to right, e.g. `[3][4]f32` is 3 arrays of 4 floats.
 - Arrays are values. Assigning or passing an array copies all its elements.
@@ -119,7 +121,6 @@
 - Array literals are written as the array type followed by the elements in braces, separated by commas, e.g. `[3]i32{1, 2, 3}`.
 - The type can be left out when it is known from the surrounding code, e.g. `{1, 2, 3}`.
 - `_` takes the length from the literal, e.g. `[_]i32{1, 2, 3}`.
-- In the written type of a constant or variable, `_` takes the length from the value, e.g. `const primes: [_]i32 = {2, 3, 5}`. A value without a length, such as `undefined`, is a compile-time error.
 - A braced literal can initialize a read-only slice when its elements are known at compile time, e.g. `const primes: []const i32 = {2, 3, 5}`.
 - The number of elements must match the array's length. A mismatch is a compile-time error.
 - Array literals can span multiple lines.
