@@ -69,8 +69,9 @@ pub const TypeChecker = struct {
             if (ast.extractType(signature.return_type) != .void) {
                 return self.fail(signature.return_type.location, error.MainHasReturnType);
             }
-            if (signature.parameters.len > 0) {
-                return self.fail(signature.parameters[0].location, error.MainHasParameters);
+            for (signature.parameters, 0..) |parameter, index| {
+                if (index == 0 and self.isEnvironment(ast.extractType(parameter.type))) continue;
+                return self.fail(parameter.location, error.WrongMainParameters);
             }
         }
 
@@ -83,6 +84,13 @@ pub const TypeChecker = struct {
         const return_type = signature.return_type;
         if (ast.extractType(return_type) == .void) return;
         if (flow != .ended) return self.fail(return_type.location, error.MissingReturn);
+    }
+
+    fn isEnvironment(self: *const TypeChecker, value_type: types.Type) bool {
+        if (value_type != .@"struct") return false;
+        const path = self.program.modules[value_type.@"struct".module].path;
+        const in_process = path.len == 2 and std.mem.eql(u8, path[0], "std") and std.mem.eql(u8, path[1], "process");
+        return in_process and std.mem.eql(u8, value_type.@"struct".name, "Environment");
     }
 
     fn traceBlock(
@@ -1428,7 +1436,7 @@ pub const TypeError = error{
     UnexpectedReturnValue,
     MissingReturn,
     MainHasReturnType,
-    MainHasParameters,
+    WrongMainParameters,
     MainCalled,
     MainIsExternal,
     ArgumentCountMismatch,
@@ -1495,7 +1503,7 @@ fn describeError(type_error: TypeError) []const u8 {
         error.UnexpectedReturnValue => "void function cannot return a value",
         error.MissingReturn => "every path must end with a return",
         error.MainHasReturnType => "main cannot have a return type",
-        error.MainHasParameters => "main cannot have parameters",
+        error.WrongMainParameters => "main can only take a std::process::Environment",
         error.MainCalled => "main cannot be called",
         error.MainIsExternal => "main cannot be external",
         error.ArgumentCountMismatch => "wrong number of arguments",
@@ -2246,7 +2254,37 @@ test "checkFunction: rejects a return type on main" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, type_checker.failure.?.location.?);
 }
 
-test "checkFunction: rejects parameters on main" {
+test "checkFunction: accepts an Environment parameter on main" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    try compiler_directory.dir.createDirPath(std.testing.io, "std");
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/process.mn", .data = "struct Environment" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import std::process::Environment\nfn main(environment: Environment): _ = environment" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = TypeChecker.init(&arena, program);
+    try type_checker.check();
+
+    try std.testing.expectEqual(null, type_checker.failure);
+}
+
+test "checkFunction: rejects a parameter on main that is not an Environment" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -2270,8 +2308,66 @@ test "checkFunction: rejects parameters on main" {
     const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
     var type_checker = TypeChecker.init(&arena, program);
 
-    try std.testing.expectError(error.MainHasParameters, type_checker.check());
+    try std.testing.expectError(error.WrongMainParameters, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 9 }, type_checker.failure.?.location.?);
+}
+
+test "checkFunction: rejects a parameter on main after the Environment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    try compiler_directory.dir.createDirPath(std.testing.io, "std");
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/process.mn", .data = "struct Environment" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import std::process::Environment\nfn main(environment: Environment, value: i32):\n    _ = environment\n    _ = value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = TypeChecker.init(&arena, program);
+
+    try std.testing.expectError(error.WrongMainParameters, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 35 }, type_checker.failure.?.location.?);
+}
+
+test "checkFunction: rejects a struct named Environment outside std::process on main" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Environment\nfn main(environment: Environment): _ = environment" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = TypeChecker.init(&arena, program);
+
+    try std.testing.expectError(error.WrongMainParameters, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 9 }, type_checker.failure.?.location.?);
 }
 
 test "checkFunction: rejects a missing return" {
