@@ -30,6 +30,7 @@ pub const DeclarationKind = union(enum) {
 pub const FunctionDefinition = struct {
     signature: FunctionSignature,
     body: []Statement,
+    default_of: ?Resolution.Trait = null,
 };
 
 pub const FunctionSignature = struct {
@@ -51,6 +52,7 @@ pub const StatementKind = union(enum) {
     discard: Expression,
     call: Expression,
     constant_declaration: ConstantDeclaration,
+    tuple_declaration: TupleDeclaration,
     variable_declaration: VariableDeclaration,
     assignment: Assignment,
     @"if": If,
@@ -67,6 +69,18 @@ pub const ConstantDeclaration = struct {
     resolved: bool = false,
 };
 
+pub const TupleDeclaration = struct {
+    names: []ElementName,
+    value: Expression,
+};
+
+pub const ElementName = struct {
+    name: []const u8,
+    pointer: bool = false,
+    location: token.Location,
+    type: ?types.Type = null,
+};
+
 pub const StructDefinition = struct {
     name: []const u8,
     fields: []Field,
@@ -77,13 +91,20 @@ pub const StructDefinition = struct {
 pub const TraitDefinition = struct {
     name: []const u8,
     functions: []FunctionSignature,
+    defaults: []?Default,
     resolved: bool = false,
+};
+
+pub const Default = struct {
+    body: []Statement,
+    template: FunctionDefinition,
 };
 
 pub const Implementation = struct {
     trait: Expression,
     type: Expression,
     functions: usize,
+    defaults: []const usize = &.{},
     resolved: ?Resolution.Trait = null,
 };
 
@@ -132,8 +153,8 @@ pub const While = struct {
 
 pub const For = struct {
     label: ?[]const u8 = null,
-    name: []const u8,
-    name_location: token.Location,
+    names: []ElementName,
+    tuple: bool = false,
     sequence: Sequence,
     body: []Statement,
     else_body: ?[]Statement = null,
@@ -224,7 +245,9 @@ pub const Resolution = union(enum) {
     type: types.Type,
     constant: Resolution.Constant,
     local: *const Statement,
-    element: *const Statement,
+    element: Resolution.Element,
+    trait_function: Resolution.TraitFunction,
+    trait_method: Resolution.TraitFunction,
 
     pub const Function = struct {
         module: usize,
@@ -239,6 +262,16 @@ pub const Resolution = union(enum) {
     pub const Trait = struct {
         module: usize,
         declaration: usize,
+    };
+
+    pub const Element = struct {
+        statement: *const Statement,
+        position: usize,
+    };
+
+    pub const TraitFunction = struct {
+        trait: Resolution.Trait,
+        function: usize,
     };
 };
 
@@ -416,7 +449,7 @@ pub fn findMethod(
     if (receiver == .@"struct") {
         const owner = receiver.@"struct".module;
         if (findOwnFunction(modules[owner], receiver, name)) |index| {
-            search.add(.{ .module = owner, .declaration = index });
+            return .{ .found = .{ .module = owner, .declaration = index } };
         }
     }
     for (modules[caller].declarations, 0..) |declaration, index| {
@@ -478,6 +511,11 @@ pub fn findTraitFunction(
                 if (!std.mem.eql(u8, signature.name, name)) continue;
                 return .{ .module = module_index, .declaration = function_index };
             }
+            for (implementation.defaults) |default_index| {
+                const signature = module.declarations[default_index].kind.function_definition.signature;
+                if (!std.mem.eql(u8, signature.name, name)) continue;
+                return .{ .module = module_index, .declaration = default_index };
+            }
             return null;
         }
     }
@@ -513,6 +551,7 @@ pub fn extractBlocks(statement: Statement) [2][]const Statement {
         .discard,
         .call,
         .constant_declaration,
+        .tuple_declaration,
         .variable_declaration,
         .assignment,
         .@"break",
@@ -530,6 +569,7 @@ pub fn extractLabel(statement: Statement) ?[]const u8 {
         .discard,
         .call,
         .constant_declaration,
+        .tuple_declaration,
         .variable_declaration,
         .assignment,
         .@"if",
@@ -550,6 +590,36 @@ pub fn extractElementType(sequence: Sequence) types.Type {
             },
         },
     };
+}
+
+pub fn extractElementNames(statement: Statement) []ElementName {
+    return switch (statement.kind) {
+        .@"for" => |loop| loop.names,
+        .tuple_declaration => |declaration| declaration.names,
+        .noop,
+        .@"return",
+        .discard,
+        .call,
+        .constant_declaration,
+        .variable_declaration,
+        .assignment,
+        .@"if",
+        .@"while",
+        .@"break",
+        .@"continue",
+        => unreachable,
+    };
+}
+
+pub fn findElementName(element: Resolution.Element) ElementName {
+    return extractElementNames(element.statement.*)[element.position];
+}
+
+pub fn hasPointerName(names: []const ElementName) bool {
+    for (names) |name| {
+        if (name.pointer) return true;
+    }
+    return false;
 }
 
 pub fn isDiscardedName(name: []const u8) bool {
@@ -583,20 +653,241 @@ pub fn findConstantRoot(expression: Expression) ?Resolution.Constant {
     return switch (expression.kind) {
         inline .identifier, .path_expression => |name| switch (name.resolution.?) {
             .constant => |constant| constant,
-            .parameter, .function, .type, .local, .element => null,
+            .parameter, .function, .type, .local, .element, .trait_function, .trait_method => null,
         },
         .field_access => |access| {
             if (access.value.type.? == .pointer) return null;
             return findConstantRoot(access.value.*);
         },
-        .index => |indexing| switch (indexing.value.type.?) {
-            .array, .tuple => findConstantRoot(indexing.value.*),
-            .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .optional, .function, .implementer => {
-                return null;
-            },
-        },
+        .index => |indexing| findElementConstantRoot(indexing.value.*),
         else => null,
     };
+}
+
+pub fn findElementConstantRoot(value: Expression) ?Resolution.Constant {
+    return switch (value.type.?) {
+        .array, .tuple => findConstantRoot(value),
+        .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .optional, .function, .implementer => null,
+    };
+}
+
+pub fn cloneFunctionDefinition(
+    allocator: std.mem.Allocator,
+    definition: FunctionDefinition,
+) std.mem.Allocator.Error!FunctionDefinition {
+    return .{
+        .signature = try cloneFunctionSignature(allocator, definition.signature),
+        .body = try cloneStatements(allocator, definition.body),
+        .default_of = definition.default_of,
+    };
+}
+
+fn cloneFunctionSignature(
+    allocator: std.mem.Allocator,
+    signature: FunctionSignature,
+) std.mem.Allocator.Error!FunctionSignature {
+    const parameters = try allocator.alloc(TypedName, signature.parameters.len);
+    for (signature.parameters, parameters) |parameter, *cloned| {
+        cloned.* = .{
+            .name = parameter.name,
+            .type = try cloneExpression(allocator, parameter.type),
+            .location = parameter.location,
+        };
+    }
+    return .{
+        .receiver = try cloneOptionalExpression(allocator, signature.receiver),
+        .trait = try cloneOptionalExpression(allocator, signature.trait),
+        .name = signature.name,
+        .parameters = parameters,
+        .return_type = try cloneExpression(allocator, signature.return_type),
+    };
+}
+
+fn cloneStatements(allocator: std.mem.Allocator, statements: []const Statement) std.mem.Allocator.Error![]Statement {
+    const cloned = try allocator.alloc(Statement, statements.len);
+    for (statements, cloned) |statement, *copy| copy.* = try cloneStatement(allocator, statement);
+    return cloned;
+}
+
+fn cloneOptionalStatements(
+    allocator: std.mem.Allocator,
+    statements: ?[]const Statement,
+) std.mem.Allocator.Error!?[]Statement {
+    const present = statements orelse return null;
+    return try cloneStatements(allocator, present);
+}
+
+fn cloneStatement(allocator: std.mem.Allocator, statement: Statement) std.mem.Allocator.Error!Statement {
+    const kind: StatementKind = switch (statement.kind) {
+        .noop => .noop,
+        .@"return" => |value| .{ .@"return" = try cloneOptionalExpression(allocator, value) },
+        .discard => |expression| .{ .discard = try cloneExpression(allocator, expression) },
+        .call => |expression| .{ .call = try cloneExpression(allocator, expression) },
+        .constant_declaration => |constant| .{ .constant_declaration = .{
+            .name = constant.name,
+            .type = try cloneOptionalExpression(allocator, constant.type),
+            .value = try cloneExpression(allocator, constant.value),
+        } },
+        .tuple_declaration => |declaration| .{ .tuple_declaration = .{
+            .names = try allocator.dupe(ElementName, declaration.names),
+            .value = try cloneExpression(allocator, declaration.value),
+        } },
+        .variable_declaration => |variable| .{ .variable_declaration = .{
+            .name = variable.name,
+            .type = try cloneOptionalExpression(allocator, variable.type),
+            .value = try cloneExpression(allocator, variable.value),
+        } },
+        .assignment => |assignment| .{ .assignment = .{
+            .target = try cloneExpression(allocator, assignment.target),
+            .operator = assignment.operator,
+            .value = try cloneExpression(allocator, assignment.value),
+        } },
+        .@"if" => |conditional| .{ .@"if" = .{
+            .condition = try cloneExpression(allocator, conditional.condition),
+            .body = try cloneStatements(allocator, conditional.body),
+            .else_body = try cloneOptionalStatements(allocator, conditional.else_body),
+        } },
+        .@"while" => |loop| .{ .@"while" = .{
+            .label = loop.label,
+            .condition = try cloneExpression(allocator, loop.condition),
+            .body = try cloneStatements(allocator, loop.body),
+            .else_body = try cloneOptionalStatements(allocator, loop.else_body),
+        } },
+        .@"for" => |loop| .{ .@"for" = .{
+            .label = loop.label,
+            .names = try allocator.dupe(ElementName, loop.names),
+            .tuple = loop.tuple,
+            .sequence = switch (loop.sequence) {
+                .value => |value| .{ .value = try cloneExpression(allocator, value) },
+                .range => |range| .{ .range = .{
+                    .start = try cloneExpression(allocator, range.start),
+                    .end = try cloneOptionalExpression(allocator, range.end),
+                } },
+            },
+            .body = try cloneStatements(allocator, loop.body),
+            .else_body = try cloneOptionalStatements(allocator, loop.else_body),
+        } },
+        .@"break" => |jump| .{ .@"break" = .{ .label = jump.label } },
+        .@"continue" => |jump| .{ .@"continue" = .{ .label = jump.label } },
+    };
+    return .{ .kind = kind, .location = statement.location };
+}
+
+fn cloneOptionalExpression(allocator: std.mem.Allocator, expression: ?Expression) std.mem.Allocator.Error!?Expression {
+    const present = expression orelse return null;
+    return try cloneExpression(allocator, present);
+}
+
+fn cloneExpressionPointer(allocator: std.mem.Allocator, expression: *const Expression) std.mem.Allocator.Error!*Expression {
+    const cloned = try allocator.create(Expression);
+    cloned.* = try cloneExpression(allocator, expression.*);
+    return cloned;
+}
+
+fn cloneOptionalExpressionPointer(
+    allocator: std.mem.Allocator,
+    expression: ?*const Expression,
+) std.mem.Allocator.Error!?*Expression {
+    const present = expression orelse return null;
+    return try cloneExpressionPointer(allocator, present);
+}
+
+fn cloneExpressions(allocator: std.mem.Allocator, expressions: []const Expression) std.mem.Allocator.Error![]Expression {
+    const cloned = try allocator.alloc(Expression, expressions.len);
+    for (expressions, cloned) |expression, *copy| copy.* = try cloneExpression(allocator, expression);
+    return cloned;
+}
+
+fn cloneArguments(allocator: std.mem.Allocator, arguments: []const Argument) std.mem.Allocator.Error![]Argument {
+    const cloned = try allocator.alloc(Argument, arguments.len);
+    for (arguments, cloned) |argument, *copy| {
+        copy.* = .{
+            .name = argument.name,
+            .value = try cloneExpression(allocator, argument.value),
+            .location = argument.location,
+        };
+    }
+    return cloned;
+}
+
+fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std.mem.Allocator.Error!Expression {
+    const kind: ExpressionKind = switch (expression.kind) {
+        .integer_literal,
+        .float_literal,
+        .boolean_literal,
+        .string_literal,
+        .undefined,
+        .null,
+        .identifier,
+        .path_expression,
+        => expression.kind,
+        .call => |call| .{ .call = .{
+            .callee = call.callee,
+            .arguments = try cloneArguments(allocator, call.arguments),
+        } },
+        .method_call => |call| .{ .method_call = .{
+            .receiver = try cloneExpressionPointer(allocator, call.receiver),
+            .name = call.name,
+            .name_location = call.name_location,
+            .arguments = try cloneArguments(allocator, call.arguments),
+        } },
+        .negation => |operand| .{ .negation = try cloneExpressionPointer(allocator, operand) },
+        .binary => |binary| .{ .binary = .{
+            .operator = binary.operator,
+            .operator_location = binary.operator_location,
+            .left = try cloneExpressionPointer(allocator, binary.left),
+            .right = try cloneExpressionPointer(allocator, binary.right),
+        } },
+        .unary => |unary| .{ .unary = .{
+            .operator = unary.operator,
+            .operand = try cloneExpressionPointer(allocator, unary.operand),
+        } },
+        .address_of => |operand| .{ .address_of = try cloneExpressionPointer(allocator, operand) },
+        .array_type => |array_type| .{ .array_type = .{
+            .length = try cloneOptionalExpressionPointer(allocator, array_type.length),
+            .element = try cloneExpressionPointer(allocator, array_type.element),
+        } },
+        .composite_literal => |literal| .{ .composite_literal = .{
+            .type = try cloneOptionalExpressionPointer(allocator, literal.type),
+            .elements = try cloneArguments(allocator, literal.elements),
+        } },
+        .slice_type => |slice_type| .{ .slice_type = .{
+            .constant = slice_type.constant,
+            .element = try cloneExpressionPointer(allocator, slice_type.element),
+        } },
+        .index => |indexing| .{ .index = .{
+            .value = try cloneExpressionPointer(allocator, indexing.value),
+            .index = try cloneExpressionPointer(allocator, indexing.index),
+        } },
+        .slice => |slice| .{ .slice = .{
+            .value = try cloneExpressionPointer(allocator, slice.value),
+            .start = try cloneOptionalExpressionPointer(allocator, slice.start),
+            .end = try cloneOptionalExpressionPointer(allocator, slice.end),
+        } },
+        .pointer_type => |pointer_type| .{ .pointer_type = .{
+            .many = pointer_type.many,
+            .constant = pointer_type.constant,
+            .target = try cloneExpressionPointer(allocator, pointer_type.target),
+        } },
+        .optional_type => |optional_type| .{ .optional_type = .{
+            .child = try cloneExpressionPointer(allocator, optional_type.child),
+        } },
+        .tuple_type => |tuple_type| .{ .tuple_type = .{
+            .elements = try cloneExpressions(allocator, tuple_type.elements),
+        } },
+        .function_type => |function_type| .{ .function_type = .{
+            .parameters = try cloneExpressions(allocator, function_type.parameters),
+            .return_type = try cloneExpressionPointer(allocator, function_type.return_type),
+        } },
+        .field_access => |access| .{ .field_access = .{
+            .value = try cloneExpressionPointer(allocator, access.value),
+            .field = access.field,
+            .field_location = access.field_location,
+        } },
+        .dereference => |operand| .{ .dereference = try cloneExpressionPointer(allocator, operand) },
+        .unwrap => |operand| .{ .unwrap = try cloneExpressionPointer(allocator, operand) },
+    };
+    return .{ .kind = kind, .location = expression.location };
 }
 
 test "extractBlocks: finds the body and the else block of a loop" {

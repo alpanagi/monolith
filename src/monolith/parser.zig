@@ -271,6 +271,9 @@ pub const Parser = struct {
         if (try self.parseFor(allocator, offset, depth, else_depth)) |statement| return statement;
         if (self.parseJump(offset)) |statement| return statement;
         if (try self.parseDiscard(allocator, offset)) |statement| return statement;
+        if (try self.parseTupleDeclaration(allocator, offset)) |declaration| {
+            return .{ .kind = .{ .tuple_declaration = declaration }, .location = location };
+        }
         if (try self.parseConstantDeclaration(allocator, offset)) |constant| {
             return .{ .kind = .{ .constant_declaration = constant }, .location = location };
         }
@@ -370,8 +373,8 @@ pub const Parser = struct {
         const location = self.tokens[position].location;
         const label = self.parseLabel(&position);
         if (self.match(&position, .keyword_for) == null) return null;
-        const name_location = self.tokens[position].location;
-        const name = try self.parseElementName(&position);
+        const tuple = self.tokens[position].kind == .left_parenthesis;
+        const names = try self.parseElementNames(allocator, &position);
         _ = try self.expect(&position, .keyword_in, error.ExpectedIn);
         const sequence = try self.parseSequence(allocator, &position);
         _ = try self.expect(&position, .colon, error.ExpectedColon);
@@ -384,8 +387,8 @@ pub const Parser = struct {
         offset.* = position;
         const loop: ast.For = .{
             .label = label,
-            .name = name,
-            .name_location = name_location,
+            .names = names,
+            .tuple = tuple,
             .sequence = sequence,
             .body = body,
             .else_body = else_body,
@@ -393,14 +396,41 @@ pub const Parser = struct {
         return .{ .kind = .{ .@"for" = loop }, .location = location };
     }
 
-    fn parseElementName(self: *Parser, offset: *usize) ParseError![]const u8 {
-        const name = switch (self.tokens[offset.*].kind) {
+    fn parseElementNames(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError![]ast.ElementName {
+        var position = offset.*;
+        if (self.match(&position, .left_parenthesis) == null) {
+            const name = try self.parseElementName(&position);
+            offset.* = position;
+            return allocator.dupe(ast.ElementName, &.{name});
+        }
+        var names: std.ArrayList(ast.ElementName) = .empty;
+        while (true) {
+            try names.append(allocator, try self.parseElementName(&position));
+            if (self.match(&position, .comma) == null) break;
+        }
+        _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
+
+        offset.* = position;
+        return names.items;
+    }
+
+    fn parseElementName(self: *Parser, offset: *usize) ParseError!ast.ElementName {
+        var position = offset.*;
+        const location = self.tokens[position].location;
+        const pointer = self.match(&position, .asterisk) != null;
+        const name = switch (self.tokens[position].kind) {
             .identifier => |identifier| identifier,
             .underscore => "_",
-            else => return self.fail(offset.*, error.ExpectedIdentifier),
+            else => return self.fail(position, error.ExpectedIdentifier),
         };
-        offset.* += 1;
-        return name;
+        if (pointer and ast.isDiscardedName(name)) return self.fail(position, error.ExpectedIdentifier);
+
+        offset.* = position + 1;
+        return .{ .name = name, .pointer = pointer, .location = location };
     }
 
     fn parseSequence(
@@ -541,6 +571,24 @@ pub const Parser = struct {
 
         offset.* = position;
         return .{ .kind = .{ .call = call }, .location = call.location };
+    }
+
+    fn parseTupleDeclaration(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.TupleDeclaration {
+        var position = offset.*;
+        _ = self.match(&position, .keyword_const) orelse return null;
+        if (self.tokens[position].kind != .left_parenthesis) return null;
+        const names = try self.parseElementNames(allocator, &position);
+        _ = try self.expect(&position, .equals, error.ExpectedEquals);
+        const value = (try self.parseExpression(allocator, &position)) orelse {
+            return self.fail(position, error.ExpectedExpression);
+        };
+
+        offset.* = position;
+        return .{ .names = names, .value = value };
     }
 
     fn parseConstantDeclaration(
@@ -684,6 +732,7 @@ pub const Parser = struct {
         _ = self.match(&position, .keyword_trait) orelse return null;
         const name = try self.expect(&position, .identifier, error.ExpectedIdentifier);
         var functions: std.ArrayList(ast.FunctionSignature) = .empty;
+        var defaults: std.ArrayList(?ast.Default) = .empty;
         if (self.match(&position, .colon) != null) {
             const depth = try self.expectBlock(position, 0);
             while (try self.matchBlockLine(&position, depth, 0)) {
@@ -691,15 +740,24 @@ pub const Parser = struct {
                 const signature = parsed orelse {
                     return self.fail(position, error.ExpectedFunctionKeyword);
                 };
-                if (self.tokens[position].kind == .colon) {
-                    return self.fail(position, error.TraitFunctionBody);
-                }
                 try functions.append(allocator, signature);
+                if (self.match(&position, .colon) == null) {
+                    try defaults.append(allocator, null);
+                    continue;
+                }
+                const body = try self.parseBlock(allocator, &position, depth);
+                const definition: ast.FunctionDefinition = .{ .signature = signature, .body = body };
+                const template = try ast.cloneFunctionDefinition(allocator, definition);
+                try defaults.append(allocator, .{ .body = body, .template = template });
             }
         }
 
         offset.* = position;
-        return .{ .name = name.kind.identifier, .functions = functions.items };
+        return .{
+            .name = name.kind.identifier,
+            .functions = functions.items,
+            .defaults = defaults.items,
+        };
     }
 
     fn parseImplementation(
@@ -1417,7 +1475,6 @@ pub const ParseError = error{
     ExpectedColon,
     ExpectedFunctionKeyword,
     ExternalFunctionBody,
-    TraitFunctionBody,
     ExpectedFor,
     ExpectedArrow,
     ExpectedType,
@@ -1510,7 +1567,6 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.ExpectedColon => "expected ':'",
         error.ExpectedFunctionKeyword => "expected 'fn'",
         error.ExternalFunctionBody => "external functions have no body",
-        error.TraitFunctionBody => "functions of a trait have no body",
         error.ExpectedFor => "expected 'for'",
         error.ExpectedArrow => "expected '->'",
         error.ExpectedType => "expected a type",
@@ -2118,8 +2174,9 @@ test "parseFor: parses a name, a sequence and an indented body" {
 
     const statement = module.declarations[0].kind.function_definition.body[0];
     const loop = statement.kind.@"for";
-    try std.testing.expectEqualStrings("item", loop.name);
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 9 }, loop.name_location);
+    try std.testing.expectEqualStrings("item", loop.names[0].name);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 9 }, loop.names[0].location);
+    try std.testing.expect(!loop.tuple);
     try std.testing.expectEqualStrings("items", loop.sequence.value.kind.identifier.name);
     try std.testing.expectEqual(2, loop.body.len);
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, statement.location);
@@ -2164,6 +2221,60 @@ test "parseFor: rejects a missing colon" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 30 }, parser.failure.?.location.?);
 }
 
+test "parseElementNames: parses names in parentheses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): for (name, *score, _) in pairs: step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const loop = module.declarations[0].kind.function_definition.body[0].kind.@"for";
+    try std.testing.expect(loop.tuple);
+    try std.testing.expectEqual(3, loop.names.len);
+    try std.testing.expectEqualStrings("name", loop.names[0].name);
+    try std.testing.expect(!loop.names[0].pointer);
+    try std.testing.expectEqualStrings("score", loop.names[1].name);
+    try std.testing.expect(loop.names[1].pointer);
+    try std.testing.expectEqualStrings("_", loop.names[2].name);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, loop.names[1].location);
+}
+
+test "parseElementNames: parses one name in parentheses as a tuple pattern" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): for (name) in pairs: step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const loop = module.declarations[0].kind.function_definition.body[0].kind.@"for";
+    try std.testing.expect(loop.tuple);
+    try std.testing.expectEqualStrings("name", loop.names[0].name);
+}
+
+test "parseElementNames: rejects names in parentheses inside names in parentheses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): for (name, (score, rank)) in pairs: step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, parser.failure.?.location.?);
+}
+
+test "parseElementNames: rejects a missing closing parenthesis" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): for (name, score in pairs: step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedRightParenthesis, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 29 }, parser.failure.?.location.?);
+}
+
 test "parseElementName: parses an underscore" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2173,8 +2284,8 @@ test "parseElementName: parses an underscore" {
     const module = try parser.parse(&arena);
 
     const loop = module.declarations[0].kind.function_definition.body[0].kind.@"for";
-    try std.testing.expectEqualStrings("_", loop.name);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, loop.name_location);
+    try std.testing.expectEqualStrings("_", loop.names[0].name);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, loop.names[0].location);
 }
 
 test "parseElementName: rejects a name that is not an identifier" {
@@ -2188,15 +2299,30 @@ test "parseElementName: rejects a name that is not an identifier" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
 }
 
-test "parseElementName: rejects names in parentheses" {
+test "parseElementName: parses a pointer name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): for (item, index) in (items, 0..): step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): for *card in cards: step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const loop = module.declarations[0].kind.function_definition.body[0].kind.@"for";
+    try std.testing.expectEqualStrings("card", loop.names[0].name);
+    try std.testing.expect(loop.names[0].pointer);
+    try std.testing.expect(!loop.tuple);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, loop.names[0].location);
+}
+
+test "parseElementName: rejects a pointer to an underscore" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): for *_ in cards: step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 17 }, parser.failure.?.location.?);
 }
 
 test "parseSequence: parses ranges with and without an end" {
@@ -2423,6 +2549,17 @@ test "parseVariableDeclaration: rejects a missing value" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, parser.failure.?.location.?);
 }
 
+test "parseVariableDeclaration: rejects names in parentheses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): var (name, score) = pair");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
+}
+
 test "parseAssignment: parses an assignment to a field" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2547,6 +2684,45 @@ test "parseCallStatement: rejects a field access as a statement" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, parser.failure.?.location.?);
 }
 
+test "parseTupleDeclaration: parses names in parentheses and a value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    const (name, *score) = pair\n    step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const statement = module.declarations[0].kind.function_definition.body[0];
+    const declaration = statement.kind.tuple_declaration;
+    try std.testing.expectEqual(2, declaration.names.len);
+    try std.testing.expectEqualStrings("name", declaration.names[0].name);
+    try std.testing.expect(declaration.names[1].pointer);
+    try std.testing.expectEqualStrings("pair", declaration.value.kind.identifier.name);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, statement.location);
+}
+
+test "parseTupleDeclaration: rejects a written type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): const (name, score): [i32, bool] = pair");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedEquals, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 31 }, parser.failure.?.location.?);
+}
+
+test "parseTupleDeclaration: rejects names in parentheses inside names in parentheses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): const (name, (score, rank)) = pair");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, parser.failure.?.location.?);
+}
+
 test "parseConstantDeclaration: parses a path as the value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2599,6 +2775,17 @@ test "parseConstantDeclaration: parses a written type" {
     const constant = module.declarations[0].kind.constant_declaration;
     try std.testing.expectEqualStrings("i32", constant.type.?.kind.identifier.name);
     try std.testing.expectEqualStrings("5", constant.value.kind.integer_literal.text);
+}
+
+test "parseConstantDeclaration: rejects names in parentheses at the top level" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("const (name, score) = pair");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 7 }, parser.failure.?.location.?);
 }
 
 test "parseConstantDeclaration: rejects a colon without a type" {
@@ -2828,15 +3015,21 @@ test "parseTraitDefinition: parses a function without a Self parameter" {
     try std.testing.expectEqualStrings("Self", function.return_type.kind.identifier.name);
 }
 
-test "parseTraitDefinition: rejects a function with a body" {
+test "parseTraitDefinition: parses a function with a body as a default" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("trait Shape:\n    fn area(self: Self) -> i32: return 1");
+    var lexer = @import("lexer.zig").Lexer.init("trait Shape:\n    fn area(self: Self) -> i32\n    fn double(self: Self) -> i32:\n        return self.area() * 2");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
 
-    try std.testing.expectError(error.TraitFunctionBody, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 31 }, parser.failure.?.location.?);
+    const definition = module.declarations[0].kind.trait_definition;
+    try std.testing.expectEqual(2, definition.functions.len);
+    try std.testing.expectEqual(null, definition.defaults[0]);
+    const default = definition.defaults[1].?;
+    try std.testing.expectEqual(ast.BinaryOperator.multiply, default.body[0].kind.@"return".?.kind.binary.operator);
+    try std.testing.expect(default.template.body.ptr != default.body.ptr);
+    try std.testing.expectEqualStrings("double", default.template.signature.name);
 }
 
 test "parseImplementation: lists the functions of an implementation as declarations on its type" {

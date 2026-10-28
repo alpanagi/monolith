@@ -92,6 +92,11 @@
 - A struct cannot hold a value of its own type, directly or through other structs, arrays or tuples. A pointer to its own type is allowed, e.g. `next: ?*Node`.
 - Structs are values. Assigning or passing a struct copies all its fields.
 - `value.field` gives a field of a struct.
+- A struct's block can also declare functions, e.g. `fn area(self: Self) -> i32: return self.side`. In the block, `Self` is the struct's type.
+- A function in a struct's block is reached through the struct's name and `::`, e.g. `Square::new()`.
+- A function whose first parameter's type is written `Self` is a method. `value.name(arguments)` calls it with `value` as the first argument, e.g. `square.area()`.
+- A method is found by the exact type of the value.
+- Two functions in a struct's block cannot have the same name, and they cannot have the name of a field.
 
 ## Literals
 
@@ -181,6 +186,12 @@
 - Top-level declarations can be used anywhere in their module, before or after they are declared.
 - An unused local constant or variable is a compile-time error.
 - A variable that is never modified is a compile-time error.
+- `const` followed by names in parentheses takes a tuple apart, e.g. `const (name, score) = pair`. Each name is a constant holding the element at its position.
+- The number of names must match the number of elements of the tuple.
+- A name `_` leaves its element without a name.
+- `*name` holds a pointer to the element instead of a copy, e.g. `const (name, *score) = pair`. It is allowed only where `&` is allowed, and the pointer is read-only when the element cannot be modified (see Pointer Operations).
+- `var` cannot take a tuple apart.
+- Taking a tuple apart is allowed only inside functions.
 
 ## Expressions
 
@@ -312,7 +323,8 @@
 - `for name in sequence:` runs its block once for each element of the sequence, in order, with `name` holding the element. A sequence is an array, a slice, a pointer to an array or a range.
 - `start..end` is a range of the `usize` values from `start` up to, but not including, `end`, e.g. `for index in 0..count:`. `start..` is a range without an end. A start after the end is illegal behavior.
 - The sequence is evaluated once, before the first run of the block. An array is not copied: the loop goes over the array itself.
-- The name is a constant and can be used only in the block.
+- Names in parentheses take each element apart, e.g. `for (name, score) in pairs:`, and `*name` holds a pointer to each element instead of a copy, e.g. `for *card in cards:`, as in a constant declaration (see Variables and Constants).
+- The names are constants and can be used only in the block.
 - A name `_` leaves the element without a name, and the block cannot refer to it, e.g. `for _ in 0..3:`.
 - An unused name is a compile-time error.
 - `else:` runs its block when the sequence ends, but not when the loop is left with `break` or `return`. It is on the line after the `for` block, at the same indentation as `for`. Its block is not part of the loop, so `break` and `continue` in it act on an enclosing loop.
@@ -347,3 +359,19 @@
 - `import` is written at the top level of a module. The name it makes available cannot be the same as another import or top-level declaration of the module.
 - Other modules can use every top-level declaration of a module.
 - A module can be next to a directory with the same name, e.g. `shapes.mn` and `shapes/`. A declaration in the module with the same name as a module or directory in the directory is a compile-time error, e.g. `circle` in `shapes.mn` and `shapes/circle.mn`.
+
+## Traits
+
+- A trait is declared with `trait`, its name, and its functions in an indented block, e.g. `trait Shape:` followed by `fn area(self: Self) -> i32`. In the block, `Self` is the type that implements the trait.
+- A trait's function without a body only declares its signature. With a body, the body is its default implementation, e.g. `fn describe(self: Self) -> i32: return self.area()`.
+- A default implementation can use only the trait's functions on `Self`, not fields or the implementing type's own functions.
+- A trait is implemented for a type with `impl`, the trait, `for`, the type, and its functions in an indented block, e.g. `impl Shape for Square:`. In the block, `Self` is that type.
+- An implementation defines each function of the trait with the trait's signature, where `Self` stands for the type. A function with a default implementation can be left out, and the default implementation is used.
+- An implementation can only define the trait's functions.
+- Any type can implement a trait, e.g. `impl Shape for []const u8:`, at most once in a program.
+- Implementations are declared at the top level of a module.
+- A trait's methods can be called only in modules that declare or import the trait, e.g. `import shapes::Shape`.
+- A trait's functions are reached through the implementing type, e.g. `Square::new()`.
+- A trait's method can also be called through the trait, with the value as the first argument, e.g. `Shape::area(square)`.
+- A function in a struct's block shadows a trait's function with the same name, e.g. `square.area()` and `Square::area(square)` call the struct's `area`. The trait's is called through the trait, e.g. `Shape::area(square)`.
+- A method that a type gets from two traits cannot be called as `value.name()`. Calling it through a trait chooses that trait's method.
