@@ -4103,7 +4103,7 @@ test "checkAddresses: rejects the address of an element of a constant that refer
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const mask = 1i32 << 2\nconst pair = (i32, bool){mask, true}\nexternal fn keep(value: *const i32)\nfn main(): keep(&pair[0])" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const mask = 1i32 << 2\nconst pair = [i32, bool]{mask, true}\nexternal fn keep(value: *const i32)\nfn main(): keep(&pair[0])" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4680,7 +4680,7 @@ test "checkStatement: accepts writing an element of a variable array and tuple" 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    var values = [2]i32{1, 2}\n    var pair = (i32, bool){1, true}\n    values[0] = 3\n    pair[1] = false\n    const copy = values\n    const other = pair\n    _ = copy\n    _ = other" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    var values = [2]i32{1, 2}\n    var pair = [i32, bool]{1, true}\n    values[0] = 3\n    pair[1] = false\n    const copy = values\n    const other = pair\n    _ = copy\n    _ = other" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7991,7 +7991,7 @@ test "inferType: takes the type written before a tuple literal" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const pair = (i32, bool){1, true}\n    _ = pair" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const pair = [i32, bool]{1, true}\n    _ = pair" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8001,6 +8001,51 @@ test "inferType: takes the type written before a tuple literal" {
 
     const value = loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.constant_declaration.value;
     try std.testing.expectEqual(types.Type.boolean, value.type.?.tuple.elements[1]);
+}
+
+test "inferType: takes a one-element tuple type written before the braces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const single = [i32]{1}\n    _ = single" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    const value = loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.constant_declaration.value;
+    try std.testing.expectEqual(1, value.type.?.tuple.elements.len);
+    try std.testing.expectEqual(types.Type{ .number = .i32 }, value.type.?.tuple.elements[0]);
+}
+
+test "inferType: takes the empty tuple type written before empty braces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const empty = []{}\n    _ = empty" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    const value = loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.constant_declaration.value;
+    try std.testing.expectEqual(0, value.type.?.tuple.elements.len);
 }
 
 test "inferType: rejects braces without a type" {
@@ -9881,7 +9926,7 @@ test "checkCompositeLiteral: checks the elements against an alias written before
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Pair = (i32, bool)\nfn make() -> Pair: return Pair{1, 2}" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Pair = [i32, bool]\nfn make() -> Pair: return Pair{1, 2}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10010,7 +10055,7 @@ test "checkCompositeLiteral: checks each element of a tuple against its own type
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> (i32, bool): return {1, 2}" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> [i32, bool]: return {1, 2}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10031,7 +10076,7 @@ test "checkCompositeLiteral: rejects a tuple literal with another number of elem
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> (i32, bool): return {1}" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> [i32, bool]: return {1}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10040,6 +10085,93 @@ test "checkCompositeLiteral: rejects a tuple literal with another number of elem
 
     try std.testing.expectError(error.WrongTupleLength, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 34 }, type_checker.failure.?.location.?);
+}
+
+test "checkCompositeLiteral: gives braces of one element the type of a one-element tuple" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> [i32]: return {1}" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    const value = loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.@"return".?;
+    try std.testing.expectEqual(types.Type{ .number = .i32 }, value.kind.composite_literal.elements[0].value.type.?);
+    try std.testing.expectEqual(1, value.type.?.tuple.elements.len);
+}
+
+test "checkCompositeLiteral: gives empty braces the empty tuple type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> []: return {}" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    const value = loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.@"return".?;
+    try std.testing.expectEqual(0, value.type.?.tuple.elements.len);
+}
+
+test "checkCompositeLiteral: rejects empty braces where a one-element tuple is expected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> [i32]: return {}" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.WrongTupleLength, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, type_checker.failure.?.location.?);
+}
+
+test "checkCompositeLiteral: rejects an element where the empty tuple is expected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> []: return {1}" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.WrongTupleLength, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, type_checker.failure.?.location.?);
 }
 
 test "checkCompositeLiteral: gives braces over several lines the type of the tuple" {
@@ -10052,7 +10184,7 @@ test "checkCompositeLiteral: gives braces over several lines the type of the tup
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> (i32, bool): return {\n    1,\n    true,\n}" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> [i32, bool]: return {\n    1,\n    true,\n}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10099,7 +10231,7 @@ test "checkCompositeLiteral: gives a struct literal in a tuple literal its eleme
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Data:\n    value: i32\nfn make() -> (Data, i32): return {{value = 1}, 2}" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Data:\n    value: i32\nfn make() -> [Data, i32]: return {{value = 1}, 2}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10191,7 +10323,7 @@ test "checkConstruction: rejects named values where a tuple is expected" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> (i32, bool): return {one = 1, two = true}" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> [i32, bool]: return {one = 1, two = true}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10507,7 +10639,7 @@ test "checkIndex: gives an element of a tuple the type of that element" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn second(pair: (i32, bool)):\n    const element = pair[1]\n    _ = element" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn second(pair: [i32, bool]):\n    const element = pair[1]\n    _ = element" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10679,7 +10811,7 @@ test "checkTupleIndex: rejects an index that is not an integer literal" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn second(pair: (i32, bool), position: usize) -> bool: return pair[position]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn second(pair: [i32, bool], position: usize) -> bool: return pair[position]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10700,7 +10832,7 @@ test "checkTupleIndex: rejects an index outside the tuple" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn third(pair: (i32, bool)) -> bool: return pair[2]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn third(pair: [i32, bool]) -> bool: return pair[2]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10709,6 +10841,27 @@ test "checkTupleIndex: rejects an index outside the tuple" {
 
     try std.testing.expectError(error.IndexOutOfRange, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 50 }, type_checker.failure.?.location.?);
+}
+
+test "checkTupleIndex: rejects an index into the empty tuple" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(empty: []) -> i32: return empty[0]" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.IndexOutOfRange, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 42 }, type_checker.failure.?.location.?);
 }
 
 test "checkTupleIndex: rejects a suffixed index of another type" {
@@ -10721,7 +10874,7 @@ test "checkTupleIndex: rejects a suffixed index of another type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn second(pair: (i32, bool)) -> bool: return pair[1u8]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn second(pair: [i32, bool]) -> bool: return pair[1u8]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);

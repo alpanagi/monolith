@@ -3116,7 +3116,7 @@ test "expectRuntimeType: rejects a tuple with a function type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn apply(pair: (i32, fn())): _ = pair" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn apply(pair: [i32, fn()]): _ = pair" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5038,7 +5038,7 @@ test "resolveLiteralType: resolves a local alias of a tuple type before braces" 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const Pair = (i32, bool)\n    const pair = Pair{1, true}\n    _ = pair" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const Pair = [i32, bool]\n    const pair = Pair{1, true}\n    _ = pair" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5776,7 +5776,7 @@ test "resolveTupleType: gives tuples with the same elements in the same order on
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(one: (i32, bool), two: (i32, bool), three: (bool, i32)):\n    _ = one\n    _ = two\n    _ = three" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(one: [i32, bool], two: [i32, bool], three: [bool, i32]):\n    _ = one\n    _ = two\n    _ = three" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5799,7 +5799,7 @@ test "resolveTupleType: resolves a tuple type through a constant" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Pair = (i32, (bool, u8))\nfn show(pair: Pair): _ = pair" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Pair = [i32, [bool, u8]]\nfn show(pair: Pair): _ = pair" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7512,7 +7512,7 @@ test "expectEvaluable: rejects an unwrap inside a tuple literal" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const maybe: ?i32 = null\nconst pair = (i32, bool){maybe.?, true}\nfn read() -> (i32, bool): return pair" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const maybe: ?i32 = null\nconst pair = [i32, bool]{maybe.?, true}\nfn read() -> [i32, bool]: return pair" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7588,7 +7588,7 @@ test "expectEvaluable: accepts operators in constants written at each use" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const limit: i32 = 10\nconst double: i32 = limit * 2\nconst pair: (i32, bool) = {-limit, limit > 1}\nfn main(): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const limit: i32 = 10\nconst double: i32 = limit * 2\nconst pair: [i32, bool] = {-limit, limit > 1}\nfn main(): noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);

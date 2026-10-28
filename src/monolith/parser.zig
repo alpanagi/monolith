@@ -1029,20 +1029,32 @@ pub const Parser = struct {
             offset.* = position;
             return .{ .kind = .{ .array_type = array_type }, .location = bracket.location };
         }
-        if (self.match(&position, .right_bracket) != null) {
-            const constant = self.match(&position, .keyword_const) != null;
+        var elements: std.ArrayList(ast.Expression) = .empty;
+        var trailing_comma = false;
+        while (self.tokens[position].kind != .right_bracket) {
+            const element = (try self.parseExpression(allocator, &position)) orelse {
+                return self.fail(position, error.ExpectedExpression);
+            };
+            try elements.append(allocator, element);
+            trailing_comma = self.match(&position, .comma) != null;
+            if (!trailing_comma) break;
+        }
+        _ = try self.expect(&position, .right_bracket, error.ExpectedRightBracket);
+        const empty = elements.items.len == 0;
+        const constant = empty and self.match(&position, .keyword_const) != null;
+        const has_comma = elements.items.len > 1 or trailing_comma;
+        if (!constant and (has_comma or !self.isTypeStart(position))) {
+            offset.* = position;
+            const tuple_type: ast.TupleType = .{ .elements = elements.items };
+            return .{ .kind = .{ .tuple_type = tuple_type }, .location = bracket.location };
+        }
+        if (empty) {
             const slice_type = try self.parseSliceType(allocator, &position, constant);
             offset.* = position;
             return .{ .kind = .{ .slice_type = slice_type }, .location = bracket.location };
         }
         const length = try allocator.create(ast.Expression);
-        length.* = (try self.parseExpression(allocator, &position)) orelse {
-            return self.fail(position, error.ExpectedArrayLength);
-        };
-        if (self.tokens[position].kind == .comma) {
-            return self.fail(offset.* + 1, error.ExpectedArrayLength);
-        }
-        _ = try self.expect(&position, .right_bracket, error.ExpectedRightBracket);
+        length.* = elements.items[0];
         const array_type = try self.parseArrayType(allocator, &position, length);
 
         offset.* = position;
@@ -1055,27 +1067,14 @@ pub const Parser = struct {
         offset: *usize,
     ) ParseError!?ast.Expression {
         var position = offset.*;
-        const parenthesis = self.match(&position, .left_parenthesis) orelse return null;
-        var elements: std.ArrayList(ast.Expression) = .empty;
-        var trailing_comma = false;
-        while (self.tokens[position].kind != .right_parenthesis) {
-            const element = (try self.parseExpression(allocator, &position)) orelse {
-                return self.fail(position, error.ExpectedType);
-            };
-            try elements.append(allocator, element);
-            trailing_comma = self.match(&position, .comma) != null;
-            if (!trailing_comma) break;
-        }
+        _ = self.match(&position, .left_parenthesis) orelse return null;
+        const inner = (try self.parseExpression(allocator, &position)) orelse {
+            return self.fail(position, error.ExpectedExpression);
+        };
         _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
-        if (elements.items.len == 1 and !trailing_comma) {
-            offset.* = position;
-            return elements.items[0];
-        }
-        if (elements.items.len < 2) return self.fail(offset.*, error.TooFewTupleElements);
 
         offset.* = position;
-        const tuple_type: ast.TupleType = .{ .elements = elements.items };
-        return .{ .kind = .{ .tuple_type = tuple_type }, .location = parenthesis.location };
+        return inner;
     }
 
     fn parseArrayType(
@@ -1431,8 +1430,6 @@ pub const ParseError = error{
     ExpectedRightBracket,
     ExpectedLeftBrace,
     ExpectedRightBrace,
-    ExpectedArrayLength,
-    TooFewTupleElements,
     MixedNamedValues,
     ExpectedField,
     ParameterDefault,
@@ -1526,8 +1523,6 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.ExpectedRightBracket => "expected ']'",
         error.ExpectedLeftBrace => "expected '{'",
         error.ExpectedRightBrace => "expected '}'",
-        error.ExpectedArrayLength => "expected one array length",
-        error.TooFewTupleElements => "a tuple has at least two elements",
         error.MixedNamedValues => "either every value has a name or none does",
         error.ExpectedField => "expected a field or a function",
         error.ParameterDefault => "parameters cannot have default values, use a struct parameter with field defaults",
@@ -1830,7 +1825,7 @@ test "parseReturnType: rejects an optional type without an arrow" {
 test "parseReturnType: rejects a tuple type without an arrow" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("external fn pair() (i32, bool)");
+    var lexer = @import("lexer.zig").Lexer.init("external fn pair() [i32, bool]");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -3546,7 +3541,7 @@ test "parseCompositeLiteral: parses the array type written before the braces" {
 test "parseCompositeLiteral: parses the tuple type written before the braces" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const pair = (i32, bool){1, true}");
+    var lexer = @import("lexer.zig").Lexer.init("const pair = [i32, bool]{1, true}");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3554,6 +3549,32 @@ test "parseCompositeLiteral: parses the tuple type written before the braces" {
     const literal = module.declarations[0].kind.constant_declaration.value.kind.composite_literal;
     try std.testing.expectEqual(2, literal.type.?.kind.tuple_type.elements.len);
     try std.testing.expectEqual(true, literal.elements[1].value.kind.boolean_literal);
+}
+
+test "parseCompositeLiteral: parses a one-element tuple type written before the braces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("const single = [i32]{1}");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const literal = module.declarations[0].kind.constant_declaration.value.kind.composite_literal;
+    try std.testing.expectEqualStrings("i32", literal.type.?.kind.tuple_type.elements[0].kind.identifier.name);
+    try std.testing.expectEqualStrings("1", literal.elements[0].value.kind.integer_literal.text);
+}
+
+test "parseCompositeLiteral: parses the empty tuple type written before empty braces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("const empty = []{}");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const literal = module.declarations[0].kind.constant_declaration.value.kind.composite_literal;
+    try std.testing.expectEqual(0, literal.type.?.kind.tuple_type.elements.len);
+    try std.testing.expectEqual(0, literal.elements.len);
 }
 
 test "parseCompositeLiteral: parses empty braces" {
@@ -3715,15 +3736,15 @@ test "parseBrackets: parses an array type with a length to infer" {
     try std.testing.expectEqualStrings("Card", array_type.element.kind.identifier.name);
 }
 
-test "parseBrackets: rejects an array type with two lengths" {
+test "parseBrackets: reads brackets with two types as a tuple type when a type follows" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(values: [1, 2]i32): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(pair: [i32, bool] value: i32): noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
-    try std.testing.expectError(error.ExpectedArrayLength, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, parser.failure.?.location.?);
+    try std.testing.expectError(error.ExpectedRightParenthesis, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 27 }, parser.failure.?.location.?);
 }
 
 test "parseBrackets: rejects a missing closing bracket" {
@@ -3778,10 +3799,10 @@ test "parseBrackets: parses an array of pointers" {
     try std.testing.expectEqualStrings("i32", array_type.element.kind.pointer_type.target.kind.identifier.name);
 }
 
-test "parseParentheses: parses a tuple type" {
+test "parseBrackets: parses a tuple type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(pair: (i32, bool,)): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(pair: [i32, bool]): noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3791,6 +3812,71 @@ test "parseParentheses: parses a tuple type" {
     try std.testing.expectEqual(2, tuple_type.elements.len);
     try std.testing.expectEqualStrings("bool", tuple_type.elements[1].kind.identifier.name);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 15 }, parameter.type.location);
+}
+
+test "parseBrackets: parses a tuple type with a trailing comma" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn show(pair: [i32, bool,]): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const parameter = module.declarations[0].kind.function_definition.signature.parameters[0];
+    try std.testing.expectEqual(2, parameter.type.kind.tuple_type.elements.len);
+}
+
+test "parseBrackets: parses one type in brackets as a tuple type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: [i32]): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const parameter = module.declarations[0].kind.function_definition.signature.parameters[0];
+    const tuple_type = parameter.type.kind.tuple_type;
+    try std.testing.expectEqual(1, tuple_type.elements.len);
+    try std.testing.expectEqualStrings("i32", tuple_type.elements[0].kind.identifier.name);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parameter.type.location);
+}
+
+test "parseBrackets: parses empty brackets as the empty tuple type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: []): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const parameter = module.declarations[0].kind.function_definition.signature.parameters[0];
+    try std.testing.expectEqual(0, parameter.type.kind.tuple_type.elements.len);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parameter.type.location);
+}
+
+test "parseBrackets: parses a name in brackets followed by a type as an array type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn show(values: [count]i32): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const parameter = module.declarations[0].kind.function_definition.signature.parameters[0];
+    const array_type = parameter.type.kind.array_type;
+    try std.testing.expectEqualStrings("count", array_type.length.?.kind.identifier.name);
+    try std.testing.expectEqualStrings("i32", array_type.element.kind.identifier.name);
+}
+
+test "parseBrackets: reads brackets with a trailing comma as a tuple type when a type follows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn show(values: [4,]i32): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedRightParenthesis, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 21 }, parser.failure.?.location.?);
 }
 
 test "parseParentheses: reads one type in parentheses as that type" {
@@ -3818,15 +3904,26 @@ test "parseParentheses: groups an expression" {
     try std.testing.expectEqual(ast.BinaryOperator.add, value.kind.binary.left.kind.binary.operator);
 }
 
-test "parseParentheses: rejects a tuple of one element" {
+test "parseParentheses: rejects a comma between types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn show(pair: (i32, bool)): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedRightParenthesis, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
+}
+
+test "parseParentheses: rejects a comma after one type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("fn show(value: (i32,)): noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
-    try std.testing.expectError(error.TooFewTupleElements, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
+    try std.testing.expectError(error.ExpectedRightParenthesis, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 20 }, parser.failure.?.location.?);
 }
 
 test "parseParentheses: rejects empty parentheses" {
@@ -3836,8 +3933,8 @@ test "parseParentheses: rejects empty parentheses" {
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
-    try std.testing.expectError(error.TooFewTupleElements, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
+    try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 17 }, parser.failure.?.location.?);
 }
 
 test "parsePointerType: parses a pointer to a single value" {

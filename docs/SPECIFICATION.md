@@ -70,9 +70,10 @@
 
 ### Tuple Types
 
-- A tuple holds a fixed number of values whose types can differ. Its type lists the element types in parentheses, e.g. `(i32, bool)`.
+- A tuple holds a fixed number of values whose types can differ. Its type lists the element types in brackets, e.g. `[i32, bool]`.
 - Tuples are structural: two tuple types with the same element types in the same order are the same type.
-- A tuple has at least two elements.
+- A tuple can have any number of elements, e.g. `[i32]` and `[]`. Brackets without a comma that are followed by a type are an array or a slice instead.
+- Tuple types can span multiple lines. A comma after the last element type is allowed.
 - Tuples support indexing with an index known at compile time, starting at 0.
 
 ### Function Types
@@ -146,7 +147,7 @@
 
 ### Tuple Literals
 
-- Tuple literals are written as the tuple type followed by the elements in braces, e.g. `(i32, bool){1, true}`.
+- Tuple literals are written as the tuple type followed by the elements in braces, e.g. `[i32, bool]{1, true}`.
 - The type can be left out when it is known from the surrounding code, e.g. `{1, true}`.
 - Tuple literals can span multiple lines.
 - A comma after the last element is allowed.

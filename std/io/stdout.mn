@@ -1,3 +1,7 @@
 external fn mn_runtime_stdout_write(text: []const u8)
 
 const write = mn_runtime_stdout_write
+
+fn println(text: []const u8, _: []):
+    write(text)
+    write("\n")
