@@ -963,6 +963,18 @@ test "lexWord: recognizes the for and in keywords" {
     try std.testing.expectEqualStrings("inside", lexer.tokens.items[3].kind.identifier);
 }
 
+test "lexWord: recognizes the typeclass and instance keywords" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("typeclass instance trait impl");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_typeclass);
+    try std.testing.expect(lexer.tokens.items[2].kind == .keyword_instance);
+    try std.testing.expectEqualStrings("trait", lexer.tokens.items[3].kind.identifier);
+    try std.testing.expectEqualStrings("impl", lexer.tokens.items[4].kind.identifier);
+}
+
 test "lexWord: recognizes the comptime keyword" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

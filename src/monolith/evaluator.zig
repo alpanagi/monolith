@@ -115,7 +115,7 @@ pub const Evaluator = struct {
     fn isKnownWith(self: *const Evaluator, expression: ast.Expression, calls: bool) bool {
         return switch (expression.kind) {
             .integer_literal, .float_literal, .boolean_literal, .string_literal, .null => true,
-            inline .identifier, .path_expression => |name| self.isKnownResolution(name.resolution, calls),
+            inline .identifier, .path_expression, .member => |name| self.isKnownResolution(name.resolution, calls),
             .negation, .unwrap, .dereference, .address_of => |operand| self.isKnownWith(operand.*, calls),
             .unary => |unary| self.isKnownWith(unary.operand.*, calls),
             .binary => |binary| self.isKnownWith(binary.left.*, calls) and self.isKnownWith(binary.right.*, calls),
@@ -150,7 +150,7 @@ pub const Evaluator = struct {
                 if (statement.kind != .constant_declaration) return false;
                 return self.isKnownWith(statement.kind.constant_declaration.value, calls);
             },
-            .parameter, .element, .trait_function, .trait_method => false,
+            .parameter, .element, .typeclass_function, .typeclass_method => false,
         };
     }
 
@@ -170,7 +170,7 @@ pub const Evaluator = struct {
             .string_literal => |text| self.makeString(expression.type.?, text),
             .null => .{ .optional = null },
             .undefined => self.makeUndefined(expression.type.?),
-            inline .identifier, .path_expression => |name| self.readResolution(location, name.resolution.?),
+            inline .identifier, .path_expression, .member => |name| self.readResolution(location, name.resolution.?),
             .negation => |operand| self.evaluateNegation(expression, operand.*),
             .unary => |unary| self.evaluateUnary(expression, unary),
             .binary => |binary| self.evaluateBinary(expression, binary),
@@ -193,15 +193,25 @@ pub const Evaluator = struct {
         const created = try preparer.beginStruct(preparer.context, struct_type);
         if (self.calls.items.len > 0) {
             const innermost = &self.calls.items[self.calls.items.len - 1];
-            if (innermost.frame == self.frame) innermost.pending = created;
+            if (innermost.frame == self.frame) {
+                innermost.pending = created;
+                try innermost.created.append(self.arena.allocator(), created.@"struct".origin.?);
+            }
         }
         try preparer.finishStruct(preparer.context, struct_type, created, location);
         return .{ .type = created };
     }
 
+    fn convert(self: *Evaluator, value: Value, value_type: types.Type, expected: types.Type) EvaluateError!Value {
+        if (countOptionals(value_type) >= countOptionals(expected)) return convertDirectly(value, value_type, expected);
+        const cell = try self.arena.allocator().create(Value);
+        cell.* = try self.copy(convertDirectly(value, value_type, expected.optional.child));
+        return .{ .optional = cell };
+    }
+
     fn evaluateConverted(self: *Evaluator, expression: ast.Expression, expected: types.Type) EvaluateError!Value {
         const value = try self.evaluateExpression(expression);
-        return convert(value, expression.type.?, expected);
+        return self.convert(value, expression.type.?, expected);
     }
 
     fn readResolution(self: *Evaluator, location: token.Location, resolution: ast.Resolution) EvaluateError!Value {
@@ -210,7 +220,7 @@ pub const Evaluator = struct {
             .function => |function| Value{ .function = function },
             .type => |value_type| Value{ .type = value_type },
             .parameter, .local, .element => (try self.findCell(location, resolution)).*,
-            .trait_function, .trait_method => return self.fail(location, error.CannotEvaluate),
+            .typeclass_function, .typeclass_method => return self.fail(location, error.CannotEvaluate),
         };
         if (value == .undefined) return self.fail(location, error.ReadUndefined);
         return value;
@@ -226,7 +236,7 @@ pub const Evaluator = struct {
                 .element => |element| {
                     if (frame.elements.get(element)) |cell| return cell;
                 },
-                .constant, .function, .type, .trait_function, .trait_method => unreachable,
+                .constant, .function, .type, .typeclass_function, .typeclass_method => unreachable,
             }
         }
         if (resolution == .local and resolution.local.kind == .constant_declaration) {
@@ -242,7 +252,7 @@ pub const Evaluator = struct {
     fn findPlace(self: *Evaluator, expression: ast.Expression) EvaluateError!Value.Pointer {
         const location = expression.location;
         switch (expression.kind) {
-            inline .identifier, .path_expression => |name| {
+            inline .identifier, .path_expression, .member => |name| {
                 const resolution = name.resolution.?;
                 const value_type = expression.type.?;
                 return switch (resolution) {
@@ -252,7 +262,7 @@ pub const Evaluator = struct {
                         .root_type = value_type,
                         .path = &.{},
                     },
-                    .function, .type, .trait_function, .trait_method => self.fail(location, error.CannotEvaluate),
+                    .function, .type, .typeclass_function, .typeclass_method => self.fail(location, error.CannotEvaluate),
                 };
             },
             .field_access => |access| {
@@ -321,7 +331,7 @@ pub const Evaluator = struct {
                 if (element < 0 or element >= length) return self.fail(location, error.IndexOutOfRange);
                 return self.extendPlace(many.array, @intCast(element));
             },
-            .number, .boolean, .void, .type, .@"struct", .optional, .function, .implementer => unreachable,
+            .number, .boolean, .void, .type, .@"struct", .optional, .function, .variable, .application => unreachable,
         }
     }
 
@@ -531,7 +541,7 @@ pub const Evaluator = struct {
                 }
                 return .{ .aggregate = elements };
             },
-            .number, .boolean, .void, .type, .slice, .pointer, .optional, .function, .implementer => unreachable,
+            .number, .boolean, .void, .type, .slice, .pointer, .optional, .function, .variable, .application => unreachable,
         }
     }
 
@@ -553,7 +563,7 @@ pub const Evaluator = struct {
                 if (value.many.index > available) return self.fail(location, error.SliceOutOfRange);
                 break :base .{ value.many.array, @intCast(value.many.index), available - @as(usize, @intCast(value.many.index)) };
             },
-            .number, .boolean, .void, .type, .@"struct", .optional, .tuple, .function, .implementer => unreachable,
+            .number, .boolean, .void, .type, .@"struct", .optional, .tuple, .function, .variable, .application => unreachable,
         };
         const start = try self.evaluateBound(slice.start, 0);
         const end = try self.evaluateBound(slice.end, length);
@@ -577,7 +587,7 @@ pub const Evaluator = struct {
 
     fn evaluateAddress(self: *Evaluator, operand: ast.Expression) EvaluateError!Value {
         switch (operand.kind) {
-            inline .identifier, .path_expression => |name| {
+            inline .identifier, .path_expression, .member => |name| {
                 if (name.resolution.? == .function) return .{ .function = name.resolution.?.function };
             },
             else => {},
@@ -590,13 +600,13 @@ pub const Evaluator = struct {
         const function = switch (resolution) {
             .function => |function| function,
             .parameter, .local, .constant, .element => (try self.readResolution(location, resolution)).function,
-            .type, .trait_function, .trait_method => return self.fail(location, error.CannotEvaluate),
+            .type, .typeclass_function, .typeclass_method => return self.fail(location, error.CannotEvaluate),
         };
         const declaration = ast.findDeclaration(self.program.modules[function.module], function.declaration);
         const definition = switch (declaration.kind) {
             .function_definition => |*definition| definition,
             .function_declaration => return self.fail(location, error.ExternalCall),
-            .constant_declaration, .struct_definition, .trait_definition, .implementation, .import => unreachable,
+            .constant_declaration, .struct_definition, .typeclass_definition, .instance_declaration, .import => unreachable,
         };
         const signature = definition.signature;
         const allocator = self.arena.allocator();
@@ -630,15 +640,29 @@ pub const Evaluator = struct {
             _ = self.calls.pop();
         };
         const caller_module_index = self.module_index;
-        self.module_index = if (definition.default_of) |trait| trait.module else function.module;
+        self.module_index = if (definition.default_of) |typeclass| typeclass.module else function.module;
         defer self.module_index = caller_module_index;
         const result: Value = switch (try self.executeBlock(definition.body)) {
             .returned => |value| value,
             .next => .void,
             .broke, .continued => unreachable,
         };
+        if (cached) try self.recordOrigin(function, result, self.calls.items[self.calls.items.len - 1].created.items);
         if (cached) try self.cache.append(self.arena.allocator(), .{ .function = function, .arguments = parameters, .result = result });
         return result;
+    }
+
+    fn recordOrigin(
+        self: *Evaluator,
+        function: ast.Resolution.Function,
+        result: Value,
+        created: []const *types.Origin,
+    ) EvaluateError!void {
+        if (result != .type or result.type != .@"struct") return;
+        const origin = result.type.@"struct".origin orelse return;
+        if (std.mem.findScalar(*types.Origin, created, origin) == null) return;
+        const preparer = self.preparer orelse return;
+        origin.* = (try preparer.findOrigin(preparer.context, function)) orelse return;
     }
 
     fn findPending(self: *const Evaluator, function: ast.Resolution.Function, arguments: []const Value) ?types.Type {
@@ -822,7 +846,7 @@ pub const Evaluator = struct {
                         const target = try self.expectPointer(value.location, try self.evaluateExpression(value));
                         break :sequence .{ target, 0, @intCast(pointer.target.array.length) };
                     },
-                    .number, .boolean, .void, .type, .@"struct", .optional, .tuple, .function, .implementer => unreachable,
+                    .number, .boolean, .void, .type, .@"struct", .optional, .tuple, .function, .variable, .application => unreachable,
                 };
                 for (0..length) |offset| {
                     try self.step(statement.location);
@@ -896,7 +920,7 @@ pub const Evaluator = struct {
                 for (struct_type.fields, fields) |field, *field_value| field_value.* = try self.makeUndefined(field.type);
                 return .{ .aggregate = fields };
             },
-            .number, .boolean, .void, .type, .slice, .pointer, .optional, .function, .implementer => return .undefined,
+            .number, .boolean, .void, .type, .slice, .pointer, .optional, .function, .variable, .application => return .undefined,
         }
     }
 
@@ -948,6 +972,7 @@ pub const Preparer = struct {
     context: *anyopaque,
     prepare: *const fn (context: *anyopaque, function: ast.Resolution.Function) AnalyzeError!void,
     beginStruct: *const fn (context: *anyopaque, struct_type: *const ast.StructType) AnalyzeError!types.Type,
+    findOrigin: *const fn (context: *anyopaque, function: ast.Resolution.Function) AnalyzeError!?types.Origin,
     finishStruct: *const fn (
         context: *anyopaque,
         struct_type: *const ast.StructType,
@@ -985,6 +1010,7 @@ const Active = struct {
     arguments: []const Value,
     frame: *Frame,
     pending: ?types.Type = null,
+    created: std.ArrayList(*types.Origin) = .empty,
 };
 
 const Frame = struct {
@@ -1043,7 +1069,7 @@ fn hasWritableReference(value_type: types.Type, visited: ?*const Visited) bool {
             }
             return false;
         },
-        .number, .boolean, .void, .type, .function, .implementer => false,
+        .number, .boolean, .void, .type, .function, .variable, .application => false,
     };
 }
 
@@ -1052,7 +1078,14 @@ const Visited = struct {
     parent: ?*const Visited,
 };
 
-fn convert(value: Value, value_type: types.Type, expected: types.Type) Value {
+fn countOptionals(value_type: types.Type) usize {
+    var count: usize = 0;
+    var current = value_type;
+    while (current == .optional) : (current = current.optional.child) count += 1;
+    return count;
+}
+
+fn convertDirectly(value: Value, value_type: types.Type, expected: types.Type) Value {
     if (expected != .slice or value_type != .pointer) return value;
     const array = value_type.pointer.target.array;
     return .{ .slice = .{ .array = value.pointer, .start = 0, .length = @intCast(array.length) } };
@@ -1099,7 +1132,7 @@ fn findNumber(value_type: types.Type) types.NumberType {
     return switch (value_type) {
         .number => |number| number,
         .optional => |optional| findNumber(optional.child),
-        .boolean, .void, .type, .@"struct", .array, .slice, .pointer, .tuple, .function, .implementer => unreachable,
+        .boolean, .void, .type, .@"struct", .array, .slice, .pointer, .tuple, .function, .variable, .application => unreachable,
     };
 }
 
@@ -1779,7 +1812,7 @@ test "evaluateCall: calls a default implementation with a pointer receiver" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn double(self: *const Self) -> i32: return self.area() * 2\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side * self.side\nfn make() -> i32:\n    const square = Square{side = 3}\n    return square.double()\nconst DOUBLE = make()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn double(self: *const T) -> i32: return self.area() * 2\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side * self.side\nfn make() -> i32:\n    const square = Square{side = 3}\n    return square.double()\nconst DOUBLE = make()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -1865,6 +1898,30 @@ test "isSameKey: tells floats apart bit for bit" {
 
     const known = loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.*;
     try std.testing.expect(std.math.signbit(known.float));
+}
+
+test "recordOrigin: gives the origin only to the struct that a call returns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Box(type T) -> type:\n    return struct:\n        value: T\nfn Pair(type T) -> type:\n    const Inner = struct:\n        value: T\n    return [2]Inner\nfn take(box: Box(i32), pair: Pair(i32)):\n    _ = box\n    _ = pair" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const parameters = loader.modules.items[0].declarations[2].kind.function_definition.signature.parameters;
+    const box = ast.extractType(parameters[0].type).@"struct";
+    try std.testing.expectEqual(ast.Resolution.Function{ .module = 0, .declaration = 0 }, box.origin.?.function.?);
+    try std.testing.expectEqual(types.Type{ .number = .i32 }, box.origin.?.arguments[0]);
+    const inner = ast.extractType(parameters[1].type).array.element.@"struct";
+    try std.testing.expectEqual(null, inner.origin.?.function);
 }
 
 test "executeTupleDeclaration: takes a tuple apart" {

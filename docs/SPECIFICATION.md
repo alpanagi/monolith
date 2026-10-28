@@ -22,7 +22,7 @@
 - Identifiers are case-sensitive. By convention only types and type constructors start with a capital letter.
 - The single character `_` is reserved and cannot be used as an identifier by the user.
 - The following identifier names are reserved and cannot be used as identifiers by the user:
-    `and`, `as`, `break`, `comptime`, `const`, `continue`, `else`, `external`, `false`, `fn`, `for`, `if`, `impl`, `import`, `in`, `many`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `trait`, `true`, `undefined`, `var`, `void`, `while`
+    `and`, `as`, `break`, `comptime`, `const`, `continue`, `else`, `external`, `false`, `fn`, `for`, `if`, `import`, `in`, `instance`, `many`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `true`, `typeclass`, `undefined`, `var`, `void`, `while`
 
 ## Built-In Types
 
@@ -67,6 +67,7 @@
 
 - An optional holds either a value or `null`. Its type is the value's type prefixed with `?`, e.g. `?i32`.
 - Optional pointers have the same size as pointers, with `null` stored as address 0.
+- A value of type `T` converts implicitly to `?T`, e.g. `var count: ?i32 = 5`. Deeper optionals are not wrapped implicitly, e.g. an `i32` does not convert to `??i32`.
 
 ### Tuple Types
 
@@ -364,21 +365,28 @@
 - Other modules can use every top-level declaration of a module.
 - A module can be next to a directory with the same name, e.g. `shapes.mn` and `shapes/`. A declaration in the module with the same name as a module or directory in the directory is a compile-time error, e.g. `circle` in `shapes.mn` and `shapes/circle.mn`.
 
-## Traits
+## Typeclasses
 
-- A trait is declared with `trait`, its name, and its functions in an indented block, e.g. `trait Shape:` followed by `fn area(self: Self) -> i32`. In the block, `Self` is the type that implements the trait.
-- A trait's function without a body only declares its signature. With a body, the body is its default implementation, e.g. `fn describe(self: Self) -> i32: return self.area()`.
-- A default implementation can use only the trait's functions on `Self`, not fields or the implementing type's own functions.
-- A trait is implemented for a type with `impl`, the trait, `for`, the type, and its functions in an indented block, e.g. `impl Shape for Square:`. In the block, `Self` is that type.
-- An implementation defines each function of the trait with the trait's signature, where `Self` stands for the type. A function with a default implementation can be left out, and the default implementation is used.
-- An implementation can only define the trait's functions.
-- Any type can implement a trait, e.g. `impl Shape for []const u8:`, at most once in a program.
-- Implementations are declared at the top level of a module.
-- A trait's methods can be called only in modules that declare or import the trait, e.g. `import shapes::Shape`.
-- A trait's functions are reached through the implementing type, e.g. `Square::new()`.
-- A trait's method can also be called through the trait, with the value as the first argument, e.g. `Shape::area(square)`. For a method whose first parameter is a pointer, the argument is a pointer, e.g. `Shape::grow(&square)`.
-- A function in a struct's block shadows a trait's function with the same name, e.g. `square.area()` and `Square::area(square)` call the struct's `area`. The trait's is called through the trait, e.g. `Shape::area(square)`.
-- A method that a type gets from two traits cannot be called as `value.name()`. Calling it through a trait chooses that trait's method.
+- A typeclass is declared with `typeclass`, its name, its parameters in parentheses, and its functions in an indented block, e.g. `typeclass Show(type T):` followed by `fn show(value: T, output: *Writer)`.
+- A parameter is a type, e.g. `type T`, or a type constructor written with the types it takes, e.g. `type F(type)`.
+- A parameter can require instances of other typeclasses, e.g. `typeclass Ord(type T: Eq):`. Every instance of `Ord(T)` then needs an instance of `Eq(T)`, and `Ord`'s functions can use `Eq`'s.
+- A typeclass's function without a body only declares its signature. With a body, the body is its default implementation.
+- A default implementation can use only the functions of its typeclass and of the typeclasses its parameters require.
+- A typeclass's function can take its own `type` parameters, e.g. `fn map(type A, type B, value: F(A), function: *fn(A) -> B) -> F(B)`.
+- An instance is declared with `instance`, the typeclass with its arguments, and its functions in an indented block, e.g. `instance Show(Card):`.
+- An instance can cover every instantiation of a type through its own parameters, e.g. `instance(type A: Show) Show(List(A)):`.
+- An instance defines each function of the typeclass with the typeclass's signature, with the arguments in place of the parameters. A function with a default implementation can be left out, and the default implementation is used.
+- An instance can only define the typeclass's functions.
+- Two instances of a typeclass cannot cover the same arguments, e.g. `instance Show(List(u8)):` next to `instance(type A: Show) Show(List(A)):`.
+- Instances are declared at the top level of a module.
+- A typeclass's functions can be called only in modules that declare or import the typeclass, e.g. `import shapes::Shape`.
+- A typeclass's function is called through the typeclass, e.g. `Show::show(card, output)`, with the instance chosen by the types of the arguments. If more than one instance fits, the call is a compile-time error.
+- A typeclass with its arguments names one instance, e.g. `Default(Card)::value()`. A function whose arguments do not decide the instance is called this way.
+- A typeclass's function whose first parameter's type is a parameter of the typeclass, or a pointer to one, can also be called as a method, e.g. `card.show(output)` (see Structs).
+- A function in a struct's block shadows a typeclass's function with the same name. A method that a type gets from two typeclasses cannot be called as `value.name()`.
+- A parameter whose type is a typeclass with one parameter takes a value of any type with an instance, e.g. `fn report(value: Show)` called as `report(card)`. Each different type gets its own instance of the function.
+- A `type` parameter can require instances, e.g. `fn parse(type T: Parse, text: []const u8) -> T`.
+- A function with such parameters is checked once, before any instance, and can use them only through the functions of the typeclasses they require.
 
 ## Compile-Time Evaluation
 
@@ -388,8 +396,8 @@
 - Top-level constants are evaluated at compile time.
 - A parameter written `type T` takes a type, e.g. `fn List(type T) -> type`. A parameter marked `comptime` takes a value known at compile time, e.g. `comptime format: []const u8`. Their arguments are evaluated at compile time.
 - A function gets its own instance for each different set of arguments to its `type` and `comptime` parameters.
-- `struct:` followed by an indented block, written like a struct's, is a struct without a name, e.g. `return struct:` followed by `items: []T`. `trait:` followed by an indented block, written like a trait's, is a trait without a name.
-- `trait` is the type of traits, e.g. `fn Iterator(type T) -> trait`. A trait value can be used wherever a trait's name can, e.g. `impl Iterator([Card, usize]) for Zip:`.
+- A function with `type` or `comptime` parameters is checked for everything that does not depend on them, even if it is never called.
+- `struct:` followed by an indented block, written like a struct's, is a struct without a name, e.g. `return struct:` followed by `items: []T`.
 - A call evaluated at compile time gives the same result for the same arguments, e.g. `List(i32)` is the same type everywhere.
 - Any function can be evaluated at compile time, unless it reaches an external function.
 - Illegal behavior during compile-time evaluation is a compile-time error.

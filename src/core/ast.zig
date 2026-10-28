@@ -25,17 +25,24 @@ pub const DeclarationKind = union(enum) {
     function_definition: FunctionDefinition,
     constant_declaration: ConstantDeclaration,
     struct_definition: StructDefinition,
-    trait_definition: TraitDefinition,
-    implementation: Implementation,
+    typeclass_definition: TypeclassDefinition,
+    instance_declaration: InstanceDeclaration,
     import: Import,
 };
 
 pub const FunctionDefinition = struct {
     signature: FunctionSignature,
     body: []Statement,
-    default_of: ?Resolution.Trait = null,
+    default_of: ?Resolution.Typeclass = null,
     template: ?Resolution.Function = null,
     bindings: []const Binding = &.{},
+    instance: ?InstanceReference = null,
+    instance_arguments: []const types.Argument = &.{},
+    pattern: bool = false,
+    constraints: []const Constraint = &.{},
+    check_only: bool = false,
+    dropped_names: []const []const u8 = &.{},
+    lenient: bool = false,
     body_progress: Progress = .pending,
     check_progress: Progress = .pending,
 };
@@ -47,7 +54,13 @@ pub const Binding = struct {
     pub const Target = union(enum) {
         type: types.Type,
         constant: Resolution.Constant,
+        constructor: types.Constructor,
     };
+};
+
+pub const InstanceReference = struct {
+    module: usize,
+    declaration: usize,
 };
 
 pub const Progress = enum {
@@ -58,11 +71,19 @@ pub const Progress = enum {
 
 pub const FunctionSignature = struct {
     receiver: ?Expression = null,
-    trait: ?Expression = null,
+    typeclass: ?Expression = null,
     name: []const u8,
     parameters: []TypedName,
     return_type: Expression,
+    self_parameter: SelfParameter = .none,
     progress: Progress = .pending,
+};
+
+pub const SelfParameter = enum {
+    none,
+    value,
+    pointer,
+    constant_pointer,
 };
 
 pub const Statement = struct {
@@ -113,11 +134,25 @@ pub const StructDefinition = struct {
     value: ?types.Type = null,
 };
 
-pub const TraitDefinition = struct {
+pub const TypeclassDefinition = struct {
     name: []const u8,
+    parameters: []TypeclassParameter,
     functions: []FunctionSignature,
     defaults: []?Default,
     resolved: bool = false,
+};
+
+pub const TypeclassParameter = struct {
+    name: []const u8,
+    arity: usize,
+    requirement: ?Expression = null,
+    resolved_requirement: ?Resolution.Typeclass = null,
+    location: token.Location,
+};
+
+pub const Constraint = struct {
+    typeclass: Resolution.Typeclass,
+    arguments: []const types.Argument,
 };
 
 pub const Default = struct {
@@ -125,19 +160,28 @@ pub const Default = struct {
     template: FunctionDefinition,
 };
 
-pub const Implementation = struct {
-    trait: Expression,
-    type: Expression,
+pub const InstanceDeclaration = struct {
+    typeclass: Expression,
+    parameters: []InstanceParameter = &.{},
+    arguments: []Expression,
     functions: usize,
     defaults: []const usize = &.{},
-    resolved: ?Resolution.Trait = null,
+    resolved: ?Resolution.Typeclass = null,
+    resolved_arguments: []const types.Argument = &.{},
     progress: Progress = .pending,
+};
+
+pub const InstanceParameter = struct {
+    name: []const u8,
+    requirement: ?Expression = null,
+    resolved_requirement: ?Resolution.Typeclass = null,
+    location: token.Location,
 };
 
 pub const Import = struct {
     path: Path,
     name: []const u8,
-    trait: ?Resolution.Trait = null,
+    typeclass: ?Resolution.Typeclass = null,
 };
 
 pub const VariableDeclaration = struct {
@@ -219,6 +263,7 @@ pub const ExpressionKind = union(enum) {
     null,
     identifier: Identifier,
     path_expression: PathExpression,
+    member: Member,
     call: Call,
     method_call: MethodCall,
     negation: *Expression,
@@ -243,6 +288,7 @@ pub const ExpressionKind = union(enum) {
 pub const Call = struct {
     callee: Name,
     arguments: []Argument,
+    typeclass_arguments: []const types.Argument = &.{},
 };
 
 pub const Name = union(enum) {
@@ -267,6 +313,7 @@ pub const Member = struct {
     owner: *Expression,
     name: []const u8,
     resolution: ?Resolution = null,
+    typeclass_arguments: []const types.Argument = &.{},
 };
 
 pub const MethodCall = struct {
@@ -283,8 +330,8 @@ pub const Resolution = union(enum) {
     constant: Resolution.Constant,
     local: *const Statement,
     element: Resolution.Element,
-    trait_function: Resolution.TraitFunction,
-    trait_method: Resolution.TraitFunction,
+    typeclass_function: Resolution.TypeclassFunction,
+    typeclass_method: Resolution.TypeclassFunction,
 
     pub const Function = struct {
         module: usize,
@@ -296,7 +343,7 @@ pub const Resolution = union(enum) {
         declaration: usize,
     };
 
-    pub const Trait = struct {
+    pub const Typeclass = struct {
         module: usize,
         declaration: usize,
     };
@@ -306,8 +353,8 @@ pub const Resolution = union(enum) {
         position: usize,
     };
 
-    pub const TraitFunction = struct {
-        trait: Resolution.Trait,
+    pub const TypeclassFunction = struct {
+        typeclass: Resolution.Typeclass,
         function: usize,
     };
 };
@@ -429,12 +476,15 @@ pub const TypedName = struct {
     type: Expression,
     location: token.Location,
     kind: ParameterKind = .run_time,
+    requirement: ?Expression = null,
+    constraint: ?Resolution.Typeclass = null,
 };
 
 pub const ParameterKind = enum {
     run_time,
     type,
     compile_time,
+    implicit,
 };
 
 pub const Field = struct {
@@ -481,8 +531,8 @@ pub fn extractFunctionSignature(declaration: Declaration) FunctionSignature {
         .function_declaration => |function_declaration| function_declaration,
         .constant_declaration,
         .struct_definition,
-        .trait_definition,
-        .implementation,
+        .typeclass_definition,
+        .instance_declaration,
         .import,
         => unreachable,
     };
@@ -499,98 +549,113 @@ pub fn isMain(signature: FunctionSignature) bool {
     return signature.receiver == null and std.mem.eql(u8, signature.name, "main");
 }
 
-pub fn hasSelf(signature: FunctionSignature) bool {
-    if (signature.parameters.len == 0) return false;
-    var first = signature.parameters[0].type;
-    if (first.kind == .pointer_type) {
-        if (first.kind.pointer_type.many) return false;
-        first = first.kind.pointer_type.target.*;
-    }
-    if (first.kind != .identifier) return false;
-    return std.mem.eql(u8, first.kind.identifier.name, "Self");
-}
-
-pub fn findMethod(
+pub fn findInstance(
+    allocator: std.mem.Allocator,
     modules: []const Module,
-    caller: usize,
-    receiver: types.Type,
-    name: []const u8,
-) MethodSearch {
-    var search: MethodSearch = .missing;
-    if (receiver == .@"struct") {
-        const owner = receiver.@"struct".module;
-        if (findOwnFunction(modules[owner], receiver, name)) |index| {
-            return .{ .found = .{ .module = owner, .declaration = index } };
-        }
-    }
-    for (modules[caller].declarations, 0..) |declaration, index| {
-        const trait: Resolution.Trait = switch (declaration.kind) {
-            .trait_definition => .{ .module = caller, .declaration = index },
-            .import => |import| import.trait orelse continue,
-            .function_declaration,
-            .function_definition,
-            .constant_declaration,
-            .struct_definition,
-            .implementation,
-            => continue,
-        };
-        const function = findTraitFunction(modules, trait, receiver, name) orelse continue;
-        search.add(function);
-    }
-    return search;
-}
-
-pub const MethodSearch = union(enum) {
-    missing,
-    found: Resolution.Function,
-    ambiguous,
-
-    fn add(self: *MethodSearch, function: Resolution.Function) void {
-        self.* = switch (self.*) {
-            .missing => .{ .found = function },
-            .found => |found| if (std.meta.eql(found, function)) self.* else .ambiguous,
-            .ambiguous => .ambiguous,
-        };
-    }
-};
-
-pub fn findTraitFunction(
-    modules: []const Module,
-    trait: Resolution.Trait,
-    receiver: types.Type,
-    name: []const u8,
-) ?Resolution.Function {
+    typeclass: Resolution.Typeclass,
+    decided: []const ?types.Argument,
+) std.mem.Allocator.Error!InstanceSearch {
+    var found: ?InstanceReference = null;
+    var found_assigned: []?types.Argument = &.{};
     for (modules, 0..) |module, module_index| {
         for (module.declarations, 0..) |declaration, index| {
-            const implementation = switch (declaration.kind) {
-                .implementation => |implementation| implementation,
-                .function_declaration,
-                .function_definition,
-                .constant_declaration,
-                .struct_definition,
-                .trait_definition,
-                .import,
-                => continue,
-            };
-            const resolved = implementation.resolved orelse continue;
-            if (!std.meta.eql(resolved, trait) or implementation.progress != .done) continue;
-            if (!std.meta.eql(extractType(implementation.type), receiver)) continue;
-            const first = index + 1;
-            const functions = module.declarations[first .. first + implementation.functions];
-            for (functions, first..) |function, function_index| {
-                const signature = function.kind.function_definition.signature;
-                if (!std.mem.eql(u8, signature.name, name)) continue;
-                return .{ .module = module_index, .declaration = function_index };
+            if (declaration.kind != .instance_declaration) continue;
+            const instance_declaration = declaration.kind.instance_declaration;
+            if (!std.meta.eql(instance_declaration.resolved, typeclass)) continue;
+            if (instance_declaration.resolved_arguments.len != decided.len) continue;
+            const assigned = try allocator.alloc(?types.Argument, instance_declaration.parameters.len);
+            @memset(assigned, null);
+            const fits = for (instance_declaration.resolved_arguments, decided) |pattern, optional_argument| {
+                const argument = optional_argument orelse continue;
+                if (!types.matchArgument(pattern, argument, .instance, assigned)) break false;
+            } else true;
+            if (!fits) continue;
+            if (!try satisfiesRequirements(allocator, modules, instance_declaration, assigned)) continue;
+            if (found != null) return .ambiguous;
+            if (instance_declaration.parameters.len > 0) {
+                if (!try hasRequiredInstances(allocator, modules, typeclass, decided)) return .missing_requirement;
             }
-            for (implementation.defaults) |default_index| {
-                const signature = module.declarations[default_index].kind.function_definition.signature;
-                if (!std.mem.eql(u8, signature.name, name)) continue;
-                return .{ .module = module_index, .declaration = default_index };
-            }
-            return null;
+            found = .{ .module = module_index, .declaration = index };
+            found_assigned = assigned;
+        }
+    }
+    const reference = found orelse return .missing;
+    const assigned = try allocator.alloc(types.Argument, found_assigned.len);
+    for (found_assigned, assigned) |optional_argument, *argument| {
+        argument.* = optional_argument orelse return .undecided;
+    }
+    return .{ .found = .{ .reference = reference, .assigned = assigned } };
+}
+
+pub const InstanceSearch = union(enum) {
+    missing,
+    missing_requirement,
+    ambiguous,
+    undecided,
+    found: FoundInstance,
+};
+
+pub const FoundInstance = struct {
+    reference: InstanceReference,
+    assigned: []const types.Argument,
+};
+
+pub fn findInstanceMember(modules: []const Module, reference: InstanceReference, name: []const u8) ?Resolution.Function {
+    const module = modules[reference.module];
+    const instance_declaration = module.declarations[reference.declaration].kind.instance_declaration;
+    const first = reference.declaration + 1;
+    for (module.declarations[first .. first + instance_declaration.functions], first..) |function, index| {
+        if (std.mem.eql(u8, function.kind.function_definition.signature.name, name)) {
+            return .{ .module = reference.module, .declaration = index };
+        }
+    }
+    for (instance_declaration.defaults) |index| {
+        if (std.mem.eql(u8, module.declarations[index].kind.function_definition.signature.name, name)) {
+            return .{ .module = reference.module, .declaration = index };
         }
     }
     return null;
+}
+
+fn hasRequiredInstances(
+    allocator: std.mem.Allocator,
+    modules: []const Module,
+    typeclass: Resolution.Typeclass,
+    decided: []const ?types.Argument,
+) std.mem.Allocator.Error!bool {
+    const definition = modules[typeclass.module].declarations[typeclass.declaration].kind.typeclass_definition;
+    for (definition.parameters, decided) |parameter, optional_argument| {
+        const requirement = parameter.resolved_requirement orelse continue;
+        const argument = optional_argument orelse continue;
+        const required: []const ?types.Argument = &.{argument};
+        if (try findInstance(allocator, modules, requirement, required) != .found) return false;
+    }
+    return true;
+}
+
+fn satisfiesRequirements(
+    allocator: std.mem.Allocator,
+    modules: []const Module,
+    instance_declaration: InstanceDeclaration,
+    assigned: []const ?types.Argument,
+) std.mem.Allocator.Error!bool {
+    for (instance_declaration.parameters, assigned) |parameter, optional_argument| {
+        const requirement = parameter.resolved_requirement orelse continue;
+        const argument = optional_argument orelse continue;
+        const decided: []const ?types.Argument = &.{argument};
+        switch (try findInstance(allocator, modules, requirement, decided)) {
+            .missing, .missing_requirement => return false,
+            .found, .ambiguous, .undecided => {},
+        }
+    }
+    return true;
+}
+
+pub fn findOwnMethod(modules: []const Module, receiver: types.Type, name: []const u8) ?Resolution.Function {
+    if (receiver != .@"struct") return null;
+    const owner = receiver.@"struct".module;
+    const index = findOwnFunction(modules[owner], receiver, name) orelse return null;
+    return .{ .module = owner, .declaration = index };
 }
 
 fn findOwnFunction(module: Module, receiver: types.Type, name: []const u8) ?usize {
@@ -601,13 +666,13 @@ fn findOwnFunction(module: Module, receiver: types.Type, name: []const u8) ?usiz
             .function_declaration,
             .constant_declaration,
             .struct_definition,
-            .trait_definition,
-            .implementation,
+            .typeclass_definition,
+            .instance_declaration,
             .import,
             => continue,
         };
         const written = signature.receiver orelse continue;
-        if (signature.trait != null or !std.mem.eql(u8, signature.name, name)) continue;
+        if (signature.typeclass != null or !std.mem.eql(u8, signature.name, name)) continue;
         if (std.meta.eql(extractType(written), receiver)) return index;
     }
     return null;
@@ -657,7 +722,7 @@ pub fn extractElementType(sequence: Sequence) types.Type {
         .value => |value| switch (types.followPointer(value.type.?)) {
             .array => |array| array.element,
             .slice => |slice| slice.element,
-            .number, .boolean, .void, .type, .@"struct", .pointer, .optional, .tuple, .function, .implementer => {
+            .number, .boolean, .void, .type, .@"struct", .pointer, .optional, .tuple, .function, .variable, .application => {
                 unreachable;
             },
         },
@@ -725,7 +790,7 @@ pub fn findConstantRoot(expression: Expression) ?Resolution.Constant {
     return switch (expression.kind) {
         inline .identifier, .path_expression => |name| switch (name.resolution.?) {
             .constant => |constant| constant,
-            .parameter, .function, .type, .local, .element, .trait_function, .trait_method => null,
+            .parameter, .function, .type, .local, .element, .typeclass_function, .typeclass_method => null,
         },
         .field_access => |access| {
             if (access.value.type.? == .pointer) return null;
@@ -739,7 +804,7 @@ pub fn findConstantRoot(expression: Expression) ?Resolution.Constant {
 pub fn findElementConstantRoot(value: Expression) ?Resolution.Constant {
     return switch (value.type.?) {
         .array, .tuple => findConstantRoot(value),
-        .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .optional, .function, .implementer => null,
+        .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .optional, .function, .variable, .application => null,
     };
 }
 
@@ -765,6 +830,10 @@ pub fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std
         .identifier,
         .path_expression,
         => expression.kind,
+        .member => |member| .{ .member = .{
+            .owner = try cloneExpressionPointer(allocator, member.owner),
+            .name = member.name,
+        } },
         .call => |call| .{ .call = .{
             .callee = switch (call.callee) {
                 .identifier, .path_expression => call.callee,
@@ -865,14 +934,17 @@ fn cloneFunctionSignature(
             .type = try cloneExpression(allocator, parameter.type),
             .location = parameter.location,
             .kind = parameter.kind,
+            .requirement = parameter.requirement,
+            .constraint = parameter.constraint,
         };
     }
     return .{
         .receiver = try cloneOptionalExpression(allocator, signature.receiver),
-        .trait = try cloneOptionalExpression(allocator, signature.trait),
+        .typeclass = try cloneOptionalExpression(allocator, signature.typeclass),
         .name = signature.name,
         .parameters = parameters,
         .return_type = try cloneExpression(allocator, signature.return_type),
+        .self_parameter = signature.self_parameter,
     };
 }
 

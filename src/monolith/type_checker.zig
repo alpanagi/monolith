@@ -18,7 +18,7 @@ pub const TypeChecker = struct {
     arena: *std.heap.ArenaAllocator,
     program: ast.Program,
     module_index: usize = 0,
-    default: ?Default = null,
+    constraints: []const ast.Constraint = &.{},
     evaluator: Evaluator,
     resolver: ?Resolver = null,
     quiet_operations: usize = 0,
@@ -38,7 +38,7 @@ pub const TypeChecker = struct {
         for (self.program.types.entries.items) |value_type| {
             switch (value_type) {
                 .@"struct" => |struct_type| try self.checkFieldDefaults(struct_type),
-                .number, .boolean, .void, .type, .array, .slice, .pointer, .optional, .tuple, .function, .implementer => {
+                .number, .boolean, .void, .type, .array, .slice, .pointer, .optional, .tuple, .function, .variable, .application => {
                     unreachable;
                 },
             }
@@ -48,16 +48,26 @@ pub const TypeChecker = struct {
             for (module.declarations, 0..) |declaration, declaration_index| {
                 switch (declaration.kind) {
                     .function_definition => |function| {
-                        if (function.default_of == null and !ast.isGeneric(function.signature)) {
+                        if (function.default_of == null and !ast.isGeneric(function.signature) and !function.pattern) {
                             try self.prepareFunction(.{ .module = index, .declaration = declaration_index });
+                        } else if (function.default_of == null and !function.pattern and self.resolver != null) {
+                            const resolver = self.resolver.?;
+                            const resolution: ast.Resolution.Function = .{ .module = index, .declaration = declaration_index };
+                            try self.prepareFunction(try resolver.createCheckCopy(resolver.context, resolution));
                         }
                     },
-                    .trait_definition => |definition| {
-                        const trait: ast.Resolution.Trait = .{ .module = index, .declaration = declaration_index };
+                    .typeclass_definition => |definition| {
+                        const typeclass: ast.Resolution.Typeclass = .{ .module = index, .declaration = declaration_index };
                         for (definition.functions, definition.defaults) |signature, default| {
                             const written = default orelse continue;
+                            if (ast.isGeneric(signature)) {
+                                const resolver = self.resolver orelse continue;
+                                const position = findTypeclassFunction(definition, signature.name).?;
+                                try self.prepareFunction(try resolver.createDefaultCheckCopy(resolver.context, typeclass, position));
+                                continue;
+                            }
                             const function: ast.FunctionDefinition = .{ .signature = signature, .body = written.body };
-                            try self.checkDefault(function, trait, .implementer);
+                            try self.checkDefault(function, typeclass, try self.buildOwnArguments(definition));
                         }
                     },
                     .function_declaration => |signature| {
@@ -70,7 +80,7 @@ pub const TypeChecker = struct {
                         _ = try self.evaluateConstant(resolution);
                     },
                     .struct_definition,
-                    .implementation,
+                    .instance_declaration,
                     .import,
                     => {},
                 }
@@ -79,7 +89,8 @@ pub const TypeChecker = struct {
         for (self.program.modules, 0..) |module, index| {
             for (module.declarations, 0..) |declaration, declaration_index| {
                 if (declaration.kind != .function_definition) continue;
-                if (declaration.kind.function_definition.default_of == null) continue;
+                const function = declaration.kind.function_definition;
+                if (function.default_of == null or function.pattern or ast.isGeneric(function.signature)) continue;
                 try self.prepareFunction(.{ .module = index, .declaration = declaration_index });
             }
         }
@@ -103,19 +114,19 @@ pub const TypeChecker = struct {
         if (self.resolver) |resolver| try resolver.resolve(resolver.context, function);
         definition.check_progress = .running;
         const caller_module_index = self.module_index;
-        const caller_default = self.default;
+        const caller_constraints = self.constraints;
         const caller_instance_depth = self.instance_depth;
         const caller_quiet_operations = self.quiet_operations;
         defer self.module_index = caller_module_index;
-        defer self.default = caller_default;
+        defer self.constraints = caller_constraints;
         defer self.instance_depth = caller_instance_depth;
         defer self.quiet_operations = caller_quiet_operations;
         self.module_index = function.module;
-        self.default = null;
+        self.constraints = definition.constraints;
         self.instance_depth = self.findInstanceDepth(function);
         self.quiet_operations = 0;
-        if (definition.default_of) |trait| {
-            try self.checkDefault(definition.*, trait, ast.extractType(definition.signature.receiver.?));
+        if (definition.default_of) |typeclass| {
+            try self.checkDefault(definition.*, typeclass, definition.instance_arguments);
         } else {
             try self.checkFunction(definition.*);
         }
@@ -166,15 +177,31 @@ pub const TypeChecker = struct {
     fn checkDefault(
         self: *TypeChecker,
         function: ast.FunctionDefinition,
-        trait: ast.Resolution.Trait,
-        self_type: types.Type,
+        typeclass: ast.Resolution.Typeclass,
+        arguments: []const types.Argument,
     ) TypeError!void {
         const caller_module_index = self.module_index;
-        self.module_index = trait.module;
-        self.default = .{ .trait = trait, .self_type = self_type };
+        const caller_constraints = self.constraints;
+        self.module_index = typeclass.module;
         defer self.module_index = caller_module_index;
-        defer self.default = null;
+        defer self.constraints = caller_constraints;
+        const constraint: ast.Constraint = .{ .typeclass = typeclass, .arguments = arguments };
+        self.constraints = try self.expandConstraints(&.{constraint});
         try self.checkFunction(function);
+    }
+
+    fn expandConstraints(self: *TypeChecker, constraints: []const ast.Constraint) TypeError![]const ast.Constraint {
+        const resolver = self.resolver orelse return self.arena.allocator().dupe(ast.Constraint, constraints);
+        return resolver.expandConstraints(resolver.context, constraints);
+    }
+
+    fn buildOwnArguments(self: *TypeChecker, definition: ast.TypeclassDefinition) TypeError![]const types.Argument {
+        const arguments = try self.arena.allocator().alloc(types.Argument, definition.parameters.len);
+        for (definition.parameters, arguments, 0..) |parameter, *argument, index| {
+            const variable: types.Variable = .{ .scope = .typeclass, .index = index };
+            argument.* = if (parameter.arity == 0) .{ .type = .{ .variable = variable } } else .{ .constructor = .{ .variable = variable } };
+        }
+        return arguments;
     }
 
     fn checkFieldDefaults(self: *TypeChecker, struct_type: types.Struct) TypeError!void {
@@ -219,6 +246,7 @@ pub const TypeChecker = struct {
         }
 
         try self.checkBlock(signature, function.body);
+        if (function.lenient) return;
         var trace: Trace = .{};
         const flow = try self.traceBlock(&trace, function.body, .unassigned);
         try self.checkDeferredUses(function.body);
@@ -522,7 +550,7 @@ pub const TypeChecker = struct {
                 .pointer => |pointer| {
                     if (pointer.many or pointer.target != .array) return self.fail(value.location, error.NotSequence);
                 },
-                .number, .boolean, .void, .type, .@"struct", .optional, .tuple, .function, .implementer => {
+                .number, .boolean, .void, .type, .@"struct", .optional, .tuple, .function, .variable, .application => {
                     return self.fail(value.location, error.NotSequence);
                 },
             },
@@ -560,6 +588,11 @@ pub const TypeChecker = struct {
         expression: *ast.Expression,
         expected: types.Type,
     ) TypeError!void {
+        if (expected == .optional and takesExpectedType(expression.*)) {
+            try self.checkExpression(parameters, expression, expected.optional.child);
+            if (!isConvertible(expression.type.?, expected)) return self.fail(expression.location, error.TypeMismatch);
+            return;
+        }
         const value_type: types.Type = switch (expression.kind) {
             .integer_literal, .float_literal, .boolean_literal, .string_literal => value_type: {
                 try self.checkLiteral(expression.*, expected);
@@ -576,7 +609,7 @@ pub const TypeChecker = struct {
                 if (expected != .optional) return self.fail(expression.location, error.UnexpectedNull);
                 break :value_type expected;
             },
-            inline .identifier, .path_expression => |name| value_type: {
+            inline .identifier, .path_expression, .member => |name| value_type: {
                 break :value_type try self.computeValueType(parameters, expression.location, name.resolution.?);
             },
             .call, .method_call => try self.checkCall(parameters, expression),
@@ -621,6 +654,7 @@ pub const TypeChecker = struct {
             .null,
             .identifier,
             .path_expression,
+            .member,
             .call,
             .method_call,
             .address_of,
@@ -682,6 +716,7 @@ pub const TypeChecker = struct {
             .context = self,
             .prepare = prepareForEvaluator,
             .beginStruct = beginStructForEvaluator,
+            .findOrigin = findOriginForEvaluator,
             .finishStruct = finishStructForEvaluator,
         };
         self.evaluator.failure = null;
@@ -699,7 +734,24 @@ pub const TypeChecker = struct {
     fn beginStructForEvaluator(context: *anyopaque, struct_type: *const ast.StructType) AnalyzeError!types.Type {
         const self: *TypeChecker = @ptrCast(@alignCast(context));
         const resolver = self.resolver.?;
-        return resolver.beginStruct(resolver.context, struct_type);
+        var created = try resolver.beginStruct(resolver.context, struct_type);
+        const origin = try self.arena.allocator().create(types.Origin);
+        origin.* = .{};
+        created.@"struct".origin = origin;
+        return created;
+    }
+
+    fn findOriginForEvaluator(context: *anyopaque, function: ast.Resolution.Function) AnalyzeError!?types.Origin {
+        const self: *TypeChecker = @ptrCast(@alignCast(context));
+        const instance = for (self.instances.items) |instance| {
+            if (std.meta.eql(instance.function, function)) break instance;
+        } else return null;
+        const arguments = try self.arena.allocator().alloc(types.Type, instance.arguments.len);
+        for (instance.arguments, arguments) |argument, *argument_type| {
+            if (argument.value != .type) return null;
+            argument_type.* = argument.value.type;
+        }
+        return .{ .function = instance.template, .arguments = arguments };
     }
 
     fn finishStructForEvaluator(
@@ -753,13 +805,17 @@ pub const TypeChecker = struct {
         expression: *ast.Expression,
     ) TypeError!types.Type {
         if (expression.kind == .method_call) try self.resolveMethodCall(parameters, expression);
-        if (ast.extractResolution(expression.kind.call.callee) == .trait_method) {
-            try self.resolveTraitCall(parameters, expression);
+        if (ast.extractResolution(expression.kind.call.callee) == .typeclass_method) {
+            try self.resolveTypeclassCall(parameters, expression);
+        }
+        if (expression.kind.call.callee == .member) {
+            const member = expression.kind.call.callee.member;
+            if (member.typeclass_arguments.len > 0) expression.kind.call.typeclass_arguments = member.typeclass_arguments;
         }
         const call = expression.kind.call;
         const value_type = switch (ast.extractResolution(call.callee)) {
-            .function, .trait_function => try self.checkFunctionCall(parameters, expression),
-            .trait_method => unreachable,
+            .function, .typeclass_function => try self.checkFunctionCall(parameters, expression),
+            .typeclass_method => unreachable,
             .parameter, .local, .constant, .element => try self.checkValueCall(parameters, expression),
             .type => unreachable,
         };
@@ -777,7 +833,7 @@ pub const TypeChecker = struct {
         const name = method_call.name;
         const method = try self.findMethodFunction(method_call.name_location, receiver, name);
         const signature = self.extractSignature(method.function);
-        if (!ast.hasSelf(signature)) {
+        if (signature.self_parameter == .none) {
             return self.fail(method_call.name_location, error.NoSelf);
         }
         const allocator = self.arena.allocator();
@@ -789,56 +845,99 @@ pub const TypeChecker = struct {
         };
         @memcpy(arguments[1..], method_call.arguments);
         const callee: ast.Identifier = .{ .name = name, .resolution = method.function };
-        const call: ast.Call = .{ .callee = .{ .identifier = callee }, .arguments = arguments };
+        const call: ast.Call = .{
+            .callee = .{ .identifier = callee },
+            .arguments = arguments,
+            .typeclass_arguments = method.typeclass_arguments,
+        };
         expression.kind = .{ .call = call };
     }
 
-    fn resolveTraitCall(
+    fn resolveTypeclassCall(
         self: *TypeChecker,
         parameters: []const ast.TypedName,
         expression: *ast.Expression,
     ) TypeError!void {
         const call = &expression.kind.call;
         const callee = &call.callee.path_expression;
-        const method = callee.resolution.?.trait_method;
+        const method = callee.resolution.?.typeclass_method;
         const signature = self.extractSignature(callee.resolution.?);
-        if (!ast.hasSelf(signature)) return self.fail(expression.location, error.NoSelf);
         const module = self.program.modules[self.module_index];
-        if (!isTraitVisible(module, self.module_index, method.trait)) {
+        if (!isTypeclassVisible(module, self.module_index, method.typeclass)) {
             return self.fail(expression.location, error.UnknownMethod);
         }
-        if (call.arguments.len == 0) return self.fail(expression.location, error.ArgumentCountMismatch);
-        const first = call.arguments[0];
-        const argument_type = try self.inferType(parameters, &call.arguments[0].value);
-        const written = signature.parameters[0].type;
-        var receiver = argument_type;
-        if (written.kind == .pointer_type) {
-            if (argument_type != .pointer or argument_type.pointer.many) {
-                return self.fail(first.location, error.TypeMismatch);
-            }
-            const modifies = !written.kind.pointer_type.constant;
-            if (modifies and argument_type.pointer.constant) return self.fail(first.location, error.NotWritable);
-            receiver = argument_type.pointer.target;
+        if (call.arguments.len != signature.parameters.len) {
+            return self.fail(expression.location, error.ArgumentCountMismatch);
         }
-        callee.resolution = try self.findTraitMethod(first.location, method, receiver, signature.name);
+        const definition = self.extractTypeclass(method.typeclass);
+        const decided = try self.arena.allocator().alloc(?types.Argument, definition.parameters.len);
+        @memset(decided, null);
+        var deciding: ?token.Location = null;
+        for (call.arguments, signature.parameters) |*argument, parameter| {
+            if (parameter.kind != .run_time) continue;
+            const parameter_type = ast.extractType(parameter.type);
+            if (!types.containsVariable(parameter_type, .typeclass)) continue;
+            const argument_type = try self.inferType(parameters, &argument.value);
+            if (parameter_type == .pointer and argument_type == .pointer) {
+                const modifies = !parameter_type.pointer.constant;
+                if (modifies and argument_type.pointer.constant) return self.fail(argument.location, error.NotWritable);
+            }
+            if (!types.matchType(parameter_type, argument_type, .typeclass, decided, false)) {
+                return self.fail(argument.location, error.TypeMismatch);
+            }
+            if (deciding == null) deciding = argument.location;
+        }
+        const location = deciding orelse return self.fail(expression.location, error.UndecidedInstance);
+        const found = try self.findTypeclassMethod(location, method, decided, signature.name);
+        callee.resolution = found.resolution;
+        call.typeclass_arguments = found.typeclass_arguments;
     }
 
-    fn findTraitMethod(
+    fn extractTypeclass(self: *const TypeChecker, typeclass: ast.Resolution.Typeclass) ast.TypeclassDefinition {
+        return self.program.modules[typeclass.module].declarations[typeclass.declaration].kind.typeclass_definition;
+    }
+
+    fn findTypeclassMethod(
         self: *TypeChecker,
         location: token.Location,
-        method: ast.Resolution.TraitFunction,
-        receiver: types.Type,
+        method: ast.Resolution.TypeclassFunction,
+        decided: []const ?types.Argument,
         name: []const u8,
-    ) TypeError!ast.Resolution {
-        if (receiver == .implementer) {
-            const default = self.default.?;
-            if (!std.meta.eql(default.trait, method.trait)) return self.fail(location, error.NotImplemented);
-            return .{ .trait_function = method };
+    ) TypeError!Found {
+        if (containsVariable(decided)) {
+            for (self.constraints) |constraint| {
+                if (!std.meta.eql(constraint.typeclass, method.typeclass)) continue;
+                if (!matchesConstraint(constraint, decided)) continue;
+                return .{ .resolution = .{ .typeclass_function = method }, .typeclass_arguments = constraint.arguments };
+            }
+            return self.fail(location, error.NoInstance);
         }
-        const function = ast.findTraitFunction(self.program.modules, method.trait, receiver, name) orelse {
-            return self.fail(location, error.NotImplemented);
+        const function = (try self.findInstanceFunction(location, method.typeclass, decided, name)) orelse {
+            return self.fail(location, error.NoInstance);
         };
-        return .{ .function = function };
+        return .{ .resolution = .{ .function = function } };
+    }
+
+    fn findInstanceFunction(
+        self: *TypeChecker,
+        location: token.Location,
+        typeclass: ast.Resolution.Typeclass,
+        decided: []const ?types.Argument,
+        name: []const u8,
+    ) TypeError!?ast.Resolution.Function {
+        const modules = self.program.modules;
+        const found = switch (try ast.findInstance(self.arena.allocator(), modules, typeclass, decided)) {
+            .missing => return null,
+            .missing_requirement => return self.fail(location, error.MissingRequiredInstance),
+            .ambiguous => return self.fail(location, error.AmbiguousInstance),
+            .undecided => return self.fail(location, error.UndecidedInstance),
+            .found => |found| found,
+        };
+        const function = ast.findInstanceMember(modules, found.reference, name) orelse return null;
+        const instance_declaration = modules[found.reference.module].declarations[found.reference.declaration];
+        if (instance_declaration.kind.instance_declaration.parameters.len == 0) return function;
+        const resolver = self.resolver.?;
+        return try resolver.instantiateInstanceFunction(resolver.context, function, found.assigned);
     }
 
     fn buildReceiver(
@@ -848,17 +947,15 @@ pub const TypeChecker = struct {
         dereferenced: bool,
         signature: ast.FunctionSignature,
     ) TypeError!ast.Expression {
-        const written = signature.parameters[0].type;
-        const pointer = written.kind == .pointer_type;
+        const pointer = signature.self_parameter != .value;
+        const modifies = signature.self_parameter == .pointer;
         if (pointer == dereferenced) {
-            const modifies = pointer and !written.kind.pointer_type.constant;
             if (modifies and receiver.type.?.pointer.constant) return self.fail(receiver.location, error.NotWritable);
             return receiver.*;
         }
         const operand = try self.arena.allocator().create(ast.Expression);
         operand.* = receiver.*;
         if (!pointer) return .{ .kind = .{ .dereference = operand }, .location = receiver.location };
-        const modifies = !written.kind.pointer_type.constant;
         var address: ast.Expression = .{ .kind = .{ .address_of = operand }, .location = receiver.location };
         const address_type = try self.checkAddressOf(parameters, &address);
         if (modifies and address_type.pointer.constant) return self.fail(receiver.location, error.NotWritable);
@@ -871,14 +968,14 @@ pub const TypeChecker = struct {
         receiver: types.Type,
         name: []const u8,
     ) TypeError!Method {
-        if (try self.searchMethod(location, receiver, name)) |function| {
-            return .{ .function = function, .dereferenced = false };
+        if (try self.searchMethod(location, receiver, name)) |found| {
+            return .{ .function = found.resolution, .dereferenced = false, .typeclass_arguments = found.typeclass_arguments };
         }
         if (receiver != .pointer or receiver.pointer.many) return self.fail(location, error.UnknownMethod);
-        const function = (try self.searchMethod(location, receiver.pointer.target, name)) orelse {
+        const found = (try self.searchMethod(location, receiver.pointer.target, name)) orelse {
             return self.fail(location, error.UnknownMethod);
         };
-        return .{ .function = function, .dereferenced = true };
+        return .{ .function = found.resolution, .dereferenced = true, .typeclass_arguments = found.typeclass_arguments };
     }
 
     fn searchMethod(
@@ -886,37 +983,96 @@ pub const TypeChecker = struct {
         location: token.Location,
         receiver: types.Type,
         name: []const u8,
-    ) TypeError!?ast.Resolution {
-        if (self.default) |default| {
-            if (std.meta.eql(receiver, default.self_type)) return try self.findSelfFunction(location, default, name);
+    ) TypeError!?Found {
+        if (try self.findConstraintMethod(location, receiver, name)) |found| return found;
+        if (ast.findOwnMethod(self.program.modules, receiver, name)) |function| return .{ .resolution = .{ .function = function } };
+        var found: ?Found = null;
+        const module = self.program.modules[self.module_index];
+        for (module.declarations, 0..) |declaration, index| {
+            const typeclass: ast.Resolution.Typeclass = switch (declaration.kind) {
+                .typeclass_definition => .{ .module = self.module_index, .declaration = index },
+                .import => |import| import.typeclass orelse continue,
+                .function_declaration,
+                .function_definition,
+                .constant_declaration,
+                .struct_definition,
+                .instance_declaration,
+                => continue,
+            };
+            const function = (try self.findTypeclassMethodFor(location, typeclass, receiver, name)) orelse continue;
+            if (found) |earlier| {
+                if (!std.meta.eql(earlier.resolution, function)) return self.fail(location, error.AmbiguousMethod);
+            }
+            found = .{ .resolution = function };
         }
-        return switch (ast.findMethod(self.program.modules, self.module_index, receiver, name)) {
-            .found => |function| .{ .function = function },
-            .missing => null,
-            .ambiguous => self.fail(location, error.AmbiguousMethod),
-        };
+        return found;
     }
 
-    fn findSelfFunction(
+    fn findTypeclassMethodFor(
         self: *TypeChecker,
         location: token.Location,
-        default: Default,
+        typeclass: ast.Resolution.Typeclass,
+        receiver: types.Type,
         name: []const u8,
-    ) TypeError!ast.Resolution {
-        const modules = self.program.modules;
-        const trait = default.trait;
-        if (default.self_type == .implementer) {
-            const definition = modules[trait.module].declarations[trait.declaration].kind.trait_definition;
-            for (definition.functions, 0..) |signature, position| {
-                if (!std.mem.eql(u8, signature.name, name)) continue;
-                return .{ .trait_function = .{ .trait = trait, .function = position } };
-            }
-            return self.fail(location, error.UnknownMethod);
-        }
-        const function = ast.findTraitFunction(modules, trait, default.self_type, name) orelse {
-            return self.fail(location, error.UnknownMethod);
-        };
+    ) TypeError!?ast.Resolution {
+        const definition = self.extractTypeclass(typeclass);
+        const position = findTypeclassFunction(definition, name) orelse return null;
+        const signature = definition.functions[position];
+        if (signature.self_parameter == .none) return null;
+        const decided = try self.arena.allocator().alloc(?types.Argument, definition.parameters.len);
+        @memset(decided, null);
+        const first = types.followPointer(ast.extractType(signature.parameters[0].type));
+        decided[first.variable.index] = .{ .type = receiver };
+        const function = (try self.findInstanceFunction(location, typeclass, decided, name)) orelse return null;
         return .{ .function = function };
+    }
+
+    fn findConstraintMethod(
+        self: *TypeChecker,
+        location: token.Location,
+        receiver: types.Type,
+        name: []const u8,
+    ) TypeError!?Found {
+        var mentioned = false;
+        for (self.constraints) |constraint| {
+            if (!mentionsArgument(constraint, receiver)) continue;
+            mentioned = true;
+            const definition = self.extractTypeclass(constraint.typeclass);
+            const position = findTypeclassFunction(definition, name) orelse continue;
+            const signature = definition.functions[position];
+            if (signature.self_parameter == .none) continue;
+            const first = types.followPointer(ast.extractType(signature.parameters[0].type));
+            const argument = constraint.arguments[first.variable.index];
+            if (argument != .type or !std.meta.eql(argument.type, receiver)) continue;
+            if (!isConcreteArguments(constraint.arguments)) {
+                const method: ast.Resolution.TypeclassFunction = .{ .typeclass = constraint.typeclass, .function = position };
+                return .{ .resolution = .{ .typeclass_function = method }, .typeclass_arguments = constraint.arguments };
+            }
+            const function = (try self.findTypeclassMethodFor(location, constraint.typeclass, receiver, name)) orelse continue;
+            return .{ .resolution = function };
+        }
+        if (mentioned) return self.fail(location, error.UnknownMethod);
+        return null;
+    }
+
+    fn expectInstance(
+        self: *TypeChecker,
+        location: token.Location,
+        typeclass: ast.Resolution.Typeclass,
+        value_type: types.Type,
+    ) TypeError!void {
+        const decided: []const ?types.Argument = &.{.{ .type = value_type }};
+        if (containsVariable(decided)) {
+            for (self.constraints) |constraint| {
+                if (std.meta.eql(constraint.typeclass, typeclass) and matchesConstraint(constraint, decided)) return;
+            }
+            return self.fail(location, error.NoInstance);
+        }
+        switch (try ast.findInstance(self.arena.allocator(), self.program.modules, typeclass, decided)) {
+            .missing => return self.fail(location, error.NoInstance),
+            .missing_requirement => return self.fail(location, error.MissingRequiredInstance),
+            .found, .ambiguous, .undecided => {},
+        }
     }
 
     fn extractSignature(self: *const TypeChecker, function: ast.Resolution) ast.FunctionSignature {
@@ -925,9 +1081,9 @@ pub const TypeChecker = struct {
             .function => |resolved| {
                 return ast.extractFunctionSignature(ast.findDeclaration(modules[resolved.module], resolved.declaration).*);
             },
-            .trait_function, .trait_method => |resolved| {
-                const trait = resolved.trait;
-                const definition = modules[trait.module].declarations[trait.declaration].kind.trait_definition;
+            .typeclass_function, .typeclass_method => |resolved| {
+                const typeclass = resolved.typeclass;
+                const definition = modules[typeclass.module].declarations[typeclass.declaration].kind.typeclass_definition;
                 return definition.functions[resolved.function];
             },
             .parameter, .type, .constant, .local, .element => unreachable,
@@ -957,10 +1113,15 @@ pub const TypeChecker = struct {
         }
         for (call.arguments, callee.parameters) |*argument, parameter| {
             if (argument.name != null) return self.fail(argument.location, error.NamedArgument);
-            const parameter_type = ast.extractType(parameter.type);
+            const parameter_type = try self.substituteTypeclass(ast.extractType(parameter.type), call.typeclass_arguments);
             try self.checkExpression(parameters, &argument.value, parameter_type);
         }
-        return ast.extractType(callee.return_type);
+        return self.substituteTypeclass(ast.extractType(callee.return_type), call.typeclass_arguments);
+    }
+
+    fn substituteTypeclass(self: *TypeChecker, value_type: types.Type, arguments: []const types.Argument) TypeError!types.Type {
+        if (arguments.len == 0) return value_type;
+        return types.substitute(self.arena.allocator(), self.program.types, value_type, arguments);
     }
 
     fn instantiateCall(
@@ -985,6 +1146,13 @@ pub const TypeChecker = struct {
                     try arguments.append(allocator, argument.*);
                     continue;
                 },
+                .implicit => {
+                    const argument_type = try self.inferType(parameters, &argument.value);
+                    try self.expectInstance(argument.location, parameter.constraint.?, argument_type);
+                    try bounds.append(allocator, .{ .type = .type, .value = .{ .type = argument_type } });
+                    try arguments.append(allocator, argument.*);
+                    continue;
+                },
                 .type => .type,
                 .compile_time => try resolver.resolveParameterType(resolver.context, template, position, bounds.items),
             };
@@ -994,6 +1162,7 @@ pub const TypeChecker = struct {
             try self.checkExpression(parameters, &argument.value, parameter_type);
             if (!self.evaluator.isKnown(argument.value)) return self.fail(argument.location, error.RuntimeArgument);
             const value = try self.evaluateValue(argument.value);
+            if (parameter.constraint) |constraint| try self.expectInstance(argument.location, constraint, value.type);
             try bounds.append(allocator, .{ .type = parameter_type, .value = value });
             if (types.isCompileTimeOnly(parameter_type)) self.type_dependencies += 1;
         }
@@ -1023,14 +1192,15 @@ pub const TypeChecker = struct {
         if (self.evaluator.findCurrentFunction()) |current| depth = @max(depth, self.findInstanceDepth(current) + 1);
         if (depth > instance_limit) return self.fail(location, error.InstanceDepth);
         const resolver = self.resolver.?;
-        const function = try resolver.instantiate(resolver.context, template, arguments, number);
+        const pattern = containsBoundVariable(arguments);
+        const function = try resolver.instantiate(resolver.context, template, arguments, number, pattern);
         try self.instances.append(self.arena.allocator(), .{
             .template = template,
             .arguments = arguments,
             .function = function,
             .depth = depth,
         });
-        try self.created.append(self.arena.allocator(), function);
+        if (!pattern) try self.created.append(self.arena.allocator(), function);
         try resolver.resolve(resolver.context, function);
         return function;
     }
@@ -1073,7 +1243,7 @@ pub const TypeChecker = struct {
         const value_type = try self.inferType(parameters, access.value);
         const struct_type = switch (followPointer(value_type)) {
             .@"struct" => |struct_type| struct_type,
-            .number, .boolean, .void, .type, .array, .slice, .pointer, .optional, .tuple, .function, .implementer => {
+            .number, .boolean, .void, .type, .array, .slice, .pointer, .optional, .tuple, .function, .variable, .application => {
                 return self.fail(access.field_location, error.NoFields);
             },
         };
@@ -1098,7 +1268,7 @@ pub const TypeChecker = struct {
                 expression.type = value_type;
                 return value_type;
             },
-            inline .identifier, .path_expression => |name| {
+            inline .identifier, .path_expression, .member => |name| {
                 const value_type = try self.computeValueType(parameters, expression.location, name.resolution.?);
                 expression.type = value_type;
                 return value_type;
@@ -1348,7 +1518,7 @@ pub const TypeChecker = struct {
         const right = binary.right;
         if (left_type) |known_left| {
             const known_right = right_type orelse {
-                try self.checkExpression(parameters, right, known_left);
+                try self.checkOperandExpression(parameters, right, known_left);
                 return known_left;
             };
             return unifyTypes(known_left, known_right) orelse {
@@ -1356,12 +1526,12 @@ pub const TypeChecker = struct {
             };
         }
         if (right_type) |known_right| {
-            try self.checkExpression(parameters, left, known_right);
+            try self.checkOperandExpression(parameters, left, known_right);
             return known_right;
         }
         const operand_type = context orelse return self.fail(left.location, error.UnknownValueType);
-        try self.checkExpression(parameters, left, operand_type);
-        try self.checkExpression(parameters, right, operand_type);
+        try self.checkOperandExpression(parameters, left, operand_type);
+        try self.checkOperandExpression(parameters, right, operand_type);
         return operand_type;
     }
 
@@ -1375,8 +1545,18 @@ pub const TypeChecker = struct {
         const operand_type = context orelse {
             return self.fail(operand.location, error.UnknownValueType);
         };
-        try self.checkExpression(parameters, operand, operand_type);
+        try self.checkOperandExpression(parameters, operand, operand_type);
         return operand_type;
+    }
+
+    fn checkOperandExpression(
+        self: *TypeChecker,
+        parameters: []const ast.TypedName,
+        operand: *ast.Expression,
+        expected: types.Type,
+    ) TypeError!void {
+        if (expected == .optional and takesExpectedType(operand.*)) return self.fail(operand.location, error.TypeMismatch);
+        try self.checkExpression(parameters, operand, expected);
     }
 
     fn checkUnary(
@@ -1467,7 +1647,7 @@ pub const TypeChecker = struct {
             .@"struct" => |struct_type| {
                 try self.checkConstruction(parameters, location, literal.elements, struct_type);
             },
-            .number, .boolean, .void, .type, .slice, .pointer, .optional, .function, .implementer => {
+            .number, .boolean, .void, .type, .slice, .pointer, .optional, .function, .variable, .application => {
                 return self.fail(location, error.UnexpectedBraces);
             },
         }
@@ -1529,7 +1709,7 @@ pub const TypeChecker = struct {
                 }
                 break :element try self.checkArrayIndex(parameters, index, pointer.target.array);
             },
-            .number, .boolean, .void, .type, .@"struct", .optional, .function, .implementer => {
+            .number, .boolean, .void, .type, .@"struct", .optional, .function, .variable, .application => {
                 return self.fail(expression.location, error.NotIndexable);
             },
         };
@@ -1587,7 +1767,7 @@ pub const TypeChecker = struct {
                 }
                 break :pointer .{ pointer.target.array.element, pointer.constant };
             },
-            .number, .boolean, .void, .type, .@"struct", .optional, .tuple, .function, .implementer => {
+            .number, .boolean, .void, .type, .@"struct", .optional, .tuple, .function, .variable, .application => {
                 return self.fail(value.location, error.NotSliceable);
             },
         };
@@ -1607,7 +1787,7 @@ pub const TypeChecker = struct {
     ) TypeError!types.Type {
         const pointer = switch (try self.inferType(parameters, expression.kind.dereference)) {
             .pointer => |pointer| pointer,
-            .number, .boolean, .void, .type, .@"struct", .array, .slice, .optional, .tuple, .function, .implementer => {
+            .number, .boolean, .void, .type, .@"struct", .array, .slice, .optional, .tuple, .function, .variable, .application => {
                 return self.fail(expression.location, error.NotAPointer);
             },
         };
@@ -1654,7 +1834,7 @@ pub const TypeChecker = struct {
                 => unreachable,
             },
             .element => |element| ast.findElementName(element).type.?,
-            .function, .trait_function, .trait_method => self.fail(location, error.FunctionUsedAsValue),
+            .function, .typeclass_function, .typeclass_method => self.fail(location, error.FunctionUsedAsValue),
         };
     }
 
@@ -1674,11 +1854,11 @@ pub const TypeChecker = struct {
         const module = self.program.modules[constant.module];
         const declaration = &ast.findDeclaration(module, constant.declaration).kind.constant_declaration;
         const caller_module_index = self.module_index;
-        const caller_default = self.default;
+        const caller_constraints = self.constraints;
         self.module_index = constant.module;
-        self.default = null;
+        self.constraints = &.{};
         defer self.module_index = caller_module_index;
-        defer self.default = caller_default;
+        defer self.constraints = caller_constraints;
         const written = if (declaration.type) |*written| written else null;
         const caller_compile_time = self.compile_time;
         self.compile_time = true;
@@ -1747,6 +1927,7 @@ pub const TypeChecker = struct {
             .null,
             .identifier,
             .path_expression,
+            .member,
             .call,
             .method_call,
             .negation,
@@ -1795,6 +1976,7 @@ pub const TypeChecker = struct {
             .null,
             .identifier,
             .path_expression,
+            .member,
             .call,
             .method_call,
             .negation,
@@ -1876,7 +2058,7 @@ pub const TypeChecker = struct {
     ) TypeError!types.NumberType {
         const number = switch (expected) {
             .number => |number| number,
-            .boolean, .void, .type, .@"struct", .array, .slice, .pointer, .optional, .tuple, .function, .implementer => {
+            .boolean, .void, .type, .@"struct", .array, .slice, .pointer, .optional, .tuple, .function, .variable, .application => {
                 return self.fail(location, error.TypeMismatch);
             },
         };
@@ -1952,6 +2134,9 @@ pub const CheckError = error{
     UnknownMethod,
     AmbiguousMethod,
     NoSelf,
+    UndecidedInstance,
+    AmbiguousInstance,
+    MissingRequiredInstance,
     UnknownSuffix,
     UnknownValueType,
     NoFields,
@@ -1971,7 +2156,7 @@ pub const CheckError = error{
     ReversedRange,
     NotTuple,
     WrongNameCount,
-    NotImplemented,
+    NoInstance,
 };
 
 fn describeError(check_error: CheckError) []const u8 {
@@ -2026,7 +2211,10 @@ fn describeError(check_error: CheckError) []const u8 {
         error.FunctionDereferenced => "function pointers cannot be dereferenced",
         error.UnknownMethod => "unknown method",
         error.AmbiguousMethod => "method is found in more than one place",
-        error.NoSelf => "the first parameter is not Self",
+        error.NoSelf => "function is not a method",
+        error.UndecidedInstance => "name the instance, the arguments do not decide it",
+        error.AmbiguousInstance => "more than one instance fits",
+        error.MissingRequiredInstance => "type has no instance of a typeclass that the typeclass requires",
         error.UnknownSuffix => "unknown suffix",
         error.UnknownValueType => "value has no known type",
         error.NoFields => "value has no fields",
@@ -2046,7 +2234,7 @@ fn describeError(check_error: CheckError) []const u8 {
         error.ReversedRange => "range starts after its end",
         error.NotTuple => "names in parentheses need a tuple",
         error.WrongNameCount => "number of names does not match the tuple",
-        error.NotImplemented => "type does not implement the trait",
+        error.NoInstance => "type has no instance of the typeclass",
     };
 }
 
@@ -2064,7 +2252,23 @@ pub const Resolver = struct {
         template: ast.Resolution.Function,
         arguments: []const Bound,
         number: usize,
+        pattern: bool,
     ) AnalyzeError!ast.Resolution.Function,
+    instantiateInstanceFunction: *const fn (
+        context: *anyopaque,
+        function: ast.Resolution.Function,
+        assigned: []const types.Argument,
+    ) AnalyzeError!ast.Resolution.Function,
+    createCheckCopy: *const fn (context: *anyopaque, function: ast.Resolution.Function) AnalyzeError!ast.Resolution.Function,
+    createDefaultCheckCopy: *const fn (
+        context: *anyopaque,
+        typeclass: ast.Resolution.Typeclass,
+        position: usize,
+    ) AnalyzeError!ast.Resolution.Function,
+    expandConstraints: *const fn (
+        context: *anyopaque,
+        constraints: []const ast.Constraint,
+    ) AnalyzeError![]const ast.Constraint,
     beginStruct: *const fn (context: *anyopaque, struct_type: *const ast.StructType) AnalyzeError!types.Type,
     finishStruct: *const fn (
         context: *anyopaque,
@@ -2086,14 +2290,15 @@ const Instance = struct {
     depth: usize,
 };
 
-const Default = struct {
-    trait: ast.Resolution.Trait,
-    self_type: types.Type,
-};
-
 const Method = struct {
     function: ast.Resolution,
     dereferenced: bool,
+    typeclass_arguments: []const types.Argument = &.{},
+};
+
+const Found = struct {
+    resolution: ast.Resolution,
+    typeclass_arguments: []const types.Argument = &.{},
 };
 
 const Trace = struct {
@@ -2194,6 +2399,11 @@ fn isUnfinishedArray(written: ast.Expression) bool {
 }
 
 fn isConvertible(value_type: types.Type, expected: types.Type) bool {
+    if (isDirectlyConvertible(value_type, expected)) return true;
+    return expected == .optional and isDirectlyConvertible(value_type, expected.optional.child);
+}
+
+fn isDirectlyConvertible(value_type: types.Type, expected: types.Type) bool {
     if (isReadOnlyMatch(value_type, expected)) return true;
     if (expected != .slice or value_type != .pointer) return false;
     const pointer = value_type.pointer;
@@ -2212,6 +2422,14 @@ fn isReadOnlyMatch(value_type: types.Type, expected: types.Type) bool {
     if (value_type != .slice or expected != .slice) return false;
     const element = value_type.slice.element;
     return expected.slice.constant and std.meta.eql(element, expected.slice.element);
+}
+
+fn takesExpectedType(expression: ast.Expression) bool {
+    return switch (expression.kind) {
+        .integer_literal, .float_literal, .negation, .composite_literal => !hasOwnType(expression),
+        .boolean_literal => true,
+        else => false,
+    };
 }
 
 fn hasOwnType(expression: ast.Expression) bool {
@@ -2246,6 +2464,7 @@ fn hasOwnType(expression: ast.Expression) bool {
         .string_literal,
         .identifier,
         .path_expression,
+        .member,
         .call,
         .method_call,
         .address_of,
@@ -2283,15 +2502,71 @@ fn isEquatable(value_type: types.Type) bool {
         .number, .boolean, .type, .pointer => true,
         .array => |array| isEquatable(array.element),
         .optional => |optional| isEquatable(optional.child),
-        .void, .@"struct", .slice, .tuple, .function, .implementer => false,
+        .void, .@"struct", .slice, .tuple, .function, .variable, .application => false,
     };
+}
+
+fn containsBoundVariable(arguments: []const Bound) bool {
+    for (arguments) |argument| {
+        if (argument.value != .type) continue;
+        if (types.containsVariable(argument.value.type, .function) or types.containsVariable(argument.value.type, .typeclass)) return true;
+    }
+    return false;
+}
+
+fn containsVariable(decided: []const ?types.Argument) bool {
+    for (decided) |optional_argument| {
+        const argument = optional_argument orelse continue;
+        switch (argument) {
+            .type => |value_type| {
+                if (types.containsVariable(value_type, .typeclass) or types.containsVariable(value_type, .function)) return true;
+            },
+            .constructor => |constructor| if (constructor == .variable) return true,
+        }
+    }
+    return false;
+}
+
+fn matchesConstraint(constraint: ast.Constraint, decided: []const ?types.Argument) bool {
+    if (constraint.arguments.len != decided.len) return false;
+    for (constraint.arguments, decided) |argument, optional_argument| {
+        const decided_argument = optional_argument orelse continue;
+        if (!std.meta.eql(argument, decided_argument)) return false;
+    }
+    return true;
+}
+
+fn mentionsArgument(constraint: ast.Constraint, receiver: types.Type) bool {
+    for (constraint.arguments) |argument| {
+        if (argument == .type and std.meta.eql(argument.type, receiver)) return true;
+    }
+    return false;
+}
+
+fn isConcreteArguments(arguments: []const types.Argument) bool {
+    for (arguments) |argument| {
+        switch (argument) {
+            .type => |value_type| {
+                if (types.containsVariable(value_type, .typeclass) or types.containsVariable(value_type, .function)) return false;
+            },
+            .constructor => |constructor| if (constructor == .variable) return false,
+        }
+    }
+    return true;
+}
+
+fn findTypeclassFunction(definition: ast.TypeclassDefinition, name: []const u8) ?usize {
+    for (definition.functions, 0..) |signature, position| {
+        if (std.mem.eql(u8, signature.name, name)) return position;
+    }
+    return null;
 }
 
 fn isOrdered(value_type: types.Type) bool {
     return switch (value_type) {
         .number => true,
         .pointer => |pointer| pointer.many,
-        .boolean, .void, .type, .@"struct", .array, .slice, .optional, .tuple, .function, .implementer => {
+        .boolean, .void, .type, .@"struct", .array, .slice, .optional, .tuple, .function, .variable, .application => {
             return false;
         },
     };
@@ -2310,29 +2585,29 @@ fn findField(fields: []const types.Field, name: []const u8) ?types.Field {
 
 fn findFunction(expression: ast.Expression) ?ast.Resolution {
     return switch (expression.kind) {
-        inline .identifier, .path_expression => |name| switch (name.resolution.?) {
-            .function, .trait_function => name.resolution.?,
-            .parameter, .type, .constant, .local, .element, .trait_method => null,
+        inline .identifier, .path_expression, .member => |name| switch (name.resolution.?) {
+            .function, .typeclass_function => name.resolution.?,
+            .parameter, .type, .constant, .local, .element, .typeclass_method => null,
         },
         else => null,
     };
 }
 
-fn isTraitVisible(module: ast.Module, module_index: usize, trait: ast.Resolution.Trait) bool {
+fn isTypeclassVisible(module: ast.Module, module_index: usize, typeclass: ast.Resolution.Typeclass) bool {
     for (module.declarations, 0..) |declaration, index| {
         switch (declaration.kind) {
-            .trait_definition => {
-                if (trait.module == module_index and trait.declaration == index) return true;
+            .typeclass_definition => {
+                if (typeclass.module == module_index and typeclass.declaration == index) return true;
             },
             .import => |import| {
-                const imported = import.trait orelse continue;
-                if (std.meta.eql(imported, trait)) return true;
+                const imported = import.typeclass orelse continue;
+                if (std.meta.eql(imported, typeclass)) return true;
             },
             .function_declaration,
             .function_definition,
             .constant_declaration,
             .struct_definition,
-            .implementation,
+            .instance_declaration,
             => {},
         }
     }
@@ -2341,9 +2616,9 @@ fn isTraitVisible(module: ast.Module, module_index: usize, trait: ast.Resolution
 
 fn isPlace(expression: ast.Expression) bool {
     return switch (expression.kind) {
-        inline .identifier, .path_expression => |name| switch (name.resolution.?) {
+        inline .identifier, .path_expression, .member => |name| switch (name.resolution.?) {
             .local, .parameter, .constant, .element => true,
-            .function, .type, .trait_function, .trait_method => false,
+            .function, .type, .typeclass_function, .typeclass_method => false,
         },
         .field_access => |access| access.value.type.? == .pointer or isPlace(access.value.*),
         .index => |indexing| isElementPlace(indexing.value.*),
@@ -2360,11 +2635,11 @@ fn isWritable(expression: ast.Expression) bool {
     return switch (expression.kind) {
         .identifier => |identifier| switch (identifier.resolution.?) {
             .local => |statement| statement.kind == .variable_declaration,
-            .parameter, .function, .type, .constant, .element, .trait_function, .trait_method => false,
+            .parameter, .function, .type, .constant, .element, .typeclass_function, .typeclass_method => false,
         },
         .field_access => |access| switch (access.value.type.?) {
             .pointer => |pointer| !pointer.constant,
-            .number, .boolean, .void, .type, .@"struct", .array, .slice, .optional, .tuple, .function, .implementer => {
+            .number, .boolean, .void, .type, .@"struct", .array, .slice, .optional, .tuple, .function, .variable, .application => {
                 return isWritable(access.value.*);
             },
         },
@@ -2378,7 +2653,7 @@ fn isElementWritable(container: ast.Expression) bool {
     return switch (container.type.?) {
         .slice => |slice| !slice.constant,
         .pointer => |pointer| !pointer.constant,
-        .number, .boolean, .void, .type, .@"struct", .array, .optional, .tuple, .function, .implementer => {
+        .number, .boolean, .void, .type, .@"struct", .array, .optional, .tuple, .function, .variable, .application => {
             return isWritable(container);
         },
     };
@@ -2462,6 +2737,7 @@ fn findUse(variable: *const ast.Statement, expression: ast.Expression) Use {
         .undefined,
         .null,
         .path_expression,
+        .member,
         .negation,
         .array_type,
         .slice_type,
@@ -2774,7 +3050,7 @@ test "prepareFunction: checks a function that a top-level constant calls before 
     try std.testing.expectEqual(Value{ .integer = 9 }, loader.modules.items[0].declarations[0].kind.constant_declaration.known.?.*);
 }
 
-test "checkDefault: checks a default that no implementation uses" {
+test "checkDefault: lets a default use the typeclass that its typeclass requires" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -2784,7 +3060,27 @@ test "checkDefault: checks a default that no implementation uses" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn double(_: Self) -> i32: return true" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Eq(type T):\n    fn equal(one: T, two: T) -> bool\ntypeclass Ord(type T: Eq):\n    fn less(one: T, two: T) -> bool\n    fn at_most(one: T, two: T) -> bool: return Ord::less(one, two) or one.equal(two)\ninstance Eq(i32):\n    fn equal(one: i32, two: i32) -> bool: return one == two\ninstance Ord(i32):\n    fn less(one: i32, two: i32) -> bool: return one < two\nconst LOWER = Ord::at_most(3i32, 3i32)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[6].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .boolean = true }, known);
+}
+
+test "checkDefault: checks a default that no instance uses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn double(_: T) -> i32: return true" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2792,21 +3088,21 @@ test "checkDefault: checks a default that no implementation uses" {
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 39 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 36 }, type_checker.failure.?.location.?);
 }
 
-test "checkDefault: checks a default against the trait before the implementations that use it" {
+test "checkDefault: checks a default against the typeclass before the instances that use it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
     defer program_directory.cleanup();
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn double(self: Self) -> i32: return self.side" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn double(self: T) -> i32: return self.side" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes::Shape\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes::Shape\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2815,7 +3111,7 @@ test "checkDefault: checks a default against the trait before the implementation
 
     try std.testing.expectError(error.NoFields, type_checker.check());
     try std.testing.expectEqualStrings("shapes", type_checker.failure.?.module.?[0]);
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 47 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 44 }, type_checker.failure.?.location.?);
 }
 
 test "checkFieldDefaults: gives a struct literal default the type of its field" {
@@ -2924,6 +3220,161 @@ test "check: leaves out a function with compile-time parameters that is never ca
 
     const signature = loader.modules.items[0].declarations[0].kind.function_definition.signature;
     try std.testing.expectEqual(null, signature.return_type.kind.identifier.resolution);
+}
+
+test "check: reports an error that does not depend on a type parameter without a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn broken(type T, value: T) -> T:\n    const count: i32 = true\n    _ = count\n    return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 24 }, analyzer.failure.?.location.?);
+}
+
+test "check: leaves an error that depends on a type parameter to the instances" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn broken(type T, value: T) -> T:\n    const doubled = value + true\n    _ = doubled\n    return value\nfn main(): noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(null, body[0].kind.constant_declaration.value.type);
+}
+
+test "check: reports an error that depends on a type parameter in the instance that has it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn broken(type T, value: T) -> T:\n    const doubled = value + true\n    _ = doubled\n    return value\nfn main(): _ = broken(i32, 1)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MismatchedOperands, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 27 }, analyzer.failure.?.location.?);
+}
+
+test "check: leaves the branches of a condition on a type parameter to the instances" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(type T) -> i32:\n    if T == i32:\n        return true\n    return 0\nfn main(): noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(null, body[0].kind.@"if".condition.type);
+}
+
+test "check: checks a comptime parameter as a value of its type without a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn repeat(comptime count: usize) -> usize:\n    const doubled: usize = count * 2\n    const flag: bool = doubled\n    _ = flag\n    return doubled" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 24 }, analyzer.failure.?.location.?);
+}
+
+test "check: leaves a type that depends on a comptime value to the instances" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn zeros(comptime count: usize) -> usize:\n    const values: [count]bool = 1\n    _ = values\n    return count\nfn main(): noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(null, body[0].kind.constant_declaration.value.type);
+}
+
+test "check: checks the constrained part of a partly constrained function without a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T):\n    fn show(value: T) -> i32\nfn report(type T: Show, type U, value: T, other: U) -> i32:\n    _ = other\n    return value.show() + true" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MismatchedOperands, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 25 }, analyzer.failure.?.location.?);
+}
+
+test "check: checks a default whose typeclass function has its own type parameters without an instance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Mapper(type F(type)):\n    fn size(type A, value: F(A)) -> usize:\n        const count: usize = true\n        _ = count\n        _ = value\n        return 1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 30 }, analyzer.failure.?.location.?);
 }
 
 test "checkFunction: rejects a return type on main" {
@@ -7822,7 +8273,7 @@ test "checkExpression: rejects null for a value that is not optional" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 17 }, type_checker.failure.?.location.?);
 }
 
-test "checkExpression: keeps an optional of an optional apart from the optional" {
+test "checkExpression: converts a value to an optional where an optional is expected" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -7832,7 +8283,48 @@ test "checkExpression: keeps an optional of an optional apart from the optional"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn wrap(value: ?i32) -> ??i32: return value" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Box:\n    value: ?i32\nfn take(value: ?i32) -> i32: return value orelse 0\nfn wrap(value: i32) -> ?i32: return value\nfn convert() -> i32:\n    var count: ?i32 = 5\n    count = 6\n    const box = Box{value = 7}\n    const pair = [?i32, bool]{8, true}\n    _ = box\n    _ = pair\n    _ = wrap(1)\n    return take(count orelse 0) + take(3)\nconst TOTAL = convert()\nconst MAYBE: ?i32 = 5\nconst NESTED: ??i32 = MAYBE" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 9 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[5].kind.constant_declaration.known.?.optional.?.*);
+    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[6].kind.constant_declaration.known.?.optional.?.optional.?.*);
+}
+
+test "checkExpression: rejects a literal where an optional of an optional is expected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const NESTED: ??i32 = 5" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, analyzer.failure.?.location.?);
+}
+
+test "checkExpression: wraps a value in only one level of optional" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn wrap(value: i32) -> ??i32: return value" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7840,7 +8332,7 @@ test "checkExpression: keeps an optional of an optional apart from the optional"
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 39 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 38 }, type_checker.failure.?.location.?);
 }
 
 test "checkExpression: accepts null for an optional of an optional" {
@@ -8355,7 +8847,7 @@ test "resolveMethodCall: rejects a function whose first parameter names the stru
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 42 }, type_checker.failure.?.location.?);
 }
 
-test "resolveMethodCall: calls a function of a trait of the file" {
+test "resolveMethodCall: calls a method of a typeclass with several parameters" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8365,7 +8857,27 @@ test "resolveMethodCall: calls a function of a trait of the file" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\nfn show(square: Square) -> i32: return square.area()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Iterator(type I, type T):\n    fn next(iterator: *I) -> ?T\nstruct Counter:\n    count: usize\ninstance Iterator(Counter, [usize, bool]):\n    fn next(iterator: *Counter) -> ?[usize, bool]:\n        iterator.count += 1\n        return [usize, bool]{iterator.count, true}\nfn first() -> usize:\n    var counter = Counter{count = 0}\n    const pair = counter.next().?\n    return pair[0]\nconst FIRST = first()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .integer = 1 }, known);
+}
+
+test "resolveMethodCall: calls a function of a typeclass of the file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\nfn show(square: Square) -> i32: return square.area()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8378,7 +8890,7 @@ test "resolveMethodCall: calls a function of a trait of the file" {
     try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 3 } }, callee.resolution.?);
 }
 
-test "resolveMethodCall: rejects a function of a trait that is not imported" {
+test "resolveMethodCall: rejects a function of a typeclass that is not imported" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8388,8 +8900,8 @@ test "resolveMethodCall: rejects a function of a trait that is not imported" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nstruct Square:\n    side: i32\nimpl shapes::Shape for Square:\n    fn area(self: Self) -> i32: return self.side\nfn show(square: Square) -> i32: return square.area()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nstruct Square:\n    side: i32\ninstance shapes::Shape(Square):\n    fn area(self: Square) -> i32: return self.side\nfn show(square: Square) -> i32: return square.area()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8400,7 +8912,7 @@ test "resolveMethodCall: rejects a function of a trait that is not imported" {
     try std.testing.expectEqual(token.Location{ .row = 6, .column = 47 }, type_checker.failure.?.location.?);
 }
 
-test "resolveMethodCall: calls a function of an imported trait" {
+test "resolveMethodCall: calls a function of an imported typeclass" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8410,8 +8922,8 @@ test "resolveMethodCall: calls a function of an imported trait" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes::Shape\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\nfn show(square: Square) -> i32: return square.area()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes::Shape\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\nfn show(square: Square) -> i32: return square.area()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8421,7 +8933,7 @@ test "resolveMethodCall: calls a function of an imported trait" {
     try type_checker.check();
 }
 
-test "resolveMethodCall: calls a function of a trait imported under another name" {
+test "resolveMethodCall: calls a function of a typeclass imported under another name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8431,8 +8943,8 @@ test "resolveMethodCall: calls a function of a trait imported under another name
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes::Shape as Form\nstruct Square:\n    side: i32\nimpl Form for Square:\n    fn area(self: Self) -> i32: return self.side\nfn show(square: Square) -> i32: return square.area()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes::Shape as Form\nstruct Square:\n    side: i32\ninstance Form(Square):\n    fn area(self: Square) -> i32: return self.side\nfn show(square: Square) -> i32: return square.area()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8442,7 +8954,7 @@ test "resolveMethodCall: calls a function of a trait imported under another name
     try type_checker.check();
 }
 
-test "resolveMethodCall: calls the function of the struct's block over a trait's function" {
+test "resolveMethodCall: calls the function of the struct's block over a typeclass's function" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8452,7 +8964,7 @@ test "resolveMethodCall: calls the function of the struct's block over a trait's
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\nstruct Square:\n    side: i32\n    fn area(self: Self) -> i32: return self.side\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side * self.side\nfn show(square: Square) -> i32: return square.area()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\nstruct Square:\n    side: i32\n    fn area(self: Self) -> i32: return self.side\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side * self.side\nfn show(square: Square) -> i32: return square.area()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8465,7 +8977,7 @@ test "resolveMethodCall: calls the function of the struct's block over a trait's
     try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 2 } }, ast.extractResolution(call.callee));
 }
 
-test "resolveMethodCall: rejects a method that two traits give a type" {
+test "resolveMethodCall: rejects a method that two typeclasses give a type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8475,7 +8987,7 @@ test "resolveMethodCall: rejects a method that two traits give a type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\ntrait Figure:\n    fn area(self: Self) -> i32\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\nimpl Figure for Square:\n    fn area(self: Self) -> i32: return self.side * 2\nfn show(square: Square) -> i32: return square.area()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\ntypeclass Figure(type T):\n    fn area(self: T) -> i32\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\ninstance Figure(Square):\n    fn area(self: Square) -> i32: return self.side * 2\nfn show(square: Square) -> i32: return square.area()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8486,7 +8998,7 @@ test "resolveMethodCall: rejects a method that two traits give a type" {
     try std.testing.expectEqual(token.Location{ .row = 11, .column = 47 }, type_checker.failure.?.location.?);
 }
 
-test "resolveMethodCall: calls a function of the trait through self in a default" {
+test "resolveMethodCall: calls a function of the typeclass through self in a default" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8496,7 +9008,7 @@ test "resolveMethodCall: calls a function of the trait through self in a default
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn double(self: Self) -> i32: return self.area() * 2\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn double(self: T) -> i32: return self.area() * 2\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8504,14 +9016,14 @@ test "resolveMethodCall: calls a function of the trait through self in a default
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
     try type_checker.check();
 
-    const definition = loader.modules.items[0].declarations[0].kind.trait_definition;
+    const definition = loader.modules.items[0].declarations[0].kind.typeclass_definition;
     const product = definition.defaults[1].?.body[0].kind.@"return".?.kind.binary;
     const callee = product.left.kind.call.callee.identifier;
-    const function: ast.Resolution.TraitFunction = .{ .trait = .{ .module = 0, .declaration = 0 }, .function = 0 };
-    try std.testing.expectEqual(ast.Resolution{ .trait_function = function }, callee.resolution.?);
+    const function: ast.Resolution.TypeclassFunction = .{ .typeclass = .{ .module = 0, .declaration = 0 }, .function = 0 };
+    try std.testing.expectEqual(ast.Resolution{ .typeclass_function = function }, callee.resolution.?);
 }
 
-test "resolveMethodCall: calls the function of the implementation through self in a default made for it" {
+test "resolveMethodCall: calls the function of the instance through self in a default made for it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8521,7 +9033,7 @@ test "resolveMethodCall: calls the function of the implementation through self i
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn double(self: Self) -> i32: return self.area() * 2\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn double(self: T) -> i32: return self.area() * 2\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8535,7 +9047,7 @@ test "resolveMethodCall: calls the function of the implementation through self i
     try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 3 } }, callee.resolution.?);
 }
 
-test "resolveMethodCall: calls a default on a value of an implementing type" {
+test "resolveMethodCall: calls a default on a value of a type with an instance" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8545,7 +9057,7 @@ test "resolveMethodCall: calls a default on a value of an implementing type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn double(self: Self) -> i32: return self.area() * 2\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\nfn show(square: Square) -> i32: return square.double()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn double(self: T) -> i32: return self.area() * 2\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\nfn show(square: Square) -> i32: return square.double()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8558,7 +9070,7 @@ test "resolveMethodCall: calls a default on a value of an implementing type" {
     try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 5 } }, callee.resolution.?);
 }
 
-test "resolveMethodCall: calls the function of the implementation instead of the default" {
+test "resolveMethodCall: calls the function of the instance instead of the default" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8568,7 +9080,7 @@ test "resolveMethodCall: calls the function of the implementation instead of the
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn double(self: Self) -> i32: return self.area() * 2\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\n    fn double(self: Self) -> i32: return self.side\nfn show(square: Square) -> i32: return square.double()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn double(self: T) -> i32: return self.area() * 2\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\n    fn double(self: Square) -> i32: return self.side\nfn show(square: Square) -> i32: return square.double()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8609,7 +9121,7 @@ test "resolveMethodCall: takes the address of the value for a method with a poin
     try std.testing.expectEqualStrings("counter", read.arguments[0].value.kind.identifier.name);
 }
 
-test "resolveMethodCall: calls the methods of a trait with each kind of receiver" {
+test "resolveMethodCall: calls the methods of a typeclass with each kind of receiver" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8619,7 +9131,7 @@ test "resolveMethodCall: calls the methods of a trait with each kind of receiver
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn grow(self: *Self)\n    fn measure(self: *const Self) -> i32\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\n    fn grow(self: *Self): self.side += 1\n    fn measure(self: *const Self) -> i32: return self.side\nfn main():\n    var square = Square{side = 1}\n    square.grow()\n    _ = square.measure()\n    _ = square.area()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn grow(self: *T)\n    fn measure(self: *const T) -> i32\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\n    fn grow(self: *Square): self.side += 1\n    fn measure(self: *const Square) -> i32: return self.side\nfn main():\n    var square = Square{side = 1}\n    square.grow()\n    _ = square.measure()\n    _ = square.area()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8648,7 +9160,7 @@ test "resolveMethodCall: calls a default implementation with a pointer receiver"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn double(self: *const Self) -> i32: return self.area() * 2\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\nfn main():\n    const square = Square{side = 1}\n    _ = square.double()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn double(self: *const T) -> i32: return self.area() * 2\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\nfn main():\n    const square = Square{side = 1}\n    _ = square.double()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8667,7 +9179,7 @@ test "resolveMethodCall: calls a default implementation with a pointer receiver"
     try std.testing.expectEqualStrings("self", area.arguments[0].value.kind.dereference.kind.identifier.name);
 }
 
-test "resolveTraitCall: calls the function of the implementation through the trait" {
+test "resolveTypeclassCall: decides the instance by an argument after the first" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8677,7 +9189,245 @@ test "resolveTraitCall: calls the function of the implementation through the tra
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn unit() -> Self\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\n    fn unit() -> Self: return Square{side = 1}\nfn show(square: Square) -> i32: return Shape::area(square)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(shape: T) -> i32\n    fn scale(factor: i32, shape: T) -> i32\n    fn total(shapes: []const T) -> i32\n    fn same(one: T, two: T) -> bool\nstruct Square:\n    side: i32\nstruct Circle:\n    radius: i32\ninstance Shape(Square):\n    fn area(shape: Square) -> i32: return shape.side\n    fn scale(factor: i32, shape: Square) -> i32: return factor * shape.side\n    fn total(shapes: []const Square) -> i32: return shapes[0].side\n    fn same(one: Square, two: Square) -> bool: return one.side == two.side\ninstance Shape(Circle):\n    fn area(shape: Circle) -> i32: return shape.radius\n    fn scale(factor: i32, shape: Circle) -> i32: return factor * shape.radius\n    fn total(shapes: []const Circle) -> i32: return shapes[0].radius\n    fn same(one: Circle, two: Circle) -> bool: return one.radius == two.radius\nconst SCALED = Shape::scale(2, Circle{radius = 3})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[13].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .integer = 6 }, known);
+}
+
+test "resolveTypeclassCall: decides the instance through a slice of the parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(shape: T) -> i32\n    fn scale(factor: i32, shape: T) -> i32\n    fn total(shapes: []const T) -> i32\n    fn same(one: T, two: T) -> bool\nstruct Square:\n    side: i32\nstruct Circle:\n    radius: i32\ninstance Shape(Square):\n    fn area(shape: Square) -> i32: return shape.side\n    fn scale(factor: i32, shape: Square) -> i32: return factor * shape.side\n    fn total(shapes: []const Square) -> i32: return shapes[0].side\n    fn same(one: Square, two: Square) -> bool: return one.side == two.side\ninstance Shape(Circle):\n    fn area(shape: Circle) -> i32: return shape.radius\n    fn scale(factor: i32, shape: Circle) -> i32: return factor * shape.radius\n    fn total(shapes: []const Circle) -> i32: return shapes[0].radius\n    fn same(one: Circle, two: Circle) -> bool: return one.radius == two.radius\nconst SQUARES = [2]Square{Square{side = 4}, Square{side = 5}}\nconst TOTAL = Shape::total(SQUARES[..])" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[14].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .integer = 4 }, known);
+}
+
+test "resolveTypeclassCall: rejects arguments that decide different instances" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(shape: T) -> i32\n    fn scale(factor: i32, shape: T) -> i32\n    fn total(shapes: []const T) -> i32\n    fn same(one: T, two: T) -> bool\nstruct Square:\n    side: i32\nstruct Circle:\n    radius: i32\ninstance Shape(Square):\n    fn area(shape: Square) -> i32: return shape.side\n    fn scale(factor: i32, shape: Square) -> i32: return factor * shape.side\n    fn total(shapes: []const Square) -> i32: return shapes[0].side\n    fn same(one: Square, two: Square) -> bool: return one.side == two.side\ninstance Shape(Circle):\n    fn area(shape: Circle) -> i32: return shape.radius\n    fn scale(factor: i32, shape: Circle) -> i32: return factor * shape.radius\n    fn total(shapes: []const Circle) -> i32: return shapes[0].radius\n    fn same(one: Circle, two: Circle) -> bool: return one.radius == two.radius\nconst SAME = Shape::same(Square{side = 1}, Circle{radius = 1})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 20, .column = 44 }, analyzer.failure.?.location.?);
+}
+
+test "resolveTypeclassCall: picks the only instance that fits the decided parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Convert(type From, type To):\n    fn convert(value: From) -> To\nstruct Celsius:\n    degrees: i32\nstruct Fahrenheit:\n    degrees: i32\ninstance Convert(Celsius, Fahrenheit):\n    fn convert(value: Celsius) -> Fahrenheit: return Fahrenheit{degrees = value.degrees * 9 / 5 + 32}\nconst HOT = Convert::convert(Celsius{degrees = 100})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .integer = 212 }, known.aggregate[0]);
+}
+
+test "resolveTypeclassCall: rejects a call that more than one instance fits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Convert(type From, type To):\n    fn convert(value: From) -> To\nstruct Celsius:\n    degrees: i32\nstruct Fahrenheit:\n    degrees: i32\ninstance Convert(Celsius, Fahrenheit):\n    fn convert(value: Celsius) -> Fahrenheit: return Fahrenheit{degrees = value.degrees * 9 / 5 + 32}\ninstance Convert(Celsius, i32):\n    fn convert(value: Celsius) -> i32: return value.degrees\nconst HOT = Convert::convert(Celsius{degrees = 100})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.AmbiguousInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 11, .column = 30 }, analyzer.failure.?.location.?);
+}
+
+test "resolveTypeclassCall: matches a type constructor parameter against a struct a call gives" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Container(type F(type)):\n    fn size(value: F(i32)) -> usize\nfn Box(type T) -> type:\n    return struct:\n        value: T\ninstance Container(Box):\n    fn size(value: Box(i32)) -> usize:\n        _ = value\n        return 4\nconst SIZE = Container::size(Box(i32){value = 3})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .integer = 4 }, known);
+}
+
+test "resolveTypeclassCall: calls a function of a generic instance for each binding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T):\n    fn show(value: T) -> i32\n    fn twice(value: T) -> i32: return Show::show(value) * 2\ninstance Show(i32):\n    fn show(value: i32) -> i32: return value\nfn List(type T) -> type:\n    return struct:\n        first: T\ninstance(type A: Show) Show(List(A)):\n    fn show(value: List(A)) -> i32: return Show::show(value.first) + 1\nconst ONE = Show::show(List(i32){first = 5})\nconst TWO = Show::show(List(List(i32)){first = List(i32){first = 5}})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[6].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .integer = 6 }, known);
+    const two = loader.modules.items[0].declarations[7].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .integer = 7 }, two);
+}
+
+test "resolveTypeclassCall: calls a default of a generic instance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T):\n    fn show(value: T) -> i32\n    fn twice(value: T) -> i32: return Show::show(value) * 2\ninstance Show(i32):\n    fn show(value: i32) -> i32: return value\nfn List(type T) -> type:\n    return struct:\n        first: T\ninstance(type A: Show) Show(List(A)):\n    fn show(value: List(A)) -> i32: return Show::show(value.first) + 1\nconst TWICE = Show::twice(List(i32){first = 5})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[6].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .integer = 12 }, known);
+}
+
+test "resolveTypeclassCall: skips a generic instance whose requirement does not hold" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T):\n    fn show(value: T) -> i32\n    fn twice(value: T) -> i32: return Show::show(value) * 2\ninstance Show(i32):\n    fn show(value: i32) -> i32: return value\nfn List(type T) -> type:\n    return struct:\n        first: T\ninstance(type A: Show) Show(List(A)):\n    fn show(value: List(A)) -> i32: return Show::show(value.first) + 1\nconst FLAG = Show::show(List(bool){first = true})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NoInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 11, .column = 25 }, analyzer.failure.?.location.?);
+}
+
+test "resolveTypeclassCall: calls a typeclass function with its own type parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Mapper(type F(type)):\n    fn map(type A, type B, value: F(A), function: *fn(A) -> B) -> F(B)\nfn Box(type T) -> type:\n    return struct:\n        value: T\ninstance Mapper(Box):\n    fn map(type A, type B, value: Box(A), function: *fn(A) -> B) -> Box(B): return Box(B){value = function(value.value)}\nfn positive(value: i32) -> bool: return value > 0\nconst MAPPED = Mapper::map(i32, bool, Box(i32){value = 3}, &positive)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .boolean = true }, known.aggregate[0]);
+}
+
+test "resolveTypeclassCall: rejects a generic instance whose binding lacks a required instance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Eq(type T):\n    fn equal(one: T, two: T) -> bool\ntypeclass Ord(type T: Eq):\n    fn less(one: T, two: T) -> bool\nfn List(type T) -> type:\n    return struct:\n        first: T\ninstance(type A) Ord(List(A)):\n    fn less(_: List(A), _: List(A)) -> bool: return true\nconst LESS = Ord::less(List(i32){first = 1}, List(i32){first = 2})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MissingRequiredInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 10, .column = 24 }, analyzer.failure.?.location.?);
+}
+
+test "resolveTypeclassCall: accepts a generic instance whose binding has the required instance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Eq(type T):\n    fn equal(one: T, two: T) -> bool\ntypeclass Ord(type T: Eq):\n    fn less(one: T, two: T) -> bool\nfn List(type T) -> type:\n    return struct:\n        first: T\ninstance(type A) Ord(List(A)):\n    fn less(_: List(A), _: List(A)) -> bool: return true\ninstance(type A) Eq(List(A)):\n    fn equal(_: List(A), _: List(A)) -> bool: return true\nconst LESS = Ord::less(List(i32){first = 1}, List(i32){first = 2})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[7].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .boolean = true }, known);
+}
+
+test "resolveTypeclassCall: calls the function of the instance through the typeclass" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn unit() -> T\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\n    fn unit() -> Square: return Square{side = 1}\nfn show(square: Square) -> i32: return Shape::area(square)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8690,7 +9440,7 @@ test "resolveTraitCall: calls the function of the implementation through the tra
     try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 3 } }, ast.extractResolution(call.callee));
 }
 
-test "resolveTraitCall: finds the implementation for the type a pointer argument points to" {
+test "resolveTypeclassCall: finds the instance for the type a pointer argument points to" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8700,7 +9450,7 @@ test "resolveTraitCall: finds the implementation for the type a pointer argument
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn grow(self: *Self)\n    fn measure(self: *const Self) -> i32\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\n    fn grow(self: *Self): self.side += 1\n    fn measure(self: *const Self) -> i32: return self.side\nfn main():\n    var square = Square{side = 1}\n    Shape::grow(&square)\n    _ = Shape::measure(&square)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn grow(self: *T)\n    fn measure(self: *const T) -> i32\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\n    fn grow(self: *Square): self.side += 1\n    fn measure(self: *const Square) -> i32: return self.side\nfn main():\n    var square = Square{side = 1}\n    Shape::grow(&square)\n    _ = Shape::measure(&square)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8716,7 +9466,7 @@ test "resolveTraitCall: finds the implementation for the type a pointer argument
     try std.testing.expectEqualStrings("square", grow.arguments[0].value.kind.address_of.kind.identifier.name);
 }
 
-test "resolveTraitCall: accepts a pointer that can modify the value for a read-only pointer receiver" {
+test "resolveTypeclassCall: accepts a pointer that can modify the value for a read-only pointer receiver" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8726,7 +9476,7 @@ test "resolveTraitCall: accepts a pointer that can modify the value for a read-o
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn grow(self: *Self)\n    fn measure(self: *const Self) -> i32\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\n    fn grow(self: *Self): self.side += 1\n    fn measure(self: *const Self) -> i32: return self.side\nfn show(pointer: *Square) -> i32: return Shape::measure(pointer)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn grow(self: *T)\n    fn measure(self: *const T) -> i32\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\n    fn grow(self: *Square): self.side += 1\n    fn measure(self: *const Square) -> i32: return self.side\nfn show(pointer: *Square) -> i32: return Shape::measure(pointer)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8737,7 +9487,7 @@ test "resolveTraitCall: accepts a pointer that can modify the value for a read-o
     try std.testing.expectEqual(null, type_checker.failure);
 }
 
-test "resolveTraitCall: rejects a read-only pointer for a receiver that modifies" {
+test "resolveTypeclassCall: rejects a read-only pointer for a receiver that modifies" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8747,7 +9497,7 @@ test "resolveTraitCall: rejects a read-only pointer for a receiver that modifies
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn grow(self: *Self)\n    fn measure(self: *const Self) -> i32\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\n    fn grow(self: *Self): self.side += 1\n    fn measure(self: *const Self) -> i32: return self.side\nfn bump(pointer: *const Square): Shape::grow(pointer)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn grow(self: *T)\n    fn measure(self: *const T) -> i32\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\n    fn grow(self: *Square): self.side += 1\n    fn measure(self: *const Square) -> i32: return self.side\nfn bump(pointer: *const Square): Shape::grow(pointer)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8758,7 +9508,7 @@ test "resolveTraitCall: rejects a read-only pointer for a receiver that modifies
     try std.testing.expectEqual(token.Location{ .row = 11, .column = 46 }, type_checker.failure.?.location.?);
 }
 
-test "resolveTraitCall: rejects a value that is not a pointer for a pointer receiver" {
+test "resolveTypeclassCall: rejects a value that is not a pointer for a pointer receiver" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8768,7 +9518,7 @@ test "resolveTraitCall: rejects a value that is not a pointer for a pointer rece
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn grow(self: *Self)\n    fn measure(self: *const Self) -> i32\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\n    fn grow(self: *Self): self.side += 1\n    fn measure(self: *const Self) -> i32: return self.side\nfn bump(square: Square): Shape::grow(square)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn grow(self: *T)\n    fn measure(self: *const T) -> i32\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\n    fn grow(self: *Square): self.side += 1\n    fn measure(self: *const Square) -> i32: return self.side\nfn bump(square: Square): Shape::grow(square)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8779,7 +9529,7 @@ test "resolveTraitCall: rejects a value that is not a pointer for a pointer rece
     try std.testing.expectEqual(token.Location{ .row = 11, .column = 38 }, type_checker.failure.?.location.?);
 }
 
-test "resolveTraitCall: calls a default implementation with a pointer receiver through the trait" {
+test "resolveTypeclassCall: calls a default implementation with a pointer receiver through the typeclass" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8789,7 +9539,7 @@ test "resolveTraitCall: calls a default implementation with a pointer receiver t
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn double(self: *const Self) -> i32: return self.area() * 2\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\nfn main():\n    const square = Square{side = 1}\n    _ = Shape::double(&square)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn double(self: *const T) -> i32: return self.area() * 2\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\nfn main():\n    const square = Square{side = 1}\n    _ = Shape::double(&square)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8801,7 +9551,7 @@ test "resolveTraitCall: calls a default implementation with a pointer receiver t
     try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 5 } }, ast.extractResolution(call.callee));
 }
 
-test "resolveTraitCall: chooses the trait's function over the function of the struct's block" {
+test "resolveTypeclassCall: chooses the typeclass's function over the function of the struct's block" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8811,7 +9561,7 @@ test "resolveTraitCall: chooses the trait's function over the function of the st
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\nstruct Square:\n    side: i32\n    fn area(self: Self) -> i32: return self.side\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side * self.side\nfn show(square: Square) -> i32: return Shape::area(square)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\nstruct Square:\n    side: i32\n    fn area(self: Self) -> i32: return self.side\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side * self.side\nfn show(square: Square) -> i32: return Shape::area(square)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8824,7 +9574,7 @@ test "resolveTraitCall: chooses the trait's function over the function of the st
     try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 4 } }, ast.extractResolution(call.callee));
 }
 
-test "resolveTraitCall: chooses the function of the trait it is called through" {
+test "resolveTypeclassCall: chooses the function of the typeclass it is called through" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8834,7 +9584,7 @@ test "resolveTraitCall: chooses the function of the trait it is called through" 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\ntrait Figure:\n    fn area(self: Self) -> i32\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\nimpl Figure for Square:\n    fn area(self: Self) -> i32: return self.side * 2\nfn shape(square: Square) -> i32: return Shape::area(square)\nfn figure(square: Square) -> i32: return Figure::area(square)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\ntypeclass Figure(type T):\n    fn area(self: T) -> i32\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\ninstance Figure(Square):\n    fn area(self: Square) -> i32: return self.side * 2\nfn shape(square: Square) -> i32: return Shape::area(square)\nfn figure(square: Square) -> i32: return Figure::area(square)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8849,7 +9599,7 @@ test "resolveTraitCall: chooses the function of the trait it is called through" 
     try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 6 } }, ast.extractResolution(figure.callee));
 }
 
-test "resolveTraitCall: calls a default implementation through the trait" {
+test "resolveTypeclassCall: calls a default implementation through the typeclass" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8859,7 +9609,7 @@ test "resolveTraitCall: calls a default implementation through the trait" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn double(self: Self) -> i32: return self.area() * 2\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\nfn show(square: Square) -> i32: return Shape::double(square)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn double(self: T) -> i32: return self.area() * 2\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\nfn show(square: Square) -> i32: return Shape::double(square)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8872,18 +9622,18 @@ test "resolveTraitCall: calls a default implementation through the trait" {
     try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 5 } }, ast.extractResolution(call.callee));
 }
 
-test "resolveTraitCall: calls a function of an imported trait through the trait" {
+test "resolveTypeclassCall: calls a function of an imported typeclass through the typeclass" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
     defer program_directory.cleanup();
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes::Shape\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\nfn show(square: Square) -> i32: return Shape::area(square)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes::Shape\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\nfn show(square: Square) -> i32: return Shape::area(square)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8896,18 +9646,18 @@ test "resolveTraitCall: calls a function of an imported trait through the trait"
     try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 3 } }, ast.extractResolution(call.callee));
 }
 
-test "resolveTraitCall: rejects a trait that is neither declared nor imported" {
+test "resolveTypeclassCall: rejects a typeclass that is neither declared nor imported" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
     defer program_directory.cleanup();
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nstruct Square:\n    side: i32\nimpl shapes::Shape for Square:\n    fn area(self: Self) -> i32: return self.side\nfn show(square: Square) -> i32: return shapes::Shape::area(square)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nstruct Square:\n    side: i32\ninstance shapes::Shape(Square):\n    fn area(self: Square) -> i32: return self.side\nfn show(square: Square) -> i32: return shapes::Shape::area(square)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8918,7 +9668,7 @@ test "resolveTraitCall: rejects a trait that is neither declared nor imported" {
     try std.testing.expectEqual(token.Location{ .row = 6, .column = 40 }, type_checker.failure.?.location.?);
 }
 
-test "resolveTraitCall: rejects a function without a Self parameter through the trait" {
+test "resolveTypeclassCall: rejects a call whose arguments do not decide the instance" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8928,18 +9678,18 @@ test "resolveTraitCall: rejects a function without a Self parameter through the 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn unit() -> Self\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\n    fn unit() -> Self: return Square{side = 1}\nfn make() -> Square: return Shape::unit()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn unit() -> T\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\n    fn unit() -> Square: return Square{side = 1}\nfn make() -> Square: return Shape::unit()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
-    try std.testing.expectError(error.NoSelf, type_checker.check());
+    try std.testing.expectError(error.UndecidedInstance, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 9, .column = 29 }, type_checker.failure.?.location.?);
 }
 
-test "findTraitMethod: rejects a value whose type does not implement the trait" {
+test "findTypeclassMethod: rejects a value whose type has no instance of the typeclass" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8949,18 +9699,18 @@ test "findTraitMethod: rejects a value whose type does not implement the trait" 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn unit() -> Self\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\n    fn unit() -> Self: return Square{side = 1}\nstruct Circle:\n    radius: i32\nfn show(circle: Circle) -> i32: return Shape::area(circle)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn unit() -> T\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\n    fn unit() -> Square: return Square{side = 1}\nstruct Circle:\n    radius: i32\nfn show(circle: Circle) -> i32: return Shape::area(circle)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
-    try std.testing.expectError(error.NotImplemented, type_checker.check());
+    try std.testing.expectError(error.NoInstance, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 11, .column = 52 }, type_checker.failure.?.location.?);
 }
 
-test "findTraitMethod: calls the trait's function on Self through the trait in a default" {
+test "findTypeclassMethod: calls the typeclass's function on the typeclass parameter through the typeclass in a default" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8970,7 +9720,7 @@ test "findTraitMethod: calls the trait's function on Self through the trait in a
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn double(self: Self) -> i32: return Shape::area(self) * 2" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn double(self: T) -> i32: return Shape::area(self) * 2" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8978,10 +9728,10 @@ test "findTraitMethod: calls the trait's function on Self through the trait in a
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
     try type_checker.check();
 
-    const definition = loader.modules.items[0].declarations[0].kind.trait_definition;
+    const definition = loader.modules.items[0].declarations[0].kind.typeclass_definition;
     const product = definition.defaults[1].?.body[0].kind.@"return".?.kind.binary;
-    const function: ast.Resolution.TraitFunction = .{ .trait = .{ .module = 0, .declaration = 0 }, .function = 0 };
-    try std.testing.expectEqual(ast.Resolution{ .trait_function = function }, ast.extractResolution(product.left.kind.call.callee));
+    const function: ast.Resolution.TypeclassFunction = .{ .typeclass = .{ .module = 0, .declaration = 0 }, .function = 0 };
+    try std.testing.expectEqual(ast.Resolution{ .typeclass_function = function }, ast.extractResolution(product.left.kind.call.callee));
 }
 
 test "buildReceiver: rejects a constant for a receiver that modifies it" {
@@ -9126,7 +9876,7 @@ test "findMethodFunction: calls the method of the pointer's own type over the me
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\nstruct Square:\n    side: i32\n    fn area(self: Self) -> i32: return self.side\nimpl Shape for *Square:\n    fn area(self: Self) -> i32: return self.side * 2\nfn show(pointer: *Square) -> i32: return pointer.area()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\nstruct Square:\n    side: i32\n    fn area(self: Self) -> i32: return self.side\ninstance Shape(*Square):\n    fn area(self: *Square) -> i32: return self.side * 2\nfn show(pointer: *Square) -> i32: return pointer.area()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9160,7 +9910,7 @@ test "findMethodFunction: finds no method behind two pointers" {
     try std.testing.expectEqual(token.Location{ .row = 6, .column = 52 }, type_checker.failure.?.location.?);
 }
 
-test "findSelfFunction: rejects a function of the implementing type through self in a default" {
+test "findSelfFunction: rejects a function of the struct through self in a default" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -9170,7 +9920,7 @@ test "findSelfFunction: rejects a function of the implementing type through self
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn double(self: Self) -> i32: return self.size()\nstruct Square:\n    side: i32\n    fn size(self: Self) -> i32: return self.side\nimpl Shape for Square" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn double(self: T) -> i32: return self.size()\nstruct Square:\n    side: i32\n    fn size(self: Self) -> i32: return self.side\ninstance Shape(Square)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9178,7 +9928,7 @@ test "findSelfFunction: rejects a function of the implementing type through self
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.UnknownMethod, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 47 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 44 }, type_checker.failure.?.location.?);
 }
 
 test "checkFunctionCall: rejects a call that gives a type at run time" {
@@ -9220,6 +9970,144 @@ test "checkFunctionCall: accepts a call that gives a type in a function that giv
     try std.testing.expectEqual(types.Type{ .number = .i32 }, ast.extractType(parameters[0].type));
 }
 
+test "instantiateCall: creates an instance for each type given to a parameter of a typeclass type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T):\n    fn show(value: T) -> i32\ninstance Show(i32):\n    fn show(value: i32) -> i32: return value\ninstance Show(bool):\n    fn show(value: bool) -> i32:\n        if value: return 1\n        return 0\nfn report(value: Show) -> i32: return Show::show(value) + value.show()\nconst ONE = report(5i32)\nconst TWO = report(true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[6].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .integer = 10 }, known);
+    const two = loader.modules.items[0].declarations[7].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .integer = 2 }, two);
+}
+
+test "instantiateCall: rejects a value of a type without an instance for a parameter of a typeclass type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T):\n    fn show(value: T) -> i32\ninstance Show(i32):\n    fn show(value: i32) -> i32: return value\ninstance Show(bool):\n    fn show(value: bool) -> i32:\n        if value: return 1\n        return 0\nfn report(value: Show) -> i32: return value.show()\nconst THREE = report(3u8)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NoInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 10, .column = 22 }, analyzer.failure.?.location.?);
+}
+
+test "instantiateCall: binds a type parameter that requires a typeclass" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Default(type T):\n    fn value() -> T\ninstance Default(i32):\n    fn value() -> i32: return 7\nfn make(type T: Default) -> T: return Default(T)::value()\nconst SEVEN = make(i32)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .integer = 7 }, known);
+}
+
+test "instantiateCall: rejects a type without an instance of the required typeclass" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Default(type T):\n    fn value() -> T\ninstance Default(i32):\n    fn value() -> i32: return 7\nfn make(type T: Default) -> T: return Default(T)::value()\nconst FLAG = make(bool)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NoInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 19 }, analyzer.failure.?.location.?);
+}
+
+test "check: checks a function with a parameter of a typeclass type before any call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T):\n    fn show(value: T) -> i32\ninstance Show(i32):\n    fn show(value: i32) -> i32: return value\ninstance Show(bool):\n    fn show(value: bool) -> i32:\n        if value: return 1\n        return 0\nfn report(value: Show) -> i32: return value + 1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 9, .column = 47 }, analyzer.failure.?.location.?);
+}
+
+test "check: rejects a function that uses a constrained type through another typeclass" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T):\n    fn show(value: T) -> i32\ninstance Show(i32):\n    fn show(value: i32) -> i32: return value\ninstance Show(bool):\n    fn show(value: bool) -> i32:\n        if value: return 1\n        return 0\ntypeclass Size(type T):\n    fn size(value: T) -> i32\nfn measure(type T: Show, value: T) -> i32: return Size::size(value)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NoInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 11, .column = 62 }, analyzer.failure.?.location.?);
+}
+
+test "check: lets a constrained function use the typeclasses that its typeclass requires" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Eq(type T):\n    fn equal(one: T, two: T) -> bool\ntypeclass Ord(type T: Eq):\n    fn less(one: T, two: T) -> bool\n    fn at_most(one: T, two: T) -> bool: return Ord::less(one, two) or one.equal(two)\ninstance Eq(i32):\n    fn equal(one: i32, two: i32) -> bool: return one == two\ninstance Ord(i32):\n    fn less(one: i32, two: i32) -> bool: return one < two\nfn same(type T: Ord, one: T, two: T) -> bool: return Eq::equal(one, two)\nconst SAME = same(i32, 4, 4)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[7].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .boolean = true }, known);
+}
+
 test "instantiateCall: creates an instance per set of compile-time arguments and reuses it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -9242,7 +10130,7 @@ test "instantiateCall: creates an instance per set of compile-time arguments and
     const third = body[2].kind.discard.kind.call.callee.identifier.resolution.?.function;
     try std.testing.expectEqual(first, second);
     try std.testing.expect(!std.meta.eql(first, third));
-    try std.testing.expectEqual(4, loader.modules.items[0].declarations.len);
+    try std.testing.expectEqual(5, loader.modules.items[0].declarations.len);
     try std.testing.expectEqual(2, body[0].kind.discard.kind.call.arguments.len);
 }
 
@@ -9890,7 +10778,7 @@ test "checkFieldAccess: reads a field through a multiple value pointer" {
     try std.testing.expectEqual(types.Type{ .number = .i32 }, value_type);
 }
 
-test "checkFieldAccess: rejects a field of Self in a default" {
+test "checkFieldAccess: rejects a field of the typeclass parameter in a default" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -9900,7 +10788,7 @@ test "checkFieldAccess: rejects a field of Self in a default" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32: return self.side\nstruct Square:\n    side: i32\nimpl Shape for Square" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32: return self.side\nstruct Square:\n    side: i32\ninstance Shape(Square)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9908,7 +10796,7 @@ test "checkFieldAccess: rejects a field of Self in a default" {
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.NoFields, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 45 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 42 }, type_checker.failure.?.location.?);
 }
 
 test "inferType: gives a call its return type" {
@@ -13743,7 +14631,7 @@ test "computeFunctionType: puts the receiver of a method first" {
     try std.testing.expectEqual(types.Type{ .number = .f32 }, function.return_type);
 }
 
-test "computeFunctionType: gives a function of a trait implementation the type of its signature" {
+test "computeFunctionType: gives a function of a typeclass instance the type of its signature" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -13753,7 +14641,7 @@ test "computeFunctionType: gives a function of a trait implementation the type o
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\nfn get() -> *fn(Square) -> i32: return &Square::area" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\nfn get() -> *fn(Square) -> i32: return &Shape(Square)::area" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);

@@ -184,7 +184,7 @@ pub const Generator = struct {
                     .function_definition => |function| function.signature,
                     .function_declaration => |function_declaration| function_declaration,
                     .constant_declaration, .struct_definition => continue,
-                    .trait_definition, .implementation, .import => continue,
+                    .typeclass_definition, .instance_declaration, .import => continue,
                 };
                 const name = self.names[module_index][index].?;
                 try self.checkName(name, declaration.location);
@@ -387,7 +387,7 @@ pub const Generator = struct {
                         try collectPrototypeTags(allocator, &tags, element, false);
                     }
                 },
-                .number, .boolean, .void, .type, .pointer, .function, .implementer => {
+                .number, .boolean, .void, .type, .pointer, .function, .variable, .application => {
                     unreachable;
                 },
             }
@@ -446,7 +446,7 @@ pub const Generator = struct {
             .slice => try self.generateSliceDefinition(writer, value_type),
             .optional => try self.generateOptionalDefinition(writer, value_type),
             .tuple => try self.generateTupleDefinition(writer, value_type),
-            .number, .boolean, .void, .type, .pointer, .function, .implementer => {
+            .number, .boolean, .void, .type, .pointer, .function, .variable, .application => {
                 unreachable;
             },
         }
@@ -491,7 +491,7 @@ pub const Generator = struct {
                 .function_definition => |function| function.signature,
                 .function_declaration => |function_declaration| function_declaration,
                 .constant_declaration, .struct_definition => continue,
-                .trait_definition, .implementation, .import => continue,
+                .typeclass_definition, .instance_declaration, .import => continue,
             };
             for (signature.parameters) |parameter| {
                 const parameter_type = ast.extractType(parameter.type);
@@ -540,7 +540,7 @@ pub const Generator = struct {
                 }
                 return self.collectForwardType(allocator, forward, function.return_type);
             },
-            .number, .boolean, .void, .type, .implementer => return,
+            .number, .boolean, .void, .type, .variable, .application => return,
         }
         try forward.declared.append(allocator, value_type);
     }
@@ -600,7 +600,7 @@ pub const Generator = struct {
             const function = switch (declaration.kind) {
                 .function_definition => |function| function,
                 .function_declaration, .constant_declaration, .struct_definition => continue,
-                .trait_definition, .implementation, .import => continue,
+                .typeclass_definition, .instance_declaration, .import => continue,
             };
             for (function.signature.parameters) |parameter| {
                 try self.recordType(allocator, &reached, ast.extractType(parameter.type));
@@ -923,7 +923,7 @@ pub const Generator = struct {
                 },
                 else => unreachable,
             },
-            .void, .type, .function, .implementer => unreachable,
+            .void, .type, .function, .variable, .application => unreachable,
         }
     }
 
@@ -1011,7 +1011,7 @@ pub const Generator = struct {
                     try writer.print(".{s}", .{struct_type.fields[position].name});
                     current = struct_type.fields[position].type;
                 },
-                .number, .boolean, .void, .type, .slice, .pointer, .optional, .function, .implementer => unreachable,
+                .number, .boolean, .void, .type, .slice, .pointer, .optional, .function, .variable, .application => unreachable,
             }
         }
     }
@@ -1063,7 +1063,7 @@ pub const Generator = struct {
                 }
             },
             .function_definition, .constant_declaration, .struct_definition => {},
-            .trait_definition, .implementation, .import => {},
+            .typeclass_definition, .instance_declaration, .import => {},
         }
     }
 
@@ -1090,7 +1090,7 @@ pub const Generator = struct {
                 if (pointer.target == .function) return self.recordType(allocator, reached, pointer.target);
                 return;
             },
-            .number, .boolean, .void, .type, .@"struct", .slice, .implementer => return,
+            .number, .boolean, .void, .type, .@"struct", .slice, .variable, .application => return,
         }
         if (isPointerOptional(value_type)) return self.recordType(allocator, reached, value_type.optional.child);
         if (isZeroSized(value_type)) return;
@@ -1101,7 +1101,7 @@ pub const Generator = struct {
             .tuple => |tuple| {
                 for (tuple.elements) |element| try self.recordType(allocator, reached, element);
             },
-            .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .function, .implementer => {
+            .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .function, .variable, .application => {
                 unreachable;
             },
         }
@@ -1195,7 +1195,7 @@ pub const Generator = struct {
             .function_definition => |function| function.signature,
             .function_declaration => |function_declaration| function_declaration,
             .constant_declaration, .struct_definition => unreachable,
-            .trait_definition, .implementation, .import => unreachable,
+            .typeclass_definition, .instance_declaration, .import => unreachable,
         };
         try self.generateType(writer, ast.extractType(signature.return_type));
         try writer.writeByte(' ');
@@ -1269,7 +1269,7 @@ pub const Generator = struct {
                     try self.generateIndentation(writer);
                     return writer.writeAll(if (self.in_main) "return 0;\n" else "return;\n");
                 };
-                if (isZeroSized(returned.type.?)) {
+                if (isZeroSized(returned.type.?) and isZeroSized(self.return_type)) {
                     if (hasEffects(returned.*)) {
                         try self.generateIndentation(writer);
                         try self.generateStatementEffects(allocator, reached, writer, returned);
@@ -1760,7 +1760,7 @@ pub const Generator = struct {
                     try self.generatePartValue(allocator, reached, writer, statement, part);
                     try writer.writeAll(".length");
                 },
-                .number, .boolean, .void, .type, .@"struct", .pointer, .optional, .tuple, .function, .implementer => {
+                .number, .boolean, .void, .type, .@"struct", .pointer, .optional, .tuple, .function, .variable, .application => {
                     unreachable;
                 },
             },
@@ -1920,8 +1920,46 @@ pub const Generator = struct {
         expression: *const ast.Expression,
         expected: types.Type,
     ) WriteError!void {
+        if (isOptionalWrap(expression.type.?, expected)) return self.generateWrapped(allocator, reached, writer, expression, expected, false);
         if (!isArrayToSlice(expression.type.?, expected)) return self.generateExpression(allocator, reached, writer, expression.*);
         try self.generateSliceOf(allocator, reached, writer, expression, null, null, expected, .expression);
+    }
+
+    fn generateWrapped(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        expression: *const ast.Expression,
+        expected: types.Type,
+        operand: bool,
+    ) WriteError!void {
+        const child = expected.optional.child;
+        if (isPointerOptional(expected)) {
+            if (operand) return self.generateConvertedOperand(allocator, reached, writer, expression, child);
+            return self.generateConverted(allocator, reached, writer, expression, child);
+        }
+        try self.recordType(allocator, reached, expected);
+        if (isZeroSized(child)) {
+            const effects = hasEffects(expression.*);
+            if (effects) {
+                try writer.writeAll("(");
+                try self.generateEffects(allocator, reached, writer, expression.*);
+                try writer.writeAll(", ");
+            }
+            try self.generateCompoundStart(writer, expected, .expression);
+            try writer.writeAll(".present = true }");
+            if (effects) try writer.writeAll(")");
+            return;
+        }
+        try self.generateCompoundStart(writer, expected, .expression);
+        try writer.writeAll(".value = ");
+        if (operand) {
+            try self.generateConvertedOperand(allocator, reached, writer, expression, child);
+        } else {
+            try self.generateConverted(allocator, reached, writer, expression, child);
+        }
+        try writer.writeAll(", .present = true }");
     }
 
     fn generateStatementEffects(
@@ -2010,6 +2048,7 @@ pub const Generator = struct {
         expression: *const ast.Expression,
         expected: types.Type,
     ) WriteError!void {
+        if (isOptionalWrap(expression.type.?, expected)) return self.generateWrapped(allocator, reached, writer, expression, expected, true);
         if (!isArrayToSlice(expression.type.?, expected)) return self.generateOperand(allocator, reached, writer, expression);
         try self.generateSliceOf(allocator, reached, writer, expression, null, null, expected, .expression);
     }
@@ -2082,19 +2121,19 @@ pub const Generator = struct {
                 .constant => |constant| try self.generateConstant(allocator, reached, writer, constant),
                 .local, .element => try writer.writeAll(self.findLocalName(identifier.resolution.?).?),
                 .function => |function| try self.generateFunctionName(allocator, reached, writer, function),
-                .type, .trait_function, .trait_method => unreachable,
+                .type, .typeclass_function, .typeclass_method => unreachable,
             },
-            .path_expression => |path_expression| switch (path_expression.resolution.?) {
+            inline .path_expression, .member => |name| switch (name.resolution.?) {
                 .constant => |constant| try self.generateConstant(allocator, reached, writer, constant),
                 .function => |function| try self.generateFunctionName(allocator, reached, writer, function),
-                .parameter, .type, .local, .element, .trait_function, .trait_method => unreachable,
+                .parameter, .type, .local, .element, .typeclass_function, .typeclass_method => unreachable,
             },
             .call => |call| {
                 const hoists = try self.generateHoistedEffects(allocator, reached, writer, call.arguments);
                 switch (ast.extractResolution(call.callee)) {
                     .function => |function| try self.generateFunctionCall(allocator, reached, writer, call, function),
                     .parameter, .local, .constant, .element => try self.generateValueCall(allocator, reached, writer, call),
-                    .type, .trait_function, .trait_method => unreachable,
+                    .type, .typeclass_function, .typeclass_method => unreachable,
                 }
                 if (hoists) try writer.writeByte(')');
             },
@@ -2458,7 +2497,7 @@ pub const Generator = struct {
             .tuple => return writer.print("._{d}", .{indexing.position.?}),
             .array, .slice => try writer.writeAll(".items"),
             .pointer => |pointer| if (!pointer.many) try writer.writeAll("->items"),
-            .number, .boolean, .void, .type, .@"struct", .optional, .function, .implementer => {
+            .number, .boolean, .void, .type, .@"struct", .optional, .function, .variable, .application => {
                 unreachable;
             },
         }
@@ -2514,7 +2553,7 @@ pub const Generator = struct {
         const read_only = switch (value.type.?) {
             .array => isStoredAsConstant(value.*),
             .pointer => |pointer| pointer.constant,
-            .number, .boolean, .void, .type, .@"struct", .slice, .optional, .tuple, .function, .implementer => false,
+            .number, .boolean, .void, .type, .@"struct", .slice, .optional, .tuple, .function, .variable, .application => false,
         };
         if (read_only) {
             try writer.writeByte('(');
@@ -2525,7 +2564,7 @@ pub const Generator = struct {
         switch (value.type.?) {
             .array, .slice => try writer.writeAll(".items"),
             .pointer => |pointer| if (!pointer.many) try writer.writeAll("->items"),
-            .number, .boolean, .void, .type, .@"struct", .optional, .tuple, .function, .implementer => {
+            .number, .boolean, .void, .type, .@"struct", .optional, .tuple, .function, .variable, .application => {
                 unreachable;
             },
         }
@@ -2568,7 +2607,7 @@ pub const Generator = struct {
                 try self.generateBase(allocator, reached, writer, value);
                 try writer.writeAll(".length");
             },
-            .number, .boolean, .void, .type, .@"struct", .pointer, .optional, .tuple, .function, .implementer => {
+            .number, .boolean, .void, .type, .@"struct", .pointer, .optional, .tuple, .function, .variable, .application => {
                 unreachable;
             },
         }
@@ -2690,7 +2729,7 @@ pub const Generator = struct {
                 const constant_declaration = declaration.kind.constant_declaration;
                 break :callee_type ast.extractDeclaredType(constant_declaration.type, constant_declaration.value);
             },
-            .function, .type, .trait_function, .trait_method => unreachable,
+            .function, .type, .typeclass_function, .typeclass_method => unreachable,
         };
         try writer.writeByte('(');
         var written = false;
@@ -2802,7 +2841,7 @@ pub const Generator = struct {
                 try self.generateExpression(allocator, reached, writer, expression.*);
             },
             .string_literal => try self.generateString(writer, expression.*, .initializer),
-            inline .identifier, .path_expression => |name| {
+            inline .identifier, .path_expression, .member => |name| {
                 if (name.resolution.? == .function) {
                     return self.generateFunctionName(allocator, reached, writer, name.resolution.?.function);
                 }
@@ -2862,7 +2901,7 @@ pub const Generator = struct {
             },
             .boolean => "bool",
             .void => "void",
-            .type, .function, .implementer => unreachable,
+            .type, .function, .variable, .application => unreachable,
             .@"struct" => |struct_type| {
                 try writer.writeAll("mn_");
                 for (self.program.modules[struct_type.module].path) |part| {
@@ -2972,7 +3011,7 @@ pub const Generator = struct {
                 try self.generateTypeName(writer, function.return_type);
             },
             .void => try writer.writeAll("void"),
-            .type, .implementer => unreachable,
+            .type, .variable, .application => unreachable,
         }
     }
 
@@ -3026,6 +3065,7 @@ pub const Generator = struct {
             .null,
             .identifier,
             .path_expression,
+            .member,
             .method_call,
             .array_type,
             .slice_type,
@@ -3060,7 +3100,7 @@ pub const Generator = struct {
         const constant = switch (declaration.kind) {
             .constant_declaration => |constant| constant,
             .function_declaration, .function_definition, .struct_definition => return false,
-            .trait_definition, .implementation, .import => return false,
+            .typeclass_definition, .instance_declaration, .import => return false,
         };
         if (ast.isAlias(constant) or constant.value.type == null) return false;
         const value_type = ast.extractDeclaredType(constant.type, constant.value);
@@ -3188,20 +3228,28 @@ fn buildCName(
     const module = program.modules[module_index];
     switch (declaration.kind) {
         .function_definition => |function| {
+            if (function.check_only) return null;
             const signature = function.signature;
             if (module_index == 0 and ast.isMain(signature)) return signature.name;
+            if (signature.typeclass) |typeclass| {
+                var parts: std.ArrayList([]const u8) = .empty;
+                for (function.instance_arguments) |argument| {
+                    try parts.append(allocator, switch (argument) {
+                        .type => |argument_type| try buildTypeName(allocator, program, module_index, argument_type),
+                        .constructor => |constructor| try buildConstructorName(allocator, program, module_index, constructor),
+                    });
+                    try parts.append(allocator, "_");
+                }
+                try parts.appendSlice(allocator, &.{ extractLastName(typeclass), "_", signature.name });
+                const name = try std.mem.concat(allocator, u8, parts.items);
+                return try buildQualifiedName(allocator, module.path, name);
+            }
             const receiver = signature.receiver orelse {
                 return try buildQualifiedName(allocator, module.path, signature.name);
             };
             const receiver_type = ast.extractType(receiver);
             const type_name = try buildTypeName(allocator, program, module_index, receiver_type);
-            const trait = signature.trait orelse {
-                const parts = &.{ type_name, "_", signature.name };
-                const name = try std.mem.concat(allocator, u8, parts);
-                return try buildQualifiedName(allocator, module.path, name);
-            };
-            const trait_name = extractLastName(trait);
-            const parts = &.{ type_name, "_", trait_name, "_", signature.name };
+            const parts = &.{ type_name, "_", signature.name };
             const name = try std.mem.concat(allocator, u8, parts);
             return try buildQualifiedName(allocator, module.path, name);
         },
@@ -3209,8 +3257,22 @@ fn buildCName(
         .constant_declaration => |constant| {
             return try buildQualifiedName(allocator, module.path, constant.name);
         },
-        .struct_definition, .trait_definition, .implementation, .import => return null,
+        .struct_definition, .typeclass_definition, .instance_declaration, .import => return null,
     }
+}
+
+fn buildConstructorName(
+    allocator: std.mem.Allocator,
+    program: ast.Program,
+    module_index: usize,
+    constructor: types.Constructor,
+) std.mem.Allocator.Error![]const u8 {
+    const function = constructor.function;
+    const declaration = ast.findDeclaration(program.modules[function.module], function.declaration).*;
+    const name = declaration.kind.function_definition.signature.name;
+    if (function.module == module_index) return name;
+    const path = try std.mem.join(allocator, "_", program.modules[function.module].path);
+    return std.mem.concat(allocator, u8, &.{ path, "_", name });
 }
 
 fn buildTypeName(
@@ -3264,7 +3326,7 @@ fn buildTypeName(
             return name.items;
         },
         .void => "void",
-        .type, .implementer => unreachable,
+        .type, .variable, .application => unreachable,
     };
 }
 
@@ -3312,7 +3374,7 @@ fn collectContainedModulesOf(
                 try collectContainedModulesOf(allocator, contained, element);
             }
         },
-        .number, .boolean, .void, .type, .slice, .pointer, .function, .implementer => {},
+        .number, .boolean, .void, .type, .slice, .pointer, .function, .variable, .application => {},
     }
 }
 
@@ -3342,7 +3404,7 @@ fn collectPrototypeTags(
             if (!in_prototype or containsType(tags.items, value_type)) return;
             try tags.append(allocator, value_type);
         },
-        .number, .boolean, .void, .type, .implementer => {},
+        .number, .boolean, .void, .type, .variable, .application => {},
     }
 }
 
@@ -3382,6 +3444,7 @@ fn hasEffects(expression: ast.Expression) bool {
         .null,
         .identifier,
         .path_expression,
+        .member,
         .array_type,
         .slice_type,
         .pointer_type,
@@ -3478,7 +3541,7 @@ fn collectEqualities(
     const child = switch (value_type) {
         .array => |array| array.element,
         .optional => |optional| optional.child,
-        .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .tuple, .function, .implementer => {
+        .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .tuple, .function, .variable, .application => {
             unreachable;
         },
     };
@@ -3490,7 +3553,7 @@ fn hasEqualityHelper(value_type: types.Type) bool {
     return switch (value_type) {
         .array => !isZeroSized(value_type),
         .optional => !isPointerOptional(value_type),
-        .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .tuple, .function, .implementer => false,
+        .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .tuple, .function, .variable, .application => false,
     };
 }
 
@@ -3706,7 +3769,7 @@ fn isMemoryRead(expression: ast.Expression) bool {
         .identifier => |identifier| switch (identifier.resolution.?) {
             .local => |statement| statement.kind == .variable_declaration,
             .parameter, .constant, .function, .type, .element => false,
-            .trait_function, .trait_method => unreachable,
+            .typeclass_function, .typeclass_method => unreachable,
         },
         .field_access => |access| access.value.type.? == .pointer or isMemoryRead(access.value.*),
         .index => |indexing| !isStorage(indexing.value.type.?) or isMemoryRead(indexing.value.*),
@@ -3804,6 +3867,7 @@ fn collectScopeChildren(
         .null,
         .identifier,
         .path_expression,
+        .member,
         .method_call,
         .negation,
         .array_type,
@@ -3830,7 +3894,7 @@ fn extractBody(kind: ast.DeclarationKind) []const ast.Statement {
     return switch (kind) {
         .function_definition => |function| function.body,
         .function_declaration, .constant_declaration, .struct_definition => &.{},
-        .trait_definition, .implementation, .import => &.{},
+        .typeclass_definition, .instance_declaration, .import => &.{},
     };
 }
 
@@ -4059,7 +4123,7 @@ fn isStoredAsConstant(expression: ast.Expression) bool {
             .local => |statement| statement.kind == .constant_declaration,
             .constant, .element => true,
             .parameter, .function, .type => false,
-            .trait_function, .trait_method => unreachable,
+            .typeclass_function, .typeclass_method => unreachable,
         },
         .path_expression => true,
         .field_access => |access| {
@@ -4071,7 +4135,7 @@ fn isStoredAsConstant(expression: ast.Expression) bool {
             .array, .tuple => isStoredAsConstant(indexing.value.*),
             .pointer => |pointer| pointer.constant,
             .slice => false,
-            .number, .boolean, .void, .type, .@"struct", .optional, .function, .implementer => {
+            .number, .boolean, .void, .type, .@"struct", .optional, .function, .variable, .application => {
                 unreachable;
             },
         },
@@ -4089,7 +4153,7 @@ fn findTargetRoot(target: ast.Expression) ?*const ast.Statement {
         },
         .index => |indexing| switch (indexing.value.type.?) {
             .array, .tuple => findTargetRoot(indexing.value.*),
-            .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .optional, .function, .implementer => {
+            .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .optional, .function, .variable, .application => {
                 return null;
             },
         },
@@ -4187,7 +4251,8 @@ fn generateKnownByte(writer: *std.Io.Writer, byte: u8) WriteError!void {
 fn isCompileTimeFunction(declaration: ast.Declaration) bool {
     if (declaration.kind != .function_definition) return false;
     const signature = declaration.kind.function_definition.signature;
-    if (ast.isGeneric(signature)) return true;
+    const definition = declaration.kind.function_definition;
+    if (ast.isGeneric(signature) or definition.pattern or definition.check_only) return true;
     if (types.isCompileTimeOnly(ast.extractType(signature.return_type))) return true;
     for (signature.parameters) |parameter| {
         if (types.isCompileTimeOnly(ast.extractType(parameter.type))) return true;
@@ -4227,6 +4292,17 @@ fn collectAddressedConstantsOf(
     }
 }
 
+fn isOptionalWrap(value_type: types.Type, expected: types.Type) bool {
+    if (expected != .optional) return false;
+    var value_count: usize = 0;
+    var current = value_type;
+    while (current == .optional) : (current = current.optional.child) value_count += 1;
+    var expected_count: usize = 0;
+    current = expected;
+    while (current == .optional) : (current = current.optional.child) expected_count += 1;
+    return value_count < expected_count;
+}
+
 fn isArrayToSlice(value_type: types.Type, expected: types.Type) bool {
     if (expected != .slice or value_type != .pointer) return false;
     return !value_type.pointer.many and value_type.pointer.target == .array;
@@ -4247,7 +4323,7 @@ fn isPointerOptional(value_type: types.Type) bool {
 fn findStruct(value_type: types.Type) ?types.Struct {
     return switch (value_type) {
         .@"struct" => |struct_type| struct_type,
-        .number, .boolean, .void, .type, .array, .slice, .pointer, .optional, .tuple, .function, .implementer => {
+        .number, .boolean, .void, .type, .array, .slice, .pointer, .optional, .tuple, .function, .variable, .application => {
             return null;
         },
     };
@@ -4278,7 +4354,7 @@ fn orderDefinition(
                 try orderDefinition(allocator, ordered, module_index, element);
             }
         },
-        .number, .boolean, .void, .type, .pointer, .function, .implementer => return,
+        .number, .boolean, .void, .type, .pointer, .function, .variable, .application => return,
     }
     try ordered.append(allocator, value_type);
 }
@@ -4426,7 +4502,7 @@ fn isSameCType(one: types.Type, two: types.Type) bool {
         .function => |function| two == .function and
             isSameCType(function.return_type, two.function.return_type) and
             isSameCTypes(function.parameters, two.function.parameters),
-        .number, .boolean, .void, .type, .@"struct", .implementer => {
+        .number, .boolean, .void, .type, .@"struct", .variable, .application => {
             return std.meta.eql(one, two);
         },
     };
@@ -6620,7 +6696,7 @@ test "generateFunction: writes each instance of a function with a comptime param
     );
 }
 
-test "generateFunction: generates a default for each implementation that uses it" {
+test "generateFunction: generates a default for each instance that uses it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -6636,7 +6712,7 @@ test "generateFunction: generates a default for each implementation that uses it
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn double(self: Self) -> i32: return self.area() * 2\n    fn unit() -> Self\n    fn twice() -> i32: return Self::unit().double()\nstruct Square:\n    side: i32\nstruct Circle:\n    radius: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side * self.side\n    fn unit() -> Self: return Square{side = 1}\nimpl Shape for Circle:\n    fn area(self: Self) -> i32: return self.radius * 3\n    fn unit() -> Self: return Circle{radius = 1}\n    fn double(self: Self) -> i32: return self.radius\nfn main():\n    const square = Square{side = 2}\n    _ = square.double()\n    _ = Square::twice()\n    _ = Circle::twice()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn double(self: T) -> i32: return self.area() * 2\n    fn unit() -> T\n    fn twice() -> i32: return Shape(T)::unit().double()\nstruct Square:\n    side: i32\nstruct Circle:\n    radius: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side * self.side\n    fn unit() -> Square: return Square{side = 1}\ninstance Shape(Circle):\n    fn area(self: Circle) -> i32: return self.radius * 3\n    fn unit() -> Circle: return Circle{radius = 1}\n    fn double(self: Circle) -> i32: return self.radius\nfn main():\n    const square = Square{side = 2}\n    _ = square.double()\n    _ = Shape(Square)::twice()\n    _ = Shape(Circle)::twice()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -6653,14 +6729,14 @@ test "generateFunction: generates a default for each implementation that uses it
     );
 }
 
-test "generateFunction: generates a default in the module of the implementation" {
+test "generateFunction: generates a default in the module of the instance" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
     defer program_directory.cleanup();
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "fn scale() -> i32: return 2\ntrait Shape:\n    fn area(self: Self) -> i32\n    fn double(self: Self) -> i32: return self.area() * scale()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "fn scale() -> i32: return 2\ntypeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn double(self: T) -> i32: return self.area() * scale()" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -6670,7 +6746,7 @@ test "generateFunction: generates a default in the module of the implementation"
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nimport shapes::Shape\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\nfn main():\n    const square = Square{side = 2}\n    _ = square.double()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nimport shapes::Shape\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\nfn main():\n    const square = Square{side = 2}\n    _ = square.double()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12764,7 +12840,7 @@ test "generateFunctionCall: passes the receiver of a method as its first argumen
     );
 }
 
-test "generateFunctionCall: calls the function of a trait through the trait and the function of the struct through the value and the type" {
+test "generateFunctionCall: calls the function of a typeclass through the typeclass and the function of the struct through the value and the type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -12780,7 +12856,7 @@ test "generateFunctionCall: calls the function of a trait through the trait and 
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\nstruct Square:\n    side: i32\n    fn area(self: Self) -> i32: return self.side\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side * self.side\nfn main():\n    const square = Square{side = 2}\n    _ = square.area()\n    _ = Square::area(square)\n    _ = Shape::area(square)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\nstruct Square:\n    side: i32\n    fn area(self: Self) -> i32: return self.side\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side * self.side\nfn main():\n    const square = Square{side = 2}\n    _ = square.area()\n    _ = Square::area(square)\n    _ = Shape::area(square)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12797,7 +12873,7 @@ test "generateFunctionCall: calls the function of a trait through the trait and 
     );
 }
 
-test "generateFunctionCall: passes the pointer written as the first argument of a call through a trait" {
+test "generateFunctionCall: calls a function of a named instance and points to one" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -12813,7 +12889,217 @@ test "generateFunctionCall: passes the pointer written as the first argument of 
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn grow(self: *Self)\n    fn measure(self: *const Self) -> i32\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn grow(self: *Self): self.side += 1\n    fn measure(self: *const Self) -> i32: return self.side\nfn main():\n    var square = Square{side = 1}\n    Shape::grow(&square)\n    _ = Shape::measure(&square)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(shape: T) -> i32\n    fn unit() -> T\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(shape: Square) -> i32: return shape.side\n    fn unit() -> Square: return Square{side = 1}\nfn main():\n    const square = Shape(Square)::unit()\n    const area = &Shape(Square)::area\n    _ = area(square)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_Square_Shape_area(mn_main_Square shape) {\n    return shape.side;\n}\n\nmn_main_Square mn_main_Square_Shape_unit() {\n    return (mn_main_Square){ .side = 1 };\n}\n\nint main() {\n    const mn_main_Square square = mn_main_Square_Shape_unit();\n    typeof(int32_t (*)(struct mn_main_Square)) const area = mn_main_Square_Shape_area;\n    area(square);\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFunctionCall: calls a function of an instance with several arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Iterator(type I, type T):\n    fn next(iterator: *I) -> ?T\nstruct Counter:\n    count: usize\ninstance Iterator(Counter, [usize, bool]):\n    fn next(iterator: *Counter) -> ?[usize, bool]:\n        iterator.count += 1\n        return [usize, bool]{iterator.count, true}\nfn main():\n    var counter = Counter{count = 0}\n    _ = counter.next()\n    _ = Iterator(Counter, [usize, bool])::next(&counter)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_tuple_2_usize_bool_defined\n#define mn_tuple_2_usize_bool_defined\ntypedef struct mn_tuple_2_usize_bool {\n    size_t _0;\n    bool _1;\n} mn_tuple_2_usize_bool;\n#endif\n\n#ifndef mn_optional_tuple_2_usize_bool_defined\n#define mn_optional_tuple_2_usize_bool_defined\ntypedef struct mn_optional_tuple_2_usize_bool {\n    mn_tuple_2_usize_bool value;\n    bool present;\n} mn_optional_tuple_2_usize_bool;\n#endif\n\nchar mn_zero_sized;\n\nmn_optional_tuple_2_usize_bool mn_main_Counter_tuple_2_usize_bool_Iterator_next(struct mn_main_Counter * iterator) {\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &iterator->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n    return (mn_optional_tuple_2_usize_bool){ .value = (mn_tuple_2_usize_bool){ ._0 = iterator->count, ._1 = true }, .present = true };\n}\n\nint main() {\n    mn_main_Counter counter = (mn_main_Counter){ .count = 0u };\n    mn_main_Counter_tuple_2_usize_bool_Iterator_next(&counter);\n    mn_main_Counter_tuple_2_usize_bool_Iterator_next(&counter);\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFunctionCall: calls a function of a generic instance for two arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T):\n    fn show(value: T) -> i32\n    fn twice(value: T) -> i32: return Show::show(value) * 2\ninstance Show(i32):\n    fn show(value: i32) -> i32: return value\nfn List(type T) -> type:\n    return struct:\n        first: T\ninstance(type A: Show) Show(List(A)):\n    fn show(value: List(A)) -> i32: return Show::show(value.first) + 1\nfn main():\n    _ = Show::show(List(i32){first = 5})\n    _ = Show::show(List(List(i32)){first = List(i32){first = 5}})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_i32_Show_show(int32_t value) {\n    return value;\n}\n\nint main() {\n    mn_main_List_1_Show_show((mn_main_List_1){ .first = 5 });\n    mn_main_List_2_Show_show((mn_main_List_2){ .first = (mn_main_List_1){ .first = 5 } });\n}\n\nint32_t mn_main_i32_Show_twice(int32_t value) {\n    return (mn_main_i32_Show_show(value) * 2);\n}\n\nint32_t mn_main_List_1_Show_show(mn_main_List_1 value) {\n    return (mn_main_i32_Show_show(value.first) + 1);\n}\n\nint32_t mn_main_List_2_Show_show(mn_main_List_2 value) {\n    return (mn_main_List_1_Show_show(value.first) + 1);\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFunctionCall: calls a typeclass function with its own type parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Mapper(type F(type)):\n    fn map(type A, type B, value: F(A), function: *fn(A) -> B) -> F(B)\nfn Box(type T) -> type:\n    return struct:\n        value: T\ninstance Mapper(Box):\n    fn map(type A, type B, value: Box(A), function: *fn(A) -> B) -> Box(B): return Box(B){value = function(value.value)}\nfn positive(value: i32) -> bool: return value > 0\nfn main(): _ = Mapper::map(i32, bool, Box(i32){value = 3}, &positive)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nbool mn_main_positive(int32_t value) {\n    return (value > 0);\n}\n\nint main() {\n    mn_main_Box_Mapper_map_1((mn_main_Box_1){ .value = 3 }, mn_main_positive);\n}\n\nmn_main_Box_2 mn_main_Box_Mapper_map_1(mn_main_Box_1 value, typeof(bool (*)(int32_t)) function) {\n    return (mn_main_Box_2){ .value = function(value.value) };\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFunctionCall: calls the instance of a function with a parameter of a typeclass type for each type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T):\n    fn show(value: T) -> i32\ninstance Show(i32):\n    fn show(value: i32) -> i32: return value\ninstance Show(bool):\n    fn show(value: bool) -> i32:\n        if value: return 1\n        return 0\nfn report(value: Show) -> i32: return value.show() + 1\nfn main():\n    _ = report(5i32)\n    _ = report(true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_i32_Show_show(int32_t value) {\n    return value;\n}\n\nint32_t mn_main_bool_Show_show(bool value) {\n    if (value) {\n        return 1;\n    }\n    return 0;\n}\n\nint main() {\n    mn_main_report_1(5);\n    mn_main_report_2(true);\n}\n\nint32_t mn_main_report_1(int32_t value) {\n    return (mn_main_i32_Show_show(value) + 1);\n}\n\nint32_t mn_main_report_2(bool value) {\n    return (mn_main_bool_Show_show(value) + 1);\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFunctionCall: wraps a converted value in an optional" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Box:\n    value: ?i32\nfn take(value: ?i32) -> i32: return value orelse 0\nfn wrap(value: i32) -> ?i32: return value\nfn read(box: Box) -> i32: return box.value orelse 0\nfn main():\n    var count: ?i32 = 5\n    count = 6\n    _ = read(Box{value = 7})\n    _ = wrap(1)\n    _ = take(3)\n    _ = take(count)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_take(mn_optional_i32 value) {\n    return (value.present ? value.value : 0);\n}\n\nmn_optional_i32 mn_main_wrap(int32_t value) {\n    return (mn_optional_i32){ .value = value, .present = true };\n}\n\nint32_t mn_main_read(mn_main_Box box) {\n    mn_optional_i32 mn_temporary_1;\n    return (mn_temporary_1 = box.value, (mn_temporary_1.present ? mn_temporary_1.value : 0));\n}\n\nint main() {\n    mn_optional_i32 count = (mn_optional_i32){ .value = 5, .present = true };\n    count = (mn_optional_i32){ .value = 6, .present = true };\n    mn_main_read((mn_main_Box){ .value = (mn_optional_i32){ .value = 7, .present = true } });\n    mn_main_wrap(1);\n    mn_main_take((mn_optional_i32){ .value = 3, .present = true });\n    mn_main_take(count);\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFunctionCall: runs a zero-sized value that is wrapped in an optional" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nexternal fn make() -> Marker\nfn wrap() -> ?Marker: return make()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_optional_main_Marker_defined\n#define mn_optional_main_Marker_defined\ntypedef struct mn_optional_main_Marker {\n    bool present;\n} mn_optional_main_Marker;\n#endif\n\nmn_optional_main_Marker mn_main_wrap() {\n    return (make(), (mn_optional_main_Marker){ .present = true });\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFunctionCall: passes the pointer written as the first argument of a call through a typeclass" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn grow(self: *T)\n    fn measure(self: *const T) -> i32\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn grow(self: *Square): self.side += 1\n    fn measure(self: *const Square) -> i32: return self.side\nfn main():\n    var square = Square{side = 1}\n    Shape::grow(&square)\n    _ = Shape::measure(&square)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13875,7 +14161,7 @@ test "buildCName: keeps main only for the entry point" {
     );
 }
 
-test "buildCName: names a function of an implementation after its type, its trait and its name" {
+test "buildCName: names a function of an instance after its type, its typeclass and its name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -13891,7 +14177,7 @@ test "buildCName: names a function of an implementation after its type, its trai
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13924,7 +14210,7 @@ test "buildTypeName: names a slice by its elements" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\nimpl Shape for []const u8:\n    fn area(self: Self) -> i32:\n        _ = self\n        return 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\ninstance Shape([]const u8):\n    fn area(self: []const u8) -> i32:\n        _ = self\n        return 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13957,7 +14243,7 @@ test "buildTypeName: names a pointer by its count, mutability and target" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\nimpl Shape for *many const u8:\n    fn area(self: Self) -> i32:\n        _ = self\n        return 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\ninstance Shape(*many const u8):\n    fn area(self: *many const u8) -> i32:\n        _ = self\n        return 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
