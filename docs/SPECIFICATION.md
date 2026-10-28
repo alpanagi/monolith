@@ -334,7 +334,7 @@
 - Arguments are given in the order of the parameters.
 - `&name` gives a pointer to a function, e.g. to pass it as an argument. A pointer to a function is called like a function.
 - `external fn` declares a function defined outside the program, without a body, e.g. `external fn write(text: []const u8)`.
-- `main` has either no parameters or one parameter of type `std::process::Environment`, and no return type. It cannot be called, used as a value or be external.
+- `main` has no parameters and no return type, and cannot be called, used as a value or be external.
 
 ## Modules
 

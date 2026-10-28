@@ -5733,41 +5733,6 @@ test "generateFunction: generates main as the entry point" {
     try std.testing.expectEqualStrings("#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {}\n", files[1].contents);
 }
 
-test "generateFunction: generates main with an Environment as the entry point" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    var compiler_directory = std.testing.tmpDir(.{});
-    defer compiler_directory.cleanup();
-    try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/process.mn", .data = "struct Environment" });
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    const compiler_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
-    );
-    var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import std::process::Environment\nfn main(environment: Environment): show(environment)\nfn show(environment: Environment): _ = environment" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-    try name_resolver.resolve();
-    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
-    try type_checker.check();
-    var generator = Generator.init(program);
-    const files = try generator.generateFiles(arena.allocator());
-
-    try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    mn_main_show();\n}\n\nvoid mn_main_show() {}\n",
-        files[1].contents,
-    );
-}
-
 test "generateSignature: keeps the names of external functions" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
