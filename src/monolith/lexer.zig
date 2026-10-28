@@ -899,6 +899,17 @@ test "lexWord: recognizes the struct keyword" {
     try std.testing.expectEqualStrings("structure", lexer.tokens.items[2].kind.identifier);
 }
 
+test "lexWord: recognizes the import and as keywords" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("import as ask");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_import);
+    try std.testing.expect(lexer.tokens.items[2].kind == .keyword_as);
+    try std.testing.expectEqualStrings("ask", lexer.tokens.items[3].kind.identifier);
+}
+
 test "lexWord: recognizes return and boolean keywords" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -939,6 +950,17 @@ test "lexWord: recognizes the control flow keywords" {
     try std.testing.expect(lexer.tokens.items[4].kind == .keyword_break);
     try std.testing.expect(lexer.tokens.items[5].kind == .keyword_continue);
     try std.testing.expectEqualStrings("iffy", lexer.tokens.items[6].kind.identifier);
+}
+
+test "lexWord: recognizes the for and in keywords" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("for in inside");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_for);
+    try std.testing.expect(lexer.tokens.items[2].kind == .keyword_in);
+    try std.testing.expectEqualStrings("inside", lexer.tokens.items[3].kind.identifier);
 }
 
 test "lexWord: recognizes the null keyword" {

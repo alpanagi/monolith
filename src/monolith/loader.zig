@@ -83,6 +83,19 @@ pub const Loader = struct {
         return self.loadNamespace(arena, io, path);
     }
 
+    pub fn hasMember(
+        self: *Loader,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        path: ast.Path,
+        name: []const u8,
+    ) LoadError!bool {
+        const member = try std.mem.concat(allocator, []const u8, &.{ path, &.{name} });
+        const file = try self.buildModuleFileName(allocator, member);
+        if (try isFile(io, file)) return true;
+        return isDirectory(io, try self.buildDirectoryName(allocator, member));
+    }
+
     fn fail(
         self: *Loader,
         module_index: usize,
@@ -103,9 +116,7 @@ pub const Loader = struct {
     ) LoadError!?Namespace {
         const allocator = arena.allocator();
         const file = try self.buildModuleFileName(allocator, path);
-        const joined = try std.mem.join(allocator, "/", path);
-        const root = self.chooseRoot(path[0]);
-        const directory_path = try std.fs.path.join(allocator, &.{ root, joined });
+        const directory_path = try self.buildDirectoryName(allocator, path);
         const is_file = try isFile(io, file);
         const is_directory = try isDirectory(io, directory_path);
         if (!is_file and !is_directory) return null;
@@ -113,6 +124,15 @@ pub const Loader = struct {
         var module: ?usize = null;
         if (is_file) module = try self.loadModule(arena, io, path);
         return .{ .path = path, .module = module, .directory = is_directory };
+    }
+
+    fn buildDirectoryName(
+        self: *Loader,
+        allocator: std.mem.Allocator,
+        path: ast.Path,
+    ) std.mem.Allocator.Error![]const u8 {
+        const joined = try std.mem.join(allocator, "/", path);
+        return std.fs.path.join(allocator, &.{ self.chooseRoot(path[0]), joined });
     }
 
     fn chooseRoot(self: *Loader, name: []const u8) []const u8 {
@@ -368,6 +388,30 @@ test "loadMember: loads each module once" {
 
     try std.testing.expectEqual(first.module.?, second.module.?);
     try std.testing.expectEqual(2, loader.modules.items.len);
+}
+
+test "hasMember: finds a module and a directory in the directory of a module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.createDirPath(io, "shapes/lines");
+    try program_directory.dir.writeFile(io, .{ .sub_path = "shapes/circle.mn", .data = "" });
+    try program_directory.dir.writeFile(io, .{ .sub_path = "shapes.mn", .data = "" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = Loader.init(program_path, program_path);
+    const allocator = arena.allocator();
+    const path: ast.Path = &.{"shapes"};
+
+    try std.testing.expect(try loader.hasMember(allocator, io, path, "circle"));
+    try std.testing.expect(try loader.hasMember(allocator, io, path, "lines"));
+    try std.testing.expect(!try loader.hasMember(allocator, io, path, "square"));
+    try std.testing.expect(!try loader.hasMember(allocator, io, &.{"circle"}, "shapes"));
+    try std.testing.expectEqual(0, loader.modules.items.len);
 }
 
 test "loadModule: reports failures in the module they are in" {

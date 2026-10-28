@@ -930,6 +930,12 @@ pub const Generator = struct {
                 } else null;
                 try collectTargetSteps(allocator, &steps, statement, written, address);
             }
+            if (statement.kind == .@"for") {
+                for (try collectParts(allocator, &statement.kind.@"for")) |part| {
+                    if (!self.isStoredPart(statement, part) and !hasEffects(part.expression.*)) continue;
+                    try collectScopeSteps(allocator, &steps, statement, part.expression);
+                }
+            }
             const expression = findStatementExpression(statement) orelse continue;
             try collectScopeSteps(allocator, &steps, statement, expression);
         }
@@ -982,19 +988,23 @@ pub const Generator = struct {
         reached: *Reached,
         writer: *std.Io.Writer,
         block: []const ast.Statement,
-        continue_label: ?usize,
+        loop: ?*const ast.Statement,
     ) WriteError!void {
-        const empty = for (block) |*statement| {
+        const named = if (loop) |statement| self.declaresElements(statement) else false;
+        const empty = !named and for (block) |*statement| {
             if (self.hasOutput(statement)) break false;
         } else true;
         if (empty) return writer.writeAll("{}");
 
         try writer.writeAll("{\n");
         self.depth += 1;
+        if (named) try self.generateElementDeclarations(allocator, reached, writer, loop.?);
         for (block) |*statement| try self.generateStatement(allocator, reached, writer, statement);
-        if (continue_label) |number| {
-            try self.generateIndentation(writer);
-            try writer.print("mn_continue_{d}:;\n", .{number});
+        if (loop) |statement| {
+            if (containsGoto(block, statement, .@"continue", statement)) {
+                try self.generateIndentation(writer);
+                try writer.print("mn_continue_{d}:;\n", .{self.findLoopNumber(statement)});
+            }
         }
         self.depth -= 1;
         try self.generateIndentation(writer);
@@ -1044,6 +1054,7 @@ pub const Generator = struct {
                 try writer.writeByte('\n');
             },
             .@"while" => try self.generateWhile(allocator, reached, writer, statement),
+            .@"for" => try self.generateFor(allocator, reached, writer, statement),
             .@"break" => |jump| try self.generateJump(writer, jump.loop.?, .@"break"),
             .@"continue" => |jump| try self.generateJump(writer, jump.loop.?, .@"continue"),
         }
@@ -1068,14 +1079,14 @@ pub const Generator = struct {
             .noop => false,
             .constant_declaration, .variable_declaration => {
                 const value = extractLocal(statement.*).?.value;
-                return self.findLocalName(statement) != null or hasEffects(value);
+                return self.findLocalName(.{ .local = statement }) != null or hasEffects(value);
             },
             .assignment => |assignment| {
                 if (self.hasTarget(assignment.target)) return true;
                 return hasEffects(assignment.target) or hasEffects(assignment.value);
             },
             .discard => |expression| expression.kind != .identifier,
-            .@"return", .call, .@"if", .@"while", .@"break", .@"continue" => true,
+            .@"return", .call, .@"if", .@"while", .@"for", .@"break", .@"continue" => true,
         };
     }
 
@@ -1089,7 +1100,7 @@ pub const Generator = struct {
     fn hasTarget(self: *const Generator, target: ast.Expression) bool {
         if (isZeroSized(target.type.?)) return false;
         const root = findTargetRoot(target) orelse return true;
-        return self.findLocalName(root) != null;
+        return self.findLocalName(.{ .local = root }) != null;
     }
 
     fn generateExpressionStatement(
@@ -1113,23 +1124,31 @@ pub const Generator = struct {
     ) WriteError!void {
         const value = findStatementExpression(statement).?;
         try self.generateIndentation(writer);
-        const name = self.findLocalName(statement) orelse {
+        const name = self.findLocalName(.{ .local = statement }) orelse {
             try self.generateStatementEffects(allocator, reached, writer, value);
             return writer.writeAll(";\n");
         };
-        const constant = statement.kind == .constant_declaration;
         const local_type = findLocalType(statement.*);
         try self.recordType(allocator, reached, local_type);
-        const pointer = local_type == .pointer or isPointerOptional(local_type);
-        if (constant and !pointer) try writer.writeAll("const ");
-        try self.generateType(writer, local_type);
-        if (constant and pointer) try writer.writeAll(" const");
+        try self.generateLocalType(writer, local_type, statement.kind == .constant_declaration);
         try writer.print(" {s}", .{name});
         if (value.kind != .undefined) {
             try writer.writeAll(" = ");
             try self.generateFullValue(allocator, reached, writer, value, local_type);
         }
         try writer.writeAll(";\n");
+    }
+
+    fn generateLocalType(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        local_type: types.Type,
+        constant: bool,
+    ) WriteError!void {
+        const pointer = local_type == .pointer or isPointerOptional(local_type);
+        if (constant and !pointer) try writer.writeAll("const ");
+        try self.generateType(writer, local_type);
+        if (constant and pointer) try writer.writeAll(" const");
     }
 
     fn generateAssignment(
@@ -1255,24 +1274,222 @@ pub const Generator = struct {
         statement: *const ast.Statement,
     ) WriteError!void {
         const loop = &statement.kind.@"while";
-        const number = self.findLoopNumber(statement);
-        const continue_label = if (containsGoto(loop.body, statement, .@"continue", statement)) number else null;
         try self.generateIndentation(writer);
         try writer.writeAll("while (");
         try self.generateFullExpression(allocator, reached, writer, &loop.condition);
         try writer.writeAll(") ");
+        try self.generateLoopBody(allocator, reached, writer, statement);
+        try self.generateLoopEnd(allocator, reached, writer, statement);
+    }
+
+    fn generateFor(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+    ) WriteError!void {
+        for (try collectParts(allocator, &statement.kind.@"for")) |part| {
+            try self.generatePart(allocator, reached, writer, statement, part);
+        }
+        if (!isEmptyLoop(statement.*)) {
+            const number = self.findLoopNumber(statement);
+            try self.generateIndentation(writer);
+            try writer.print("for (size_t mn_index_{d} = 0; ", .{number});
+            if (hasLength(statement.kind.@"for")) {
+                try writer.print("mn_index_{d} < ", .{number});
+                try self.generateLength(allocator, reached, writer, statement);
+            }
+            try writer.print("; mn_index_{d} += 1) ", .{number});
+            try self.generateLoopBody(allocator, reached, writer, statement);
+        }
+        try self.generateLoopEnd(allocator, reached, writer, statement);
+    }
+
+    fn generatePart(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+        part: Part,
+    ) WriteError!void {
+        const expression = part.expression;
+        if (!self.isStoredPart(statement, part)) {
+            if (!hasEffects(expression.*)) return;
+            try self.generateIndentation(writer);
+            try self.generateStatementEffects(allocator, reached, writer, expression);
+            return writer.writeAll(";\n");
+        }
+        const part_type = expression.type.?;
+        try self.recordType(allocator, reached, part_type);
+        try self.generateIndentation(writer);
+        if (isAddressedPart(part)) {
+            try self.generateTaggedType(writer, part_type);
+            try writer.writeAll(" const * const ");
+            try self.generatePartName(writer, statement, part);
+            try writer.writeAll(" = ");
+            try self.generateAddress(allocator, reached, writer, expression);
+            return writer.writeAll(";\n");
+        }
+        try self.generateLocalType(writer, part_type, true);
+        try writer.writeByte(' ');
+        try self.generatePartName(writer, statement, part);
+        try writer.writeAll(" = ");
+        try self.generateFullValue(allocator, reached, writer, expression, part_type);
+        try writer.writeAll(";\n");
+    }
+
+    fn generateAddress(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        place: *const ast.Expression,
+    ) WriteError!void {
+        const sequenced = self.sequenced;
+        defer self.sequenced = sequenced;
+        self.sequenced = self.hasSteps(place);
+        if (!self.sequenced) {
+            try writer.writeByte('&');
+            return self.generateExpression(allocator, reached, writer, place.*);
+        }
+        try writer.writeByte('(');
+        try self.generateSteps(allocator, reached, writer, place);
+        try writer.writeAll(", &");
+        try self.generateExpression(allocator, reached, writer, place.*);
+        try writer.writeByte(')');
+    }
+
+    fn isStoredPart(self: *const Generator, statement: *const ast.Statement, part: Part) bool {
+        if (isDirect(part.expression.*) or isEmptyLoop(statement.*)) return false;
+        const measured = hasLength(statement.kind.@"for");
+        const named = self.findLocalName(.{ .element = statement }) != null;
+        return switch (part.role) {
+            .sequence => named or (measured and part.expression.type.? == .slice),
+            .start => named or measured,
+            .end => measured,
+        };
+    }
+
+    fn generatePartName(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+        part: Part,
+    ) WriteError!void {
+        try writer.print("mn_{t}_{d}", .{ part.role, self.findLoopNumber(statement) });
+    }
+
+    fn generatePartValue(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+        part: Part,
+    ) WriteError!void {
+        if (isDirect(part.expression.*)) return self.generateExpression(allocator, reached, writer, part.expression.*);
+        try self.generatePartName(writer, statement, part);
+    }
+
+    fn generateLength(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+    ) WriteError!void {
+        switch (statement.kind.@"for".sequence) {
+            .value => |*value| switch (followPointer(value.type.?)) {
+                .array => |array| try writer.print("{d}", .{array.length}),
+                .slice => {
+                    const part: Part = .{ .expression = value, .role = .sequence };
+                    try self.generatePartValue(allocator, reached, writer, statement, part);
+                    try writer.writeAll(".length");
+                },
+                .number, .boolean, .void, .type, .@"struct", .pointer, .optional, .tuple, .function, .implementer => {
+                    unreachable;
+                },
+            },
+            .range => |*range| {
+                const end: Part = .{ .expression = &range.end.?, .role = .end };
+                try self.generatePartValue(allocator, reached, writer, statement, end);
+                if (isZeroLiteral(range.start)) return;
+                try writer.writeAll(" - ");
+                const start: Part = .{ .expression = &range.start, .role = .start };
+                try self.generatePartValue(allocator, reached, writer, statement, start);
+            },
+        }
+    }
+
+    fn declaresElements(self: *const Generator, statement: *const ast.Statement) bool {
+        if (statement.kind != .@"for") return false;
+        return self.findLocalName(.{ .element = statement }) != null;
+    }
+
+    fn generateElementDeclarations(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+    ) WriteError!void {
+        const name = self.findLocalName(.{ .element = statement }).?;
+        const sequence = &statement.kind.@"for".sequence;
+        const number = self.findLoopNumber(statement);
+        const element_type = ast.extractElementType(sequence.*);
+        try self.recordType(allocator, reached, element_type);
+        try self.generateIndentation(writer);
+        try self.generateLocalType(writer, element_type, true);
+        try writer.print(" {s} = ", .{name});
+        switch (sequence.*) {
+            .value => |*value| {
+                const part: Part = .{ .expression = value, .role = .sequence };
+                try self.recordPointerTarget(allocator, reached, value.type.?);
+                try self.generatePartValue(allocator, reached, writer, statement, part);
+                const pointed = value.type.? == .pointer or isAddressedPart(part);
+                try writer.writeAll(if (pointed) "->items[" else ".items[");
+                try writer.print("mn_index_{d}]", .{number});
+            },
+            .range => |*range| {
+                if (!isZeroLiteral(range.start)) {
+                    const part: Part = .{ .expression = &range.start, .role = .start };
+                    try self.generatePartValue(allocator, reached, writer, statement, part);
+                    try writer.writeAll(" + ");
+                }
+                try writer.print("mn_index_{d}", .{number});
+            },
+        }
+        try writer.writeAll(";\n");
+    }
+
+    fn generateLoopBody(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+    ) WriteError!void {
         const enclosing_loop = self.innermost_loop;
         self.innermost_loop = statement;
-        try self.generateBlock(allocator, reached, writer, loop.body, continue_label);
+        try self.generateBlock(allocator, reached, writer, ast.extractBlocks(statement.*)[0], statement);
         self.innermost_loop = enclosing_loop;
         try writer.writeByte('\n');
-        if (loop.else_body) |else_body| {
-            for (else_body) |*else_statement| try self.generateStatement(allocator, reached, writer, else_statement);
-        }
-        if (containsGoto(loop.body, statement, .@"break", statement)) {
-            try self.generateIndentation(writer);
-            try writer.print("mn_break_{d}:;\n", .{number});
-        }
+    }
+
+    fn generateLoopEnd(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+    ) WriteError!void {
+        const body, const else_body = ast.extractBlocks(statement.*);
+        for (else_body) |*else_statement| try self.generateStatement(allocator, reached, writer, else_statement);
+        if (isEmptyLoop(statement.*) or !containsGoto(body, statement, .@"break", statement)) return;
+        try self.generateIndentation(writer);
+        try writer.print("mn_break_{d}:;\n", .{self.findLoopNumber(statement)});
     }
 
     fn generateJump(
@@ -1492,20 +1709,20 @@ pub const Generator = struct {
             .identifier => |identifier| switch (identifier.resolution.?) {
                 .parameter => try writer.writeAll(identifier.name),
                 .constant => |constant| try self.generateConstant(allocator, reached, writer, constant),
-                .local => |statement| try writer.writeAll(self.findLocalName(statement).?),
+                .local, .element => try writer.writeAll(self.findLocalName(identifier.resolution.?).?),
                 .function => |function| try self.generateFunctionName(allocator, reached, writer, function),
                 .type => unreachable,
             },
             .path_expression => |path_expression| switch (path_expression.resolution.?) {
                 .constant => |constant| try self.generateConstant(allocator, reached, writer, constant),
                 .function => |function| try self.generateFunctionName(allocator, reached, writer, function),
-                .parameter, .type, .local => unreachable,
+                .parameter, .type, .local, .element => unreachable,
             },
             .call => |call| {
                 const hoists = try self.generateHoistedEffects(allocator, reached, writer, call.arguments);
                 switch (ast.extractResolution(call.callee)) {
                     .function => |function| try self.generateFunctionCall(allocator, reached, writer, call, function),
-                    .parameter, .local, .constant => try self.generateValueCall(allocator, reached, writer, call),
+                    .parameter, .local, .constant, .element => try self.generateValueCall(allocator, reached, writer, call),
                     .type => unreachable,
                 }
                 if (hoists) try writer.writeByte(')');
@@ -2050,9 +2267,9 @@ pub const Generator = struct {
         return true;
     }
 
-    fn findLocalName(self: *const Generator, statement: *const ast.Statement) ?[]const u8 {
+    fn findLocalName(self: *const Generator, resolution: ast.Resolution) ?[]const u8 {
         for (self.local_names) |local_name| {
-            if (local_name.statement == statement) return local_name.name;
+            if (std.meta.eql(local_name.resolution, resolution)) return local_name.name;
         }
         return null;
     }
@@ -2091,8 +2308,12 @@ pub const Generator = struct {
                 break :callee_type ast.extractType(self.parameters[index].type);
             },
             .local => |statement| callee_type: {
-                try writer.writeAll(self.findLocalName(statement).?);
+                try writer.writeAll(self.findLocalName(.{ .local = statement }).?);
                 break :callee_type findLocalType(statement.*);
+            },
+            .element => |loop| callee_type: {
+                try writer.writeAll(self.findLocalName(.{ .element = loop }).?);
+                break :callee_type ast.extractElementType(loop.kind.@"for".sequence);
             },
             .constant => |constant| callee_type: {
                 try self.generateConstant(allocator, reached, writer, constant);
@@ -2526,7 +2747,7 @@ const UnicodeEscape = struct {
 };
 
 const LocalName = struct {
-    statement: *const ast.Statement,
+    resolution: ast.Resolution,
     name: []const u8,
     location: token.Location,
 };
@@ -2548,6 +2769,17 @@ const Step = struct {
     statement: *const ast.Statement,
     temporary: ?usize,
     address: ?types.Type = null,
+};
+
+const Part = struct {
+    expression: *const ast.Expression,
+    role: Role,
+};
+
+const Role = enum {
+    sequence,
+    start,
+    end,
 };
 
 fn buildCNames(
@@ -2923,8 +3155,68 @@ fn findStatementExpression(statement: *const ast.Statement) ?*const ast.Expressi
         .assignment => |*assignment| &assignment.value,
         .@"if" => |*conditional| &conditional.condition,
         .@"while" => |*loop| &loop.condition,
-        .@"break", .@"continue" => null,
+        .@"for", .@"break", .@"continue" => null,
     };
+}
+
+fn collectParts(allocator: std.mem.Allocator, loop: *const ast.For) std.mem.Allocator.Error![]const Part {
+    var parts: std.ArrayList(Part) = .empty;
+    switch (loop.sequence) {
+        .value => |*value| try parts.append(allocator, .{ .expression = value, .role = .sequence }),
+        .range => |*range| {
+            try parts.append(allocator, .{ .expression = &range.start, .role = .start });
+            if (range.end) |*end| try parts.append(allocator, .{ .expression = end, .role = .end });
+        },
+    }
+    return parts.items;
+}
+
+fn hasLength(loop: ast.For) bool {
+    return loop.sequence == .value or loop.sequence.range.end != null;
+}
+
+fn isEmptyLoop(statement: ast.Statement) bool {
+    if (statement.kind != .@"for") return false;
+    switch (statement.kind.@"for".sequence) {
+        .value => |value| {
+            const sequence_type = followPointer(value.type.?);
+            return sequence_type == .array and sequence_type.array.length == 0;
+        },
+        .range => |range| {
+            const end = range.end orelse return false;
+            if (range.start.kind != .integer_literal or end.kind != .integer_literal) return false;
+            return parseInteger(range.start) == parseInteger(end);
+        },
+    }
+}
+
+fn isDirect(expression: ast.Expression) bool {
+    if (expression.kind == .integer_literal) return true;
+    if (!isPlainName(expression)) return false;
+    return expression.type.? == .array or !isMemoryRead(expression);
+}
+
+fn isAddressedPart(part: Part) bool {
+    const expression = part.expression.*;
+    if (part.role != .sequence or expression.type.? != .array) return false;
+    return !isDirect(expression) and isPlace(expression);
+}
+
+fn isPlace(expression: ast.Expression) bool {
+    return switch (expression.kind) {
+        .identifier, .path_expression, .dereference => true,
+        .field_access => |access| access.value.type.? == .pointer or isPlace(access.value.*),
+        .index => |indexing| !isStorage(indexing.value.type.?) or isPlace(indexing.value.*),
+        else => false,
+    };
+}
+
+fn isZeroLiteral(expression: ast.Expression) bool {
+    return expression.kind == .integer_literal and parseInteger(expression) == 0;
+}
+
+fn parseInteger(expression: ast.Expression) u128 {
+    return std.fmt.parseInt(u128, expression.kind.integer_literal.text, 0) catch unreachable;
 }
 
 fn collectScopeSteps(
@@ -3033,7 +3325,7 @@ fn isMemoryRead(expression: ast.Expression) bool {
     return switch (expression.kind) {
         .identifier => |identifier| switch (identifier.resolution.?) {
             .local => |statement| statement.kind == .variable_declaration,
-            .parameter, .constant, .function, .type => false,
+            .parameter, .constant, .function, .type, .element => false,
         },
         .field_access => |access| access.value.type.? == .pointer or isMemoryRead(access.value.*),
         .index => |indexing| !isStorage(indexing.value.type.?) or isMemoryRead(indexing.value.*),
@@ -3176,30 +3468,45 @@ fn buildLocalNames(
     var statements: std.ArrayList(*const ast.Statement) = .empty;
     try collectStatements(allocator, &statements, body);
     for (statements.items) |statement| {
+        if (statement.kind == .@"for") try written.append(allocator, statement.kind.@"for".name);
         const local = extractLocal(statement.*) orelse continue;
         try written.append(allocator, local.name);
     }
 
     var local_names: std.ArrayList(LocalName) = .empty;
     for (statements.items) |statement| {
-        if (!isDeclared(body, statement)) continue;
-        const source_name = extractLocal(statement.*).?.name;
-        var name = source_name;
-        var number: usize = 1;
-        while (containsName(taken.items, name) or
-            (number > 1 and containsName(written.items, name)))
-        {
-            number += 1;
-            name = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ source_name, number });
+        if (statement.kind == .@"for" and isElementDeclared(statement)) {
+            const loop = statement.kind.@"for";
+            try local_names.append(allocator, .{
+                .resolution = .{ .element = statement },
+                .name = try reserveName(allocator, &taken, written.items, loop.name),
+                .location = loop.name_location,
+            });
         }
-        try taken.append(allocator, name);
+        if (!isDeclared(body, statement)) continue;
         try local_names.append(allocator, .{
-            .statement = statement,
-            .name = name,
+            .resolution = .{ .local = statement },
+            .name = try reserveName(allocator, &taken, written.items, extractLocal(statement.*).?.name),
             .location = statement.location,
         });
     }
     return local_names.items;
+}
+
+fn reserveName(
+    allocator: std.mem.Allocator,
+    taken: *std.ArrayList([]const u8),
+    written: []const []const u8,
+    source_name: []const u8,
+) std.mem.Allocator.Error![]const u8 {
+    var name = source_name;
+    var number: usize = 1;
+    while (containsName(taken.items, name) or (number > 1 and containsName(written, name))) {
+        number += 1;
+        name = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ source_name, number });
+    }
+    try taken.append(allocator, name);
+    return name;
 }
 
 fn collectStatements(
@@ -3221,7 +3528,7 @@ fn collectLoops(
     try collectStatements(allocator, &statements, body);
     var loops: std.ArrayList(*const ast.Statement) = .empty;
     for (statements.items) |statement| {
-        if (statement.kind == .@"while") try loops.append(allocator, statement);
+        if (statement.kind == .@"while" or statement.kind == .@"for") try loops.append(allocator, statement);
     }
     return loops.items;
 }
@@ -3243,9 +3550,9 @@ fn containsGoto(
                 const else_body = conditional.else_body orelse continue;
                 if (containsGoto(else_body, loop, tag, innermost_loop)) return true;
             },
-            .@"while" => |inner| {
-                if (containsGoto(inner.body, loop, tag, statement)) return true;
-                const else_body = inner.else_body orelse continue;
+            .@"while", .@"for" => {
+                const inner_body, const else_body = ast.extractBlocks(statement.*);
+                if (!isEmptyLoop(statement.*) and containsGoto(inner_body, loop, tag, statement)) return true;
                 if (containsGoto(else_body, loop, tag, innermost_loop)) return true;
             },
             .noop, .@"return", .discard, .call, .constant_declaration, .variable_declaration, .assignment => {},
@@ -3260,14 +3567,14 @@ fn isGoto(
     innermost_loop: ?*const ast.Statement,
 ) bool {
     if (loop != innermost_loop) return true;
-    return tag == .@"break" and loop.kind.@"while".else_body != null;
+    return tag == .@"break" and ast.extractBlocks(loop.*)[1].len != 0;
 }
 
 fn extractLocal(statement: ast.Statement) ?Local {
     return switch (statement.kind) {
         .constant_declaration => |constant| .{ .name = constant.name, .value = constant.value },
         .variable_declaration => |variable| .{ .name = variable.name, .value = variable.value },
-        .noop, .@"return", .discard, .call, .assignment, .@"if", .@"while", .@"break", .@"continue" => null,
+        .noop, .@"return", .discard, .call, .assignment, .@"if", .@"while", .@"for", .@"break", .@"continue" => null,
     };
 }
 
@@ -3275,7 +3582,7 @@ fn findLocalType(statement: ast.Statement) types.Type {
     return switch (statement.kind) {
         .constant_declaration => |constant| ast.extractDeclaredType(constant.type, constant.value),
         .variable_declaration => |variable| ast.extractDeclaredType(variable.type, variable.value),
-        .noop, .@"return", .discard, .call, .assignment, .@"if", .@"while", .@"break", .@"continue" => {
+        .noop, .@"return", .discard, .call, .assignment, .@"if", .@"while", .@"for", .@"break", .@"continue" => {
             unreachable;
         },
     };
@@ -3287,6 +3594,13 @@ fn isDeclared(body: []const ast.Statement, statement: *const ast.Statement) bool
     if (kind == .constant_declaration and ast.isAlias(kind.constant_declaration)) return false;
     if (isZeroSized(findLocalType(statement.*))) return false;
     return !isDiscarded(body, .{ .local = statement });
+}
+
+fn isElementDeclared(loop: *const ast.Statement) bool {
+    const for_loop = loop.kind.@"for";
+    if (ast.isDiscardedName(for_loop.name)) return false;
+    if (isZeroSized(ast.extractElementType(for_loop.sequence))) return false;
+    return !isDiscarded(for_loop.body, .{ .element = loop });
 }
 
 fn isDiscardedParameter(
@@ -3311,7 +3625,7 @@ fn isDiscarded(body: []const ast.Statement, resolution: ast.Resolution) bool {
             .@"break",
             .@"continue",
             => continue,
-            .@"if", .@"while" => {
+            .@"if", .@"while", .@"for" => {
                 for (ast.extractBlocks(statement)) |block| {
                     if (isDiscarded(block, resolution)) return true;
                 }
@@ -3328,7 +3642,7 @@ fn isStoredAsConstant(expression: ast.Expression) bool {
     return switch (expression.kind) {
         .identifier => |identifier| switch (identifier.resolution.?) {
             .local => |statement| statement.kind == .constant_declaration,
-            .constant => true,
+            .constant, .element => true,
             .parameter, .function, .type => false,
         },
         .path_expression => true,
@@ -3382,6 +3696,11 @@ fn collectAddressedConstants(
                 if (statement.kind == .assignment) {
                     const target = &statement.kind.assignment.target;
                     try collectAddressedConstantsOf(allocator, &addressed, target);
+                }
+                if (statement.kind == .@"for") {
+                    for (try collectParts(allocator, &statement.kind.@"for")) |part| {
+                        try collectAddressedConstantsOf(allocator, &addressed, part.expression);
+                    }
                 }
                 const expression = findStatementExpression(statement) orelse continue;
                 try collectAddressedConstantsOf(allocator, &addressed, expression);
@@ -3643,7 +3962,7 @@ test "Generator.generate: writes the modules and the runtime files they use" {
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
     const compiler_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &compiler_directory.sub_path });
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(): std::stdout::write(\"hi\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import std\nfn show(): std::stdout::write(\"hi\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3707,7 +4026,7 @@ test "Generator.generate: builds an executable when the main module defines main
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
     const compiler_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &compiler_directory.sub_path });
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "hello.mn", .data = "fn main(): std::stdout::write(\"hi\\n\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "hello.mn", .data = "import std\nfn main(): std::stdout::write(\"hi\\n\")" });
     try loader.loadMainModule(&arena, std.testing.io, "hello");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3780,7 +4099,7 @@ test "generateFiles: includes the headers of the modules it calls" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): utils::add(1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils\nfn main(): utils::add(1)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3816,7 +4135,7 @@ test "generateFiles: includes the headers of the structs its functions use" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(line: shapes::Line): _ = line" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn show(line: shapes::Line): _ = line" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3851,7 +4170,7 @@ test "generateFiles: writes the standard library at its module path" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): std::stdout::write(\"hi\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import std\nfn main(): std::stdout::write(\"hi\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3887,7 +4206,7 @@ test "generateFiles: includes the headers of the modules a field access reaches"
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Line:\n    width: i32\nexternal fn make() -> Line" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn width() -> i32: return shapes::make().width" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn width() -> i32: return shapes::make().width" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3916,7 +4235,7 @@ test "generateFiles: includes the headers of the structs that constants build" {
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Point:\n    x: i32\nconst origin = Point{x = 0}" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> i32: return shapes::origin.x" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn make() -> i32: return shapes::origin.x" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4272,14 +4591,14 @@ test "checkStructCycles: rejects modules that contain each other's structs" {
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
     defer program_directory.cleanup();
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "first.mn", .data = "struct One:\n    two: second::Two\nstruct Zero:\n    value: i32" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "second.mn", .data = "struct Two:\n    zero: first::Zero" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "first.mn", .data = "import second\nstruct One:\n    two: second::Two\nstruct Zero:\n    value: i32" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "second.mn", .data = "import first\nstruct Two:\n    zero: first::Zero" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(one: first::One): _ = one" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import first\nfn show(one: first::One): _ = one" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4292,7 +4611,7 @@ test "checkStructCycles: rejects modules that contain each other's structs" {
     try std.testing.expectError(error.StructsContainEachOther, generator.generateFiles(arena.allocator()));
     try std.testing.expectEqualStrings("modules contain each other's structs", generator.failure.?.message);
     try std.testing.expectEqual(loader.modules.items[2].path, generator.failure.?.module.?);
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, generator.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, generator.failure.?.location.?);
 }
 
 test "generateHeader: defines the used structs in the order they depend on each other" {
@@ -4327,14 +4646,14 @@ test "generateHeader: includes the headers of the modules whose structs it conta
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
     defer program_directory.cleanup();
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Line:\n    start: points::Point" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "import points\nstruct Line:\n    start: points::Point" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "points.mn", .data = "struct Point:\n    x: i32" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(line: shapes::Line): _ = line" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn show(line: shapes::Line): _ = line" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4356,7 +4675,7 @@ test "generateHeader: includes the headers of the modules whose structs a tuple 
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
     defer program_directory.cleanup();
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Line:\n    ends: (points::Point, colors::Color)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "import points\nimport colors\nstruct Line:\n    ends: (points::Point, colors::Color)" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "points.mn", .data = "struct Point:\n    x: i32" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "colors.mn", .data = "struct Color:\n    red: u8" });
     const program_path = try std.fs.path.join(
@@ -4364,7 +4683,7 @@ test "generateHeader: includes the headers of the modules whose structs a tuple 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(line: shapes::Line): _ = line" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn show(line: shapes::Line): _ = line" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4452,7 +4771,7 @@ test "generateForwardDeclarations: declares the structs of other modules that si
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(line: shapes::Line): _ = line" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn show(line: shapes::Line): _ = line" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4486,7 +4805,7 @@ test "collectForwardType: declares the struct of another module that a pointer p
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(line: *shapes::Line): _ = line" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn show(line: *shapes::Line): _ = line" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4940,7 +5259,7 @@ test "generateZeroSizedObject: defines the shared zero-sized object only in the 
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "other.mn", .data = "struct Marker\nfn locate(marker: Marker) -> *const Marker: return &marker" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): _ = other::locate(other::Marker{})" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import other\nfn main(): _ = other::locate(other::Marker{})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5009,7 +5328,7 @@ test "recordCalledFunction: includes the header of a function called in a loop" 
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "fn draw(): noop" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): while false: shapes::draw()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn main(): while false: shapes::draw()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5077,7 +5396,7 @@ test "recordCalledFunction: records the runtime functions that a field access ca
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn seconds() -> i64: return std::clock::now().seconds" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import std\nfn seconds() -> i64: return std::clock::now().seconds" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5103,7 +5422,7 @@ test "recordCalledFunction: includes the headers of the functions that operands 
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "numbers.mn", .data = "fn one() -> i32: return 1" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn two() -> i32: return -numbers::one() + 1" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import numbers\nfn two() -> i32: return -numbers::one() + 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5131,8 +5450,8 @@ test "recordType: includes the headers of the structs that defaults build" {
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "geometry.mn", .data = "struct Size:\n    width: i32" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Options:\n    size: geometry::Size = geometry::Size{width = 1}\nfn draw(options: Options): _ = options" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): shapes::draw(shapes::Options{})" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "import geometry\nstruct Options:\n    size: geometry::Size = geometry::Size{width = 1}\nfn draw(options: Options): _ = options" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn main(): shapes::draw(shapes::Options{})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5220,7 +5539,7 @@ test "recordPointerTarget: includes the header of a struct that an assignment ta
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Line:\n    width: i32" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn widen(line: *shapes::Line): line.width = 2" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn widen(line: *shapes::Line): line.width = 2" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5249,7 +5568,7 @@ test "recordPointerTarget: includes the header of a struct that a usize moves a 
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Line:\n    width: i32" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn advance(lines: *many shapes::Line, count: usize) -> *many shapes::Line: return count + lines" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn advance(lines: *many shapes::Line, count: usize) -> *many shapes::Line: return count + lines" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5277,7 +5596,7 @@ test "recordPointerTarget: includes the header of a struct read through a pointe
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Line:\n    width: i32" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn width(line: *const shapes::Line) -> i32: return line.width" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn width(line: *const shapes::Line) -> i32: return line.width" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5366,7 +5685,7 @@ test "recordModule: includes the header of a stored array that an inlined slice 
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "data.mn", .data = "const values = [2]i32{1, 2}\nconst items = values[..]" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(values: []const i32): _ = values\nfn main(): take(data::items)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import data\nfn take(values: []const i32): _ = values\nfn main(): take(data::items)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5468,7 +5787,7 @@ test "generateSignature: names main of other modules like any function" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): utils::one()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils\nfn main(): utils::one()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5608,6 +5927,39 @@ test "generateParameters: leaves out the name of a parameter discarded in a loop
     try std.testing.expectEqualStrings(
         "#pragma once\n\n#include \"runtime/monolith.h\"\n\nvoid mn_main_show(int32_t);\n",
         files[0].contents,
+    );
+}
+
+test "generateParameters: leaves out the name of a parameter discarded in a for loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(value: i32):\n    for _ in 0..3:\n        _ = value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nvoid mn_main_show(int32_t) {\n    for (size_t mn_index_1 = 0; mn_index_1 < 3u; mn_index_1 += 1) {}\n}\n",
+        files[1].contents,
     );
 }
 
@@ -7012,6 +7364,600 @@ test "generateWhile: writes no label for a loop with an else block and no break"
     );
 }
 
+test "generateFor: counts over the length of an array" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn main():\n    const items = [3]i32{1, 2, 3}\n    for item in items: take(item)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_array_3_i32_defined\n#define mn_array_3_i32_defined\ntypedef struct mn_array_3_i32 {\n    int32_t items[3];\n} mn_array_3_i32;\n#endif\n\nchar mn_zero_sized;\n\nvoid mn_main_take(int32_t) {}\n\nint main() {\n    const mn_array_3_i32 items = (mn_array_3_i32){ .items = { 1, 2, 3 } };\n    for (size_t mn_index_1 = 0; mn_index_1 < 3; mn_index_1 += 1) {\n        const int32_t item = items.items[mn_index_1];\n        mn_main_take(item);\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFor: counts over a slice" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(value: i32)\nfn show(items: []const i32): for item in items: take(item)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nvoid mn_main_show(mn_slice_i32 items) {\n    for (size_t mn_index_1 = 0; mn_index_1 < items.length; mn_index_1 += 1) {\n        const int32_t item = items.items[mn_index_1];\n        take(item);\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFor: loops without a condition over a range without an end" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(index: usize)\nfn main(): for index in 1..: take(index)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    for (size_t mn_index_1 = 0; ; mn_index_1 += 1) {\n        const size_t index = 1u + mn_index_1;\n        take(index);\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFor: counts over a pointer to an array" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(value: i32)\nfn show(items: *[3]i32): for item in items: take(item)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_array_3_i32_defined\n#define mn_array_3_i32_defined\ntypedef struct mn_array_3_i32 {\n    int32_t items[3];\n} mn_array_3_i32;\n#endif\n\nvoid mn_main_show(struct mn_array_3_i32 * items) {\n    for (size_t mn_index_1 = 0; mn_index_1 < 3; mn_index_1 += 1) {\n        const int32_t item = items->items[mn_index_1];\n        take(item);\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFor: reads a variable array in place" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(value: i32)\nfn main():\n    var items = [2]i32{1, 2}\n    for item in items:\n        items[1] = item\n        take(item)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    mn_array_2_i32 items = (mn_array_2_i32){ .items = { 1, 2 } };\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        const int32_t item = items.items[mn_index_1];\n        items.items[1u] = item;\n        take(item);\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFor: counts over a range from its start to its end" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(value: usize)\nfn show(count: usize): for index in 2..count: take(index)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nvoid mn_main_show(size_t count) {\n    for (size_t mn_index_1 = 0; mn_index_1 < count - 2u; mn_index_1 += 1) {\n        const size_t index = 2u + mn_index_1;\n        take(index);\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFor: evaluates the start of a range without an end once before the loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn first() -> usize\nexternal fn take(index: usize)\nfn main(): for index in first()..: take(index)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    const size_t mn_start_1 = first();\n    for (size_t mn_index_1 = 0; ; mn_index_1 += 1) {\n        const size_t index = mn_start_1 + mn_index_1;\n        take(index);\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFor: continues with the next elements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn step(index: usize) -> bool\nfn main():\n    outer: for index in 0..3:\n        if step(index): continue\n        while step(index): continue outer" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    for (size_t mn_index_1 = 0; mn_index_1 < 3u; mn_index_1 += 1) {\n        const size_t index = mn_index_1;\n        if (step(index)) {\n            continue;\n        }\n        while (step(index)) {\n            goto mn_continue_1;\n        }\n        mn_continue_1:;\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFor: leaves out the loop over an empty array" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(value: i32)\nexternal fn stop()\nfn show(items: [0]i32):\n    for item in items:\n        take(item)\n        break\n    else: stop()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nvoid mn_main_show() {\n    stop();\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFor: leaves out the loop over a range whose bounds are equal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(index: usize)\nexternal fn stop()\nfn main():\n    for index in 3..3: take(index)\n    else: stop()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    stop();\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generatePart: stores a sequence that needs temporaries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn one() -> i32\nexternal fn two() -> i32\nexternal fn pick(left: i32, right: i32) -> []const i32\nexternal fn take(value: i32)\nfn main(): for item in pick(one(), two()): take(item)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    const mn_slice_i32 mn_sequence_1 = (mn_temporary_1 = one(), mn_temporary_2 = two(), pick(mn_temporary_1, mn_temporary_2));\n    for (size_t mn_index_1 = 0; mn_index_1 < mn_sequence_1.length; mn_index_1 += 1) {\n        const int32_t item = mn_sequence_1.items[mn_index_1];\n        take(item);\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generatePart: evaluates a sequence without a name only for its effects" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn make() -> [2]i32\nexternal fn step()\nfn main(): for _ in make(): step()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    make();\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        step();\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generatePart: stores the address of an array that is not a name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Data:\n    items: [2]i32\nexternal fn one() -> usize\nexternal fn two() -> usize\nexternal fn pick(left: usize, right: usize) -> usize\nexternal fn take(value: i32)\nfn show(all: []Data): for item in all[pick(one(), two())].items: take(item)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_main_Data_defined\n#define mn_slice_main_Data_defined\ntypedef struct mn_slice_main_Data {\n    struct mn_main_Data *items;\n    size_t length;\n} mn_slice_main_Data;\n#endif\n\nvoid mn_main_show(mn_slice_main_Data all) {\n    size_t mn_temporary_1;\n    size_t mn_temporary_2;\n    size_t mn_temporary_3;\n    struct mn_array_2_i32 const * const mn_sequence_1 = (mn_temporary_1 = one(), mn_temporary_2 = two(), mn_temporary_3 = pick(mn_temporary_1, mn_temporary_2), &all.items[mn_temporary_3].items);\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        const int32_t item = mn_sequence_1->items[mn_index_1];\n        take(item);\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generatePart: stores an array that has no storage of its own" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn make() -> [2]i32\nexternal fn take(value: i32)\nfn main(): for item in make(): take(item)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    const mn_array_2_i32 mn_sequence_1 = make();\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        const int32_t item = mn_sequence_1.items[mn_index_1];\n        take(item);\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "isStoredPart: stores a sequence held by a variable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(value: i32)\nfn show(items: []const i32, others: []const i32):\n    var current = items\n    for item in current:\n        current = others\n        take(item)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nvoid mn_main_show(mn_slice_i32 items, mn_slice_i32 others) {\n    mn_slice_i32 current = items;\n    const mn_slice_i32 mn_sequence_1 = current;\n    for (size_t mn_index_1 = 0; mn_index_1 < mn_sequence_1.length; mn_index_1 += 1) {\n        const int32_t item = mn_sequence_1.items[mn_index_1];\n        current = others;\n        take(item);\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateElementDeclarations: leaves out a zero-sized element" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nexternal fn step()\nfn take(marker: Marker): _ = marker\nfn show(markers: [2]Marker):\n    for marker in markers:\n        take(marker)\n        step()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nvoid mn_main_take() {}\n\nvoid mn_main_show() {\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        mn_main_take();\n        step();\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateElementDeclarations: numbers a name that shadows an outer local" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(value: i32)\nfn show(items: []const i32):\n    const item = 1i32\n    take(item)\n    for item in items: take(item)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nvoid mn_main_show(mn_slice_i32 items) {\n    const int32_t item = 1;\n    take(item);\n    for (size_t mn_index_1 = 0; mn_index_1 < items.length; mn_index_1 += 1) {\n        const int32_t item_2 = items.items[mn_index_1];\n        take(item_2);\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateLoopEnd: writes the else block of a for loop and jumps over it on break" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn step(value: i32) -> bool\nexternal fn stop()\nfn show(items: []const i32):\n    for item in items:\n        if step(item): break\n    else: stop()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nvoid mn_main_show(mn_slice_i32 items) {\n    for (size_t mn_index_1 = 0; mn_index_1 < items.length; mn_index_1 += 1) {\n        const int32_t item = items.items[mn_index_1];\n        if (step(item)) {\n            goto mn_break_1;\n        }\n    }\n    stop();\n    mn_break_1:;\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateJump: writes a jump to the innermost loop as a plain break or continue" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -7089,6 +8035,39 @@ test "generateJump: breaks from the else block of an inner loop as from the inne
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_run(bool running) {\n    while (running) {\n        while (step()) {}\n        break;\n    }\n}\n\nint main() {\n    mn_main_run(true);\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateJump: breaks from the else block of a for loop as from the enclosing loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn step() -> bool\nfn main():\n    while step():\n        for _ in 0..3: noop\n        else: break" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    while (step()) {\n        for (size_t mn_index_2 = 0; mn_index_2 < 3u; mn_index_2 += 1) {}\n        break;\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -10270,6 +11249,39 @@ test "generateValueCall: calls through the function pointer" {
     );
 }
 
+test "generateValueCall: calls through a name of a for loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(callbacks: [2]*fn()): for callback in callbacks: callback()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_array_2_function_0_void_defined\n#define mn_array_2_function_0_void_defined\ntypedef struct mn_array_2_function_0_void {\n    typeof(void (*)()) items[2];\n} mn_array_2_function_0_void;\n#endif\n\nvoid mn_main_show(mn_array_2_function_0_void callbacks) {\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        typeof(void (*)()) const callback = callbacks.items[mn_index_1];\n        callback();\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateValueCall: passes a pointer to an array as a slice" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -10308,7 +11320,7 @@ test "generateValueCall: calls through a constant of another module" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): _ = steps::step(1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import steps\nfn main(): _ = steps::step(1)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);

@@ -68,11 +68,15 @@ pub const NameResolver = struct {
                     .function_definition, .function_declaration => error.DuplicateFunction,
                     .constant_declaration => error.DuplicateConstant,
                     .struct_definition => error.DuplicateStruct,
-                    .trait_definition, .import => error.DuplicateTrait,
+                    .trait_definition => error.DuplicateTrait,
+                    .import => error.DuplicateImport,
                     .implementation => unreachable,
                 });
             }
             if (isReservedName(module.path, name)) return self.fail(location, error.ReservedName);
+            if (declaration.kind != .import and try self.hasMember(module.path, name)) {
+                return self.fail(location, error.NamedLikeModule);
+            }
             switch (declaration.kind) {
                 .function_definition => |function| {
                     const definition = &module.declarations[index].kind.function_definition;
@@ -304,7 +308,7 @@ pub const NameResolver = struct {
         };
         return switch (resolution) {
             .type => |value_type| value_type,
-            .parameter, .function, .constant, .local => {
+            .parameter, .function, .constant, .local, .element => {
                 return self.fail(expression.location, error.TypeMismatch);
             },
         };
@@ -420,6 +424,11 @@ pub const NameResolver = struct {
                 try self.resolveLoop(block, statement);
                 if (loop.else_body) |else_body| try self.resolveNamesInBlock(block, else_body);
             },
+            .@"for" => |*loop| {
+                try self.resolveSequence(scope, &loop.sequence);
+                try self.resolveLoop(block, statement);
+                if (loop.else_body) |else_body| try self.resolveNamesInBlock(block, else_body);
+            },
             .@"break" => |*jump| {
                 jump.loop = try self.resolveJump(block, statement.location, jump.label, error.BreakOutsideLoop);
             },
@@ -430,21 +439,62 @@ pub const NameResolver = struct {
         return null;
     }
 
+    fn resolveSequence(self: *NameResolver, scope: Scope, sequence: *ast.Sequence) ResolveError!void {
+        switch (sequence.*) {
+            .value => |*value| try self.resolveNamesInExpression(scope, value),
+            .range => |*range| {
+                try self.resolveNamesInExpression(scope, &range.start);
+                if (range.end) |*end| try self.resolveNamesInExpression(scope, end);
+            },
+        }
+    }
+
     fn resolveLoop(self: *NameResolver, block: Block, statement: *ast.Statement) ResolveError!void {
-        const loop = statement.kind.@"while";
-        if (loop.label) |label| {
+        const label = ast.extractLabel(statement.*);
+        if (label) |name| {
             const module = self.loader.modules.items[self.module_index];
-            if (isReservedName(module.path, label)) return self.fail(statement.location, error.ReservedName);
-            if (findLoop(block.loops.items, label) != null) {
+            if (isReservedName(module.path, name)) return self.fail(statement.location, error.ReservedName);
+            if (findLoop(block.loops.items, name) != null) {
                 return self.fail(statement.location, error.DuplicateLabel);
             }
         }
         try block.loops.append(self.arena.allocator(), .{ .statement = statement });
-        try self.resolveNamesInBlock(block, loop.body);
+        const start = block.locals.items.len;
+        const body = switch (statement.kind) {
+            .@"while" => |loop| loop.body,
+            .@"for" => |loop| body: {
+                try self.declareElement(block, statement, loop.name, loop.name_location);
+                break :body loop.body;
+            },
+            else => unreachable,
+        };
+        try self.resolveNamesInBlock(block, body);
+        for (block.locals.items[start..]) |local| {
+            try self.expectUsed(local.use, local.location, error.UnusedLoopName);
+        }
+        block.locals.shrinkRetainingCapacity(start);
         const resolved = block.loops.pop().?;
-        if (loop.label != null and !resolved.label_used) {
+        if (label != null and !resolved.label_used) {
             return self.fail(statement.location, error.UnusedLabel);
         }
+    }
+
+    fn declareElement(
+        self: *NameResolver,
+        block: Block,
+        statement: *ast.Statement,
+        name: []const u8,
+        location: token.Location,
+    ) ResolveError!void {
+        if (ast.isDiscardedName(name)) return;
+        const module = self.loader.modules.items[self.module_index];
+        if (isReservedName(module.path, name)) return self.fail(location, error.ReservedName);
+        try block.locals.append(self.arena.allocator(), .{
+            .name = name,
+            .target = .{ .element = statement },
+            .statement = statement,
+            .location = location,
+        });
     }
 
     fn resolveJump(
@@ -527,8 +577,9 @@ pub const NameResolver = struct {
             else => return null,
         };
         return switch (target) {
-            .function, .type, .namespace, .method, .trait => target,
-            .constant, .local => null,
+            .function, .type, .method, .trait => target,
+            .namespace => self.fail(value.location, error.ModuleInConstant),
+            .constant, .local, .element => null,
         };
     }
 
@@ -625,7 +676,7 @@ pub const NameResolver = struct {
         const location = expression.location;
         if (findLocal(scope.locals, identifier.name)) |local| {
             try self.recordDiscard(&local.use, location);
-            identifier.resolution = .{ .local = local.statement };
+            identifier.resolution = extractLocalResolution(local.*);
             return;
         }
         if (findTypedName(scope.parameters, identifier.name)) |index| {
@@ -810,11 +861,12 @@ pub const NameResolver = struct {
                 .assignment,
                 .@"if",
                 .@"while",
+                .@"for",
                 .@"break",
                 .@"continue",
                 => return self.fail(expression.location, error.InvalidLength),
             },
-            .parameter, .function, .type => return self.fail(expression.location, error.InvalidLength),
+            .parameter, .function, .type, .element => return self.fail(expression.location, error.InvalidLength),
         };
         if (constant.type) |written| {
             const usize_type: types.Type = .{ .number = .usize };
@@ -957,6 +1009,7 @@ pub const NameResolver = struct {
             .type => |value| .{ .type = value },
             .constant => |constant| .{ .constant = constant },
             .local => |local| .{ .local = local },
+            .element => |element| .{ .element = element },
             .function => |function| {
                 const module = self.loader.modules.items[function.module];
                 const declaration = module.declarations[function.declaration];
@@ -967,7 +1020,7 @@ pub const NameResolver = struct {
             },
             .method => unreachable,
             .trait => self.fail(location, error.TraitUsedAsValue),
-            .namespace => self.fail(location, error.UnknownName),
+            .namespace => self.fail(location, error.ModuleUsedAsValue),
         };
     }
 
@@ -1017,6 +1070,7 @@ pub const NameResolver = struct {
         return switch (target) {
             .function => |function| .{ .function = function },
             .local => |local| .{ .local = local },
+            .element => |element| .{ .element = element },
             .constant => |constant| .{ .constant = constant },
             .type, .namespace, .method, .trait => {
                 return self.fail(location, error.NotAFunction);
@@ -1038,7 +1092,6 @@ pub const NameResolver = struct {
             return self.resolveDeclaration(self.module_index, index);
         }
         if (types.findBuiltInType(name)) |built_in_type| return .{ .type = built_in_type };
-        if (try self.loadRoot(location, name)) |namespace| return .{ .namespace = namespace };
         return self.fail(location, error.UnknownName);
     }
 
@@ -1053,7 +1106,7 @@ pub const NameResolver = struct {
             return switch (owner) {
                 .type => |receiver| .{ .method = .{ .receiver = receiver, .name = last } },
                 .trait => self.fail(location, error.TraitUsedAsValue),
-                .function, .namespace, .constant, .local, .method => unreachable,
+                .function, .namespace, .constant, .local, .element, .method => unreachable,
             };
         }
         var namespace = try self.resolveFirstNamespace(scope, location, path[0]);
@@ -1070,33 +1123,35 @@ pub const NameResolver = struct {
         prefix: ast.Path,
     ) ResolveError!?Target {
         const last = prefix[prefix.len - 1];
-        var module_index = self.module_index;
-        if (prefix.len == 1) {
-            if (findLocal(scope.locals, last)) |local| {
-                if (local.target != .type and local.target != .trait) return null;
-                local.use.used = true;
-                return local.target;
-            }
-            if (findTypedName(scope.parameters, last) != null) return null;
-            if (std.mem.eql(u8, last, "Self")) return try self.resolveName(location, last);
-            const module = self.loader.modules.items[self.module_index];
-            if (findDeclaration(module, last) == null) {
-                const built_in_type = types.findBuiltInType(last) orelse return null;
-                return .{ .type = built_in_type };
-            }
-        } else {
+        if (prefix.len > 1) {
             var namespace = try self.resolveFirstNamespace(scope, location, prefix[0]);
             for (prefix[1 .. prefix.len - 1]) |name| {
                 namespace = try self.resolveMemberNamespace(location, namespace, name);
             }
-            module_index = namespace.module orelse return null;
+            const module_index = namespace.module orelse return null;
+            const index = findMember(self.loader.modules.items[module_index], last) orelse return null;
+            return self.findOwner(module_index, index);
         }
-        const module = self.loader.modules.items[module_index];
-        const index = findDeclaration(module, last) orelse return null;
+        if (findLocal(scope.locals, last)) |local| {
+            if (local.target != .type and local.target != .trait) return null;
+            local.use.used = true;
+            return local.target;
+        }
+        if (findTypedName(scope.parameters, last) != null) return null;
+        if (std.mem.eql(u8, last, "Self")) return try self.resolveName(location, last);
+        const module = self.loader.modules.items[self.module_index];
+        const index = findDeclaration(module, last) orelse {
+            const built_in_type = types.findBuiltInType(last) orelse return null;
+            return .{ .type = built_in_type };
+        };
+        return self.findOwner(self.module_index, index);
+    }
+
+    fn findOwner(self: *NameResolver, module_index: usize, index: usize) ResolveError!?Target {
         const target = try self.resolveDeclaration(module_index, index);
         return switch (target) {
             .type, .trait => target,
-            .function, .namespace, .constant, .local, .method => null,
+            .function, .namespace, .constant, .local, .element, .method => null,
         };
     }
 
@@ -1106,18 +1161,14 @@ pub const NameResolver = struct {
         location: token.Location,
         name: []const u8,
     ) ResolveError!Namespace {
-        const module = self.loader.modules.items[self.module_index];
-        if (findLocal(scope.locals, name)) |local| {
-            local.use.used = true;
-            if (local.target == .namespace) return local.target.namespace;
-            return self.fail(location, error.NoMembers);
-        }
+        if (findLocal(scope.locals, name) != null) return self.fail(location, error.NoMembers);
         if (findTypedName(scope.parameters, name) != null) {
             return self.fail(location, error.NoMembers);
         }
-        if (try self.findConstantNamespace(self.module_index, name)) |namespace| return namespace;
-        if (try self.loadRoot(location, name)) |namespace| return namespace;
-        if (findDeclaration(module, name) != null) return self.fail(location, error.NoMembers);
+        const module = self.loader.modules.items[self.module_index];
+        if (findDeclaration(module, name)) |index| {
+            return self.expectNamespace(location, self.module_index, index);
+        }
         if (isBuiltInTypeName(name)) return self.fail(location, error.NoMembers);
         return self.fail(location, error.UnknownName);
     }
@@ -1128,17 +1179,37 @@ pub const NameResolver = struct {
         namespace: Namespace,
         name: []const u8,
     ) ResolveError!Namespace {
-        if (namespace.module) |module_index| {
-            if (try self.findConstantNamespace(module_index, name)) |target| return target;
-        }
         if (try self.loadMember(namespace, name)) |member| return member;
         if (namespace.module) |module_index| {
-            if (findDeclaration(self.loader.modules.items[module_index], name) != null) {
-                return self.fail(location, error.NoMembers);
+            const module = self.loader.modules.items[module_index];
+            if (isImported(module, name)) return self.fail(location, error.ImportNotMember);
+            if (findMember(module, name)) |index| {
+                return self.expectNamespace(location, module_index, index);
             }
         }
         if (namespace.directory) return self.fail(location, error.ModuleNotFound);
         return self.fail(location, error.UnknownName);
+    }
+
+    fn expectNamespace(
+        self: *NameResolver,
+        location: token.Location,
+        module_index: usize,
+        index: usize,
+    ) ResolveError!Namespace {
+        switch (self.loader.modules.items[module_index].declarations[index].kind) {
+            .import, .constant_declaration => {
+                const target = try self.resolveDeclaration(module_index, index);
+                if (target == .namespace) return target.namespace;
+            },
+            .function_definition,
+            .function_declaration,
+            .struct_definition,
+            .trait_definition,
+            .implementation,
+            => {},
+        }
+        return self.fail(location, error.NoMembers);
     }
 
     fn resolveMember(
@@ -1149,26 +1220,16 @@ pub const NameResolver = struct {
     ) ResolveError!Target {
         if (namespace.module) |module_index| {
             const module = self.loader.modules.items[module_index];
-            if (findDeclaration(module, name)) |index| {
+            if (findMember(module, name)) |index| {
                 return self.resolveDeclaration(module_index, index);
             }
         }
         if (try self.loadMember(namespace, name)) |member| return .{ .namespace = member };
+        if (namespace.module) |module_index| {
+            const module = self.loader.modules.items[module_index];
+            if (isImported(module, name)) return self.fail(location, error.ImportNotMember);
+        }
         return self.fail(location, error.UnknownName);
-    }
-
-    fn findConstantNamespace(
-        self: *NameResolver,
-        module_index: usize,
-        name: []const u8,
-    ) ResolveError!?Namespace {
-        const module = self.loader.modules.items[module_index];
-        const index = findDeclaration(module, name) orelse return null;
-        if (module.declarations[index].kind != .constant_declaration) return null;
-        return switch (try self.resolveConstant(module_index, index)) {
-            .function, .type, .constant, .local, .method, .trait => null,
-            .namespace => |namespace| namespace,
-        };
     }
 
     fn resolveDeclaration(
@@ -1183,27 +1244,32 @@ pub const NameResolver = struct {
             .constant_declaration => self.resolveConstant(module_index, index),
             .struct_definition => .{ .type = try self.resolveStruct(module_index, index) },
             .trait_definition => .{ .trait = .{ .module = module_index, .declaration = index } },
-            .import => .{ .trait = try self.resolveImport(module_index, index) },
+            .import => self.resolveImport(module_index, index),
             .implementation => unreachable,
         };
     }
 
-    fn resolveImport(
-        self: *NameResolver,
-        module_index: usize,
-        index: usize,
-    ) ResolveError!ast.Resolution.Trait {
-        const import = &self.loader.modules.items[module_index].declarations[index].kind.import;
-        if (import.resolved) |trait| return trait;
+    fn resolveImport(self: *NameResolver, module_index: usize, index: usize) ResolveError!Target {
+        const declaration = &self.loader.modules.items[module_index].declarations[index];
+        const import = &declaration.kind.import;
+        const location = declaration.location;
         const caller_module_index = self.module_index;
         const caller_self_type = self.self_type;
         self.module_index = module_index;
         self.self_type = null;
         defer self.module_index = caller_module_index;
         defer self.self_type = caller_self_type;
-        const trait = try self.expectTrait(&import.trait);
-        import.resolved = trait;
-        return trait;
+        const path = import.path;
+        var namespace = (try self.loadRoot(location, path[0])) orelse {
+            return self.fail(location, error.ModuleNotFound);
+        };
+        if (path.len == 1) return .{ .namespace = namespace };
+        for (path[1 .. path.len - 1]) |name| {
+            namespace = try self.resolveMemberNamespace(location, namespace, name);
+        }
+        const target = try self.resolveMember(location, namespace, path[path.len - 1]);
+        if (target == .trait) import.trait = target.trait;
+        return target;
     }
 
     fn resolveConstant(self: *NameResolver, module_index: usize, index: usize) ResolveError!Target {
@@ -1229,9 +1295,14 @@ pub const NameResolver = struct {
             return own;
         }
         return switch (value.kind) {
-            .identifier => |identifier| self.resolveName(declaration.location, identifier.name),
+            .identifier => |identifier| {
+                const target = try self.resolveName(declaration.location, identifier.name);
+                return self.expectHeldByConstant(declaration.location, target);
+            },
             .path_expression => |path_expression| {
-                return self.resolvePath(.{}, declaration.location, path_expression.path);
+                const path = path_expression.path;
+                const target = try self.resolvePath(.{}, declaration.location, path);
+                return self.expectHeldByConstant(declaration.location, target);
             },
             .integer_literal, .float_literal, .boolean_literal, .string_literal, .undefined, .null => own,
             .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type => {
@@ -1250,6 +1321,15 @@ pub const NameResolver = struct {
                 return self.fail(value.location, error.CannotEvaluate);
             },
         };
+    }
+
+    fn expectHeldByConstant(
+        self: *NameResolver,
+        location: token.Location,
+        target: Target,
+    ) NameError!Target {
+        if (target == .namespace) return self.fail(location, error.ModuleInConstant);
+        return target;
     }
 
     fn expectEvaluable(
@@ -1390,6 +1470,13 @@ pub const NameResolver = struct {
         return member;
     }
 
+    fn hasMember(self: *NameResolver, path: ast.Path, name: []const u8) ResolveError!bool {
+        const allocator = self.arena.allocator();
+        return self.loader.hasMember(allocator, self.io, path, name) catch |load_error| {
+            return self.failLoading(load_error);
+        };
+    }
+
     fn failLoading(self: *NameResolver, load_error: LoadError) LoadError {
         self.failure = self.loader.failure;
         return load_error;
@@ -1426,6 +1513,11 @@ pub const NameError = error{
     UnknownMethod,
     AmbiguousMethod,
     DuplicateTrait,
+    DuplicateImport,
+    NamedLikeModule,
+    ImportNotMember,
+    ModuleUsedAsValue,
+    ModuleInConstant,
     NotATrait,
     TraitUsedAsValue,
     NotInTrait,
@@ -1451,6 +1543,7 @@ pub const NameError = error{
     UnknownLabel,
     BreakOutsideLoop,
     ContinueOutsideLoop,
+    UnusedLoopName,
 };
 
 const ValueForm = enum {
@@ -1498,6 +1591,7 @@ const Target = union(enum) {
     type: types.Type,
     constant: ast.Resolution.Constant,
     local: *const ast.Statement,
+    element: *const ast.Statement,
     method: Method,
     trait: ast.Resolution.Trait,
 };
@@ -1527,6 +1621,11 @@ fn describeError(name_error: NameError) []const u8 {
         error.UnknownMethod => "unknown method",
         error.AmbiguousMethod => "method is found in more than one place",
         error.DuplicateTrait => "trait is already defined",
+        error.DuplicateImport => "name is already defined",
+        error.NamedLikeModule => "name is already used by a module or directory",
+        error.ImportNotMember => "an import is not a member of its module",
+        error.ModuleUsedAsValue => "a module cannot be used here",
+        error.ModuleInConstant => "a constant cannot hold a module, use import",
         error.NotATrait => "not a trait",
         error.TraitUsedAsValue => "a trait cannot be used here",
         error.NotInTrait => "function is not in the trait",
@@ -1552,6 +1651,7 @@ fn describeError(name_error: NameError) []const u8 {
         error.UnknownLabel => "label does not name an enclosing loop",
         error.BreakOutsideLoop => "break outside a loop",
         error.ContinueOutsideLoop => "continue outside a loop",
+        error.UnusedLoopName => "loop name is unused, use _",
     };
 }
 
@@ -1687,6 +1787,16 @@ fn findDeclaration(module: ast.Module, name: []const u8) ?usize {
     return null;
 }
 
+fn findMember(module: ast.Module, name: []const u8) ?usize {
+    if (isImported(module, name)) return null;
+    return findDeclaration(module, name);
+}
+
+fn isImported(module: ast.Module, name: []const u8) bool {
+    const index = findDeclaration(module, name) orelse return false;
+    return module.declarations[index].kind == .import;
+}
+
 fn isMethod(declaration: ast.Declaration) bool {
     if (declaration.kind != .function_definition) return false;
     return declaration.kind.function_definition.signature.receiver != null;
@@ -1699,14 +1809,7 @@ fn extractName(declaration: ast.Declaration) []const u8 {
         .constant_declaration => |constant| constant.name,
         .struct_definition => |definition| definition.name,
         .trait_definition => |definition| definition.name,
-        .import => |import| switch (import.trait.kind) {
-            .identifier => |identifier| identifier.name,
-            .path_expression => |path_expression| {
-                const path = path_expression.path;
-                return path[path.len - 1];
-            },
-            else => unreachable,
-        },
+        .import => |import| import.name,
         .implementation => unreachable,
     };
 }
@@ -1821,7 +1924,7 @@ fn findStorageRoot(expression: ast.Expression) ast.Expression {
 
 fn findLoop(loops: []Loop, label: []const u8) ?*Loop {
     for (loops) |*loop| {
-        const loop_label = loop.statement.kind.@"while".label orelse continue;
+        const loop_label = ast.extractLabel(loop.statement.*) orelse continue;
         if (std.mem.eql(u8, loop_label, label)) return loop;
     }
     return null;
@@ -1834,6 +1937,11 @@ fn findLocal(locals: []Local, name: []const u8) ?*Local {
         if (std.mem.eql(u8, locals[index].name, name)) return &locals[index];
     }
     return null;
+}
+
+fn extractLocalResolution(local: Local) ast.Resolution {
+    if (local.target == .element) return .{ .element = local.target.element };
+    return .{ .local = local.statement };
 }
 
 test "NameResolver.resolve: records what each name refers to" {
@@ -2085,13 +2193,13 @@ test "resolveModule: allows reserved names in the standard library" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): std::stdout::write(\"hi\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import std\nfn main(): std::stdout::write(\"hi\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
 
-    const function = loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.call.kind.call.callee.path_expression.resolution.?.function;
+    const function = loader.modules.items[0].declarations[1].kind.function_definition.body[0].kind.call.kind.call.callee.path_expression.resolution.?.function;
     try std.testing.expectEqual(1, function.module);
     try std.testing.expectEqual(0, function.declaration);
 }
@@ -2153,6 +2261,113 @@ test "resolveModule: rejects two traits with the same name" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, name_resolver.failure.?.location.?);
 }
 
+test "resolveModule: rejects an import named like a function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn add(): noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn add(): noop\nimport utils::add" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.DuplicateImport, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveModule: rejects two imports with the same name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn add(): noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils\nimport other::utils" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.DuplicateImport, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveModule: rejects a declaration named like a module in the directory of its module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.createDirPath(std.testing.io, "shapes");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "fn draw(): noop\nfn circle(): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes/circle.mn", .data = "fn area(): noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn main(): shapes::circle()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NamedLikeModule, name_resolver.resolve());
+    try std.testing.expectEqual(loader.modules.items[1].path, name_resolver.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveModule: rejects a declaration named like a directory in the directory of its module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.createDirPath(std.testing.io, "shapes/lines");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct lines" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NamedLikeModule, name_resolver.resolve());
+    try std.testing.expectEqual(loader.modules.items[1].path, name_resolver.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveModule: accepts an import named like a module in the directory of its module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.createDirPath(std.testing.io, "shapes");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn circle(): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "import utils::circle" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes/circle.mn", .data = "fn area(): noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes::circle\nfn main(): circle::area()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try name_resolver.resolve();
+}
+
 test "resolveTrait: resolves a trait of a module that is resolved later" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2164,7 +2379,7 @@ test "resolveTrait: resolves a trait of a module that is resolved later" {
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Square:\n    side: i32\nimpl shapes::Shape for Square:\n    fn area(self: Self) -> i32: return self.side\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nstruct Square:\n    side: i32\nimpl shapes::Shape for Square:\n    fn area(self: Self) -> i32: return self.side\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2515,13 +2730,13 @@ test "resolvePendingMethod: finds a function of a struct of another module" {
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "cards.mn", .data = "struct Card:\n    fn new() -> Card: return Card{}" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): _ = cards::Card::new()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import cards\nfn main(): _ = cards::Card::new()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
 
-    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
     const callee = body[0].kind.discard.kind.call.callee.path_expression;
     const module = loader.modules.items[callee.resolution.?.function.module];
     try std.testing.expectEqualStrings("cards", module.path[0]);
@@ -3604,6 +3819,51 @@ test "resolveNamesInStatement: resolves a break in the else block of a loop to t
     try std.testing.expectEqual(&body[0], inner.else_body.?[0].kind.@"break".loop.?);
 }
 
+test "resolveSequence: resolves a sequence outside the names of its loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn main():\n    const items = [2]i32{1, 2}\n    for items in items: take(items)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
+    const loop = body[1].kind.@"for";
+    try std.testing.expectEqual(&body[0], loop.sequence.value.kind.identifier.resolution.?.local);
+    const argument = loop.body[0].kind.call.kind.call.arguments[0].value.kind.identifier;
+    try std.testing.expectEqual(&body[1], argument.resolution.?.element);
+}
+
+test "resolveSequence: resolves both bounds of a range" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: usize): _ = value\nfn main():\n    const first = 1usize\n    const last = 3usize\n    for index in first..last: take(index)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
+    const range = body[2].kind.@"for".sequence.range;
+    try std.testing.expectEqual(&body[0], range.start.kind.identifier.resolution.?.local);
+    try std.testing.expectEqual(&body[1], range.end.?.kind.identifier.resolution.?.local);
+}
+
 test "resolveLoop: resolves a labeled break and continue to the labeled loop" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3702,6 +3962,182 @@ test "resolveLoop: rejects a reserved label" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, name_resolver.failure.?.location.?);
 }
 
+test "resolveLoop: ends the names of a for loop at the end of its body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn show(items: []const i32):\n    for item in items: take(item)\n    take(item)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownName, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 10 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveLoop: leaves the names of a for loop out of its else block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn show(items: []const i32):\n    for item in items: take(item)\n    else: take(item)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownName, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 16 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveLoop: rejects an unused name of a for loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn show(items: []const i32): for item in items: step()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnusedLoopName, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 34 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveLoop: accepts an underscore in place of a name of a for loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn main(): for _ in 0..3: step()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    try std.testing.expectEqual(null, name_resolver.failure);
+}
+
+test "resolveLoop: resolves a labeled break and continue to a labeled for loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    outer: for _ in 0..3:\n        while false: continue outer\n        break outer" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    const outer = body[0].kind.@"for";
+    try std.testing.expectEqual(&body[0], outer.body[0].kind.@"while".body[0].kind.@"continue".loop.?);
+    try std.testing.expectEqual(&body[0], outer.body[1].kind.@"break".loop.?);
+}
+
+test "resolveLoop: rejects a label of a for loop that repeats the label of an enclosing loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    outer: while true:\n        outer: for _ in 0..3: break outer\n        break outer" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.DuplicateLabel, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 9 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveLoop: rejects an unused label of a for loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    outer: for _ in 0..3: break" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnusedLabel, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, name_resolver.failure.?.location.?);
+}
+
+test "declareElement: resolves the name to its loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn show(items: []const i32): for item in items: take(item)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
+    const arguments = body[0].kind.@"for".body[0].kind.call.kind.call.arguments;
+    try std.testing.expectEqual(&body[0], arguments[0].value.kind.identifier.resolution.?.element);
+}
+
+test "declareElement: rejects a reserved name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn show(items: []const i32): for mn_item in items: take(mn_item)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ReservedName, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 34 }, name_resolver.failure.?.location.?);
+}
+
 test "resolveJump: rejects a break outside a loop" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3732,6 +4168,25 @@ test "resolveJump: rejects a continue in the else block of a loop without an enc
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    while false: noop\n    else: continue" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ContinueOutsideLoop, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 11 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveJump: rejects a continue in the else block of a for loop without an enclosing loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    for _ in 0..3: noop\n    else: continue" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4033,6 +4488,26 @@ test "findAlias: holds the value of a constant that names a value" {
     try std.testing.expectEqual(&body[0], body[1].kind.@"return".?.kind.identifier.resolution.?.local);
 }
 
+test "findAlias: rejects a module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "fn draw(): noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn main():\n    const figures = shapes\n    figures::draw()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ModuleInConstant, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 21 }, name_resolver.failure.?.location.?);
+}
+
 test "resolveTarget: assigns a variable" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4173,6 +4648,25 @@ test "resolveTarget: rejects assigning to a parameter" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, name_resolver.failure.?.location.?);
 }
 
+test "resolveTarget: rejects assigning to a name of a for loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(items: []const i32): for item in items: item = 1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NotAssignable, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 49 }, name_resolver.failure.?.location.?);
+}
+
 test "resolveTarget: rejects an unknown name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4276,6 +4770,27 @@ test "resolveDiscardedName: discards a variable" {
     try std.testing.expectEqual(&body[0], discarded.kind.identifier.resolution.?.local);
 }
 
+test "resolveDiscardedName: discards a name of a for loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(items: []const i32): for item in items: _ = item" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    const discarded = body[0].kind.@"for".body[0].kind.discard;
+    try std.testing.expectEqual(&body[0], discarded.kind.identifier.resolution.?.element);
+}
+
 test "resolveDiscardedName: rejects a name that is not a parameter or local constant" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4375,13 +4890,13 @@ test "resolveNamesInExpression: resolves a function of another module used as a 
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn value() -> i32: return utils::add" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils\nfn value() -> i32: return utils::add" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
 
-    const value = loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.@"return".?;
+    const value = loader.modules.items[0].declarations[1].kind.function_definition.body[0].kind.@"return".?;
     const function = value.kind.path_expression.resolution.?.function;
     const declaration = loader.modules.items[function.module].declarations[function.declaration];
     try std.testing.expectEqualStrings("add", ast.extractFunctionSignature(declaration).name);
@@ -4565,13 +5080,13 @@ test "resolveLiteralType: resolves a struct of another module before braces" {
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "other.mn", .data = "struct Data:\n    value: i32" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> other::Data: return other::Data{value = 1}" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import other\nfn make() -> other::Data: return other::Data{value = 1}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
 
-    const returned = loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.@"return".?;
+    const returned = loader.modules.items[0].declarations[1].kind.function_definition.body[0].kind.@"return".?;
     const struct_type = ast.extractType(returned.kind.composite_literal.type.?.*).@"struct";
     try std.testing.expectEqualStrings("Data", struct_type.name);
     try std.testing.expectEqual(1, struct_type.module);
@@ -5508,6 +6023,26 @@ test "expectValue: rejects main as an argument" {
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 15 }, name_resolver.failure.?.location.?);
 }
 
+test "expectValue: rejects a module as a value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn add(): noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils\nfn value() -> i32: return utils" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ModuleUsedAsValue, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 27 }, name_resolver.failure.?.location.?);
+}
+
 test "resolveCallee: rejects an unknown call" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5604,13 +6139,13 @@ test "resolveCallee: resolves a call of a constant of another module" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): _ = steps::step(1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import steps\nfn main(): _ = steps::step(1)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
 
-    const call = loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.discard.kind.call;
+    const call = loader.modules.items[0].declarations[1].kind.function_definition.body[0].kind.discard.kind.call;
     try std.testing.expectEqual(ast.Resolution{ .constant = .{ .module = 1, .declaration = 1 } }, call.callee.path_expression.resolution.?);
 }
 
@@ -5631,13 +6166,13 @@ test "resolveCallee: rejects calling a module" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): utils()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils\nfn main(): utils()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.NotAFunction, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveCallee: calls a function through a constant" {
@@ -5804,6 +6339,26 @@ test "resolveName: lets a top-level constant shadow a built-in type" {
     try std.testing.expectEqual(ast.Resolution{ .constant = .{ .module = 0, .declaration = 0 } }, value.kind.identifier.resolution.?);
 }
 
+test "resolveName: rejects a module that is not imported" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn add(): noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn value() -> i32: return utils" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownName, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 27 }, name_resolver.failure.?.location.?);
+}
+
 test "resolvePath: rejects a call through a trait" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5859,13 +6414,13 @@ test "resolvePath: resolves a call through a module" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): utils::add()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils\nfn main(): utils::add()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
 
-    const function = loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.call.kind.call.callee.path_expression.resolution.?.function;
+    const function = loader.modules.items[0].declarations[1].kind.function_definition.body[0].kind.call.kind.call.callee.path_expression.resolution.?.function;
     try std.testing.expectEqual(1, function.module);
     try std.testing.expectEqual(1, function.declaration);
 }
@@ -5888,18 +6443,18 @@ test "resolvePath: resolves a call through a directory" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): std::stdout::write()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import std\nfn main(): std::stdout::write()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
 
-    const function = loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.call.kind.call.callee.path_expression.resolution.?.function;
+    const function = loader.modules.items[0].declarations[1].kind.function_definition.body[0].kind.call.kind.call.callee.path_expression.resolution.?.function;
     try std.testing.expectEqual(1, function.module);
     try std.testing.expectEqual(0, function.declaration);
 }
 
-test "resolvePath: resolves a call through a constant that names a module" {
+test "resolvePath: resolves a call through an imported module" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -5917,7 +6472,7 @@ test "resolvePath: resolves a call through a constant that names a module" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const stdout = std::stdout\nfn main(): stdout::write()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import std::stdout\nfn main(): stdout::write()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5970,29 +6525,6 @@ test "findPathOwner: prefers a declaration over a built-in type" {
     try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 1 } }, callee.resolution.?);
 }
 
-test "resolveFirstNamespace: reaches a namespace through a local constant" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "fn draw(): noop" });
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const figures = shapes\n    figures::draw()" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-    try name_resolver.resolve();
-
-    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
-    const function = body[1].kind.call.kind.call.callee.path_expression.resolution.?.function;
-    try std.testing.expectEqual(1, function.module);
-    try std.testing.expectEqual(0, function.declaration);
-}
-
 test "resolveFirstNamespace: rejects members of a parameter" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6018,7 +6550,7 @@ test "resolveFirstNamespace: rejects members of a parameter" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 22 }, name_resolver.failure.?.location.?);
 }
 
-test "resolveFirstNamespace: lets a parameter hide a module" {
+test "resolveFirstNamespace: lets a parameter shadow an import" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -6035,16 +6567,16 @@ test "resolveFirstNamespace: lets a parameter hide a module" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn run(utils: i32): utils::add()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils\nfn run(utils: i32): utils::add()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.NoMembers, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 21 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 21 }, name_resolver.failure.?.location.?);
 }
 
-test "resolveFirstNamespace: lets a local constant hide a module" {
+test "resolveFirstNamespace: lets a local constant shadow an import" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -6061,13 +6593,81 @@ test "resolveFirstNamespace: lets a local constant hide a module" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const utils = 5i32\n    utils::add()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils\nfn main():\n    const utils = 5i32\n    utils::add()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.NoMembers, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 5 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveFirstNamespace: rejects a module that is not imported" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn add(): noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): utils::add()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownName, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqual(1, loader.modules.items.len);
+}
+
+test "resolveFirstNamespace: rejects the standard library when it is not imported" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    try compiler_directory.dir.createDirPath(std.testing.io, "std");
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn write()" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): std::stdout::write()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownName, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveFirstNamespace: rejects members of an imported function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn add(): noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils::add\nfn main(): add::more()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NoMembers, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveMemberNamespace: rejects members of a function" {
@@ -6087,13 +6687,13 @@ test "resolveMemberNamespace: rejects members of a function" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): utils::add::more()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils\nfn main(): utils::add::more()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.NoMembers, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveMemberNamespace: rejects a module missing from a directory" {
@@ -6113,46 +6713,62 @@ test "resolveMemberNamespace: rejects a module missing from a directory" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): std::missing::write()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import std\nfn main(): std::missing::write()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.ModuleNotFound, name_resolver.resolve());
     try std.testing.expectEqual(loader.modules.items[0].path, name_resolver.failure.?.module.?);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, name_resolver.failure.?.location.?);
 }
 
-test "resolveMember: lets a function share its name with a module" {
+test "resolveMemberNamespace: rejects an import of another module" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
     defer program_directory.cleanup();
-    var compiler_directory = std.testing.tmpDir(.{});
-    defer compiler_directory.cleanup();
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn math(): noop" });
-    try program_directory.dir.createDirPath(std.testing.io, "utils");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils/math.mn", .data = "fn add(): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn add(): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "import utils" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    const compiler_path = try std.fs.path.join(
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn main(): shapes::utils::add()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ImportNotMember, name_resolver.resolve());
+    try std.testing.expectEqual(loader.modules.items[0].path, name_resolver.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveMember: reaches a declaration of a module and a module in its directory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.createDirPath(std.testing.io, "shapes");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "fn draw(): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes/circle.mn", .data = "fn area(): noop" });
+    const program_path = try std.fs.path.join(
         arena.allocator(),
-        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    utils::math()\n    utils::math::add()\n" });
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn main():\n    shapes::draw()\n    shapes::circle::area()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
 
-    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
     const function = body[0].kind.call.kind.call.callee.path_expression.resolution.?.function;
-    try std.testing.expectEqual(1, function.module);
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"shapes"}), loader.modules.items[function.module].path);
     const module_function = body[1].kind.call.kind.call.callee.path_expression.resolution.?.function;
-    try std.testing.expectEqual(2, module_function.module);
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{ "shapes", "circle" }), loader.modules.items[module_function.module].path);
 }
 
 test "resolveMember: rejects a call that ends at a directory" {
@@ -6172,14 +6788,14 @@ test "resolveMember: rejects a call that ends at a directory" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): utils::math()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils\nfn main(): utils::math()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.NotAFunction, name_resolver.resolve());
     try std.testing.expectEqual(loader.modules.items[0].path, name_resolver.failure.?.module.?);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveMember: rejects a name the module does not declare" {
@@ -6206,6 +6822,28 @@ test "resolveMember: rejects a name the module does not declare" {
 
     try std.testing.expectError(error.UnknownName, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveMember: rejects an import of another module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn add(): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "import utils::add" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn main(): shapes::add()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ImportNotMember, name_resolver.resolve());
+    try std.testing.expectEqual(loader.modules.items[0].path, name_resolver.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveImport: binds the name of the imported trait" {
@@ -6250,15 +6888,59 @@ test "resolveImport: rejects an import with the name of another declaration" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, name_resolver.failure.?.location.?);
 }
 
-test "resolveConstant: follows a constant into the modules below what it names" {
+test "resolveImport: binds a constant of a module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "cards.mn", .data = "const cards: i32 = 52" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import cards::cards\nfn count() -> i32: return cards" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const value = loader.modules.items[0].declarations[1].kind.function_definition.body[0].kind.@"return".?;
+    try std.testing.expectEqual(ast.Resolution{ .constant = .{ .module = 1, .declaration = 0 } }, value.kind.identifier.resolution.?);
+}
+
+test "resolveImport: binds a function, an external function and a struct of a module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn add(): noop\nexternal fn write()\nstruct Point:\n    x: i32" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils::add\nimport utils::write\nimport utils::Point\nfn run(point: Point):\n    add()\n    write()\n    _ = point" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const function = loader.modules.items[0].declarations[3].kind.function_definition;
+    try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 1, .declaration = 0 } }, function.body[0].kind.call.kind.call.callee.identifier.resolution.?);
+    try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 1, .declaration = 1 } }, function.body[1].kind.call.kind.call.callee.identifier.resolution.?);
+    try std.testing.expectEqual(1, ast.extractType(function.signature.parameters[0].type).@"struct".module);
+}
+
+test "resolveImport: binds the name after as" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
     defer program_directory.cleanup();
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
-    try program_directory.dir.createDirPath(std.testing.io, "utils");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils/math.mn", .data = "fn add(): noop" });
+    try compiler_directory.dir.createDirPath(std.testing.io, "std/io");
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/io/stdout.mn", .data = "external fn write()" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -6268,15 +6950,96 @@ test "resolveConstant: follows a constant into the modules below what it names" 
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const tools = utils\nfn main(): tools::math::add()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import std::io::stdout as out\nfn main(): out::write()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
 
-    const call = loader.modules.items[0].declarations[1].kind.function_definition.body[0].kind.call.kind.call;
-    const function = call.callee.path_expression.resolution.?.function;
-    try std.testing.expectEqualStrings("math", loader.modules.items[function.module].path[1]);
+    const function = loader.modules.items[0].declarations[1].kind.function_definition.body[0].kind.call.kind.call.callee.path_expression.resolution.?.function;
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{ "std", "io", "stdout" }), loader.modules.items[function.module].path);
+}
+
+test "resolveImport: leaves the last name of the path unbound after as" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn add(): noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils as tools\nfn main(): utils::add()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownName, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveImport: binds a name in the whole module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn add(): noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): utils::add()\nimport utils" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const function = loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.call.kind.call.callee.path_expression.resolution.?.function;
+    try std.testing.expectEqual(1, function.module);
+}
+
+test "resolveImport: rejects a root that is neither a module nor a directory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): noop\nimport missing" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ModuleNotFound, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveImport: rejects an import of an import" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn add(): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "import utils::add" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes::add" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ImportNotMember, name_resolver.resolve());
+    try std.testing.expectEqual(loader.modules.items[0].path, name_resolver.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveConstant: rejects constants that refer to each other" {
@@ -6336,7 +7099,7 @@ test "resolveConstant: reports errors in the value at the constant" {
     defer program_directory.cleanup();
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "output.mn", .data = "const write = std::missing" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "output.mn", .data = "import std\nconst write = std::missing" });
     try compiler_directory.dir.createDirPath(std.testing.io, "std");
     try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn write()" });
     const program_path = try std.fs.path.join(
@@ -6348,14 +7111,14 @@ test "resolveConstant: reports errors in the value at the constant" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): output::write()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import output\nfn main(): output::write()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.UnknownName, name_resolver.resolve());
     try std.testing.expectEqual(loader.modules.items[1].path, name_resolver.failure.?.module.?);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveConstant: resolves a constant that names a type" {
@@ -6571,6 +7334,75 @@ test "resolveConstant: resolves a pointer to a function with a written type" {
     const constant = loader.modules.items[0].declarations[1].kind.constant_declaration;
     try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 0 } }, constant.value.kind.address_of.kind.identifier.resolution.?);
     try std.testing.expect(ast.extractType(constant.type.?).pointer.target == .function);
+}
+
+test "expectHeldByConstant: rejects a module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    try compiler_directory.dir.createDirPath(std.testing.io, "std");
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn write()" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import std\nconst stdout = std::stdout\nfn main(): stdout::write()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ModuleInConstant, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, name_resolver.failure.?.location.?);
+}
+
+test "expectHeldByConstant: rejects a directory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.createDirPath(std.testing.io, "utils");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils/math.mn", .data = "fn add(): noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils\nconst tools = utils\nfn main(): tools::math::add()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ModuleInConstant, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, name_resolver.failure.?.location.?);
+}
+
+test "expectHeldByConstant: keeps a function of an imported module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn add(): noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils\nconst plus = utils::add\nfn main(): plus()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const callee = loader.modules.items[0].declarations[2].kind.function_definition.body[0].kind.call.kind.call.callee;
+    try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 1, .declaration = 0 } }, callee.identifier.resolution.?);
 }
 
 test "expectEvaluable: accepts pointers to functions in a stored constant" {
@@ -7056,7 +7888,7 @@ test "resolveFields: reports errors in the module of the struct" {
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Point:\n    x: Missing" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(point: shapes::Point): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn show(point: shapes::Point): noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7143,7 +7975,7 @@ test "resolveFields: rejects a default that cannot be evaluated at compile time"
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 18 }, name_resolver.failure.?.location.?);
 }
 
-test "loadRoot: reports the reserved name monolith at the path" {
+test "loadRoot: reports the reserved name monolith at the import" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -7160,14 +7992,14 @@ test "loadRoot: reports the reserved name monolith at the path" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): monolith::one()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import monolith\nfn main(): monolith::one()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.ReservedModuleName, name_resolver.resolve());
     try std.testing.expectEqual(loader.modules.items[0].path, name_resolver.failure.?.module.?);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, name_resolver.failure.?.location.?);
 }
 
 test "failLoading: reports failures in the module that is loaded" {
@@ -7187,7 +8019,7 @@ test "failLoading: reports failures in the module that is loaded" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main(): utils::one()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils\nfn main(): utils::one()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);

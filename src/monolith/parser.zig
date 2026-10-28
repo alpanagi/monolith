@@ -268,6 +268,7 @@ pub const Parser = struct {
         const else_depth: ?usize = if (self.tokens[offset.* - 1].kind == .indent) depth else null;
         if (try self.parseIf(allocator, offset, depth, else_depth)) |statement| return statement;
         if (try self.parseWhile(allocator, offset, depth, else_depth)) |statement| return statement;
+        if (try self.parseFor(allocator, offset, depth, else_depth)) |statement| return statement;
         if (self.parseJump(offset)) |statement| return statement;
         if (try self.parseDiscard(allocator, offset)) |statement| return statement;
         if (try self.parseConstantDeclaration(allocator, offset)) |constant| {
@@ -356,6 +357,68 @@ pub const Parser = struct {
             .else_body = else_body,
         };
         return .{ .kind = .{ .@"while" = loop }, .location = location };
+    }
+
+    fn parseFor(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        depth: usize,
+        else_depth: ?usize,
+    ) ParseError!?ast.Statement {
+        var position = offset.*;
+        const location = self.tokens[position].location;
+        const label = self.parseLabel(&position);
+        if (self.match(&position, .keyword_for) == null) return null;
+        const name_location = self.tokens[position].location;
+        const name = try self.parseElementName(&position);
+        _ = try self.expect(&position, .keyword_in, error.ExpectedIn);
+        const sequence = try self.parseSequence(allocator, &position);
+        _ = try self.expect(&position, .colon, error.ExpectedColon);
+        const body = try self.parseBlock(allocator, &position, depth);
+        var else_body: ?[]ast.Statement = null;
+        if (self.matchElse(&position, else_depth)) {
+            else_body = try self.parseElseBlock(allocator, &position, depth);
+        }
+
+        offset.* = position;
+        const loop: ast.For = .{
+            .label = label,
+            .name = name,
+            .name_location = name_location,
+            .sequence = sequence,
+            .body = body,
+            .else_body = else_body,
+        };
+        return .{ .kind = .{ .@"for" = loop }, .location = location };
+    }
+
+    fn parseElementName(self: *Parser, offset: *usize) ParseError![]const u8 {
+        const name = switch (self.tokens[offset.*].kind) {
+            .identifier => |identifier| identifier,
+            .underscore => "_",
+            else => return self.fail(offset.*, error.ExpectedIdentifier),
+        };
+        offset.* += 1;
+        return name;
+    }
+
+    fn parseSequence(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!ast.Sequence {
+        var position = offset.*;
+        const value = (try self.parseExpression(allocator, &position)) orelse {
+            return self.fail(position, error.ExpectedExpression);
+        };
+        const sequence: ast.Sequence = if (self.match(&position, .dot_dot) == null)
+            .{ .value = value }
+        else
+            .{ .range = .{ .start = value, .end = try self.parseExpression(allocator, &position) } };
+
+        offset.* = position;
+        return sequence;
     }
 
     fn parseLabel(self: *Parser, offset: *usize) ?[]const u8 {
@@ -685,12 +748,15 @@ pub const Parser = struct {
     ) ParseError!?ast.Import {
         var position = offset.*;
         _ = self.match(&position, .keyword_import) orelse return null;
-        const trait = (try self.parseNameExpression(allocator, &position)) orelse {
-            return self.fail(position, error.ExpectedIdentifier);
-        };
+        const first = try self.expect(&position, .identifier, error.ExpectedIdentifier);
+        const path = try self.parsePath(allocator, &position, first);
+        var name = path[path.len - 1];
+        if (self.match(&position, .keyword_as) != null) {
+            name = (try self.expect(&position, .identifier, error.ExpectedIdentifier)).kind.identifier;
+        }
 
         offset.* = position;
-        return .{ .trait = trait };
+        return .{ .path = path, .name = name };
     }
 
     fn expectBlock(self: *Parser, offset: usize, outer: usize) ParseError!usize {
@@ -1374,6 +1440,7 @@ pub const ParseError = error{
     UnexpectedIndentation,
     InconsistentIndentation,
     ChainedComparison,
+    ExpectedIn,
 };
 
 const OperatorToken = struct {
@@ -1468,6 +1535,7 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.UnexpectedIndentation => "unexpected indentation",
         error.InconsistentIndentation => "indentation does not match any outer level",
         error.ChainedComparison => "comparisons cannot be chained, use and",
+        error.ExpectedIn => "expected 'in'",
     };
 }
 
@@ -2045,6 +2113,161 @@ test "parseWhile: rejects an else if" {
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 10 }, parser.failure.?.location.?);
 }
 
+test "parseFor: parses a name, a sequence and an indented body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    for item in items:\n        step()\n        stop()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const statement = module.declarations[0].kind.function_definition.body[0];
+    const loop = statement.kind.@"for";
+    try std.testing.expectEqualStrings("item", loop.name);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 9 }, loop.name_location);
+    try std.testing.expectEqualStrings("items", loop.sequence.value.kind.identifier.name);
+    try std.testing.expectEqual(2, loop.body.len);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, statement.location);
+}
+
+test "parseFor: parses a label, an inline body and an else block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    outer: for item in items: step()\n    else: stop()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(1, body.len);
+    const loop = body[0].kind.@"for";
+    try std.testing.expectEqualStrings("outer", loop.label.?);
+    try std.testing.expectEqualStrings("step", loop.body[0].kind.call.kind.call.callee.identifier.name);
+    try std.testing.expectEqualStrings("stop", loop.else_body.?[0].kind.call.kind.call.callee.identifier.name);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, body[0].location);
+}
+
+test "parseFor: rejects a missing in" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): for item items: step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIn, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 21 }, parser.failure.?.location.?);
+}
+
+test "parseFor: rejects a missing colon" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): for item in items step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedColon, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 30 }, parser.failure.?.location.?);
+}
+
+test "parseElementName: parses an underscore" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): for _ in items: step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const loop = module.declarations[0].kind.function_definition.body[0].kind.@"for";
+    try std.testing.expectEqualStrings("_", loop.name);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, loop.name_location);
+}
+
+test "parseElementName: rejects a name that is not an identifier" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): for 5 in items: step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
+}
+
+test "parseElementName: rejects names in parentheses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): for (item, index) in (items, 0..): step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
+}
+
+test "parseSequence: parses ranges with and without an end" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    for index in 0..: step()\n    for index in 1..limit: step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const open = body[0].kind.@"for".sequence.range;
+    try std.testing.expectEqualStrings("0", open.start.kind.integer_literal.text);
+    try std.testing.expectEqual(null, open.end);
+    const closed = body[1].kind.@"for".sequence.range;
+    try std.testing.expectEqualStrings("1", closed.start.kind.integer_literal.text);
+    try std.testing.expectEqualStrings("limit", closed.end.?.kind.identifier.name);
+}
+
+test "parseSequence: parses a value in parentheses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): for item in (items): step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const sequence = module.declarations[0].kind.function_definition.body[0].kind.@"for".sequence;
+    try std.testing.expectEqualStrings("items", sequence.value.kind.identifier.name);
+}
+
+test "parseSequence: parses a range whose start is in parentheses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): for index in (start)..end: step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const range = module.declarations[0].kind.function_definition.body[0].kind.@"for".sequence.range;
+    try std.testing.expectEqualStrings("start", range.start.kind.identifier.name);
+    try std.testing.expectEqualStrings("end", range.end.?.kind.identifier.name);
+}
+
+test "parseSequence: rejects a missing sequence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): for item in: step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, parser.failure.?.location.?);
+}
+
+test "parseSequence: leaves a range outside a for unparsed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    const range = 0..3\n    noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.UnexpectedToken, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 20 }, parser.failure.?.location.?);
+}
+
 test "parseLabel: rejects a label before a statement that is not a loop" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2332,16 +2555,16 @@ test "parseCallStatement: rejects a field access as a statement" {
 test "parseConstantDeclaration: parses a path as the value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const stdout = std::stdout");
+    var lexer = @import("lexer.zig").Lexer.init("const write = stdout::write");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const constant = module.declarations[0].kind.constant_declaration;
-    try std.testing.expectEqualStrings("stdout", constant.name);
+    try std.testing.expectEqualStrings("write", constant.name);
     try std.testing.expectEqual(2, constant.value.kind.path_expression.path.len);
-    try std.testing.expectEqualStrings("std", constant.value.kind.path_expression.path[0]);
-    try std.testing.expectEqualStrings("stdout", constant.value.kind.path_expression.path[1]);
+    try std.testing.expectEqualStrings("stdout", constant.value.kind.path_expression.path[0]);
+    try std.testing.expectEqualStrings("write", constant.value.kind.path_expression.path[1]);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, module.declarations[0].location);
 }
 
@@ -2649,7 +2872,7 @@ test "parseImplementation: rejects a missing for" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, parser.failure.?.location.?);
 }
 
-test "parseImport: parses the path of a trait" {
+test "parseImport: binds the last name of the path" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("import shapes::Shape");
@@ -2657,9 +2880,60 @@ test "parseImport: parses the path of a trait" {
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
-    const path = module.declarations[0].kind.import.trait.kind.path_expression.path;
-    try std.testing.expectEqualStrings("shapes", path[0]);
-    try std.testing.expectEqualStrings("Shape", path[1]);
+    const import = module.declarations[0].kind.import;
+    try std.testing.expectEqual(2, import.path.len);
+    try std.testing.expectEqualStrings("shapes", import.path[0]);
+    try std.testing.expectEqualStrings("Shape", import.path[1]);
+    try std.testing.expectEqualStrings("Shape", import.name);
+}
+
+test "parseImport: binds the name after as" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("import std::io::stdout as out\nimport std as library");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const import = module.declarations[0].kind.import;
+    try std.testing.expectEqual(3, import.path.len);
+    try std.testing.expectEqualStrings("stdout", import.path[2]);
+    try std.testing.expectEqualStrings("out", import.name);
+    try std.testing.expectEqual(1, module.declarations[1].kind.import.path.len);
+    try std.testing.expectEqualStrings("library", module.declarations[1].kind.import.name);
+}
+
+test "parseImport: rejects a missing path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("import as out");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 8 }, parser.failure.?.location.?);
+}
+
+test "parseImport: rejects a missing name after as" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("import std::io::stdout as\nfn main(): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
+}
+
+test "parseImport: rejects a reserved word as the name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("import std::io::stdout as as");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 27 }, parser.failure.?.location.?);
 }
 
 test "expectBlock: rejects empty block" {
@@ -3774,12 +4048,12 @@ test "parseNameExpression: parses a path used as a value" {
 test "parsePath: rejects a separator without a name after it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const stdout = std::");
+    var lexer = @import("lexer.zig").Lexer.init("const write = stdout::");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 21 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, parser.failure.?.location.?);
 }
 
 test "parseNegation: wraps a number literal in a negation" {

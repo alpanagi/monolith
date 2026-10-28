@@ -55,6 +55,7 @@ pub const StatementKind = union(enum) {
     assignment: Assignment,
     @"if": If,
     @"while": While,
+    @"for": For,
     @"break": Jump,
     @"continue": Jump,
 };
@@ -87,8 +88,9 @@ pub const Implementation = struct {
 };
 
 pub const Import = struct {
-    trait: Expression,
-    resolved: ?Resolution.Trait = null,
+    path: Path,
+    name: []const u8,
+    trait: ?Resolution.Trait = null,
 };
 
 pub const VariableDeclaration = struct {
@@ -126,6 +128,25 @@ pub const While = struct {
     condition: Expression,
     body: []Statement,
     else_body: ?[]Statement = null,
+};
+
+pub const For = struct {
+    label: ?[]const u8 = null,
+    name: []const u8,
+    name_location: token.Location,
+    sequence: Sequence,
+    body: []Statement,
+    else_body: ?[]Statement = null,
+};
+
+pub const Sequence = union(enum) {
+    value: Expression,
+    range: Range,
+};
+
+pub const Range = struct {
+    start: Expression,
+    end: ?Expression = null,
 };
 
 pub const Jump = struct {
@@ -203,6 +224,7 @@ pub const Resolution = union(enum) {
     type: types.Type,
     constant: Resolution.Constant,
     local: *const Statement,
+    element: *const Statement,
 
     pub const Function = struct {
         module: usize,
@@ -400,7 +422,7 @@ pub fn findMethod(
     for (modules[caller].declarations, 0..) |declaration, index| {
         const trait: Resolution.Trait = switch (declaration.kind) {
             .trait_definition => .{ .module = caller, .declaration = index },
-            .import => |import| import.resolved orelse continue,
+            .import => |import| import.trait orelse continue,
             .function_declaration,
             .function_definition,
             .constant_declaration,
@@ -485,6 +507,7 @@ pub fn extractBlocks(statement: Statement) [2][]const Statement {
     return switch (statement.kind) {
         .@"if" => |conditional| .{ conditional.body, conditional.else_body orelse &.{} },
         .@"while" => |loop| .{ loop.body, loop.else_body orelse &.{} },
+        .@"for" => |loop| .{ loop.body, loop.else_body orelse &.{} },
         .noop,
         .@"return",
         .discard,
@@ -495,6 +518,37 @@ pub fn extractBlocks(statement: Statement) [2][]const Statement {
         .@"break",
         .@"continue",
         => .{ &.{}, &.{} },
+    };
+}
+
+pub fn extractLabel(statement: Statement) ?[]const u8 {
+    return switch (statement.kind) {
+        .@"while" => |loop| loop.label,
+        .@"for" => |loop| loop.label,
+        .noop,
+        .@"return",
+        .discard,
+        .call,
+        .constant_declaration,
+        .variable_declaration,
+        .assignment,
+        .@"if",
+        .@"break",
+        .@"continue",
+        => null,
+    };
+}
+
+pub fn extractElementType(sequence: Sequence) types.Type {
+    return switch (sequence) {
+        .range => .{ .number = .usize },
+        .value => |value| switch (types.followPointer(value.type.?)) {
+            .array => |array| array.element,
+            .slice => |slice| slice.element,
+            .number, .boolean, .void, .type, .@"struct", .pointer, .optional, .tuple, .function, .implementer => {
+                unreachable;
+            },
+        },
     };
 }
 
@@ -529,7 +583,7 @@ pub fn findConstantRoot(expression: Expression) ?Resolution.Constant {
     return switch (expression.kind) {
         inline .identifier, .path_expression => |name| switch (name.resolution.?) {
             .constant => |constant| constant,
-            .parameter, .function, .type, .local => null,
+            .parameter, .function, .type, .local, .element => null,
         },
         .field_access => |access| {
             if (access.value.type.? == .pointer) return null;
@@ -577,6 +631,28 @@ test "extractBlocks: finds an empty else block for an if without one" {
     const blocks = extractBlocks(conditional);
     try std.testing.expectEqual(@as([]const Statement, &body), blocks[0]);
     try std.testing.expectEqual(0, blocks[1].len);
+}
+
+test "extractElementType: finds the element of the array a pointer points to" {
+    const location: token.Location = .{ .row = 1, .column = 1 };
+    const array: types.Array = .{ .length = 3, .element = .boolean };
+    const pointer: types.Pointer = .{ .target = .{ .array = &array }, .many = false, .constant = true };
+    const sequence: Sequence = .{ .value = .{
+        .kind = .{ .identifier = .{ .name = "data" } },
+        .type = .{ .pointer = &pointer },
+        .location = location,
+    } };
+
+    try std.testing.expectEqual(types.Type.boolean, extractElementType(sequence));
+}
+
+test "extractElementType: finds usize elements in a range" {
+    const location: token.Location = .{ .row = 1, .column = 1 };
+    const sequence: Sequence = .{ .range = .{
+        .start = .{ .kind = .{ .integer_literal = .{ .text = "0", .suffix = null } }, .location = location },
+    } };
+
+    try std.testing.expectEqual(types.Type{ .number = .usize }, extractElementType(sequence));
 }
 
 test "findConstantRoot: finds the constant that stores a field or an element" {

@@ -22,7 +22,7 @@
 - Identifiers are case-sensitive. By convention only types and type constructors start with a capital letter.
 - The single character `_` is reserved and cannot be used as an identifier by the user.
 - The following identifier names are reserved and cannot be used as identifiers by the user:
-    `and`, `break`, `const`, `continue`, `else`, `external`, `false`, `fn`, `for`, `if`, `impl`, `import`, `many`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `trait`, `true`, `undefined`, `var`, `void`, `while`
+    `and`, `as`, `break`, `const`, `continue`, `else`, `external`, `false`, `fn`, `for`, `if`, `impl`, `import`, `in`, `many`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `trait`, `true`, `undefined`, `var`, `void`, `while`
 
 ## Built-In Types
 
@@ -305,8 +305,21 @@
 
 - `while condition:` runs its block as long as the condition is true. The condition is a `bool`, evaluated before each run of the block.
 - `else:` runs its block when the condition is false, but not when the loop is left with `break` or `return`. It is on the line after the `while` block, at the same indentation as `while`. Its block is not part of the loop, so `break` and `continue` in it act on an enclosing loop.
-- `break` leaves the innermost loop. `continue` ends the current run of its block and evaluates the condition again.
-- A loop can have a label before `while`, e.g. `outer: while running:`. `break outer` and `continue outer` act on that loop instead of the innermost one.
+
+### For
+
+- `for name in sequence:` runs its block once for each element of the sequence, in order, with `name` holding the element. A sequence is an array, a slice, a pointer to an array or a range.
+- `start..end` is a range of the `usize` values from `start` up to, but not including, `end`, e.g. `for index in 0..count:`. `start..` is a range without an end. A start after the end is illegal behavior.
+- The sequence is evaluated once, before the first run of the block. An array is not copied: the loop goes over the array itself.
+- The name is a constant and can be used only in the block.
+- A name `_` leaves the element without a name, and the block cannot refer to it, e.g. `for _ in 0..3:`.
+- An unused name is a compile-time error.
+- `else:` runs its block when the sequence ends, but not when the loop is left with `break` or `return`. It is on the line after the `for` block, at the same indentation as `for`. Its block is not part of the loop, so `break` and `continue` in it act on an enclosing loop.
+
+### Break and Continue
+
+- `break` leaves the innermost loop. `continue` ends the current run of its block: a `while` evaluates its condition again, and a `for` goes on with the next element.
+- A loop can have a label before `while` or `for`, e.g. `outer: while running:`. `break outer` and `continue outer` act on that loop instead of the innermost one.
 - A label cannot repeat the label of an enclosing loop. An unused label is a compile-time error.
 - `break` and `continue` outside a loop are a compile-time error.
 
@@ -321,4 +334,15 @@
 - Arguments are given in the order of the parameters.
 - `&name` gives a pointer to a function, e.g. to pass it as an argument. A pointer to a function is called like a function.
 - `external fn` declares a function defined outside the program, without a body, e.g. `external fn write(text: []const u8)`.
-- The program starts at `main`. It has no parameters and no return type, and cannot be called, used as a value or be external.
+- `main` has no parameters and no return type, and cannot be called, used as a value or be external.
+
+## Modules
+
+- Each `.mn` file is a module. Its path is its location in the program's directory without the extension, with `::` between names, e.g. `shapes/circle.mn` is `shapes::circle`.
+- The program starts at the function `main` in `main.mn`.
+- `std` is the standard library. A program's own `std.mn` or `std` directory is a compile-time error.
+- `import path` makes the last name of the path available in the module. The path names a directory, a module or a declaration in a module, e.g. `import std::io::stdout` allows `stdout::write("hi")`.
+- `import path as name` makes it available as `name` instead, e.g. `import std::io::stdout as out`.
+- `import` is written at the top level of a module. The name it makes available cannot be the same as another import or top-level declaration of the module.
+- Other modules can use every top-level declaration of a module.
+- A module can be next to a directory with the same name, e.g. `shapes.mn` and `shapes/`. A declaration in the module with the same name as a module or directory in the directory is a compile-time error, e.g. `circle` in `shapes.mn` and `shapes/circle.mn`.

@@ -12,7 +12,9 @@ pub const keywords = std.StaticStringMap(token.TokenKind).initComptime(.{
     .{ "trait", .keyword_trait },
     .{ "impl", .keyword_impl },
     .{ "for", .keyword_for },
+    .{ "in", .keyword_in },
     .{ "import", .keyword_import },
+    .{ "as", .keyword_as },
     .{ "noop", .keyword_noop },
     .{ "return", .keyword_return },
     .{ "if", .keyword_if },
@@ -59,6 +61,8 @@ test "isName: rejects keywords and the discard symbol" {
     try std.testing.expect(!isName("else"));
     try std.testing.expect(!isName("break"));
     try std.testing.expect(!isName("continue"));
+    try std.testing.expect(!isName("as"));
+    try std.testing.expect(!isName("in"));
     try std.testing.expect(!isName("_"));
 }
 
