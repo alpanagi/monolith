@@ -2,13 +2,11 @@ const std = @import("std");
 const c = @import("c");
 const core = @import("core");
 const monolith = @import("monolith");
-const ast = core.ast;
 const types = core.types;
 
+const Analyzer = monolith.Analyzer;
 const Failure = core.Failure;
 const Loader = monolith.Loader;
-const NameResolver = monolith.NameResolver;
-const TypeChecker = monolith.TypeChecker;
 
 const isName = monolith.isName;
 
@@ -42,16 +40,9 @@ pub fn main(init: std.process.Init) !u8 {
     };
 
     var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(arena, io, &loader, &type_registry);
-    name_resolver.resolve() catch |resolve_error| {
-        const failure = name_resolver.failure orelse return resolve_error;
-        return report(allocator, stderr, &loader, failure);
-    };
-    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
-
-    var type_checker = TypeChecker.init(arena, program);
-    type_checker.check() catch |type_error| {
-        const failure = type_checker.failure orelse return type_error;
+    var analyzer = Analyzer.init(arena, io, &loader, &type_registry);
+    const program = analyzer.analyze() catch |analyze_error| {
+        const failure = analyzer.failure orelse return analyze_error;
         return report(allocator, stderr, &loader, failure);
     };
 

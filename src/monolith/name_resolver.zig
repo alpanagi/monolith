@@ -4,10 +4,15 @@ const ast = core.ast;
 const token = core.token;
 const types = core.types;
 
+const AnalyzeError = @import("analyzer.zig").AnalyzeError;
+const Bound = @import("type_checker.zig").Bound;
 const Failure = core.Failure;
 const Loader = @import("loader.zig").Loader;
 const LoadError = @import("loader.zig").LoadError;
 const Namespace = @import("loader.zig").Namespace;
+const Resolver = @import("type_checker.zig").Resolver;
+const TypeChecker = @import("type_checker.zig").TypeChecker;
+const Value = core.Value;
 
 pub const NameResolver = struct {
     arena: *std.heap.ArenaAllocator,
@@ -18,6 +23,10 @@ pub const NameResolver = struct {
     constant_depth: usize = 0,
     self_type: ?types.Type = null,
     trait: ?ast.Resolution.Trait = null,
+    bindings: []const ast.Binding = &.{},
+    owner_name: []const u8 = "",
+    structs: std.ArrayList(StructCount) = .empty,
+    type_checker: ?*TypeChecker = null,
     pending: std.ArrayList(PendingMethod) = .empty,
     failure: ?Failure = null,
 
@@ -31,12 +40,14 @@ pub const NameResolver = struct {
     }
 
     pub fn resolve(self: *NameResolver) ResolveError!void {
+        if (self.type_checker) |type_checker| type_checker.resolver = self.buildResolver();
+        try self.loadImportedModules();
+        try self.addDefaults();
         var index: usize = 0;
         while (index < self.loader.modules.items.len) : (index += 1) {
             self.module_index = index;
             try self.resolveModule();
         }
-        try self.addDefaults();
         for (self.pending.items) |pending| try self.resolvePendingMethod(pending);
         try self.expectSingleImplementations();
     }
@@ -46,7 +57,7 @@ pub const NameResolver = struct {
         for (module.declarations, 0..) |declaration, index| {
             if (isMethod(declaration)) {
                 if (declaration.kind.function_definition.signature.trait == null) {
-                    try self.resolveMethod(index);
+                    try self.resolveFunction(self.module_index, index);
                 }
                 continue;
             }
@@ -80,15 +91,8 @@ pub const NameResolver = struct {
                 return self.fail(location, error.NamedLikeModule);
             }
             switch (declaration.kind) {
-                .function_definition => |function| {
-                    const definition = &module.declarations[index].kind.function_definition;
-                    try self.resolveFunctionTypes(&definition.signature);
-                    try self.resolveNamesInFunction(function);
-                },
-                .function_declaration => {
-                    const kind = &module.declarations[index].kind;
-                    try self.resolveFunctionTypes(&kind.function_declaration);
-                },
+                .function_definition => try self.resolveFunction(self.module_index, index),
+                .function_declaration => try self.resolveExternalSignature(self.module_index, index),
                 .trait_definition => {
                     const module_index = self.module_index;
                     try self.resolveTrait(.{ .module = module_index, .declaration = index });
@@ -112,17 +116,21 @@ pub const NameResolver = struct {
         const caller_module_index = self.module_index;
         const caller_self_type = self.self_type;
         const caller_trait = self.trait;
+        const caller_bindings = self.bindings;
         self.module_index = trait.module;
         self.self_type = .implementer;
         self.trait = trait;
+        self.bindings = &.{};
         defer self.module_index = caller_module_index;
         defer self.self_type = caller_self_type;
         defer self.trait = caller_trait;
+        defer self.bindings = caller_bindings;
         const functions = definition.functions;
         for (functions, 0..) |*signature, function_index| {
             if (findSignature(functions[0..function_index], signature.name) != null) {
                 return self.fail(declaration.location, error.DuplicateFunction);
             }
+            if (ast.isGeneric(signature.*)) return self.fail(declaration.location, error.GenericTraitFunction);
             try self.resolveFunctionTypes(signature);
         }
         for (functions, definition.defaults) |signature, default| {
@@ -131,19 +139,41 @@ pub const NameResolver = struct {
         }
     }
 
+    fn loadImportedModules(self: *NameResolver) ResolveError!void {
+        var module_index: usize = 0;
+        while (module_index < self.loader.modules.items.len) : (module_index += 1) {
+            self.module_index = module_index;
+            const module = self.loader.modules.items[module_index];
+            for (module.declarations) |declaration| {
+                if (declaration.kind != .import) continue;
+                const path = declaration.kind.import.path;
+                var namespace = (try self.loadRoot(declaration.location, path[0])) orelse continue;
+                for (path[1..]) |name| namespace = (try self.loadMember(namespace, name)) orelse break;
+            }
+        }
+    }
+
     fn addDefaults(self: *NameResolver) ResolveError!void {
         const allocator = self.arena.allocator();
-        for (self.loader.modules.items) |*module| {
+        var module_index: usize = 0;
+        while (module_index < self.loader.modules.items.len) : (module_index += 1) {
+            self.module_index = module_index;
+            const original = self.loader.modules.items[module_index].declarations;
+            for (original) |*declaration| {
+                if (declaration.kind != .implementation) continue;
+                const implementation = &declaration.kind.implementation;
+                implementation.resolved = try self.expectTrait(&implementation.trait);
+            }
             var declarations: std.ArrayList(ast.Declaration) = .empty;
-            try declarations.appendSlice(allocator, module.declarations);
-            for (module.declarations, 0..) |declaration, index| {
+            try declarations.appendSlice(allocator, original);
+            for (original, 0..) |declaration, index| {
                 if (declaration.kind != .implementation) continue;
                 const implementation = declaration.kind.implementation;
                 const trait = implementation.resolved.?;
                 const required = self.loader.modules.items[trait.module].declarations[trait.declaration];
                 const definition = required.kind.trait_definition;
                 const first = index + 1;
-                const written = module.declarations[first .. first + implementation.functions];
+                const written = original[first .. first + implementation.functions];
                 var defaults: std.ArrayList(usize) = .empty;
                 for (definition.functions, definition.defaults) |signature, default| {
                     const template = (default orelse continue).template;
@@ -158,27 +188,39 @@ pub const NameResolver = struct {
                 }
                 declarations.items[index].kind.implementation.defaults = defaults.items;
             }
-            const start = module.declarations.len;
-            module.declarations = declarations.items;
-            for (module.declarations[start..]) |*added| {
-                try self.resolveDefault(&added.kind.function_definition);
-            }
+            self.loader.modules.items[module_index].declarations = declarations.items;
         }
     }
 
-    fn resolveDefault(self: *NameResolver, definition: *ast.FunctionDefinition) ResolveError!void {
-        const trait = definition.default_of.?;
+    fn resolveImplementationType(self: *NameResolver, module_index: usize, index: usize) ResolveError!void {
+        const implementation = &self.loader.modules.items[module_index].declarations[index].kind.implementation;
+        if (implementation.progress != .pending) return;
+        implementation.progress = .running;
         const caller_module_index = self.module_index;
         const caller_self_type = self.self_type;
         const caller_trait = self.trait;
-        self.module_index = trait.module;
-        self.self_type = ast.extractType(definition.signature.receiver.?);
-        self.trait = trait;
+        const caller_bindings = self.bindings;
         defer self.module_index = caller_module_index;
         defer self.self_type = caller_self_type;
         defer self.trait = caller_trait;
-        try self.resolveFunctionTypes(&definition.signature);
-        try self.resolveNamesInFunction(definition.*);
+        defer self.bindings = caller_bindings;
+        self.module_index = module_index;
+        self.self_type = null;
+        self.trait = null;
+        self.bindings = &.{};
+        try self.resolveNamesInExpression(.{}, &implementation.type);
+        _ = try self.expectType(&implementation.type);
+        implementation.progress = .done;
+    }
+
+    fn resolveAllImplementationTypes(self: *NameResolver) ResolveError!void {
+        var module_index: usize = 0;
+        while (module_index < self.loader.modules.items.len) : (module_index += 1) {
+            for (self.loader.modules.items[module_index].declarations, 0..) |declaration, index| {
+                if (declaration.kind != .implementation) continue;
+                try self.resolveImplementationType(module_index, index);
+            }
+        }
     }
 
     fn resolveImplementation(self: *NameResolver, index: usize) ResolveError!void {
@@ -188,8 +230,8 @@ pub const NameResolver = struct {
         const trait = try self.expectTrait(&implementation.trait);
         implementation.resolved = trait;
         try self.resolveTrait(trait);
-        try self.resolveNamesInExpression(.{}, &implementation.type);
-        const implemented = try self.expectType(implementation.type);
+        try self.resolveImplementationType(self.module_index, index);
+        const implemented = ast.extractType(implementation.type);
         const required = self.loader.modules.items[trait.module].declarations[trait.declaration];
         const signatures = required.kind.trait_definition.functions;
         const first = index + 1;
@@ -205,9 +247,9 @@ pub const NameResolver = struct {
             const expected = findSignature(signatures, signature.name) orelse {
                 return self.fail(function.location, error.NotInTrait);
             };
-            try self.resolveMethod(function_index);
+            try self.resolveFunction(self.module_index, function_index);
             const resolved = module.declarations[function_index].kind.function_definition.signature;
-            if (!matchesSignature(resolved, expected, implemented)) {
+            if (ast.isGeneric(resolved) or !matchesSignature(resolved, expected, implemented)) {
                 return self.fail(function.location, error.MismatchedTraitFunction);
             }
         }
@@ -215,6 +257,7 @@ pub const NameResolver = struct {
             if (default != null or findDefinition(functions, expected.name) != null) continue;
             return self.fail(declaration.location, error.MissingTraitFunction);
         }
+        for (implementation.defaults) |default_index| try self.resolveFunction(self.module_index, default_index);
     }
 
     fn expectTrait(
@@ -266,44 +309,339 @@ pub const NameResolver = struct {
         return false;
     }
 
-    fn resolveMethod(self: *NameResolver, index: usize) ResolveError!void {
-        const module = self.loader.modules.items[self.module_index];
-        const declaration = module.declarations[index];
-        const definition = &module.declarations[index].kind.function_definition;
+    fn resolveFunction(self: *NameResolver, module_index: usize, index: usize) ResolveError!void {
+        try self.resolveFunctionSignature(module_index, index);
+        try self.resolveFunctionBody(module_index, index);
+    }
+
+    fn resolveFunctionSignature(self: *NameResolver, module_index: usize, index: usize) ResolveError!void {
+        const module = self.loader.modules.items[module_index];
+        const declaration = ast.findDeclaration(module, index);
+        const definition = &declaration.kind.function_definition;
         const signature = &definition.signature;
-        if (isReservedName(module.path, signature.name)) {
-            return self.fail(declaration.location, error.ReservedName);
+        switch (signature.progress) {
+            .done => return,
+            .running => return self.failIn(module_index, declaration.location, error.DependencyLoop),
+            .pending => {},
         }
-        const receiver = &signature.receiver.?;
-        try self.resolveNamesInExpression(.{}, receiver);
-        const receiver_type = try self.expectType(receiver.*);
+        signature.progress = .running;
+        const caller_module_index = self.module_index;
         const caller_self_type = self.self_type;
         const caller_trait = self.trait;
-        self.self_type = receiver_type;
-        self.trait = null;
+        const caller_bindings = self.bindings;
+        defer self.module_index = caller_module_index;
         defer self.self_type = caller_self_type;
         defer self.trait = caller_trait;
-        if (signature.trait != null) {
-            try self.resolveFunctionTypes(signature);
-            return self.resolveNamesInFunction(definition.*);
-        }
-        for (module.declarations[0..index]) |earlier| {
-            if (!isMethod(earlier)) continue;
-            const earlier_signature = earlier.kind.function_definition.signature;
-            if (earlier_signature.trait != null) continue;
-            if (!std.mem.eql(u8, earlier_signature.name, signature.name)) continue;
-            const earlier_type = ast.extractType(earlier_signature.receiver.?);
-            if (std.meta.eql(earlier_type, receiver_type)) {
-                return self.fail(declaration.location, error.DuplicateFunction);
+        defer self.bindings = caller_bindings;
+        self.module_index = module_index;
+        self.self_type = null;
+        self.trait = null;
+        self.bindings = definition.bindings;
+        const caller_owner_name = self.owner_name;
+        defer self.owner_name = caller_owner_name;
+        self.owner_name = self.findOwnerName(definition.*);
+        if (definition.default_of) |trait| {
+            const receiver = &signature.receiver.?;
+            try self.resolveNamesInExpression(.{}, receiver);
+            self.self_type = try self.expectType(receiver);
+            self.module_index = trait.module;
+            self.trait = trait;
+        } else if (signature.receiver) |*receiver| {
+            if (isReservedName(module.path, signature.name)) {
+                return self.fail(declaration.location, error.ReservedName);
             }
+            try self.resolveNamesInExpression(.{}, receiver);
+            const receiver_type = try self.expectType(receiver);
+            self.self_type = receiver_type;
+            const unique = signature.trait == null and index < module.declarations.len;
+            if (unique) try self.expectUniqueMethod(module_index, index, receiver_type);
+        }
+        if (!ast.isGeneric(signature.*)) try self.resolveFunctionTypes(signature);
+        signature.progress = .done;
+    }
+
+    fn findOwnerName(self: *const NameResolver, definition: ast.FunctionDefinition) []const u8 {
+        const template = definition.template orelse return definition.signature.name;
+        const module = self.loader.modules.items[template.module];
+        return ast.findDeclaration(module, template.declaration).kind.function_definition.signature.name;
+    }
+
+    fn expectUniqueMethod(
+        self: *NameResolver,
+        module_index: usize,
+        index: usize,
+        receiver_type: types.Type,
+    ) NameError!void {
+        const module = self.loader.modules.items[module_index];
+        const declaration = module.declarations[index];
+        const signature = declaration.kind.function_definition.signature;
+        for (module.declarations, 0..) |other, other_index| {
+            if (other_index == index or !isMethod(other)) continue;
+            const other_signature = other.kind.function_definition.signature;
+            if (other_signature.trait != null or other_signature.progress != .done) continue;
+            if (!std.mem.eql(u8, other_signature.name, signature.name)) continue;
+            const other_type = ast.extractType(other_signature.receiver.?);
+            if (!std.meta.eql(other_type, receiver_type)) continue;
+            const later = module.declarations[@max(index, other_index)];
+            return self.fail(later.location, error.DuplicateFunction);
         }
         for (receiver_type.@"struct".fields) |field| {
             if (std.mem.eql(u8, field.name, signature.name)) {
                 return self.fail(declaration.location, error.MethodIsField);
             }
         }
-        try self.resolveFunctionTypes(signature);
+    }
+
+    fn resolveFunctionBody(self: *NameResolver, module_index: usize, index: usize) ResolveError!void {
+        try self.resolveFunctionSignature(module_index, index);
+        const module = self.loader.modules.items[module_index];
+        const declaration = ast.findDeclaration(module, index);
+        const definition = &declaration.kind.function_definition;
+        switch (definition.body_progress) {
+            .done => return,
+            .running => return self.failIn(module_index, declaration.location, error.DependencyLoop),
+            .pending => {},
+        }
+        if (ast.isGeneric(definition.signature)) {
+            definition.body_progress = .done;
+            return;
+        }
+        definition.body_progress = .running;
+        const caller_module_index = self.module_index;
+        const caller_self_type = self.self_type;
+        const caller_trait = self.trait;
+        const caller_bindings = self.bindings;
+        defer self.module_index = caller_module_index;
+        defer self.self_type = caller_self_type;
+        defer self.trait = caller_trait;
+        defer self.bindings = caller_bindings;
+        self.module_index = module_index;
+        self.self_type = null;
+        self.trait = definition.default_of;
+        self.bindings = definition.bindings;
+        const caller_owner_name = self.owner_name;
+        defer self.owner_name = caller_owner_name;
+        self.owner_name = self.findOwnerName(definition.*);
+        if (definition.signature.receiver) |receiver| self.self_type = ast.extractType(receiver);
+        if (definition.default_of) |trait| self.module_index = trait.module;
         try self.resolveNamesInFunction(definition.*);
+        definition.body_progress = .done;
+    }
+
+    fn resolveExternalSignature(self: *NameResolver, module_index: usize, index: usize) ResolveError!void {
+        const signature = &self.loader.modules.items[module_index].declarations[index].kind.function_declaration;
+        if (signature.progress != .pending) return;
+        signature.progress = .running;
+        const caller_module_index = self.module_index;
+        const caller_bindings = self.bindings;
+        self.module_index = module_index;
+        self.bindings = &.{};
+        defer self.module_index = caller_module_index;
+        defer self.bindings = caller_bindings;
+        try self.resolveFunctionTypes(signature);
+        signature.progress = .done;
+    }
+
+    fn resolveAllSignatures(self: *NameResolver) ResolveError!void {
+        var module_index: usize = 0;
+        while (module_index < self.loader.modules.items.len) : (module_index += 1) {
+            const module = self.loader.modules.items[module_index];
+            for (module.declarations, 0..) |declaration, index| {
+                switch (declaration.kind) {
+                    .function_definition => |function| {
+                        if (function.signature.progress == .pending) {
+                            try self.resolveFunctionSignature(module_index, index);
+                        }
+                    },
+                    .function_declaration => try self.resolveExternalSignature(module_index, index),
+                    .constant_declaration, .struct_definition, .trait_definition, .implementation, .import => {},
+                }
+            }
+        }
+    }
+
+    fn resolveForChecker(context: *anyopaque, function: ast.Resolution.Function) AnalyzeError!void {
+        const self: *NameResolver = @ptrCast(@alignCast(context));
+        const module = self.loader.modules.items[function.module];
+        const definition = ast.findDeclaration(module, function.declaration).kind.function_definition;
+        if (definition.body_progress == .done) return;
+        const caller_module_index = self.module_index;
+        defer self.module_index = caller_module_index;
+        const pending_start = self.pending.items.len;
+        try self.resolveFunctionBody(function.module, function.declaration);
+        try self.resolveAllSignatures();
+        for (self.pending.items[pending_start..]) |pending| try self.resolvePendingMethod(pending);
+        self.pending.shrinkRetainingCapacity(pending_start);
+    }
+
+    fn resolveParameterTypeForChecker(
+        context: *anyopaque,
+        template: ast.Resolution.Function,
+        position: usize,
+        arguments: []const Bound,
+    ) AnalyzeError!types.Type {
+        const self: *NameResolver = @ptrCast(@alignCast(context));
+        const allocator = self.arena.allocator();
+        const module = self.loader.modules.items[template.module];
+        const signature = ast.findDeclaration(module, template.declaration).kind.function_definition.signature;
+        var bindings: std.ArrayList(ast.Binding) = .empty;
+        var argument_index: usize = 0;
+        for (signature.parameters[0..position]) |parameter| {
+            if (parameter.kind == .run_time) continue;
+            const argument = arguments[argument_index];
+            argument_index += 1;
+            if (parameter.kind != .type) continue;
+            try bindings.append(allocator, .{ .name = parameter.name, .target = .{ .type = argument.value.type } });
+        }
+        const caller_module_index = self.module_index;
+        const caller_self_type = self.self_type;
+        const caller_trait = self.trait;
+        const caller_bindings = self.bindings;
+        defer self.module_index = caller_module_index;
+        defer self.self_type = caller_self_type;
+        defer self.trait = caller_trait;
+        defer self.bindings = caller_bindings;
+        self.module_index = template.module;
+        self.self_type = if (signature.receiver) |receiver| ast.extractType(receiver) else null;
+        self.trait = null;
+        self.bindings = bindings.items;
+        var written = try ast.cloneExpression(allocator, signature.parameters[position].type);
+        try self.resolveNamesInExpression(.{}, &written);
+        return self.expectRuntimeType(&written);
+    }
+
+    fn instantiateForChecker(
+        context: *anyopaque,
+        template: ast.Resolution.Function,
+        arguments: []const Bound,
+        number: usize,
+    ) AnalyzeError!ast.Resolution.Function {
+        const self: *NameResolver = @ptrCast(@alignCast(context));
+        const allocator = self.arena.allocator();
+        const module = &self.loader.modules.items[template.module];
+        const declaration = ast.findDeclaration(module.*, template.declaration).*;
+        var instance = try ast.cloneFunctionDefinition(allocator, declaration.kind.function_definition);
+        const name = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ instance.signature.name, number });
+        var parameters: std.ArrayList(ast.TypedName) = .empty;
+        var bindings: std.ArrayList(ast.Binding) = .empty;
+        var argument_index: usize = 0;
+        for (instance.signature.parameters) |parameter| {
+            if (parameter.kind == .run_time) {
+                try parameters.append(allocator, parameter);
+                continue;
+            }
+            const argument = arguments[argument_index];
+            argument_index += 1;
+            const target: ast.Binding.Target = switch (parameter.kind) {
+                .type => .{ .type = argument.value.type },
+                .compile_time => .{ .constant = try addBoundConstant(allocator, module, template.module, name, parameter, argument) },
+                .run_time => unreachable,
+            };
+            try bindings.append(allocator, .{ .name = parameter.name, .target = target });
+        }
+        instance.signature.name = name;
+        instance.signature.parameters = parameters.items;
+        instance.template = template;
+        instance.bindings = bindings.items;
+        const index = module.declarations.len + module.instances.items.len;
+        const created = try allocator.create(ast.Declaration);
+        created.* = .{ .kind = .{ .function_definition = instance }, .location = declaration.location };
+        try module.instances.append(allocator, created);
+        return .{ .module = template.module, .declaration = index };
+    }
+
+    fn buildResolver(self: *NameResolver) Resolver {
+        return .{
+            .context = self,
+            .resolve = resolveForChecker,
+            .resolveParameterType = resolveParameterTypeForChecker,
+            .instantiate = instantiateForChecker,
+            .beginStruct = beginStructForChecker,
+            .finishStruct = finishStructForChecker,
+        };
+    }
+
+    fn beginStructForChecker(context: *anyopaque, struct_type: *const ast.StructType) AnalyzeError!types.Type {
+        const self: *NameResolver = @ptrCast(@alignCast(context));
+        const allocator = self.arena.allocator();
+        const number = for (self.structs.items) |*created| {
+            if (created.module != struct_type.module or !std.mem.eql(u8, created.prefix, struct_type.prefix)) continue;
+            created.count += 1;
+            break created.count;
+        } else number: {
+            try self.structs.append(allocator, .{ .module = struct_type.module, .prefix = struct_type.prefix });
+            break :number 1;
+        };
+        const name = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ struct_type.prefix, number });
+        const fields = try reserveFields(allocator, struct_type.fields);
+        return .{ .@"struct" = .{ .module = struct_type.module, .name = name, .fields = fields } };
+    }
+
+    fn finishStructForChecker(
+        context: *anyopaque,
+        struct_type: *const ast.StructType,
+        value_type: types.Type,
+        location: token.Location,
+    ) AnalyzeError!void {
+        const self: *NameResolver = @ptrCast(@alignCast(context));
+        const allocator = self.arena.allocator();
+        var bindings: std.ArrayList(ast.Binding) = .empty;
+        try bindings.appendSlice(allocator, struct_type.bindings);
+        try bindings.append(allocator, .{ .name = "Self", .target = .{ .type = value_type } });
+        const caller_module_index = self.module_index;
+        const caller_self_type = self.self_type;
+        const caller_trait = self.trait;
+        const caller_bindings = self.bindings;
+        defer self.module_index = caller_module_index;
+        defer self.self_type = caller_self_type;
+        defer self.trait = caller_trait;
+        defer self.bindings = caller_bindings;
+        self.module_index = struct_type.module;
+        self.self_type = value_type;
+        self.trait = null;
+        self.bindings = bindings.items;
+        const fields = try allocator.alloc(ast.Field, struct_type.fields.len);
+        for (struct_type.fields, fields) |field, *cloned| cloned.* = try ast.cloneField(allocator, field);
+        try self.resolveFields(fields, @constCast(value_type.@"struct".fields));
+        try self.expectNotContained(value_type.@"struct", location);
+        try self.types.add(allocator, value_type);
+        try self.addStructFunctions(struct_type, bindings.items);
+    }
+
+    fn addStructFunctions(
+        self: *NameResolver,
+        struct_type: *const ast.StructType,
+        bindings: []const ast.Binding,
+    ) ResolveError!void {
+        const allocator = self.arena.allocator();
+        const module = &self.loader.modules.items[struct_type.module];
+        for (struct_type.functions, 0..) |declaration, position| {
+            const signature = declaration.kind.function_definition.signature;
+            for (struct_type.functions[0..position]) |earlier| {
+                const earlier_name = earlier.kind.function_definition.signature.name;
+                if (std.mem.eql(u8, earlier_name, signature.name)) return self.fail(declaration.location, error.DuplicateFunction);
+            }
+            if (findFieldDeclaration(struct_type.fields, signature.name) != null) {
+                return self.fail(declaration.location, error.MethodIsField);
+            }
+            var function = try ast.cloneFunctionDefinition(allocator, declaration.kind.function_definition);
+            function.bindings = bindings;
+            const index = module.declarations.len + module.instances.items.len;
+            const created = try allocator.create(ast.Declaration);
+            created.* = .{ .kind = .{ .function_definition = function }, .location = declaration.location };
+            try module.instances.append(allocator, created);
+            try self.resolveFunctionSignature(struct_type.module, index);
+            try self.type_checker.?.created.append(allocator, .{ .module = struct_type.module, .declaration = index });
+        }
+    }
+
+    fn prepareChecker(self: *NameResolver) ResolveError!*TypeChecker {
+        const type_checker = self.type_checker.?;
+        try self.resolveAllImplementationTypes();
+        try self.resolveAllSignatures();
+        type_checker.resolver = self.buildResolver();
+        type_checker.failure = null;
+        return type_checker;
     }
 
     fn resolvePendingMethod(self: *NameResolver, pending: PendingMethod) NameError!void {
@@ -330,7 +668,7 @@ pub const NameResolver = struct {
             try self.resolveTypedName(parameter.name, parameter.location, &parameter.type);
         }
         try self.resolveNamesInExpression(.{}, &signature.return_type);
-        _ = try self.expectRuntimeType(signature.return_type);
+        _ = try self.expectRuntimeType(&signature.return_type);
     }
 
     fn resolveTypedName(
@@ -342,35 +680,64 @@ pub const NameResolver = struct {
         const module = self.loader.modules.items[self.module_index];
         if (isReservedName(module.path, name)) return self.fail(location, error.ReservedName);
         try self.resolveNamesInExpression(.{}, written_type);
-        _ = try self.expectRuntimeType(written_type.*);
+        _ = try self.expectRuntimeType(written_type);
     }
 
-    fn expectRuntimeType(self: *NameResolver, expression: ast.Expression) NameError!types.Type {
+    fn expectRuntimeType(self: *NameResolver, expression: *ast.Expression) ResolveError!types.Type {
         const value_type = try self.expectType(expression);
         if (!isRuntimeType(value_type)) return self.fail(expression.location, error.FunctionWithoutPointer);
         return value_type;
     }
 
-    fn expectType(self: *NameResolver, expression: ast.Expression) NameError!types.Type {
-        const written_resolution = switch (expression.kind) {
-            inline .identifier, .path_expression => |name| name.resolution,
+    fn expectType(self: *NameResolver, expression: *ast.Expression) ResolveError!types.Type {
+        if (expression.denoted) |denoted| return denoted;
+        switch (expression.kind) {
+            inline .identifier, .path_expression => |name| {
+                const resolution = name.resolution orelse return self.fail(expression.location, error.TypeMismatch);
+                return switch (resolution) {
+                    .type => |value_type| value_type,
+                    .constant, .local => self.evaluateType(expression),
+                    .parameter, .function, .element, .trait_function, .trait_method => {
+                        return self.fail(expression.location, error.TypeMismatch);
+                    },
+                };
+            },
             .array_type => |array_type| return array_type.value.?,
             .slice_type => |slice_type| return slice_type.value.?,
             .pointer_type => |pointer_type| return pointer_type.value.?,
             .optional_type => |optional_type| return optional_type.value.?,
             .tuple_type => |tuple_type| return tuple_type.value.?,
             .function_type => |function_type| return function_type.value.?,
-            else => return self.fail(expression.location, error.TypeMismatch),
-        };
-        const resolution = written_resolution orelse {
-            return self.fail(expression.location, error.TypeMismatch);
-        };
-        return switch (resolution) {
-            .type => |value_type| value_type,
-            .parameter, .function, .constant, .local, .element, .trait_function, .trait_method => {
-                return self.fail(expression.location, error.TypeMismatch);
+            .call, .method_call, .index, .field_access, .unwrap, .dereference, .struct_type => {
+                return self.evaluateType(expression);
             },
+            .integer_literal,
+            .float_literal,
+            .boolean_literal,
+            .string_literal,
+            .undefined,
+            .null,
+            .negation,
+            .binary,
+            .unary,
+            .address_of,
+            .composite_literal,
+            .slice,
+            => return self.fail(expression.location, error.TypeMismatch),
+        }
+    }
+
+    fn evaluateType(self: *NameResolver, expression: *ast.Expression) ResolveError!types.Type {
+        if (self.type_checker == null) return self.fail(expression.location, error.TypeMismatch);
+        const type_checker = try self.prepareChecker();
+        const modules = self.loader.modules.items;
+        if (!type_checker.isKnown(modules, expression.*)) return self.fail(expression.location, error.TypeMismatch);
+        const value = type_checker.evaluateKnown(modules, self.module_index, expression, .type) catch |type_error| {
+            if (type_checker.failure) |failure| self.failure = failure;
+            return type_error;
         };
+        expression.denoted = value.type;
+        return value.type;
     }
 
     fn resolveNamesInFunction(
@@ -596,6 +963,14 @@ pub const NameResolver = struct {
             return target;
         }
         try self.resolveNamesInExpression(scope, value);
+        if (self.type_checker == null) return .{ .local = statement };
+        const modules = self.loader.modules.items;
+        if (!self.type_checker.?.isKnown(modules, value.*)) return .{ .local = statement };
+        const type_checker = try self.prepareChecker();
+        type_checker.checkKnownConstant(modules, self.module_index, constant) catch |type_error| {
+            if (type_checker.failure) |failure| self.failure = failure;
+            return type_error;
+        };
         return .{ .local = statement };
     }
 
@@ -610,17 +985,17 @@ pub const NameResolver = struct {
             if (value.kind == .composite_literal) {
                 const length = value.kind.composite_literal.elements.len;
                 try self.resolveArrayType(scope, written_type.location, array_type, length);
-                _ = try self.expectRuntimeType(written_type.*);
+                _ = try self.expectRuntimeType(written_type);
                 return;
             }
             if (array_type.length == null) {
                 try self.resolveNamesInExpression(.{ .locals = scope.locals }, array_type.element);
-                _ = try self.expectRuntimeType(array_type.element.*);
+                _ = try self.expectRuntimeType(array_type.element);
                 return;
             }
         }
         try self.resolveNamesInExpression(.{ .locals = scope.locals }, written_type);
-        _ = try self.expectRuntimeType(written_type.*);
+        _ = try self.expectRuntimeType(written_type);
     }
 
     fn findAlias(self: *NameResolver, scope: Scope, value: *ast.Expression) ResolveError!?Target {
@@ -704,6 +1079,7 @@ pub const NameResolver = struct {
             .optional_type,
             .tuple_type,
             .function_type,
+            .struct_type,
             .unwrap,
             => unreachable,
         }
@@ -831,6 +1207,11 @@ pub const NameResolver = struct {
             .function_type => |*function_type| try self.resolveFunctionType(scope, function_type),
             .field_access => |access| try self.resolveNamesInExpression(scope, access.value),
             .dereference, .unwrap => |operand| try self.resolveNamesInExpression(scope, operand),
+            .struct_type => |struct_type| {
+                struct_type.module = self.module_index;
+                struct_type.bindings = self.bindings;
+                struct_type.prefix = self.owner_name;
+            },
         }
     }
 
@@ -851,17 +1232,30 @@ pub const NameResolver = struct {
                 const resolution = name.resolution orelse {
                     return self.fail(location, error.NotLiteralType);
                 };
-                if (resolution != .type) return self.fail(location, error.NotLiteralType);
-                switch (resolution.type) {
-                    .array, .tuple, .@"struct" => {},
-                    .number, .boolean, .void, .type, .slice, .pointer, .optional, .function, .implementer => {
+                switch (resolution) {
+                    .type, .constant, .local => {},
+                    .parameter, .function, .element, .trait_function, .trait_method => {
                         return self.fail(location, error.NotLiteralType);
                     },
                 }
+                try self.expectLiteralType(literal_type);
+            },
+            .call => {
+                try self.resolveNamesInExpression(scope, literal_type);
+                try self.expectLiteralType(literal_type);
             },
             else => unreachable,
         }
-        _ = try self.expectRuntimeType(literal_type.*);
+        _ = try self.expectRuntimeType(literal_type);
+    }
+
+    fn expectLiteralType(self: *NameResolver, literal_type: *ast.Expression) ResolveError!void {
+        switch (try self.expectType(literal_type)) {
+            .array, .tuple, .@"struct" => {},
+            .number, .boolean, .void, .type, .slice, .pointer, .optional, .function, .implementer => {
+                return self.fail(literal_type.location, error.NotLiteralType);
+            },
+        }
     }
 
     fn resolveArrayType(
@@ -872,7 +1266,7 @@ pub const NameResolver = struct {
         literal_length: ?u64,
     ) ResolveError!void {
         try self.resolveNamesInExpression(.{ .locals = scope.locals }, array_type.element);
-        const element = try self.expectType(array_type.element.*);
+        const element = try self.expectType(array_type.element);
         var known_length = literal_length;
         if (array_type.length) |length| known_length = try self.expectLength(scope, length);
         const length = known_length orelse return self.fail(location, error.UnknownLength);
@@ -885,69 +1279,21 @@ pub const NameResolver = struct {
         scope: Scope,
         expression: *ast.Expression,
     ) ResolveError!u64 {
-        const literal = switch (expression.kind) {
-            .integer_literal => |literal| literal,
-            .identifier, .path_expression => try self.findLengthLiteral(scope, expression),
-            else => return self.fail(expression.location, error.InvalidLength),
-        };
-        if (literal.suffix) |suffix| {
-            if (!std.mem.eql(u8, suffix, "usize")) {
-                return self.fail(expression.location, error.InvalidLength);
-            }
+        if (expression.kind == .integer_literal and expression.kind.integer_literal.suffix == null) {
+            if (std.fmt.parseInt(u64, expression.kind.integer_literal.text, 0)) |length| {
+                return length;
+            } else |_| {}
         }
-        return std.fmt.parseInt(u64, literal.text, 0) catch {
-            return self.fail(expression.location, error.InvalidLength);
-        };
-    }
-
-    fn findLengthLiteral(
-        self: *NameResolver,
-        scope: Scope,
-        expression: *ast.Expression,
-    ) ResolveError!token.NumberLiteral {
         try self.resolveNamesInExpression(.{ .locals = scope.locals }, expression);
-        const written_resolution = switch (expression.kind) {
-            inline .identifier, .path_expression => |name| name.resolution,
-            else => unreachable,
+        const type_checker = try self.prepareChecker();
+        const modules = self.loader.modules.items;
+        if (!type_checker.isKnown(modules, expression.*)) return self.fail(expression.location, error.CannotEvaluate);
+        const usize_type: types.Type = .{ .number = .usize };
+        const value = type_checker.evaluateKnown(modules, self.module_index, expression, usize_type) catch |type_error| {
+            if (type_checker.failure) |failure| self.failure = failure;
+            return type_error;
         };
-        const resolution = written_resolution orelse {
-            return self.fail(expression.location, error.InvalidLength);
-        };
-        const constant = switch (resolution) {
-            .constant => |constant| constant: {
-                const module = self.loader.modules.items[constant.module];
-                break :constant module.declarations[constant.declaration].kind.constant_declaration;
-            },
-            .local => |statement| switch (statement.kind) {
-                .constant_declaration => |constant| constant,
-                .noop,
-                .@"return",
-                .discard,
-                .call,
-                .tuple_declaration,
-                .variable_declaration,
-                .assignment,
-                .@"if",
-                .@"while",
-                .@"for",
-                .@"break",
-                .@"continue",
-                => return self.fail(expression.location, error.InvalidLength),
-            },
-            .parameter, .function, .type, .element, .trait_function, .trait_method => {
-                return self.fail(expression.location, error.InvalidLength);
-            },
-        };
-        if (constant.type) |written| {
-            const usize_type: types.Type = .{ .number = .usize };
-            if (written.kind == .array_type or !std.meta.eql(ast.extractType(written), usize_type)) {
-                return self.fail(expression.location, error.InvalidLength);
-            }
-        }
-        if (constant.value.kind != .integer_literal) {
-            return self.fail(expression.location, error.InvalidLength);
-        }
-        return constant.value.kind.integer_literal;
+        return @intCast(value.integer);
     }
 
     fn resolveSliceType(
@@ -956,7 +1302,7 @@ pub const NameResolver = struct {
         slice_type: *ast.SliceType,
     ) ResolveError!void {
         try self.resolveNamesInExpression(.{ .locals = scope.locals }, slice_type.element);
-        const element = try self.expectType(slice_type.element.*);
+        const element = try self.expectType(slice_type.element);
         const allocator = self.arena.allocator();
         const slice = try self.types.addSlice(allocator, element, slice_type.constant);
         slice_type.value = .{ .slice = slice };
@@ -976,7 +1322,7 @@ pub const NameResolver = struct {
         pointer_type: *ast.PointerType,
     ) ResolveError!void {
         try self.resolveNamesInExpression(.{ .locals = scope.locals }, pointer_type.target);
-        const target = try self.expectType(pointer_type.target.*);
+        const target = try self.expectType(pointer_type.target);
         if (target == .function) {
             if (pointer_type.many) return self.fail(location, error.ManyFunctionPointer);
             if (pointer_type.constant) return self.fail(location, error.ConstantFunctionPointer);
@@ -995,7 +1341,7 @@ pub const NameResolver = struct {
         optional_type: *ast.OptionalType,
     ) ResolveError!void {
         try self.resolveNamesInExpression(.{ .locals = scope.locals }, optional_type.child);
-        const child = try self.expectType(optional_type.child.*);
+        const child = try self.expectType(optional_type.child);
         const optional = try self.types.addOptional(self.arena.allocator(), child);
         optional_type.value = .{ .optional = optional };
     }
@@ -1009,7 +1355,7 @@ pub const NameResolver = struct {
         const elements = try allocator.alloc(types.Type, tuple_type.elements.len);
         for (tuple_type.elements, elements) |*written, *element| {
             try self.resolveNamesInExpression(.{ .locals = scope.locals }, written);
-            element.* = try self.expectType(written.*);
+            element.* = try self.expectType(written);
         }
         const tuple = try self.types.addTuple(allocator, elements);
         tuple_type.value = .{ .tuple = tuple };
@@ -1025,10 +1371,10 @@ pub const NameResolver = struct {
         const parameters = try allocator.alloc(types.Type, function_type.parameters.len);
         for (function_type.parameters, parameters) |*written, *parameter| {
             try self.resolveNamesInExpression(type_scope, written);
-            parameter.* = try self.expectType(written.*);
+            parameter.* = try self.expectType(written);
         }
         try self.resolveNamesInExpression(type_scope, function_type.return_type);
-        const return_type = try self.expectType(function_type.return_type.*);
+        const return_type = try self.expectType(function_type.return_type);
         const function = try self.types.addFunction(allocator, parameters, return_type);
         function_type.value = .{ .function = function };
     }
@@ -1086,7 +1432,7 @@ pub const NameResolver = struct {
             .element => |element| .{ .element = element },
             .function => |function| {
                 const module = self.loader.modules.items[function.module];
-                const declaration = module.declarations[function.declaration];
+                const declaration = ast.findDeclaration(module, function.declaration).*;
                 if (ast.isMain(ast.extractFunctionSignature(declaration))) {
                     return self.fail(location, error.MainUsedAsValue);
                 }
@@ -1122,6 +1468,12 @@ pub const NameResolver = struct {
                 const path = path_expression.path;
                 const target = try self.resolvePath(scope, location, path);
                 break :target .{ target, &path_expression.resolution };
+            },
+            .member => |*member| target: {
+                try self.resolveNamesInExpression(scope, member.owner);
+                const receiver = try self.expectType(member.owner);
+                const target: Target = .{ .method = .{ .receiver = receiver, .name = member.name } };
+                break :target .{ target, &member.resolution };
             },
         };
         if (target == .method) {
@@ -1180,6 +1532,16 @@ pub const NameResolver = struct {
         location: token.Location,
         name: []const u8,
     ) ResolveError!Target {
+        var binding_index = self.bindings.len;
+        while (binding_index > 0) {
+            binding_index -= 1;
+            const binding = self.bindings[binding_index];
+            if (!std.mem.eql(u8, binding.name, name)) continue;
+            return switch (binding.target) {
+                .type => |value_type| .{ .type = value_type },
+                .constant => |constant| .{ .constant = constant },
+            };
+        }
         if (std.mem.eql(u8, name, "Self")) {
             const self_type = self.self_type orelse return self.fail(location, error.UnknownName);
             return .{ .type = self_type };
@@ -1360,12 +1722,15 @@ pub const NameResolver = struct {
         const caller_module_index = self.module_index;
         const caller_self_type = self.self_type;
         const caller_trait = self.trait;
+        const caller_bindings = self.bindings;
         self.module_index = module_index;
         self.self_type = null;
         self.trait = null;
+        self.bindings = &.{};
         defer self.module_index = caller_module_index;
         defer self.self_type = caller_self_type;
         defer self.trait = caller_trait;
+        defer self.bindings = caller_bindings;
         const path = import.path;
         var namespace = (try self.loadRoot(location, path[0])) orelse {
             return self.fail(location, error.ModuleNotFound);
@@ -1385,12 +1750,18 @@ pub const NameResolver = struct {
         const caller_module_index = self.module_index;
         const caller_self_type = self.self_type;
         const caller_trait = self.trait;
+        const caller_bindings = self.bindings;
         self.module_index = module_index;
         self.self_type = null;
         self.trait = null;
+        self.bindings = &.{};
         defer self.module_index = caller_module_index;
         defer self.self_type = caller_self_type;
         defer self.trait = caller_trait;
+        defer self.bindings = caller_bindings;
+        const caller_owner_name = self.owner_name;
+        defer self.owner_name = caller_owner_name;
+        self.owner_name = constant.name;
         self.constant_depth += 1;
         defer self.constant_depth -= 1;
         if (self.constant_depth > countConstants(self.loader.modules.items)) {
@@ -1401,7 +1772,6 @@ pub const NameResolver = struct {
         if (constant.type) |*written| {
             try self.resolveWrittenType(.{}, written, value.*);
             try self.resolveNamesInExpression(.{}, value);
-            try self.expectEvaluable(value.*, findValueForm(constant.*));
             return own;
         }
         return switch (value.kind) {
@@ -1419,16 +1789,25 @@ pub const NameResolver = struct {
                 try self.resolveNamesInExpression(.{}, value);
                 return .{ .type = ast.extractType(value.*) };
             },
-            .call, .method_call, .negation, .binary, .unary, .address_of, .composite_literal, .slice => {
+            .call,
+            .method_call,
+            .negation,
+            .binary,
+            .unary,
+            .address_of,
+            .composite_literal,
+            .slice,
+            .field_access,
+            .index,
+            .dereference,
+            .unwrap,
+            .struct_type,
+            => {
                 if (!constant.resolved) {
                     try self.resolveNamesInExpression(.{}, value);
-                    try self.expectEvaluable(value.*, findValueForm(constant.*));
                     constant.resolved = true;
                 }
                 return own;
-            },
-            .field_access, .index, .dereference, .unwrap => {
-                return self.fail(value.location, error.CannotEvaluate);
             },
         };
     }
@@ -1442,57 +1821,6 @@ pub const NameResolver = struct {
         return target;
     }
 
-    fn expectEvaluable(
-        self: *NameResolver,
-        expression: ast.Expression,
-        form: ValueForm,
-    ) NameError!void {
-        switch (expression.kind) {
-            .integer_literal,
-            .float_literal,
-            .boolean_literal,
-            .string_literal,
-            .undefined,
-            .null,
-            => {},
-            inline .identifier, .path_expression => |name| {
-                if (form == .inlined) return;
-                if (refersToOperator(self.loader.modules.items, name.resolution)) {
-                    return self.fail(expression.location, error.CannotEvaluate);
-                }
-            },
-            .negation => |operand| try self.expectEvaluable(operand.*, form),
-            .binary => |binary| {
-                if (form == .initializer or binary.operator == .@"orelse" or ast.isNullComparison(binary)) {
-                    return self.fail(expression.location, error.CannotEvaluate);
-                }
-                try self.expectEvaluable(binary.left.*, form);
-                try self.expectEvaluable(binary.right.*, form);
-            },
-            .unary => |unary| {
-                if (form == .initializer) {
-                    return self.fail(expression.location, error.CannotEvaluate);
-                }
-                try self.expectEvaluable(unary.operand.*, form);
-            },
-            .composite_literal => |literal| {
-                for (literal.elements) |element| try self.expectEvaluable(element.value, form);
-            },
-            .slice => |slice| {
-                try self.expectEvaluable(slice.value.*, form);
-                if (slice.start) |start| try self.expectEvaluable(start.*, form);
-                if (slice.end) |end| try self.expectEvaluable(end.*, form);
-            },
-            .address_of => |operand| {
-                if (!isFunctionName(operand.*)) return self.fail(expression.location, error.CannotEvaluate);
-            },
-            .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type => {},
-            .call, .method_call, .field_access, .index, .dereference, .unwrap => {
-                return self.fail(expression.location, error.CannotEvaluate);
-            },
-        }
-    }
-
     fn resolveStruct(
         self: *NameResolver,
         module_index: usize,
@@ -1504,50 +1832,54 @@ pub const NameResolver = struct {
         const caller_module_index = self.module_index;
         const caller_self_type = self.self_type;
         const caller_trait = self.trait;
+        const caller_bindings = self.bindings;
         self.module_index = module_index;
         self.self_type = null;
         self.trait = null;
+        self.bindings = &.{};
         defer self.module_index = caller_module_index;
         defer self.self_type = caller_self_type;
         defer self.trait = caller_trait;
-        if (definition.resolving) return self.fail(declaration.location, error.StructContainsItself);
-        definition.resolving = true;
-        const struct_type: types.Struct = .{
-            .module = module_index,
-            .name = definition.name,
-            .fields = try self.resolveFields(definition.fields),
-        };
+        defer self.bindings = caller_bindings;
+        const resolved = try reserveFields(self.arena.allocator(), definition.fields);
+        const struct_type: types.Struct = .{ .module = module_index, .name = definition.name, .fields = resolved };
         const value_type: types.Type = .{ .@"struct" = struct_type };
-        try self.types.add(self.arena.allocator(), value_type);
         definition.value = value_type;
+        self.self_type = value_type;
+        try self.resolveFields(definition.fields, resolved);
+        try self.expectNotContained(struct_type, declaration.location);
+        try self.types.add(self.arena.allocator(), value_type);
         return value_type;
+    }
+
+    fn expectNotContained(self: *NameResolver, struct_type: types.Struct, location: token.Location) NameError!void {
+        for (struct_type.fields) |field| {
+            if (types.containsStruct(field.type, struct_type)) return self.fail(location, error.StructContainsItself);
+        }
     }
 
     fn resolveFields(
         self: *NameResolver,
         fields: []ast.Field,
-    ) ResolveError![]const types.Field {
+        resolved: []types.Field,
+    ) ResolveError!void {
         for (fields, 0..) |*field, index| {
             const discarded = ast.isDiscardedName(field.name);
             if (!discarded and findFieldDeclaration(fields, field.name) != index) {
                 return self.fail(field.location, error.DuplicateField);
             }
             try self.resolveTypedName(field.name, field.location, &field.type);
-            if (field.default) |*default| {
-                try self.resolveNamesInExpression(.{}, default);
-                try self.expectEvaluable(default.*, .initializer);
-            }
+            if (field.default) |*default| try self.resolveNamesInExpression(.{}, default);
         }
-        const resolved = try self.arena.allocator().alloc(types.Field, fields.len);
         for (fields, resolved) |*field, *resolved_field| {
             resolved_field.* = .{
                 .name = field.name,
                 .type = ast.extractType(field.type),
                 .default = if (field.default) |*default| default else null,
+                .default_value = if (field.default != null) &field.default_value else null,
                 .location = field.location,
             };
         }
-        return resolved;
     }
 
     fn loadRoot(
@@ -1595,6 +1927,11 @@ pub const NameResolver = struct {
         return load_error;
     }
 
+    fn failIn(self: *NameResolver, module_index: usize, location: token.Location, name_error: NameError) NameError {
+        self.module_index = module_index;
+        return self.fail(location, name_error);
+    }
+
     fn fail(self: *NameResolver, location: token.Location, name_error: NameError) NameError {
         self.failure = .{
             .module = self.loader.modules.items[self.module_index].path,
@@ -1605,7 +1942,7 @@ pub const NameResolver = struct {
     }
 };
 
-pub const ResolveError = NameError || LoadError;
+pub const ResolveError = AnalyzeError;
 
 pub const NameError = error{
     DuplicateFunction,
@@ -1635,9 +1972,9 @@ pub const NameError = error{
     TraitUsedAsValue,
     NotInTrait,
     MismatchedTraitFunction,
+    GenericTraitFunction,
     MissingTraitFunction,
     DuplicateImplementation,
-    InvalidLength,
     NotLiteralType,
     UnknownLength,
     NeverModified,
@@ -1657,11 +1994,13 @@ pub const NameError = error{
     BreakOutsideLoop,
     ContinueOutsideLoop,
     UnusedLoopName,
+    DependencyLoop,
 };
 
-const ValueForm = enum {
-    inlined,
-    initializer,
+const StructCount = struct {
+    module: usize,
+    prefix: []const u8,
+    count: usize = 1,
 };
 
 const PendingMethod = struct {
@@ -1744,9 +2083,9 @@ fn describeError(name_error: NameError) []const u8 {
         error.TraitUsedAsValue => "a trait cannot be used here",
         error.NotInTrait => "function is not in the trait",
         error.MismatchedTraitFunction => "function does not match the trait",
+        error.GenericTraitFunction => "trait functions cannot take compile-time parameters",
         error.MissingTraitFunction => "implementation is missing a function of the trait",
         error.DuplicateImplementation => "trait is already implemented for this type",
-        error.InvalidLength => "array length must be a usize integer literal or a constant bound to one",
         error.NotLiteralType => "braces need an array, a tuple or a struct type",
         error.UnknownLength => "array length cannot be left out here",
         error.NeverModified => "variable is never modified, declare it with const",
@@ -1766,84 +2105,7 @@ fn describeError(name_error: NameError) []const u8 {
         error.BreakOutsideLoop => "break outside a loop",
         error.ContinueOutsideLoop => "continue outside a loop",
         error.UnusedLoopName => "loop name is unused, use _",
-    };
-}
-
-fn findValueForm(constant: ast.ConstantDeclaration) ValueForm {
-    if (constant.type) |written| {
-        if (written.kind == .array_type) return .initializer;
-        return findTypeForm(ast.extractType(written));
-    }
-    return switch (constant.value.kind) {
-        .composite_literal => |literal| {
-            const written = literal.type orelse return .inlined;
-            return findTypeForm(ast.extractType(written.*));
-        },
-        else => .inlined,
-    };
-}
-
-fn findTypeForm(value_type: types.Type) ValueForm {
-    return if (value_type == .@"struct" or value_type == .array) .initializer else .inlined;
-}
-
-fn refersToOperator(modules: []const ast.Module, resolution: ?ast.Resolution) bool {
-    const target = resolution orelse return false;
-    if (target != .constant) return false;
-    const declaration = modules[target.constant.module].declarations[target.constant.declaration];
-    return containsOperator(modules, declaration.kind.constant_declaration.value);
-}
-
-fn containsOperator(modules: []const ast.Module, expression: ast.Expression) bool {
-    switch (expression.kind) {
-        .binary, .unary => return true,
-        inline .identifier, .path_expression => |name| {
-            return refersToOperator(modules, name.resolution);
-        },
-        .composite_literal => |literal| {
-            for (literal.elements) |element| {
-                if (containsOperator(modules, element.value)) return true;
-            }
-            return false;
-        },
-        .slice => |slice| {
-            if (slice.start) |start| {
-                if (containsOperator(modules, start.*)) return true;
-            }
-            const end = slice.end orelse return false;
-            return containsOperator(modules, end.*);
-        },
-        .integer_literal,
-        .float_literal,
-        .boolean_literal,
-        .string_literal,
-        .undefined,
-        .null,
-        .call,
-        .method_call,
-        .negation,
-        .array_type,
-        .slice_type,
-        .index,
-        .pointer_type,
-        .optional_type,
-        .tuple_type,
-        .function_type,
-        .field_access,
-        .address_of,
-        .dereference,
-        .unwrap,
-        => return false,
-    }
-}
-
-fn isFunctionName(expression: ast.Expression) bool {
-    return switch (expression.kind) {
-        inline .identifier, .path_expression => |name| {
-            const resolution = name.resolution orelse return true;
-            return resolution == .function;
-        },
-        else => false,
+        error.DependencyLoop => "value depends on itself at compile time",
     };
 }
 
@@ -1941,6 +2203,34 @@ fn findSignaturePosition(signatures: []const ast.FunctionSignature, name: []cons
         if (std.mem.eql(u8, signature.name, name)) return position;
     }
     return null;
+}
+
+fn reserveFields(allocator: std.mem.Allocator, fields: []const ast.Field) std.mem.Allocator.Error![]types.Field {
+    const reserved = try allocator.alloc(types.Field, fields.len);
+    for (fields, reserved) |field, *placeholder| {
+        placeholder.* = .{ .name = field.name, .type = .void, .location = field.location };
+    }
+    return reserved;
+}
+
+fn addBoundConstant(
+    allocator: std.mem.Allocator,
+    module: *ast.Module,
+    module_index: usize,
+    instance_name: []const u8,
+    parameter: ast.TypedName,
+    argument: Bound,
+) std.mem.Allocator.Error!ast.Resolution.Constant {
+    const known = try allocator.create(Value);
+    known.* = argument.value;
+    const name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ instance_name, parameter.name });
+    const value: ast.Expression = .{ .kind = .undefined, .type = argument.type, .location = parameter.location };
+    const constant: ast.ConstantDeclaration = .{ .name = name, .value = value, .resolved = true, .known = known };
+    const index = module.declarations.len + module.instances.items.len;
+    const declaration = try allocator.create(ast.Declaration);
+    declaration.* = .{ .kind = .{ .constant_declaration = constant }, .location = parameter.location };
+    try module.instances.append(allocator, declaration);
+    return .{ .module = module_index, .declaration = index };
 }
 
 fn findDefinition(declarations: []const ast.Declaration, name: []const u8) ?usize {
@@ -2583,7 +2873,7 @@ test "addDefaults: leaves out a default that the implementation defines" {
     try std.testing.expectEqual(0, declarations[2].kind.implementation.defaults.len);
 }
 
-test "resolveDefault: resolves a call through Self to the function of the implementation" {
+test "addDefaults: lets a length call trait methods implemented by a default and by a written function" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -2593,15 +2883,34 @@ test "resolveDefault: resolves a call through Self to the function of the implem
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn unit() -> Self\n    fn make() -> Self: return Self::unit()\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\n    fn unit() -> Self: return Square{side = 1}" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(values: [count()]i32): _ = values\nfn count() -> usize:\n    const square = Square{side = 1}\n    return square.sides() + square.corners()\ntrait Shape:\n    fn sides(_: Self) -> usize\n    fn corners(self: Self) -> usize: return self.sides()\nstruct Square:\n    side: usize\nimpl Shape for Square:\n    fn sides(_: Self) -> usize: return 4" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-    try name_resolver.resolve();
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
 
-    const default = loader.modules.items[0].declarations[5].kind.function_definition;
-    const call = default.body[0].kind.@"return".?.kind.call;
-    try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 4 } }, call.callee.path_expression.resolution.?);
+    const parameters = loader.modules.items[0].declarations[0].kind.function_definition.signature.parameters;
+    try std.testing.expectEqual(8, ast.extractType(parameters[0].type).array.length);
+}
+
+test "resolveImplementation: implements a trait for a struct that a call gives" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\nfn Box(type T) -> type:\n    return struct:\n        side: T\nimpl Shape for Box(i32):\n    fn area(self: Self) -> i32: return self.side\nconst BOX = Box(i32){side = 3}\nconst AREA = BOX.area()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .integer = 3 }, known);
 }
 
 test "resolveImplementation: resolves the trait and the type" {
@@ -2837,7 +3146,7 @@ test "expectSingleImplementations: rejects a second implementation of a trait fo
     try std.testing.expectEqual(token.Location{ .row = 7, .column = 1 }, name_resolver.failure.?.location.?);
 }
 
-test "resolveMethod: resolves the receiver and self of a method" {
+test "resolveFunctionSignature: resolves the receiver and self of a method" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -2858,7 +3167,26 @@ test "resolveMethod: resolves the receiver and self of a method" {
     try std.testing.expectEqualStrings("Card", ast.extractType(signature.parameters[0].type).@"struct".name);
 }
 
-test "resolveMethod: rejects two methods with the same name for one type" {
+test "resolveFunctionSignature: rejects a signature that depends on itself at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn size(values: [count()]usize) -> usize:\n    _ = values\n    return 1\nfn count() -> usize:\n    const values = [1]usize{1}\n    return size(values)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.DependencyLoop, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 12 }, analyzer.failure.?.location.?);
+}
+
+test "expectUniqueMethod: rejects two methods with the same name for one type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -2877,7 +3205,7 @@ test "resolveMethod: rejects two methods with the same name for one type" {
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, name_resolver.failure.?.location.?);
 }
 
-test "resolveMethod: allows methods with the same name for different types" {
+test "expectUniqueMethod: allows methods with the same name for different types" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -2895,7 +3223,7 @@ test "resolveMethod: allows methods with the same name for different types" {
     try name_resolver.resolve();
 }
 
-test "resolveMethod: allows a method and a function with the same name" {
+test "expectUniqueMethod: allows a method and a function with the same name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -2913,7 +3241,7 @@ test "resolveMethod: allows a method and a function with the same name" {
     try name_resolver.resolve();
 }
 
-test "resolveMethod: rejects a method with the name of a field" {
+test "expectUniqueMethod: rejects a method with the name of a field" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -2930,6 +3258,47 @@ test "resolveMethod: rejects a method with the name of a field" {
 
     try std.testing.expectError(error.MethodIsField, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveFunctionBody: resolves a call through Self in a default to the function of the implementation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn area(self: Self) -> i32\n    fn unit() -> Self\n    fn make() -> Self: return Self::unit()\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn area(self: Self) -> i32: return self.side\n    fn unit() -> Self: return Square{side = 1}" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const default = loader.modules.items[0].declarations[5].kind.function_definition;
+    const call = default.body[0].kind.@"return".?.kind.call;
+    try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 4 } }, call.callee.path_expression.resolution.?);
+}
+
+test "resolveFunctionBody: resolves a method that a length calls at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Box:\n    count: usize\n    fn size(self: Self) -> usize: return self.count\nfn make() -> usize:\n    const box = Box{count = 2}\n    return box.size()\nfn main():\n    const values: [make()]i32 = {1, 2}\n    _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[3].kind.function_definition.body;
+    try std.testing.expectEqual(2, ast.extractType(body[0].kind.constant_declaration.type.?).array.length);
 }
 
 test "resolvePendingMethod: resolves a function declared on a type" {
@@ -3498,6 +3867,317 @@ test "expectRuntimeType: rejects an alias of a function type without a pointer" 
 
     try std.testing.expectError(error.FunctionWithoutPointer, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 20 }, name_resolver.failure.?.location.?);
+}
+
+test "beginStructForChecker: creates a new type for each struct without a name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const One = struct:\n    value: i32\nconst Two = struct:\n    value: i32\nfn take(one: One, two: Two):\n    _ = one\n    _ = two" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const parameters = loader.modules.items[0].declarations[2].kind.function_definition.signature.parameters;
+    const one = ast.extractType(parameters[0].type).@"struct";
+    const two = ast.extractType(parameters[1].type).@"struct";
+    try std.testing.expect(!std.meta.eql(one, two));
+    try std.testing.expectEqualStrings("One_1", one.name);
+    try std.testing.expectEqualStrings("Two_1", two.name);
+}
+
+test "beginStructForChecker: gives a call with the same arguments the same type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Box(type T) -> type:\n    return struct:\n        value: T\nfn take(one: Box(i32), two: Box(i32), three: Box(u8)):\n    _ = one\n    _ = two\n    _ = three" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const parameters = loader.modules.items[0].declarations[1].kind.function_definition.signature.parameters;
+    const one = ast.extractType(parameters[0].type);
+    try std.testing.expectEqual(one, ast.extractType(parameters[1].type));
+    try std.testing.expect(!std.meta.eql(one, ast.extractType(parameters[2].type)));
+    try std.testing.expectEqualStrings("Box_1", one.@"struct".name);
+    try std.testing.expectEqualStrings("Box_2", ast.extractType(parameters[2].type).@"struct".name);
+}
+
+test "finishStructForChecker: points to the struct itself through Self" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Link(type A) -> type:\n    return struct:\n        value: A\n        next: ?*Self\nfn take(link: Link(i32)): _ = link" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const parameters = loader.modules.items[0].declarations[1].kind.function_definition.signature.parameters;
+    const node = ast.extractType(parameters[0].type).@"struct";
+    try std.testing.expectEqual(types.Type{ .number = .i32 }, node.fields[0].type);
+    try std.testing.expect(std.meta.eql(node, node.fields[1].type.optional.child.pointer.target.@"struct"));
+}
+
+test "finishStructForChecker: points to the struct itself through a call with the same arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Node(type A) -> type:\n    return struct:\n        value: A\n        next: ?*Node(A)\nfn take(node: Node(i32)): _ = node" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const parameters = loader.modules.items[0].declarations[1].kind.function_definition.signature.parameters;
+    const node = ast.extractType(parameters[0].type).@"struct";
+    try std.testing.expect(std.meta.eql(node, node.fields[1].type.optional.child.pointer.target.@"struct"));
+}
+
+test "finishStructForChecker: rejects a struct that holds itself through a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Node(type A) -> type:\n    return struct:\n        next: Node(A)\nfn take(node: Node(i32)): _ = node" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.StructContainsItself, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, analyzer.failure.?.location.?);
+}
+
+test "finishStructForChecker: rejects a struct that holds itself through Self" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Node(type A) -> type:\n    return struct:\n        next: [2]Self\nfn take(node: Node(i32)): _ = node" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.StructContainsItself, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, analyzer.failure.?.location.?);
+}
+
+test "finishStructForChecker: ends a struct whose fields keep creating new types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Nested(type A) -> type:\n    return struct:\n        next: ?*Nested([A, A])\nfn take(value: Nested(i32)): _ = value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InstanceDepth, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 17 }, analyzer.failure.?.location.?);
+}
+
+test "addStructFunctions: makes the functions of a struct without a name callable through the type and on values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Counter(type T) -> type:\n    return struct:\n        count: T = 0\n        fn new() -> Self: return {}\n        fn add(self: *Self, amount: T): self.count += amount\n        fn read(self: Self) -> T: return self.count\nfn total() -> i64:\n    var counter = Counter(i64)::new()\n    counter.add(5)\n    return counter.read()\nconst TOTAL = total()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .integer = 5 }, known);
+}
+
+test "addStructFunctions: rejects a function named like a field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Box(type T) -> type:\n    return struct:\n        value: T\n        fn value(self: Self) -> T: return self.value\nfn take(box: Box(i32)): _ = box" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MethodIsField, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 9 }, analyzer.failure.?.location.?);
+}
+
+test "evaluateType: takes a parameter type from a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Number() -> type: return i32\nfn first(value: Number()) -> i32: return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const parameters = loader.modules.items[0].declarations[1].kind.function_definition.signature.parameters;
+    try std.testing.expectEqual(types.Type{ .number = .i32 }, ast.extractType(parameters[0].type));
+}
+
+test "evaluateType: takes a type from an element of an array of types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const kinds = [2]type{i32, bool}\nfn first(value: kinds[1]) -> bool: return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const parameters = loader.modules.items[0].declarations[1].kind.function_definition.signature.parameters;
+    try std.testing.expectEqual(types.Type.boolean, ast.extractType(parameters[0].type));
+}
+
+test "evaluateType: takes a type from an element of a tuple of types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const kinds = [type, type]{i32, bool}\nfn first(value: kinds[0]) -> i32: return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const parameters = loader.modules.items[0].declarations[1].kind.function_definition.signature.parameters;
+    try std.testing.expectEqual(types.Type{ .number = .i32 }, ast.extractType(parameters[0].type));
+}
+
+test "evaluateType: builds types from a constant type that a call gives" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Number() -> type: return i32\nconst Kind = Number()\nconst LENGTH: usize = 3\nfn take(values: [LENGTH]Kind, maybe: ?Kind, pointer: *Kind, pair: [Kind, bool]):\n    _ = values\n    _ = maybe\n    _ = pointer\n    _ = pair" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const parameters = loader.modules.items[0].declarations[3].kind.function_definition.signature.parameters;
+    const array = ast.extractType(parameters[0].type).array;
+    try std.testing.expectEqual(3, array.length);
+    try std.testing.expectEqual(types.Type{ .number = .i32 }, array.element);
+    try std.testing.expectEqual(types.Type{ .number = .i32 }, ast.extractType(parameters[1].type).optional.child);
+    try std.testing.expectEqual(types.Type{ .number = .i32 }, ast.extractType(parameters[2].type).pointer.target);
+    try std.testing.expectEqual(types.Type{ .number = .i32 }, ast.extractType(parameters[3].type).tuple.elements[0]);
+}
+
+test "evaluateType: takes a type from a local constant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Number() -> type: return i32\nfn main():\n    const Kind = Number()\n    var value: Kind = 1\n    value += 1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
+    try std.testing.expectEqual(types.Type{ .number = .i32 }, ast.extractType(body[1].kind.variable_declaration.type.?));
+}
+
+test "evaluateType: rejects a call that does not give a type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count() -> usize: return 1\nfn first(value: count()): _ = value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 17 }, analyzer.failure.?.location.?);
 }
 
 test "resolveNamesInFunction: resolves a name to a constant declared before it" {
@@ -5758,8 +6438,8 @@ test "expectLength: accepts a usize suffix" {
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(values: [3usize]i32): _ = values" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-    try name_resolver.resolve();
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
 
     const parameters = loader.modules.items[0].declarations[0].kind.function_definition.signature.parameters;
     try std.testing.expectEqual(3, ast.extractType(parameters[0].type).array.length);
@@ -5778,8 +6458,8 @@ test "expectLength: takes the length from a constant" {
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const size = 4usize\nfn show(values: [size]i32): _ = values" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-    try name_resolver.resolve();
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
 
     const parameters = loader.modules.items[0].declarations[1].kind.function_definition.signature.parameters;
     try std.testing.expectEqual(4, ast.extractType(parameters[0].type).array.length);
@@ -5798,8 +6478,8 @@ test "expectLength: takes the length from a usize constant" {
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const size: usize = 5\nfn show(values: [size]i32): _ = values" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-    try name_resolver.resolve();
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
 
     const parameters = loader.modules.items[0].declarations[1].kind.function_definition.signature.parameters;
     try std.testing.expectEqual(5, ast.extractType(parameters[0].type).array.length);
@@ -5815,17 +6495,17 @@ test "expectLength: takes the length from a local constant" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const size = 2usize\n    var values: [size]i32 = undefined\n    values = values" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const size = 2usize\n    const values: [size]i32 = {1, 2}\n    _ = values" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-    try name_resolver.resolve();
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
 
     const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
-    try std.testing.expectEqual(2, ast.extractType(body[1].kind.variable_declaration.type.?).array.length);
+    try std.testing.expectEqual(2, ast.extractType(body[1].kind.constant_declaration.type.?).array.length);
 }
 
-test "expectLength: rejects a length that is not an integer literal" {
+test "expectLength: rejects a length that is not a usize" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -5838,10 +6518,10 @@ test "expectLength: rejects a length that is not an integer literal" {
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(values: [true]i32): _ = values" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
-    try std.testing.expectError(error.InvalidLength, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, name_resolver.failure.?.location.?);
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, analyzer.failure.?.location.?);
 }
 
 test "expectLength: rejects a constant of another type" {
@@ -5857,10 +6537,10 @@ test "expectLength: rejects a constant of another type" {
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const size = 2i32\nfn show(values: [size]i32): _ = values" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
-    try std.testing.expectError(error.InvalidLength, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, name_resolver.failure.?.location.?);
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, analyzer.failure.?.location.?);
 }
 
 test "expectLength: rejects a constant with a written type other than usize" {
@@ -5876,10 +6556,10 @@ test "expectLength: rejects a constant with a written type other than usize" {
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const size: u8 = 2\nfn show(values: [size]i32): _ = values" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
-    try std.testing.expectError(error.InvalidLength, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, name_resolver.failure.?.location.?);
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, analyzer.failure.?.location.?);
 }
 
 test "expectLength: follows a constant that names another constant" {
@@ -5895,14 +6575,14 @@ test "expectLength: follows a constant that names another constant" {
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const size = other\nconst other = 2usize\nfn show(values: [size]i32): _ = values" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-    try name_resolver.resolve();
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
 
     const parameters = loader.modules.items[0].declarations[2].kind.function_definition.signature.parameters;
     try std.testing.expectEqual(2, ast.extractType(parameters[0].type).array.length);
 }
 
-test "expectLength: rejects a constant that is not bound to an integer literal" {
+test "expectLength: rejects a constant that is not a usize" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -5915,10 +6595,10 @@ test "expectLength: rejects a constant that is not bound to an integer literal" 
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const size = true\nfn show(values: [size]i32): _ = values" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
-    try std.testing.expectError(error.InvalidLength, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, name_resolver.failure.?.location.?);
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, analyzer.failure.?.location.?);
 }
 
 test "expectLength: rejects a variable" {
@@ -5934,13 +6614,13 @@ test "expectLength: rejects a variable" {
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    var size = 2usize\n    size = 3usize\n    var values: [size]i32 = undefined\n    values = values" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
-    try std.testing.expectError(error.InvalidLength, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 4, .column = 18 }, name_resolver.failure.?.location.?);
+    try std.testing.expectError(error.CannotEvaluate, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 18 }, analyzer.failure.?.location.?);
 }
 
-test "expectLength: rejects a length with a suffix" {
+test "expectLength: rejects a length with a suffix other than usize" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -5953,10 +6633,10 @@ test "expectLength: rejects a length with a suffix" {
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(values: [2u8]i32): _ = values" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
-    try std.testing.expectError(error.InvalidLength, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, name_resolver.failure.?.location.?);
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, analyzer.failure.?.location.?);
 }
 
 test "expectLength: rejects a negative length" {
@@ -5972,10 +6652,127 @@ test "expectLength: rejects a negative length" {
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(values: [-2]i32): _ = values" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
-    try std.testing.expectError(error.InvalidLength, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, name_resolver.failure.?.location.?);
+    try std.testing.expectError(error.NegativeUnsigned, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, analyzer.failure.?.location.?);
+}
+test "expectLength: computes a length from an operation on constants" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const SIZE = 2usize\nfn show(values: [SIZE * 3]i32): _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const parameters = loader.modules.items[0].declarations[1].kind.function_definition.signature.parameters;
+    try std.testing.expectEqual(6, ast.extractType(parameters[0].type).array.length);
+}
+
+test "expectLength: computes a length from an element of a constant array" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const SIZES = [2]usize{3, 4}\nfn show(values: [SIZES[1]]i32): _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const parameters = loader.modules.items[0].declarations[1].kind.function_definition.signature.parameters;
+    try std.testing.expectEqual(4, ast.extractType(parameters[0].type).array.length);
+}
+
+test "expectLength: computes a length from a field default of a constant struct" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Shape:\n    sides: usize = 4\nconst SQUARE = Shape{}\nfn show(values: [SQUARE.sides]i32): _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const parameters = loader.modules.items[0].declarations[2].kind.function_definition.signature.parameters;
+    try std.testing.expectEqual(4, ast.extractType(parameters[0].type).array.length);
+}
+
+test "expectLength: rejects a length whose operation overflows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const SIZE = 18446744073709551615usize\nfn show(values: [SIZE + 1]i32): _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.IntegerOverflow, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, analyzer.failure.?.location.?);
+}
+
+test "expectLength: computes a length from a call to a function declared later" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(values: [size()]i32): _ = values\nfn size() -> usize: return 2 * 3" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const parameters = loader.modules.items[0].declarations[0].kind.function_definition.signature.parameters;
+    try std.testing.expectEqual(6, ast.extractType(parameters[0].type).array.length);
+}
+
+test "expectLength: rejects a length that calls an external function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn size() -> usize\nfn show(values: [size()]i32): _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ExternalCall, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, analyzer.failure.?.location.?);
 }
 
 test "resolveSliceType: resolves a slice type through a constant" {
@@ -6814,7 +7611,7 @@ test "resolveName: rejects Self outside a struct or an implementation" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, name_resolver.failure.?.location.?);
 }
 
-test "resolveName: rejects Self in the type of a field" {
+test "resolveName: accepts a pointer to Self in the type of a field" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -6824,13 +7621,33 @@ test "resolveName: rejects Self in the type of a field" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    next: []const Self\nfn take(card: Card): _ = card" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    next: ?*Self\nfn take(card: Card): _ = card" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const card = ast.extractType(loader.modules.items[0].declarations[1].kind.function_definition.signature.parameters[0].type).@"struct";
+    try std.testing.expect(std.meta.eql(card, card.fields[0].type.optional.child.pointer.target.@"struct"));
+}
+
+test "resolveName: rejects Self without a pointer in the type of a field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    next: Self\nfn take(card: Card): _ = card" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
-    try std.testing.expectError(error.UnknownName, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 19 }, name_resolver.failure.?.location.?);
+    try std.testing.expectError(error.StructContainsItself, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveName: prefers a declaration over a built-in type" {
@@ -7717,82 +8534,6 @@ test "resolveConstant: resolves a constant that holds a literal" {
     try std.testing.expectEqual(ast.Resolution{ .constant = .{ .module = 0, .declaration = 2 } }, value.kind.identifier.resolution.?);
 }
 
-test "resolveConstant: rejects a call as the value" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> i32: return total\nconst total = one()" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 15 }, name_resolver.failure.?.location.?);
-}
-
-test "resolveConstant: rejects a field access as the value" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nconst origin = Point.x\nfn read() -> i32: return origin" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 16 }, name_resolver.failure.?.location.?);
-}
-
-test "resolveConstant: rejects an index as the value" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const values: [2]i32 = {1, 2}\nconst first = values[0]\nfn read() -> i32: return first" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 15 }, name_resolver.failure.?.location.?);
-}
-
-test "resolveConstant: rejects an address as the value" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const limit: i32 = 1\nconst pointer = &limit\nfn read() -> *const i32: return pointer" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 17 }, name_resolver.failure.?.location.?);
-}
-
 test "resolveConstant: accepts a pointer to a function as the value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -7811,25 +8552,6 @@ test "resolveConstant: accepts a pointer to a function as the value" {
 
     const call = loader.modules.items[0].declarations[2].kind.function_definition.body[0].kind.call.kind.call;
     try std.testing.expectEqual(ast.Resolution{ .constant = .{ .module = 0, .declaration = 1 } }, call.callee.identifier.resolution.?);
-}
-
-test "resolveConstant: rejects an unwrap as the value" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const maybe: ?i32 = null\nconst value = maybe.?\nfn read() -> i32: return value" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 15 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveConstant: resolves a constant that constructs a struct" {
@@ -7961,295 +8683,6 @@ test "expectHeldByConstant: keeps a function of an imported module" {
     try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 1, .declaration = 0 } }, callee.identifier.resolution.?);
 }
 
-test "expectEvaluable: accepts pointers to functions in a stored constant" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one(): noop\nfn two(): noop\nconst steps: [2]*fn() = {&one, &two}\nfn get() -> [2]*fn(): return steps" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-    try name_resolver.resolve();
-
-    const elements = loader.modules.items[0].declarations[2].kind.constant_declaration.value.kind.composite_literal.elements;
-    try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 1 } }, elements[1].value.kind.address_of.kind.identifier.resolution.?);
-}
-
-test "expectEvaluable: accepts a pointer to a method in a constant" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: f32\n    fn length(self: Self) -> f32: return self.x\nconst measure: *fn(Point) -> f32 = &Point::length" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-    try name_resolver.resolve();
-
-    const value = loader.modules.items[0].declarations[2].kind.constant_declaration.value;
-    try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 1 } }, value.kind.address_of.kind.path_expression.resolution.?);
-}
-
-test "expectEvaluable: rejects a function call inside a construction" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn zero() -> i32: return 0\nconst origin = Point{x = zero()}\nfn make() -> Point: return origin" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 4, .column = 26 }, name_resolver.failure.?.location.?);
-}
-
-test "expectEvaluable: rejects a field access inside a construction" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nconst other = Point{x = 1}\nconst origin = Point{x = other.x}\nfn make() -> Point: return origin" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 4, .column = 26 }, name_resolver.failure.?.location.?);
-}
-
-test "expectEvaluable: rejects an index in a constant with a written type" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const values: [2]i32 = {1, 2}\nconst first: i32 = values[0]\nfn read() -> i32: return first" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 20 }, name_resolver.failure.?.location.?);
-}
-
-test "expectEvaluable: rejects an unwrap inside a tuple literal" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const maybe: ?i32 = null\nconst pair = [i32, bool]{maybe.?, true}\nfn read() -> [i32, bool]: return pair" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 26 }, name_resolver.failure.?.location.?);
-}
-
-test "expectEvaluable: rejects orelse in a constant written at each use" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const maybe: ?i32 = null\nconst value = maybe orelse 1i32\nfn read() -> i32: return value" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 15 }, name_resolver.failure.?.location.?);
-}
-
-test "expectEvaluable: rejects a comparison with null in a constant written at each use" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const maybe: ?i32 = null\nconst empty = maybe == null\nfn read() -> bool: return empty" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 15 }, name_resolver.failure.?.location.?);
-}
-
-test "expectEvaluable: checks the bounds of a slice" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const limit: usize = 1 + 1\nconst values: [3]i32 = {1, 2, 3}\nstruct Holder:\n    items: []const i32\nconst holder: Holder = Holder{items = values[0..limit]}\nfn read() -> Holder: return holder" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 5, .column = 49 }, name_resolver.failure.?.location.?);
-}
-
-test "expectEvaluable: accepts operators in constants written at each use" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const limit: i32 = 10\nconst double: i32 = limit * 2\nconst pair: [i32, bool] = {-limit, limit > 1}\nfn main(): noop" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-    try name_resolver.resolve();
-
-    const double = loader.modules.items[0].declarations[1].kind.constant_declaration.value;
-    const limit = double.kind.binary.left.kind.identifier;
-    try std.testing.expectEqual(ast.Resolution{ .constant = .{ .module = 0, .declaration = 0 } }, limit.resolution.?);
-}
-
-test "expectEvaluable: rejects an operator in a stored constant" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const values: [2]i32 = {1 + 2, 3}\nfn main(): noop" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, name_resolver.failure.?.location.?);
-}
-
-test "expectEvaluable: rejects an operator in a construction without a written type" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nconst origin = Point{x = -limit}\nconst limit: i32 = 1\nfn make() -> Point: return origin" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 26 }, name_resolver.failure.?.location.?);
-}
-
-test "expectEvaluable: rejects a stored constant that uses a constant with an operator" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const limit: i32 = 1 + 2\nconst values: [2]i32 = {limit, 3}\nfn main(): noop" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 25 }, name_resolver.failure.?.location.?);
-}
-
-test "expectEvaluable: rejects an operator in a field default" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32 = 1 + 2\nfn make() -> Point: return Point{}" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 14 }, name_resolver.failure.?.location.?);
-}
-
-test "expectEvaluable: rejects a field default that uses a constant with an operator" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const limit: i32 = 1 + 2\nstruct Point:\n    x: i32 = limit\nfn make() -> Point: return Point{}" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 14 }, name_resolver.failure.?.location.?);
-}
-
 test "resolveStruct: resolves a struct used as a type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -8308,6 +8741,26 @@ test "resolveStruct: rejects structs that contain each other" {
 
     try std.testing.expectError(error.StructContainsItself, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveStruct: accepts a pointer to the struct itself" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Node:\n    next: ?*Node\nfn take(node: Node): _ = node" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const node = ast.extractType(loader.modules.items[0].declarations[1].kind.function_definition.signature.parameters[0].type).@"struct";
+    try std.testing.expect(std.meta.eql(node, node.fields[0].type.optional.child.pointer.target.@"struct"));
 }
 
 test "resolveStruct: gives every use of a struct the same type" {
@@ -8512,25 +8965,6 @@ test "resolveFields: resolves the defaults of fields" {
     try std.testing.expectEqual(ast.Resolution{ .constant = .{ .module = 0, .declaration = 0 } }, default.kind.identifier.resolution.?);
 }
 
-test "resolveFields: rejects a default that cannot be evaluated at compile time" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn zero() -> i32: return 0\nstruct Size:\n    width: i32 = zero()\nfn draw(size: Size): _ = size" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 18 }, name_resolver.failure.?.location.?);
-}
-
 test "loadRoot: reports the reserved name monolith at the import" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -8583,23 +9017,4 @@ test "failLoading: reports failures in the module that is loaded" {
     try std.testing.expectError(error.UnexpectedTab, name_resolver.resolve());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"utils"}), name_resolver.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, name_resolver.failure.?.location.?);
-}
-
-test "containsOperator: looks inside the bounds of a slice" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const limit: usize = 1 + 1\nconst values: [3]i32 = {1, 2, 3}\nconst part: []const i32 = values[0..limit]\nstruct Holder:\n    items: []const i32\nconst holder: Holder = Holder{items = part}\nfn read() -> Holder: return holder" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.CannotEvaluate, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 6, .column = 39 }, name_resolver.failure.?.location.?);
 }

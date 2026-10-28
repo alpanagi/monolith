@@ -963,6 +963,16 @@ test "lexWord: recognizes the for and in keywords" {
     try std.testing.expectEqualStrings("inside", lexer.tokens.items[3].kind.identifier);
 }
 
+test "lexWord: recognizes the comptime keyword" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("comptime comptimes");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_comptime);
+    try std.testing.expectEqualStrings("comptimes", lexer.tokens.items[2].kind.identifier);
+}
+
 test "lexWord: recognizes the null keyword" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

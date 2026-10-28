@@ -5,6 +5,7 @@ const token = core.token;
 const types = core.types;
 
 const Failure = core.Failure;
+const Value = core.Value;
 
 const followPointer = types.followPointer;
 const isZeroSized = types.isZeroSized;
@@ -22,6 +23,7 @@ pub const Generator = struct {
     parameters: []const ast.TypedName = &.{},
     return_type: types.Type = .void,
     sequenced: bool = false,
+    statics: std.ArrayList(Static) = .empty,
     module_index: usize = 0,
     depth: usize = 0,
     in_main: bool = false,
@@ -177,6 +179,7 @@ pub const Generator = struct {
         for (self.program.modules, 0..) |module, module_index| {
             self.module_index = module_index;
             for (module.declarations, 0..) |declaration, index| {
+                if (isCompileTimeFunction(declaration)) continue;
                 const signature = switch (declaration.kind) {
                     .function_definition => |function| function.signature,
                     .function_declaration => |function_declaration| function_declaration,
@@ -426,7 +429,7 @@ pub const Generator = struct {
         const type_registry = self.program.types;
         for (type_registry.entries.items) |value_type| {
             const struct_type = findStruct(value_type) orelse continue;
-            if (struct_type.module != module_index) continue;
+            if (struct_type.module != module_index or types.isCompileTimeOnly(value_type)) continue;
             try orderDefinition(allocator, &ordered, module_index, value_type);
         }
         return ordered.items;
@@ -483,6 +486,7 @@ pub const Generator = struct {
                 const value_type = ast.extractDeclaredType(constant.type, constant.value);
                 try self.collectForwardType(allocator, &forward, value_type);
             }
+            if (isCompileTimeFunction(declaration)) continue;
             const signature = switch (declaration.kind) {
                 .function_definition => |function| function.signature,
                 .function_declaration => |function_declaration| function_declaration,
@@ -550,9 +554,9 @@ pub const Generator = struct {
         for (module.declarations, 0..) |declaration, index| {
             if (!self.isStored(self.module_index, index)) continue;
             if (!declared) try writer.writeByte('\n');
-            try writer.writeAll("extern const ");
+            try writer.writeAll("extern ");
             const constant = declaration.kind.constant_declaration;
-            try self.generateType(writer, ast.extractDeclaredType(constant.type, constant.value));
+            try self.generateLocalType(writer, ast.extractDeclaredType(constant.type, constant.value), true);
             try writer.print(" {s};\n", .{self.names[self.module_index][index].?});
             declared = true;
         }
@@ -567,6 +571,7 @@ pub const Generator = struct {
         var declared = false;
         for (module.declarations, 0..) |declaration, index| {
             if (declaration.kind != kind or self.isEntryPoint(declaration.kind)) continue;
+            if (isCompileTimeFunction(declaration)) continue;
             if (!declared) try writer.writeByte('\n');
             try self.generateSignature(writer, declaration.kind, index);
             try writer.writeAll(";\n");
@@ -586,10 +591,12 @@ pub const Generator = struct {
         var reached: Reached = .{};
         var constants: std.Io.Writer.Allocating = .init(allocator);
         var functions: std.Io.Writer.Allocating = .init(allocator);
+        self.statics = .empty;
         for (module.declarations, 0..) |declaration, index| {
             if (self.isStored(self.module_index, index)) {
                 try self.generateConstantDefinition(allocator, &reached, &constants.writer, declaration, index);
             }
+            if (isCompileTimeFunction(declaration)) continue;
             const function = switch (declaration.kind) {
                 .function_definition => |function| function,
                 .function_declaration, .constant_declaration, .struct_definition => continue,
@@ -626,6 +633,7 @@ pub const Generator = struct {
             }
         }
         try self.generateZeroSizedObject(writer, module);
+        try self.generateStatics(writer);
         if (constants.written().len > 0) try writer.writeByte('\n');
         try writer.writeAll(constants.written());
         try writer.writeAll(functions.written());
@@ -799,11 +807,243 @@ pub const Generator = struct {
         const value = &constant.value;
         const constant_type = ast.extractDeclaredType(constant.type, value.*);
         try self.recordType(allocator, reached, constant_type);
-        try writer.writeAll("const ");
-        try self.generateType(writer, constant_type);
+        try self.generateLocalType(writer, constant_type, true);
         try writer.print(" {s} = ", .{self.names[self.module_index][index].?});
-        try self.generateValue(allocator, reached, writer, value, .initializer);
+        try self.generateKnownValue(allocator, reached, writer, constant.known.?.*, constant_type, .initializer);
         try writer.writeAll(";\n");
+    }
+
+    fn generateStatics(self: *Generator, writer: *std.Io.Writer) WriteError!void {
+        if (self.statics.items.len == 0) return;
+        try writer.writeByte('\n');
+        for (self.statics.items) |static| {
+            try writer.writeAll("static ");
+            try self.generateType(writer, static.root_type);
+            try writer.print(" {s};\n", .{static.name});
+        }
+        for (self.statics.items) |static| {
+            try writer.writeAll("static ");
+            try self.generateType(writer, static.root_type);
+            try writer.print(" {s} = {s};\n", .{ static.name, static.definition });
+        }
+    }
+
+    fn generateKnownValue(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        value: Value,
+        value_type: types.Type,
+        form: Form,
+    ) WriteError!void {
+        try self.recordType(allocator, reached, value_type);
+        switch (value_type) {
+            .number => |number| switch (value) {
+                .integer => |integer| try self.generateKnownInteger(writer, number, integer),
+                .float => |float| try generateKnownFloat(writer, number, float),
+                else => unreachable,
+            },
+            .boolean => try writer.writeAll(if (value.boolean) "true" else "false"),
+            .optional => |optional| {
+                const inner = value.optional orelse return self.generateNull(writer, value_type, form);
+                if (isPointerOptional(value_type)) {
+                    return self.generateKnownValue(allocator, reached, writer, inner.*, optional.child, form);
+                }
+                try self.generateCompoundStart(writer, value_type, form);
+                if (!isZeroSized(optional.child)) {
+                    try writer.writeAll(".value = ");
+                    try self.generateKnownValue(allocator, reached, writer, inner.*, optional.child, .initializer);
+                    try writer.writeAll(", ");
+                }
+                try writer.writeAll(".present = true }");
+            },
+            .array => |array| {
+                try self.generateCompoundStart(writer, value_type, form);
+                try writer.writeAll(".items = { ");
+                for (value.aggregate, 0..) |element, index| {
+                    if (index > 0) try writer.writeAll(", ");
+                    try self.generateKnownValue(allocator, reached, writer, element, array.element, .initializer);
+                }
+                try writer.writeAll(" } }");
+            },
+            .tuple => |tuple| {
+                try self.generateCompoundStart(writer, value_type, form);
+                var written = false;
+                for (value.aggregate, tuple.elements, 0..) |element, element_type, index| {
+                    if (isZeroSized(element_type)) continue;
+                    if (written) try writer.writeAll(", ");
+                    try writer.print("._{d} = ", .{index});
+                    try self.generateKnownValue(allocator, reached, writer, element, element_type, .initializer);
+                    written = true;
+                }
+                try writer.writeAll(" }");
+            },
+            .@"struct" => |struct_type| {
+                try self.generateCompoundStart(writer, value_type, form);
+                var written = false;
+                for (value.aggregate, struct_type.fields) |field_value, field| {
+                    if (isZeroSized(field.type)) continue;
+                    if (written) try writer.writeAll(", ");
+                    try writer.print(".{s} = ", .{field.name});
+                    try self.generateKnownValue(allocator, reached, writer, field_value, field.type, .initializer);
+                    written = true;
+                }
+                try writer.writeAll(" }");
+            },
+            .slice => |slice| {
+                const known = value.slice;
+                try self.generateCompoundStart(writer, value_type, form);
+                try writer.writeAll(".items = (");
+                try self.generateType(writer, slice.element);
+                try writer.writeAll(" *)");
+                try self.generateKnownElements(allocator, reached, writer, known.array, known.start);
+                try writer.print(", .length = {d} }}", .{known.length});
+            },
+            .pointer => |pointer| switch (value) {
+                .function => |function| try self.generateFunctionName(allocator, reached, writer, function),
+                .pointer => |known| {
+                    if (isZeroSized(pointer.target)) {
+                        try writer.writeAll("((");
+                        try self.generateType(writer, value_type);
+                        return writer.writeAll(")&mn_zero_sized)");
+                    }
+                    try writer.writeAll("((");
+                    try self.generateType(writer, value_type);
+                    try writer.writeAll(")&");
+                    try self.generatePlace(allocator, reached, writer, known);
+                    try writer.writeByte(')');
+                },
+                .many => |many| {
+                    try writer.writeAll("((");
+                    try self.generateType(writer, value_type);
+                    try writer.writeAll(")");
+                    try self.generateKnownElements(allocator, reached, writer, many.array, @intCast(many.index));
+                    try writer.writeByte(')');
+                },
+                else => unreachable,
+            },
+            .void, .type, .function, .implementer => unreachable,
+        }
+    }
+
+    fn generateCompoundStart(self: *Generator, writer: *std.Io.Writer, value_type: types.Type, form: Form) WriteError!void {
+        if (form == .expression) {
+            try writer.writeByte('(');
+            try self.generateType(writer, value_type);
+            try writer.writeByte(')');
+        }
+        try writer.writeAll("{ ");
+    }
+
+    fn generateKnownInteger(self: *Generator, writer: *std.Io.Writer, number: types.NumberType, value: i129) WriteError!void {
+        if (number == .i128 or number == .u128) {
+            if (value >= 0) return self.generateSplitLiteral(writer, @intCast(value), number);
+            if (value == std.math.minInt(i128)) {
+                try writer.writeAll("(-");
+                try self.generateSplitLiteral(writer, std.math.maxInt(i128), number);
+                return writer.writeAll(" - 1)");
+            }
+            try writer.writeAll("(-");
+            try self.generateSplitLiteral(writer, @intCast(-value), number);
+            return writer.writeByte(')');
+        }
+        if (value == std.math.minInt(i64)) return writer.writeAll("(-9223372036854775807 - 1)");
+        try writer.print("{d}", .{value});
+        switch (number) {
+            .u8, .u16, .u32, .u64, .usize => try writer.writeByte('u'),
+            .i8, .i16, .i32, .i64, .isize => {},
+            .i128, .u128, .f16, .f32, .f64, .f128 => unreachable,
+        }
+    }
+
+    fn generateKnownElements(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        array: Value.Pointer,
+        offset: usize,
+    ) WriteError!void {
+        if (array.text) {
+            try writer.writeByte('"');
+            var current = array.root.*;
+            for (array.path) |position| current = current.aggregate[position];
+            for (current.aggregate) |byte| try generateKnownByte(writer, @intCast(byte.integer));
+            try writer.writeByte('"');
+            if (offset > 0) try writer.print(" + {d}", .{offset});
+            return;
+        }
+        if (offset == 0) {
+            try self.generatePlace(allocator, reached, writer, array);
+            return writer.writeAll(".items");
+        }
+        try writer.writeByte('(');
+        try self.generatePlace(allocator, reached, writer, array);
+        try writer.print(".items + {d})", .{offset});
+    }
+
+    fn generatePlace(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        pointer: Value.Pointer,
+    ) WriteError!void {
+        if (self.findConstantCell(pointer.root)) |constant| {
+            try self.recordModule(allocator, reached, constant.module);
+            try writer.writeAll(self.names[constant.module][constant.declaration].?);
+        } else {
+            try writer.writeAll(try self.findStatic(allocator, reached, pointer.root, pointer.root_type));
+        }
+        var current = pointer.root_type;
+        for (pointer.path) |position| {
+            switch (current) {
+                .array => |array| {
+                    try writer.print(".items[{d}]", .{position});
+                    current = array.element;
+                },
+                .tuple => |tuple| {
+                    try writer.print("._{d}", .{position});
+                    current = tuple.elements[position];
+                },
+                .@"struct" => |struct_type| {
+                    try writer.print(".{s}", .{struct_type.fields[position].name});
+                    current = struct_type.fields[position].type;
+                },
+                .number, .boolean, .void, .type, .slice, .pointer, .optional, .function, .implementer => unreachable,
+            }
+        }
+    }
+
+    fn findConstantCell(self: *const Generator, root: *const Value) ?ast.Resolution.Constant {
+        for (self.program.modules, 0..) |module, module_index| {
+            for (module.declarations, 0..) |declaration, index| {
+                if (declaration.kind != .constant_declaration) continue;
+                const known = declaration.kind.constant_declaration.known orelse continue;
+                if (known == root) return .{ .module = module_index, .declaration = index };
+            }
+        }
+        return null;
+    }
+
+    fn findStatic(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        root: *const Value,
+        root_type: types.Type,
+    ) WriteError![]const u8 {
+        for (self.statics.items) |static| {
+            if (static.root == root) return static.name;
+        }
+        const name = try std.fmt.allocPrint(allocator, "mn_static_{d}", .{self.statics.items.len + 1});
+        const position = self.statics.items.len;
+        try self.statics.append(allocator, .{ .root = root, .root_type = root_type, .name = name, .definition = "" });
+        var definition: std.Io.Writer.Allocating = .init(allocator);
+        try self.generateKnownValue(allocator, reached, &definition.writer, root.*, root_type, .initializer);
+        self.statics.items[position].definition = definition.written();
+        return name;
     }
 
     fn recordCalledFunction(
@@ -1081,8 +1321,9 @@ pub const Generator = struct {
         return switch (statement.kind) {
             .noop => false,
             .constant_declaration, .variable_declaration => {
-                const value = extractLocal(statement.*).?.value;
-                return self.findLocalName(.{ .local = statement }) != null or hasEffects(value);
+                const named = self.findLocalName(.{ .local = statement }) != null;
+                const value = findStatementExpression(statement) orelse return named;
+                return named or hasEffects(value.*);
             },
             .tuple_declaration => |declaration| {
                 return self.declaresElements(statement) or hasEffects(declaration.value);
@@ -1359,6 +1600,10 @@ pub const Generator = struct {
         writer: *std.Io.Writer,
         conditional: *const ast.If,
     ) WriteError!void {
+        if (conditional.known) |chosen| {
+            const block = if (chosen) conditional.body else conditional.else_body orelse &.{};
+            return self.generateBlock(allocator, reached, writer, block, null);
+        }
         try writer.writeAll("if (");
         try self.generateFullExpression(allocator, reached, writer, &conditional.condition);
         try writer.writeAll(") ");
@@ -1909,7 +2154,7 @@ pub const Generator = struct {
                 try self.generateBase(allocator, reached, writer, operand);
                 try writer.writeAll(".value");
             },
-            .method_call, .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type => {
+            .method_call, .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type, .struct_type => {
                 unreachable;
             },
         }
@@ -2210,11 +2455,7 @@ pub const Generator = struct {
         try self.recordPointerTarget(allocator, reached, indexing.value.type.?);
         try self.generateBase(allocator, reached, writer, indexing.value);
         switch (indexing.value.type.?) {
-            .tuple => {
-                const text = indexing.index.kind.integer_literal.text;
-                const position = std.fmt.parseInt(u64, text, 0) catch unreachable;
-                return writer.print("._{d}", .{position});
-            },
+            .tuple => return writer.print("._{d}", .{indexing.position.?}),
             .array, .slice => try writer.writeAll(".items"),
             .pointer => |pointer| if (!pointer.many) try writer.writeAll("->items"),
             .number, .boolean, .void, .type, .@"struct", .optional, .function, .implementer => {
@@ -2369,7 +2610,9 @@ pub const Generator = struct {
             try self.recordModule(allocator, reached, constant.module);
             return writer.writeAll(self.names[constant.module][constant.declaration].?);
         }
-        try self.generateExpression(allocator, reached, writer, declaration.kind.constant_declaration.value);
+        const constant_declaration = declaration.kind.constant_declaration;
+        const constant_type = ast.extractDeclaredType(constant_declaration.type, constant_declaration.value);
+        try self.generateKnownValue(allocator, reached, writer, constant_declaration.known.?.*, constant_type, .expression);
     }
 
     fn generateHoistedEffects(
@@ -2495,12 +2738,12 @@ pub const Generator = struct {
             written = true;
         }
         for (value_type.@"struct".fields) |field| {
-            const default = field.default orelse continue;
+            if (field.default == null) continue;
             if (ast.findArgument(elements, field.name) != null) continue;
             if (isZeroSized(field.type)) continue;
             if (written) try writer.writeAll(", ");
             try writer.print(".{s} = ", .{field.name});
-            try self.generateValue(allocator, reached, writer, default, form);
+            try self.generateKnownValue(allocator, reached, writer, field.default_value.?.*.?, field.type, form);
             written = true;
         }
         try writer.writeAll(" }");
@@ -2565,8 +2808,9 @@ pub const Generator = struct {
                 }
                 const constant = name.resolution.?.constant;
                 const declarations = self.program.modules[constant.module].declarations;
-                const declaration = &declarations[constant.declaration];
-                try self.generateValue(allocator, reached, writer, &declaration.kind.constant_declaration.value, form);
+                const constant_declaration = declarations[constant.declaration].kind.constant_declaration;
+                const constant_type = ast.extractDeclaredType(constant_declaration.type, constant_declaration.value);
+                try self.generateKnownValue(allocator, reached, writer, constant_declaration.known.?.*, constant_type, form);
             },
             .composite_literal => try self.generateLiteralElements(allocator, reached, writer, expression.*, form),
             .null => try self.generateNull(writer, expression.type.?, form),
@@ -2583,6 +2827,7 @@ pub const Generator = struct {
             .optional_type,
             .tuple_type,
             .function_type,
+            .struct_type,
             .field_access,
             .dereference,
             .unwrap,
@@ -2788,6 +3033,7 @@ pub const Generator = struct {
             .optional_type,
             .tuple_type,
             .function_type,
+            .struct_type,
             => unreachable,
         }
     }
@@ -2818,8 +3064,11 @@ pub const Generator = struct {
         };
         if (ast.isAlias(constant) or constant.value.type == null) return false;
         const value_type = ast.extractDeclaredType(constant.type, constant.value);
-        if (isZeroSized(value_type)) return false;
+        if (isZeroSized(value_type) or types.isCompileTimeOnly(value_type)) return false;
         if (value_type == .@"struct" or value_type == .array) return true;
+        if (constant.known) |known| {
+            if (containsPlace(known.*)) return true;
+        }
         return containsConstant(self.addressed, .{ .module = module_index, .declaration = index });
     }
 
@@ -2895,6 +3144,13 @@ const Step = struct {
     statement: *const ast.Statement,
     temporary: ?usize,
     address: ?types.Type = null,
+};
+
+const Static = struct {
+    root: *const Value,
+    root_type: types.Type,
+    name: []const u8,
+    definition: []const u8,
 };
 
 const Part = struct {
@@ -3132,6 +3388,7 @@ fn hasEffects(expression: ast.Expression) bool {
         .optional_type,
         .tuple_type,
         .function_type,
+        .struct_type,
         => return false,
         .method_call => unreachable,
     }
@@ -3276,7 +3533,7 @@ fn findStatementExpression(statement: *const ast.Statement) ?*const ast.Expressi
         .noop => null,
         .@"return" => |*value| if (value.*) |*returned| returned else null,
         .discard, .call => |*expression| expression,
-        .constant_declaration => |*constant| &constant.value,
+        .constant_declaration => |*constant| if (constant.known != null) null else &constant.value,
         .tuple_declaration => |*declaration| &declaration.value,
         .variable_declaration => |*variable| &variable.value,
         .assignment => |*assignment| &assignment.value,
@@ -3309,11 +3566,7 @@ fn isEmptyLoop(statement: ast.Statement) bool {
             const sequence_type = followPointer(value.type.?);
             return sequence_type == .array and sequence_type.array.length == 0;
         },
-        .range => |range| {
-            const end = range.end orelse return false;
-            if (range.start.kind != .integer_literal or end.kind != .integer_literal) return false;
-            return parseInteger(range.start) == parseInteger(end);
-        },
+        .range => |range| return range.length == 0,
     }
 }
 
@@ -3559,6 +3812,7 @@ fn collectScopeChildren(
         .optional_type,
         .tuple_type,
         .function_type,
+        .struct_type,
         => {},
     }
     return children.items;
@@ -3740,7 +3994,8 @@ fn isDeclared(body: []const ast.Statement, statement: *const ast.Statement) bool
     const kind = statement.kind;
     if (kind != .constant_declaration and kind != .variable_declaration) return false;
     if (kind == .constant_declaration and ast.isAlias(kind.constant_declaration)) return false;
-    if (isZeroSized(findLocalType(statement.*))) return false;
+    const local_type = findLocalType(statement.*);
+    if (isZeroSized(local_type) or types.isCompileTimeOnly(local_type)) return false;
     return !isDiscarded(body, .{ .local = statement });
 }
 
@@ -3850,7 +4105,7 @@ fn collectAddressedConstants(
     var addressed: std.ArrayList(ast.Resolution.Constant) = .empty;
     for (program.modules) |module| {
         for (module.declarations) |declaration| {
-            if (declaration.kind != .function_definition) continue;
+            if (declaration.kind != .function_definition or isCompileTimeFunction(declaration)) continue;
             var statements: std.ArrayList(*const ast.Statement) = .empty;
             try collectStatements(allocator, &statements, declaration.kind.function_definition.body);
             for (statements.items) |statement| {
@@ -3898,6 +4153,59 @@ fn findAddressedContainer(statement: *const ast.Statement) ?*const ast.Expressio
         .@"break",
         .@"continue",
         => null,
+    };
+}
+
+fn generateKnownFloat(writer: *std.Io.Writer, number: types.NumberType, value: f128) WriteError!void {
+    const suffix = switch (number) {
+        .f16 => "f16",
+        .f32 => "f",
+        .f64 => "",
+        .f128 => "f128",
+        .i8, .i16, .i32, .i64, .i128, .isize, .u8, .u16, .u32, .u64, .u128, .usize => unreachable,
+    };
+    if (std.math.isNan(value)) return writer.print("__builtin_nan{s}(\"\")", .{suffix});
+    if (std.math.isInf(value)) {
+        if (value < 0) try writer.writeByte('-');
+        return writer.print("__builtin_inf{s}()", .{suffix});
+    }
+    switch (number) {
+        .f16 => try writer.printFloatHex(@as(f16, @floatCast(value)), .lower, null),
+        .f32 => try writer.printFloatHex(@as(f32, @floatCast(value)), .lower, null),
+        .f64 => try writer.printFloatHex(@as(f64, @floatCast(value)), .lower, null),
+        .f128 => try writer.printFloatHex(value, .lower, null),
+        .i8, .i16, .i32, .i64, .i128, .isize, .u8, .u16, .u32, .u64, .u128, .usize => unreachable,
+    }
+    try writer.writeAll(suffix);
+}
+
+fn generateKnownByte(writer: *std.Io.Writer, byte: u8) WriteError!void {
+    if (byte >= 0x20 and byte < 0x7f and byte != '"' and byte != '\\' and byte != '?') return writer.writeByte(byte);
+    try writer.print("\\{o:0>3}", .{byte});
+}
+
+fn isCompileTimeFunction(declaration: ast.Declaration) bool {
+    if (declaration.kind != .function_definition) return false;
+    const signature = declaration.kind.function_definition.signature;
+    if (ast.isGeneric(signature)) return true;
+    if (types.isCompileTimeOnly(ast.extractType(signature.return_type))) return true;
+    for (signature.parameters) |parameter| {
+        if (types.isCompileTimeOnly(ast.extractType(parameter.type))) return true;
+    }
+    return false;
+}
+
+fn containsPlace(value: Value) bool {
+    return switch (value) {
+        .pointer, .many, .slice => true,
+        .optional => |optional| if (optional) |inner| containsPlace(inner.*) else false,
+        .aggregate => |elements| {
+            for (elements) |element| {
+                if (containsPlace(element)) return true;
+            }
+            return false;
+        },
+        .integer, .float, .boolean, .void, .undefined, .function, .type => false,
     };
 }
 
@@ -4967,6 +5275,74 @@ test "generatePrototypeTags: declares the tags that pointers to functions in fie
     );
 }
 
+test "generateStruct: writes each instance of a struct without a name with its functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn List(type T) -> type:\n    return struct:\n        first: T\n        count: usize = 0\n        fn new(first: T) -> Self: return Self{first = first}\n        fn get(self: Self) -> T: return self.first\n        fn grow(self: *Self): self.count += 1\nfn make() -> List(u8): return {first = 2}\nfn main():\n    var numbers = List(i32)::new(1)\n    numbers.grow()\n    _ = numbers.get()\n    const flags = List(bool){first = true}\n    _ = flags.get()\n    _ = make()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_List_1 {\n    uint8_t first;\n    size_t count;\n} mn_main_List_1;\n\ntypedef struct mn_main_List_2 {\n    int32_t first;\n    size_t count;\n} mn_main_List_2;\n\ntypedef struct mn_main_List_3 {\n    bool first;\n    size_t count;\n} mn_main_List_3;\n\nmn_main_List_1 mn_main_make();\nmn_main_List_1 mn_main_List_1_new(uint8_t first);\nuint8_t mn_main_List_1_get(mn_main_List_1 self);\nvoid mn_main_List_1_grow(struct mn_main_List_1 * self);\nmn_main_List_2 mn_main_List_2_new(int32_t first);\nint32_t mn_main_List_2_get(mn_main_List_2 self);\nvoid mn_main_List_2_grow(struct mn_main_List_2 * self);\nmn_main_List_3 mn_main_List_3_new(bool first);\nbool mn_main_List_3_get(mn_main_List_3 self);\nvoid mn_main_List_3_grow(struct mn_main_List_3 * self);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nmn_main_List_1 mn_main_make() {\n    return (mn_main_List_1){ .first = 2u, .count = 0u };\n}\n\nint main() {\n    mn_main_List_2 numbers = mn_main_List_2_new(1);\n    mn_main_List_2_grow(&numbers);\n    mn_main_List_2_get(numbers);\n    const mn_main_List_3 flags = (mn_main_List_3){ .first = true, .count = 0u };\n    mn_main_List_3_get(flags);\n    mn_main_make();\n}\n\nmn_main_List_1 mn_main_List_1_new(uint8_t first) {\n    return (mn_main_List_1){ .first = first, .count = 0u };\n}\n\nuint8_t mn_main_List_1_get(mn_main_List_1 self) {\n    return self.first;\n}\n\nvoid mn_main_List_1_grow(struct mn_main_List_1 * self) {\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &self->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n}\n\nmn_main_List_2 mn_main_List_2_new(int32_t first) {\n    return (mn_main_List_2){ .first = first, .count = 0u };\n}\n\nint32_t mn_main_List_2_get(mn_main_List_2 self) {\n    return self.first;\n}\n\nvoid mn_main_List_2_grow(struct mn_main_List_2 * self) {\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &self->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n}\n\nmn_main_List_3 mn_main_List_3_new(bool first) {\n    return (mn_main_List_3){ .first = first, .count = 0u };\n}\n\nbool mn_main_List_3_get(mn_main_List_3 self) {\n    return self.first;\n}\n\nvoid mn_main_List_3_grow(struct mn_main_List_3 * self) {\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &self->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateStruct: writes a struct without a name that points to itself" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Node(type A) -> type:\n    return struct:\n        value: A\n        next: ?*Node(A)\nfn second(node: Node(i32)) -> ?*Node(i32): return node.next" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_Node_1 {\n    int32_t value;\n    struct mn_main_Node_1 * next;\n} mn_main_Node_1;\n\nstruct mn_main_Node_1 * mn_main_second(mn_main_Node_1 node);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nstruct mn_main_Node_1 * mn_main_second(mn_main_Node_1 node) {\n    return node.next;\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateStruct: leaves out fields of zero-sized types" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5119,6 +5495,40 @@ test "generateDeclarations: separates external functions from other functions" {
     try std.testing.expectEqualStrings(
         "#pragma once\n\n#include \"runtime/monolith.h\"\n\nvoid log(int32_t value);\n\nvoid mn_main_one();\nvoid mn_main_two();\n",
         files[0].contents,
+    );
+}
+
+test "generateDeclarations: leaves out functions and constants that hold types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Number() -> type: return i32\nconst kinds = [2]type{i32, bool}\nconst Kind = Number()\nfn first(value: kinds[1], other: Kind) -> Kind:\n    _ = value\n    return other" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\nint32_t mn_main_first(bool, int32_t other);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_first(bool, int32_t other) {\n    return other;\n}\n",
+        files[1].contents,
     );
 }
 
@@ -5578,6 +5988,156 @@ test "generateConstantDefinition: declares a constant whose length is taken from
     );
 }
 
+test "generateConstantDefinition: writes a constant computed by calls from its value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn square(value: i32) -> i32: return value * value\nconst NINE = square(3)\nconst TABLE = [2]i32{square(2), NINE}\nfn read() -> i32: return NINE + TABLE[1]" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nconst mn_array_2_i32 mn_main_TABLE = { .items = { 4, 9 } };\n\nint32_t mn_main_square(int32_t value) {\n    return (value * value);\n}\n\nint32_t mn_main_read() {\n    return (9 + mn_main_TABLE.items[1u]);\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateStatics: writes a slice of a compile-time array as static data" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> []const i32:\n    const values = [3]i32{1, 2, 3}\n    return values[1..]\nconst TAIL = make()\nfn read() -> []const i32: return TAIL" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\n#ifndef mn_array_3_i32_defined\n#define mn_array_3_i32_defined\ntypedef struct mn_array_3_i32 {\n    int32_t items[3];\n} mn_array_3_i32;\n#endif\n\nstatic mn_array_3_i32 mn_static_1;\nstatic mn_array_3_i32 mn_static_1 = { .items = { 1, 2, 3 } };\n\nconst mn_slice_i32 mn_main_TAIL = { .items = (int32_t *)(mn_static_1.items + 1), .length = 2 };\n\nmn_slice_i32 mn_main_make() {\n    const mn_array_3_i32 values = (mn_array_3_i32){ .items = { 1, 2, 3 } };\n    return (mn_slice_i32){ .items = (int32_t *)values.items + 1u, .length = 3 - 1u };\n}\n\nmn_slice_i32 mn_main_read() {\n    return mn_main_TAIL;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateStatics: points into a compile-time array as static data" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn second(text: []const u8) -> *const u8: return &text[1]\nconst SECOND = second(\"abc\")\nfn read() -> u8: return SECOND.*" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_array_3_u8_defined\n#define mn_array_3_u8_defined\ntypedef struct mn_array_3_u8 {\n    uint8_t items[3];\n} mn_array_3_u8;\n#endif\n\nstatic mn_array_3_u8 mn_static_1;\nstatic mn_array_3_u8 mn_static_1 = { .items = { 97u, 98u, 99u } };\n\nuint8_t const * const mn_main_SECOND = ((uint8_t const *)&mn_static_1.items[1]);\n\nuint8_t const * mn_main_second(mn_slice_u8 text) {\n    return &text.items[1u];\n}\n\nuint8_t mn_main_read() {\n    return (*mn_main_SECOND);\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateStatics: points into a constant instead of a copy" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const VALUES = [2]i32{1, 2}\nconst SECOND = &VALUES[1]\nfn read() -> i32: return SECOND.*" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nconst mn_array_2_i32 mn_main_VALUES = { .items = { 1, 2 } };\nint32_t const * const mn_main_SECOND = ((int32_t const *)&mn_main_VALUES.items[1]);\n\nint32_t mn_main_read() {\n    return (*mn_main_SECOND);\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateStatics: writes floats exactly and strings as text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const THIRD = 1f32 / 3f32\nconst HUGE = 1f64 / 0f64\nconst NAME = \"a\\tb\"\nfn third() -> f32: return THIRD\nfn huge() -> f64: return HUGE\nfn name() -> []const u8: return NAME" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nconst mn_slice_u8 mn_main_NAME = { .items = (uint8_t *)\"a\\011b\", .length = 3 };\n\nfloat mn_main_third() {\n    return 0x1.555556p-2f;\n}\n\ndouble mn_main_huge() {\n    return __builtin_inf();\n}\n\nmn_slice_u8 mn_main_name() {\n    return mn_main_NAME;\n}\n",
+        files[1].contents,
+    );
+}
+
 test "recordCalledFunction: includes the header of a function called in a loop" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5935,7 +6495,7 @@ test "recordPointerTarget: defines no slice for a pointer to an array that is no
     );
 }
 
-test "recordModule: includes the header of a stored array that an inlined slice constant uses" {
+test "recordModule: includes the header of a stored slice constant of another module" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -5964,7 +6524,7 @@ test "recordModule: includes the header of a stored array that an inlined slice 
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n#include \"data.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nchar mn_zero_sized;\n\nvoid mn_main_take(mn_slice_i32) {}\n\nint main() {\n    mn_main_take((mn_slice_i32){ .items = (int32_t *)mn_data_values.items, .length = 2 });\n}\n",
+        "#include \"main.h\"\n#include \"data.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nchar mn_zero_sized;\n\nvoid mn_main_take(mn_slice_i32) {}\n\nint main() {\n    mn_main_take(mn_data_items);\n}\n",
         files[1].contents,
     );
 }
@@ -5998,6 +6558,66 @@ test "generateFunction: generates main as the entry point" {
 
     try std.testing.expectEqualStrings("#pragma once\n\n#include \"runtime/monolith.h\"\n", files[0].contents);
     try std.testing.expectEqualStrings("#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {}\n", files[1].contents);
+}
+
+test "generateFunction: writes each instance of a function with a type parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn max(type T, a: T, b: T) -> T:\n    if a > b: return a\n    return b\nfn main():\n    _ = max(i32, 1, 2)\n    _ = max(u8, 3, 4)\n    _ = max(i32, 5, 6)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    mn_main_max_1(1, 2);\n    mn_main_max_2(3u, 4u);\n    mn_main_max_1(5, 6);\n}\n\nint32_t mn_main_max_1(int32_t a, int32_t b) {\n    if ((a > b)) {\n        return a;\n    }\n    return b;\n}\n\nuint8_t mn_main_max_2(uint8_t a, uint8_t b) {\n    if ((a > b)) {\n        return a;\n    }\n    return b;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFunction: writes each instance of a function with a comptime parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn scale(comptime factor: i32, value: i32) -> i32: return value * factor\nfn main():\n    _ = scale(2, 5)\n    _ = scale(3, 5)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    mn_main_scale_1(5);\n    mn_main_scale_2(5);\n}\n\nint32_t mn_main_scale_1(int32_t value) {\n    return (value * 2);\n}\n\nint32_t mn_main_scale_2(int32_t value) {\n    return (value * 3);\n}\n",
+        files[1].contents,
+    );
 }
 
 test "generateFunction: generates a default for each implementation that uses it" {
@@ -6881,6 +7501,36 @@ test "generateLocal: writes nothing for a local constant that names an array typ
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nmn_array_2_i32 mn_main_first() {\n    const mn_array_2_i32 values = (mn_array_2_i32){ .items = { 1, 2 } };\n    return values;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateLocal: writes nothing for local constants that hold types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Number() -> type: return i32\nfn main():\n    const kind = Number()\n    const kinds = [2]type{kind, bool}\n    var value: kinds[0] = 1\n    value += 1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    int32_t value = 1;\n    value = (value + 1);\n}\n",
         files[1].contents,
     );
 }
@@ -7872,6 +8522,36 @@ test "generateIf: writes the condition, the body and the else block" {
     );
 }
 
+test "generateIf: writes only the block that each instance chooses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn describe(type T, value: T) -> i32:\n    if T == bool:\n        if value: return 1\n        return 0\n    else:\n        return value\nfn main():\n    _ = describe(bool, true)\n    _ = describe(i32, 2)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    mn_main_describe_1(true);\n    mn_main_describe_2(2);\n}\n\nint32_t mn_main_describe_1(bool value) {\n    {\n        if (value) {\n            return 1;\n        }\n        return 0;\n    }\n}\n\nint32_t mn_main_describe_2(int32_t value) {\n    {\n        return value;\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateIf: chains an else if" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -8366,6 +9046,36 @@ test "generateFor: leaves out the loop over a range whose bounds are equal" {
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    stop();\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFor: leaves out the loop over a range whose bounds known at compile time are equal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn step()\nconst LIMIT = 0usize\nfn main():\n    for _ in 0..LIMIT: step()\n    for _ in 0..LIMIT + 1: step()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    const size_t mn_end_2 = (0u + 1u);\n    for (size_t mn_index_2 = 0; mn_index_2 < mn_end_2; mn_index_2 += 1) {\n        step();\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -9724,7 +10434,7 @@ test "generateExpression: writes the value of a constant at its use" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nuint8_t mn_main_mask() {\n    return 0xffu;\n}\n",
+        "#include \"main.h\"\n\nuint8_t mn_main_mask() {\n    return 255u;\n}\n",
         files[1].contents,
     );
 }
@@ -11382,6 +12092,36 @@ test "generateIndex: writes an element of a tuple constant" {
     );
 }
 
+test "generateIndex: writes an element of a tuple at an index known at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const SECOND = 1usize\nfn second(pair: [i32, bool]) -> bool: return pair[SECOND]" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_tuple_2_i32_bool_defined\n#define mn_tuple_2_i32_bool_defined\ntypedef struct mn_tuple_2_i32_bool {\n    int32_t _0;\n    bool _1;\n} mn_tuple_2_i32_bool;\n#endif\n\nbool mn_main_second(mn_tuple_2_i32_bool pair) {\n    return pair._1;\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateSlice: writes a slice of a variable" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -11937,7 +12677,7 @@ test "generateConstant: stores an array constant with a length to infer" {
     );
 }
 
-test "generateConstant: writes the operators of a constant at each use" {
+test "generateConstant: writes the value of a constant with operators at each use" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -11959,7 +12699,7 @@ test "generateConstant: writes the operators of a constant at each use" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nint32_t mn_main_sum() {\n    return ((10 * 2) + (10 * 3));\n}\n\nuint32_t mn_main_bits() {\n    return mn_shift_left_u32(1u, 4u);\n}\n\nbool mn_main_check() {\n    return (!(10 < 5));\n}\n",
+        "#include \"main.h\"\n\nint32_t mn_main_sum() {\n    return (20 + 30);\n}\n\nuint32_t mn_main_bits() {\n    return 16u;\n}\n\nbool mn_main_check() {\n    return true;\n}\n",
         files[1].contents,
     );
 }
@@ -12586,6 +13326,36 @@ test "generateFields: converts a pointer to an array in a field to a slice" {
     );
 }
 
+test "generateFields: writes a field default from its value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn start() -> i32: return 3\nstruct Point:\n    x: i32 = start()\nfn make() -> Point: return {}" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_start() {\n    return 3;\n}\n\nmn_main_Point mn_main_make() {\n    return (mn_main_Point){ .x = 3 };\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateElements: converts a pointer to an array in an element to a slice" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -12668,12 +13438,12 @@ test "generateValue: writes a slice with bounds in a stored constant" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_array_3_i32_defined\n#define mn_array_3_i32_defined\ntypedef struct mn_array_3_i32 {\n    int32_t items[3];\n} mn_array_3_i32;\n#endif\n\nconst mn_array_3_i32 mn_main_values = { .items = { 1, 2, 3 } };\nconst mn_main_Holder mn_main_holder = { .items = { .items = (int32_t *)mn_main_values.items + 1u, .length = 2u - 1u } };\n\nmn_main_Holder mn_main_read() {\n    return mn_main_holder;\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_array_3_i32_defined\n#define mn_array_3_i32_defined\ntypedef struct mn_array_3_i32 {\n    int32_t items[3];\n} mn_array_3_i32;\n#endif\n\nconst mn_array_3_i32 mn_main_values = { .items = { 1, 2, 3 } };\nconst mn_main_Holder mn_main_holder = { .items = { .items = (int32_t *)(mn_main_values.items + 1), .length = 1 } };\n\nmn_main_Holder mn_main_read() {\n    return mn_main_holder;\n}\n",
         files[1].contents,
     );
 }
 
-test "generateValue: writes an operation in a stored constant" {
+test "generateValue: writes the value of an operation in a stored constant" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -12695,7 +13465,7 @@ test "generateValue: writes an operation in a stored constant" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nconst int32_t mn_main_limit = (2 + 3);\n\nint main() {\n    keep(&mn_main_limit);\n}\n",
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nconst int32_t mn_main_limit = 5;\n\nint main() {\n    keep(&mn_main_limit);\n}\n",
         files[1].contents,
     );
 }

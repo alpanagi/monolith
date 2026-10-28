@@ -30,6 +30,7 @@ pub const TokenKind = union(enum) {
     keyword_false,
     keyword_undefined,
     keyword_null,
+    keyword_comptime,
     underscore,
     left_parenthesis,
     right_parenthesis,

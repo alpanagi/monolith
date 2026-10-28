@@ -22,7 +22,7 @@
 - Identifiers are case-sensitive. By convention only types and type constructors start with a capital letter.
 - The single character `_` is reserved and cannot be used as an identifier by the user.
 - The following identifier names are reserved and cannot be used as identifiers by the user:
-    `and`, `as`, `break`, `const`, `continue`, `else`, `external`, `false`, `fn`, `for`, `if`, `impl`, `import`, `in`, `many`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `trait`, `true`, `undefined`, `var`, `void`, `while`
+    `and`, `as`, `break`, `comptime`, `const`, `continue`, `else`, `external`, `false`, `fn`, `for`, `if`, `impl`, `import`, `in`, `many`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `trait`, `true`, `undefined`, `var`, `void`, `while`
 
 ## Built-In Types
 
@@ -231,7 +231,8 @@
 
 ### Comparison Operators
 
-- `==` and `!=` work on numbers, `bool`, pointers, arrays whose elements support them, and optionals whose values support them. Arrays are equal when all their elements are equal. Optionals are equal when both are `null` or both hold equal values. An optional can be compared with `null`.
+- `==` and `!=` work on numbers, `bool`, types, pointers, arrays whose elements support them, and optionals whose values support them. Arrays are equal when all their elements are equal. Optionals are equal when both are `null` or both hold equal values. An optional can be compared with `null`.
+- Two types are equal when they are the same type, e.g. `T == i32`.
 - `<`, `<=`, `>` and `>=` work on numbers and multiple value pointers.
 - A comparison gives a `bool`.
 
@@ -314,6 +315,7 @@
 - `if condition:` runs its block when the condition is true. The condition is a `bool`.
 - `else:` runs its block when the condition is false. It is on the line after the `if` block, at the same indentation as `if`.
 - `else if condition:` checks another condition when the previous ones are false, e.g. `if a:` followed by `else if b:` and `else:`.
+- A condition that depends on a type is evaluated at compile time, and only the block it chooses is checked and compiled, e.g. `if T == i32:` in a function with a `type T` parameter.
 
 ### While
 
@@ -377,3 +379,18 @@
 - A trait's method can also be called through the trait, with the value as the first argument, e.g. `Shape::area(square)`. For a method whose first parameter is a pointer, the argument is a pointer, e.g. `Shape::grow(&square)`.
 - A function in a struct's block shadows a trait's function with the same name, e.g. `square.area()` and `Square::area(square)` call the struct's `area`. The trait's is called through the trait, e.g. `Shape::area(square)`.
 - A method that a type gets from two traits cannot be called as `value.name()`. Calling it through a trait chooses that trait's method.
+
+## Compile-Time Evaluation
+
+- Everything a type depends on is evaluated at compile time, e.g. an array's length, a tuple's index or a struct field's default.
+- A value is known at compile time when it is a literal, a constant or parameter known at compile time, or computed from these at compile time.
+- `type` is the type of types. Types are values known at compile time, e.g. `const Number = i32`. A value whose type contains `type` exists only at compile time.
+- Top-level constants are evaluated at compile time.
+- A parameter written `type T` takes a type, e.g. `fn List(type T) -> type`. A parameter marked `comptime` takes a value known at compile time, e.g. `comptime format: []const u8`. Their arguments are evaluated at compile time.
+- A function gets its own instance for each different set of arguments to its `type` and `comptime` parameters.
+- `struct:` followed by an indented block, written like a struct's, is a struct without a name, e.g. `return struct:` followed by `items: []T`. `trait:` followed by an indented block, written like a trait's, is a trait without a name.
+- `trait` is the type of traits, e.g. `fn Iterator(type T) -> trait`. A trait value can be used wherever a trait's name can, e.g. `impl Iterator([Card, usize]) for Zip:`.
+- A call evaluated at compile time gives the same result for the same arguments, e.g. `List(i32)` is the same type everywhere.
+- Any function can be evaluated at compile time, unless it reaches an external function.
+- Illegal behavior during compile-time evaluation is a compile-time error.
+- Evaluation that does not end within a limit of steps, or nests calls beyond a limit, is a compile-time error.

@@ -2,6 +2,8 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const token = @import("token.zig");
 
+const Value = @import("value.zig").Value;
+
 pub const Type = union(enum) {
     number: NumberType,
     boolean,
@@ -46,6 +48,7 @@ pub const Field = struct {
     name: []const u8,
     type: Type,
     default: ?*ast.Expression = null,
+    default_value: ?*?Value = null,
     location: token.Location,
 };
 
@@ -191,8 +194,82 @@ pub fn findBuiltInType(name: []const u8) ?Type {
     if (findNumberType(name)) |number| return .{ .number = number };
     if (std.mem.eql(u8, name, "bool")) return .boolean;
     if (std.mem.eql(u8, name, "void")) return .void;
+    if (std.mem.eql(u8, name, "type")) return .type;
     return null;
 }
+
+pub fn isCompileTimeOnly(value_type: Type) bool {
+    return containsTypeValue(value_type, null);
+}
+
+pub fn containsStruct(value_type: Type, target: Struct) bool {
+    return containsStructWithin(value_type, target, null);
+}
+
+fn containsTypeValue(value_type: Type, visited: ?*const Visited) bool {
+    return switch (value_type) {
+        .type => true,
+        .number, .boolean, .void, .implementer => false,
+        .array => |array| containsTypeValue(array.element, visited),
+        .slice => |slice| containsTypeValue(slice.element, visited),
+        .pointer => |pointer| containsTypeValue(pointer.target, visited),
+        .optional => |optional| containsTypeValue(optional.child, visited),
+        .tuple => |tuple| {
+            for (tuple.elements) |element| {
+                if (containsTypeValue(element, visited)) return true;
+            }
+            return false;
+        },
+        .function => |function| {
+            for (function.parameters) |parameter| {
+                if (containsTypeValue(parameter, visited)) return true;
+            }
+            return containsTypeValue(function.return_type, visited);
+        },
+        .@"struct" => |struct_type| {
+            var current = visited;
+            while (current) |node| : (current = node.parent) {
+                if (node.fields.ptr == struct_type.fields.ptr) return false;
+            }
+            const node: Visited = .{ .fields = struct_type.fields, .parent = visited };
+            for (struct_type.fields) |field| {
+                if (containsTypeValue(field.type, &node)) return true;
+            }
+            return false;
+        },
+    };
+}
+
+fn containsStructWithin(value_type: Type, target: Struct, visited: ?*const Visited) bool {
+    return switch (value_type) {
+        .number, .boolean, .void, .type, .implementer, .slice, .pointer, .function => false,
+        .array => |array| containsStructWithin(array.element, target, visited),
+        .optional => |optional| containsStructWithin(optional.child, target, visited),
+        .tuple => |tuple| {
+            for (tuple.elements) |element| {
+                if (containsStructWithin(element, target, visited)) return true;
+            }
+            return false;
+        },
+        .@"struct" => |struct_type| {
+            if (std.meta.eql(struct_type, target)) return true;
+            var current = visited;
+            while (current) |node| : (current = node.parent) {
+                if (node.fields.ptr == struct_type.fields.ptr) return false;
+            }
+            const node: Visited = .{ .fields = struct_type.fields, .parent = visited };
+            for (struct_type.fields) |field| {
+                if (containsStructWithin(field.type, target, &node)) return true;
+            }
+            return false;
+        },
+    };
+}
+
+const Visited = struct {
+    fields: []const Field,
+    parent: ?*const Visited,
+};
 
 pub fn findNumberType(name: []const u8) ?NumberType {
     return std.meta.stringToEnum(NumberType, name);

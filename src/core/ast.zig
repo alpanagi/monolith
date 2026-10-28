@@ -2,6 +2,8 @@ const std = @import("std");
 const token = @import("token.zig");
 const types = @import("types.zig");
 
+const Value = @import("value.zig").Value;
+
 pub const Program = struct {
     modules: []Module,
     types: *types.Registry,
@@ -10,6 +12,7 @@ pub const Program = struct {
 pub const Module = struct {
     path: Path = &.{},
     declarations: []Declaration,
+    instances: std.ArrayList(*Declaration) = .empty,
 };
 
 pub const Declaration = struct {
@@ -31,6 +34,26 @@ pub const FunctionDefinition = struct {
     signature: FunctionSignature,
     body: []Statement,
     default_of: ?Resolution.Trait = null,
+    template: ?Resolution.Function = null,
+    bindings: []const Binding = &.{},
+    body_progress: Progress = .pending,
+    check_progress: Progress = .pending,
+};
+
+pub const Binding = struct {
+    name: []const u8,
+    target: Target,
+
+    pub const Target = union(enum) {
+        type: types.Type,
+        constant: Resolution.Constant,
+    };
+};
+
+pub const Progress = enum {
+    pending,
+    running,
+    done,
 };
 
 pub const FunctionSignature = struct {
@@ -39,6 +62,7 @@ pub const FunctionSignature = struct {
     name: []const u8,
     parameters: []TypedName,
     return_type: Expression,
+    progress: Progress = .pending,
 };
 
 pub const Statement = struct {
@@ -67,6 +91,8 @@ pub const ConstantDeclaration = struct {
     type: ?Expression = null,
     value: Expression,
     resolved: bool = false,
+    known: ?*Value = null,
+    evaluating: bool = false,
 };
 
 pub const TupleDeclaration = struct {
@@ -85,7 +111,6 @@ pub const StructDefinition = struct {
     name: []const u8,
     fields: []Field,
     value: ?types.Type = null,
-    resolving: bool = false,
 };
 
 pub const TraitDefinition = struct {
@@ -106,6 +131,7 @@ pub const Implementation = struct {
     functions: usize,
     defaults: []const usize = &.{},
     resolved: ?Resolution.Trait = null,
+    progress: Progress = .pending,
 };
 
 pub const Import = struct {
@@ -142,6 +168,7 @@ pub const If = struct {
     condition: Expression,
     body: []Statement,
     else_body: ?[]Statement = null,
+    known: ?bool = null,
 };
 
 pub const While = struct {
@@ -168,6 +195,7 @@ pub const Sequence = union(enum) {
 pub const Range = struct {
     start: Expression,
     end: ?Expression = null,
+    length: ?u64 = null,
 };
 
 pub const Jump = struct {
@@ -178,6 +206,7 @@ pub const Jump = struct {
 pub const Expression = struct {
     kind: ExpressionKind,
     type: ?types.Type = null,
+    denoted: ?types.Type = null,
     location: token.Location,
 };
 
@@ -208,6 +237,7 @@ pub const ExpressionKind = union(enum) {
     field_access: FieldAccess,
     dereference: *Expression,
     unwrap: *Expression,
+    struct_type: *StructType,
 };
 
 pub const Call = struct {
@@ -218,6 +248,7 @@ pub const Call = struct {
 pub const Name = union(enum) {
     identifier: Identifier,
     path_expression: PathExpression,
+    member: Member,
 };
 
 pub const Identifier = struct {
@@ -231,6 +262,12 @@ pub const PathExpression = struct {
 };
 
 pub const Path = []const []const u8;
+
+pub const Member = struct {
+    owner: *Expression,
+    name: []const u8,
+    resolution: ?Resolution = null,
+};
 
 pub const MethodCall = struct {
     receiver: *Expression,
@@ -335,6 +372,7 @@ pub const SliceType = struct {
 pub const Index = struct {
     value: *Expression,
     index: *Expression,
+    position: ?u64 = null,
 };
 
 pub const Slice = struct {
@@ -378,20 +416,37 @@ pub const FieldAccess = struct {
     field_location: token.Location,
 };
 
+pub const StructType = struct {
+    fields: []Field,
+    functions: []Declaration,
+    module: usize = 0,
+    bindings: []const Binding = &.{},
+    prefix: []const u8 = "",
+};
+
 pub const TypedName = struct {
     name: []const u8,
     type: Expression,
     location: token.Location,
+    kind: ParameterKind = .run_time,
+};
+
+pub const ParameterKind = enum {
+    run_time,
+    type,
+    compile_time,
 };
 
 pub const Field = struct {
     name: []const u8,
     type: Expression,
     default: ?Expression = null,
+    default_value: ?Value = null,
     location: token.Location,
 };
 
 pub fn extractType(expression: Expression) types.Type {
+    if (expression.denoted) |denoted| return denoted;
     return switch (expression.kind) {
         inline .identifier, .path_expression => |name| name.resolution.?.type,
         .array_type => |array_type| array_type.value.?,
@@ -407,6 +462,11 @@ pub fn extractType(expression: Expression) types.Type {
 pub fn extractDeclaredType(written: ?Expression, value: Expression) types.Type {
     const written_type = written orelse return value.type.?;
     return extractType(written_type);
+}
+
+pub fn findDeclaration(module: Module, index: usize) *Declaration {
+    if (index < module.declarations.len) return &module.declarations[index];
+    return module.instances.items[index - module.declarations.len];
 }
 
 pub fn extractResolution(name: Name) Resolution {
@@ -426,6 +486,13 @@ pub fn extractFunctionSignature(declaration: Declaration) FunctionSignature {
         .import,
         => unreachable,
     };
+}
+
+pub fn isGeneric(signature: FunctionSignature) bool {
+    for (signature.parameters) |parameter| {
+        if (parameter.kind != .run_time) return true;
+    }
+    return false;
 }
 
 pub fn isMain(signature: FunctionSignature) bool {
@@ -506,7 +573,7 @@ pub fn findTraitFunction(
                 => continue,
             };
             const resolved = implementation.resolved orelse continue;
-            if (!std.meta.eql(resolved, trait)) continue;
+            if (!std.meta.eql(resolved, trait) or implementation.progress != .done) continue;
             if (!std.meta.eql(extractType(implementation.type), receiver)) continue;
             const first = index + 1;
             const functions = module.declarations[first .. first + implementation.functions];
@@ -527,7 +594,8 @@ pub fn findTraitFunction(
 }
 
 fn findOwnFunction(module: Module, receiver: types.Type, name: []const u8) ?usize {
-    for (module.declarations, 0..) |declaration, index| {
+    for (0..module.declarations.len + module.instances.items.len) |index| {
+        const declaration = findDeclaration(module, index).*;
         const signature = switch (declaration.kind) {
             .function_definition => |function| function.signature,
             .function_declaration,
@@ -686,6 +754,106 @@ pub fn cloneFunctionDefinition(
     };
 }
 
+pub fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std.mem.Allocator.Error!Expression {
+    const kind: ExpressionKind = switch (expression.kind) {
+        .integer_literal,
+        .float_literal,
+        .boolean_literal,
+        .string_literal,
+        .undefined,
+        .null,
+        .identifier,
+        .path_expression,
+        => expression.kind,
+        .call => |call| .{ .call = .{
+            .callee = switch (call.callee) {
+                .identifier, .path_expression => call.callee,
+                .member => |member| .{ .member = .{
+                    .owner = try cloneExpressionPointer(allocator, member.owner),
+                    .name = member.name,
+                } },
+            },
+            .arguments = try cloneArguments(allocator, call.arguments),
+        } },
+        .method_call => |call| .{ .method_call = .{
+            .receiver = try cloneExpressionPointer(allocator, call.receiver),
+            .name = call.name,
+            .name_location = call.name_location,
+            .arguments = try cloneArguments(allocator, call.arguments),
+        } },
+        .negation => |operand| .{ .negation = try cloneExpressionPointer(allocator, operand) },
+        .binary => |binary| .{ .binary = .{
+            .operator = binary.operator,
+            .operator_location = binary.operator_location,
+            .left = try cloneExpressionPointer(allocator, binary.left),
+            .right = try cloneExpressionPointer(allocator, binary.right),
+        } },
+        .unary => |unary| .{ .unary = .{
+            .operator = unary.operator,
+            .operand = try cloneExpressionPointer(allocator, unary.operand),
+        } },
+        .address_of => |operand| .{ .address_of = try cloneExpressionPointer(allocator, operand) },
+        .array_type => |array_type| .{ .array_type = .{
+            .length = try cloneOptionalExpressionPointer(allocator, array_type.length),
+            .element = try cloneExpressionPointer(allocator, array_type.element),
+        } },
+        .composite_literal => |literal| .{ .composite_literal = .{
+            .type = try cloneOptionalExpressionPointer(allocator, literal.type),
+            .elements = try cloneArguments(allocator, literal.elements),
+        } },
+        .slice_type => |slice_type| .{ .slice_type = .{
+            .constant = slice_type.constant,
+            .element = try cloneExpressionPointer(allocator, slice_type.element),
+        } },
+        .index => |indexing| .{ .index = .{
+            .value = try cloneExpressionPointer(allocator, indexing.value),
+            .index = try cloneExpressionPointer(allocator, indexing.index),
+        } },
+        .slice => |slice| .{ .slice = .{
+            .value = try cloneExpressionPointer(allocator, slice.value),
+            .start = try cloneOptionalExpressionPointer(allocator, slice.start),
+            .end = try cloneOptionalExpressionPointer(allocator, slice.end),
+        } },
+        .pointer_type => |pointer_type| .{ .pointer_type = .{
+            .many = pointer_type.many,
+            .constant = pointer_type.constant,
+            .target = try cloneExpressionPointer(allocator, pointer_type.target),
+        } },
+        .optional_type => |optional_type| .{ .optional_type = .{
+            .child = try cloneExpressionPointer(allocator, optional_type.child),
+        } },
+        .tuple_type => |tuple_type| .{ .tuple_type = .{
+            .elements = try cloneExpressions(allocator, tuple_type.elements),
+        } },
+        .function_type => |function_type| .{ .function_type = .{
+            .parameters = try cloneExpressions(allocator, function_type.parameters),
+            .return_type = try cloneExpressionPointer(allocator, function_type.return_type),
+        } },
+        .field_access => |access| .{ .field_access = .{
+            .value = try cloneExpressionPointer(allocator, access.value),
+            .field = access.field,
+            .field_location = access.field_location,
+        } },
+        .dereference => |operand| .{ .dereference = try cloneExpressionPointer(allocator, operand) },
+        .unwrap => |operand| .{ .unwrap = try cloneExpressionPointer(allocator, operand) },
+        .struct_type => |struct_type| kind: {
+            const cloned = try allocator.create(StructType);
+            cloned.* = .{ .fields = struct_type.fields, .functions = struct_type.functions };
+            break :kind .{ .struct_type = cloned };
+        },
+    };
+    return .{ .kind = kind, .location = expression.location };
+}
+
+pub fn cloneField(allocator: std.mem.Allocator, field: Field) std.mem.Allocator.Error!Field {
+    return .{
+        .name = field.name,
+        .type = try cloneExpression(allocator, field.type),
+        .default = try cloneOptionalExpression(allocator, field.default),
+        .location = field.location,
+    };
+}
+
 fn cloneFunctionSignature(
     allocator: std.mem.Allocator,
     signature: FunctionSignature,
@@ -696,6 +864,7 @@ fn cloneFunctionSignature(
             .name = parameter.name,
             .type = try cloneExpression(allocator, parameter.type),
             .location = parameter.location,
+            .kind = parameter.kind,
         };
     }
     return .{
@@ -812,86 +981,6 @@ fn cloneArguments(allocator: std.mem.Allocator, arguments: []const Argument) std
         };
     }
     return cloned;
-}
-
-fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std.mem.Allocator.Error!Expression {
-    const kind: ExpressionKind = switch (expression.kind) {
-        .integer_literal,
-        .float_literal,
-        .boolean_literal,
-        .string_literal,
-        .undefined,
-        .null,
-        .identifier,
-        .path_expression,
-        => expression.kind,
-        .call => |call| .{ .call = .{
-            .callee = call.callee,
-            .arguments = try cloneArguments(allocator, call.arguments),
-        } },
-        .method_call => |call| .{ .method_call = .{
-            .receiver = try cloneExpressionPointer(allocator, call.receiver),
-            .name = call.name,
-            .name_location = call.name_location,
-            .arguments = try cloneArguments(allocator, call.arguments),
-        } },
-        .negation => |operand| .{ .negation = try cloneExpressionPointer(allocator, operand) },
-        .binary => |binary| .{ .binary = .{
-            .operator = binary.operator,
-            .operator_location = binary.operator_location,
-            .left = try cloneExpressionPointer(allocator, binary.left),
-            .right = try cloneExpressionPointer(allocator, binary.right),
-        } },
-        .unary => |unary| .{ .unary = .{
-            .operator = unary.operator,
-            .operand = try cloneExpressionPointer(allocator, unary.operand),
-        } },
-        .address_of => |operand| .{ .address_of = try cloneExpressionPointer(allocator, operand) },
-        .array_type => |array_type| .{ .array_type = .{
-            .length = try cloneOptionalExpressionPointer(allocator, array_type.length),
-            .element = try cloneExpressionPointer(allocator, array_type.element),
-        } },
-        .composite_literal => |literal| .{ .composite_literal = .{
-            .type = try cloneOptionalExpressionPointer(allocator, literal.type),
-            .elements = try cloneArguments(allocator, literal.elements),
-        } },
-        .slice_type => |slice_type| .{ .slice_type = .{
-            .constant = slice_type.constant,
-            .element = try cloneExpressionPointer(allocator, slice_type.element),
-        } },
-        .index => |indexing| .{ .index = .{
-            .value = try cloneExpressionPointer(allocator, indexing.value),
-            .index = try cloneExpressionPointer(allocator, indexing.index),
-        } },
-        .slice => |slice| .{ .slice = .{
-            .value = try cloneExpressionPointer(allocator, slice.value),
-            .start = try cloneOptionalExpressionPointer(allocator, slice.start),
-            .end = try cloneOptionalExpressionPointer(allocator, slice.end),
-        } },
-        .pointer_type => |pointer_type| .{ .pointer_type = .{
-            .many = pointer_type.many,
-            .constant = pointer_type.constant,
-            .target = try cloneExpressionPointer(allocator, pointer_type.target),
-        } },
-        .optional_type => |optional_type| .{ .optional_type = .{
-            .child = try cloneExpressionPointer(allocator, optional_type.child),
-        } },
-        .tuple_type => |tuple_type| .{ .tuple_type = .{
-            .elements = try cloneExpressions(allocator, tuple_type.elements),
-        } },
-        .function_type => |function_type| .{ .function_type = .{
-            .parameters = try cloneExpressions(allocator, function_type.parameters),
-            .return_type = try cloneExpressionPointer(allocator, function_type.return_type),
-        } },
-        .field_access => |access| .{ .field_access = .{
-            .value = try cloneExpressionPointer(allocator, access.value),
-            .field = access.field,
-            .field_location = access.field_location,
-        } },
-        .dereference => |operand| .{ .dereference = try cloneExpressionPointer(allocator, operand) },
-        .unwrap => |operand| .{ .unwrap = try cloneExpressionPointer(allocator, operand) },
-    };
-    return .{ .kind = kind, .location = expression.location };
 }
 
 test "extractBlocks: finds the body and the else block of a loop" {
