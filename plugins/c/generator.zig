@@ -12057,6 +12057,105 @@ test "generateFunctionCall: calls the function of a trait through the trait and 
     );
 }
 
+test "generateFunctionCall: passes the pointer written as the first argument of a call through a trait" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "trait Shape:\n    fn grow(self: *Self)\n    fn measure(self: *const Self) -> i32\nstruct Square:\n    side: i32\nimpl Shape for Square:\n    fn grow(self: *Self): self.side += 1\n    fn measure(self: *const Self) -> i32: return self.side\nfn main():\n    var square = Square{side = 1}\n    Shape::grow(&square)\n    _ = Shape::measure(&square)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_Square_Shape_grow(struct mn_main_Square * self) {\n    int32_t * mn_temporary_1;\n    mn_temporary_1 = &self->side, (*mn_temporary_1) = ((*mn_temporary_1) + 1);\n}\n\nint32_t mn_main_Square_Shape_measure(struct mn_main_Square const * self) {\n    return self->side;\n}\n\nint main() {\n    mn_main_Square square = (mn_main_Square){ .side = 1 };\n    mn_main_Square_Shape_grow(&square);\n    mn_main_Square_Shape_measure(&square);\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFunctionCall: takes the address of the receiver once for a pointer receiver" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter:\n    count: i32\n    fn read(self: Self) -> i32: return self.count\n    fn increment(self: *Self): self.count += 1\nfn next() -> usize: return 0\nfn main():\n    var counters = [2]Counter{{count = 0}, {count = 1}}\n    counters[next()].increment()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_array_2_main_Counter_defined\n#define mn_array_2_main_Counter_defined\ntypedef struct mn_array_2_main_Counter {\n    mn_main_Counter items[2];\n} mn_array_2_main_Counter;\n#endif\n\nchar mn_zero_sized;\n\nint32_t mn_main_Counter_read(mn_main_Counter self) {\n    return self.count;\n}\n\nvoid mn_main_Counter_increment(struct mn_main_Counter * self) {\n    int32_t * mn_temporary_1;\n    mn_temporary_1 = &self->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1);\n}\n\nsize_t mn_main_next() {\n    return 0u;\n}\n\nint main() {\n    mn_array_2_main_Counter counters = (mn_array_2_main_Counter){ .items = { (mn_main_Counter){ .count = 0 }, (mn_main_Counter){ .count = 1 } } };\n    mn_main_Counter_increment(&counters.items[mn_main_next()]);\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFunctionCall: dereferences a pointer once for a value receiver" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter:\n    count: i32\n    fn read(self: Self) -> i32: return self.count\n    fn increment(self: *Self): self.count += 1\nexternal fn locate() -> *Counter\nfn main():\n    _ = locate().read()\n    locate().increment()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_Counter_read(mn_main_Counter self) {\n    return self.count;\n}\n\nvoid mn_main_Counter_increment(struct mn_main_Counter * self) {\n    int32_t * mn_temporary_1;\n    mn_temporary_1 = &self->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1);\n}\n\nint main() {\n    mn_main_Counter_read((*locate()));\n    mn_main_Counter_increment(locate());\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateFunctionCall: leaves out a zero-sized receiver" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

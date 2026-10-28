@@ -94,7 +94,9 @@
 - `value.field` gives a field of a struct.
 - A struct's block can also declare functions, e.g. `fn area(self: Self) -> i32: return self.side`. In the block, `Self` is the struct's type.
 - A function in a struct's block is reached through the struct's name and `::`, e.g. `Square::new()`.
-- A function whose first parameter's type is written `Self` is a method. `value.name(arguments)` calls it with `value` as the first argument, e.g. `square.area()`.
+- A function whose first parameter's type is written `Self`, `*Self` or `*const Self` is a method. `value.name(arguments)` calls it with `value` as the first argument, e.g. `square.area()`.
+- When the first parameter is a pointer, the call takes the value's address automatically, e.g. `counter.increment()` passes `&counter`. It is allowed only where `&` is allowed, and `*Self` needs a pointer that can modify the value (see Pointer Operations).
+- A method can also be called on a pointer to the value, which is dereferenced automatically, one level only, e.g. `pointer.area()`. If the pointer's own type has a method with the same name, that method is called.
 - A method is found by the exact type of the value.
 - Two functions in a struct's block cannot have the same name, and they cannot have the name of a field.
 
@@ -372,6 +374,6 @@
 - Implementations are declared at the top level of a module.
 - A trait's methods can be called only in modules that declare or import the trait, e.g. `import shapes::Shape`.
 - A trait's functions are reached through the implementing type, e.g. `Square::new()`.
-- A trait's method can also be called through the trait, with the value as the first argument, e.g. `Shape::area(square)`.
+- A trait's method can also be called through the trait, with the value as the first argument, e.g. `Shape::area(square)`. For a method whose first parameter is a pointer, the argument is a pointer, e.g. `Shape::grow(&square)`.
 - A function in a struct's block shadows a trait's function with the same name, e.g. `square.area()` and `Square::area(square)` call the struct's `area`. The trait's is called through the trait, e.g. `Shape::area(square)`.
 - A method that a type gets from two traits cannot be called as `value.name()`. Calling it through a trait chooses that trait's method.

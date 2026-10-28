@@ -794,7 +794,7 @@ pub const NameResolver = struct {
             },
             .method_call => |*call| {
                 try self.resolveNamesInExpression(scope, call.receiver);
-                recordModifiedVariable(scope, call.receiver.*);
+                recordModifiedVariable(scope, findStorageRoot(call.receiver.*));
                 for (call.arguments) |*argument| {
                     try self.resolveNamesInExpression(scope, &argument.value);
                     recordModifiedVariable(scope, argument.value);
@@ -3843,6 +3843,24 @@ test "resolveNamesInBlock: counts passing to a method as a modification" {
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter:\n    count: i32\n    fn show(self: Self): _ = self\nfn main():\n    var counter = Counter{count = 1}\n    counter.show()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    try std.testing.expectEqual(null, name_resolver.failure);
+}
+test "resolveNamesInBlock: counts calling a method on a field of a variable as a modification" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter:\n    count: i32\n    fn increment(self: *Self): self.count += 1\nstruct Holder:\n    counter: Counter\nfn main():\n    var holder = Holder{counter = {count = 1}}\n    holder.counter.increment()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);

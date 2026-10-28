@@ -434,7 +434,11 @@ pub fn isMain(signature: FunctionSignature) bool {
 
 pub fn hasSelf(signature: FunctionSignature) bool {
     if (signature.parameters.len == 0) return false;
-    const first = signature.parameters[0].type;
+    var first = signature.parameters[0].type;
+    if (first.kind == .pointer_type) {
+        if (first.kind.pointer_type.many) return false;
+        first = first.kind.pointer_type.target.*;
+    }
     if (first.kind != .identifier) return false;
     return std.mem.eql(u8, first.kind.identifier.name, "Self");
 }
