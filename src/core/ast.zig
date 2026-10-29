@@ -245,6 +245,14 @@ pub const For = struct {
     sequence: Sequence,
     body: []Statement,
     else_body: ?[]Statement = null,
+    iterator: ?Iteration = null,
+    expansion_value: ?*Statement = null,
+    expansions: []const []Statement = &.{},
+};
+
+pub const Iteration = struct {
+    next: Resolution.Function,
+    element: types.Type,
 };
 
 pub const Defer = struct {
@@ -279,6 +287,7 @@ pub const Range = struct {
     start: Expression,
     end: ?Expression = null,
     length: ?u64 = null,
+    type: ?types.Type = null,
 };
 
 pub const Jump = struct {
@@ -322,6 +331,7 @@ pub const ExpressionKind = union(enum) {
     dereference: *Expression,
     unwrap: *Expression,
     @"try": *Expression,
+    range: *Range,
     struct_type: *StructType,
 };
 
@@ -411,6 +421,8 @@ pub const Builtin = enum {
     alignment,
     convert,
     truncate,
+    length,
+    join,
 };
 
 pub const Binary = struct {
@@ -564,6 +576,12 @@ pub const Blocks = struct {
             if (position >= branches.len) return null;
             return branches[position].body;
         }
+        if (self.statement.kind == .@"for" and isUnrolled(self.statement.kind.@"for")) {
+            const loop = self.statement.kind.@"for";
+            if (position < loop.expansions.len) return loop.expansions[position];
+            if (position == loop.expansions.len) return loop.else_body orelse &.{};
+            return null;
+        }
         const blocks = extractBlocks(self.statement);
         if (position >= blocks.len) return null;
         return blocks[position];
@@ -631,6 +649,12 @@ pub fn findInstance(
     typeclass: Resolution.Typeclass,
     decided: []const ?types.Argument,
 ) std.mem.Allocator.Error!InstanceSearch {
+    if (isTupleTypeclass(modules, typeclass)) {
+        const argument = decided[0] orelse return .undecided;
+        if (argument != .type or argument.type != .tuple) return .missing;
+        const reference: InstanceReference = .{ .module = typeclass.module, .declaration = typeclass.declaration };
+        return .{ .found = .{ .reference = reference, .assigned = &.{} } };
+    }
     var found: ?InstanceReference = null;
     var found_assigned: []?types.Argument = &.{};
     for (modules, 0..) |module, module_index| {
@@ -661,6 +685,13 @@ pub fn findInstance(
         argument.* = optional_argument orelse return .undecided;
     }
     return .{ .found = .{ .reference = reference, .assigned = assigned } };
+}
+
+pub fn isTupleTypeclass(modules: []const Module, typeclass: Resolution.Typeclass) bool {
+    const module = modules[typeclass.module];
+    if (module.path.len != 1 or !std.mem.eql(u8, module.path[0], "mn")) return false;
+    const declaration = module.declarations[typeclass.declaration];
+    return std.mem.eql(u8, declaration.kind.typeclass_definition.name, "Tuple");
 }
 
 pub const InstanceSearch = union(enum) {
@@ -777,6 +808,12 @@ pub fn extractBlocks(statement: Statement) [2][]const Statement {
         .@"continue",
         => .{ &.{}, &.{} },
     };
+}
+
+pub fn isUnrolled(loop: For) bool {
+    if (loop.sequence != .value) return false;
+    const sequence_type = loop.sequence.value.type orelse return false;
+    return sequence_type == .tuple;
 }
 
 pub fn iterateBlocks(statement: Statement) Blocks {
@@ -996,6 +1033,7 @@ pub fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std
         .dereference => |operand| .{ .dereference = try cloneExpressionPointer(allocator, operand) },
         .unwrap => |operand| .{ .unwrap = try cloneExpressionPointer(allocator, operand) },
         .@"try" => |operand| .{ .@"try" = try cloneExpressionPointer(allocator, operand) },
+        .range => |range| .{ .range = try cloneRange(allocator, range) },
         .struct_type => |struct_type| kind: {
             const cloned = try allocator.create(StructType);
             cloned.* = .{ .fields = struct_type.fields, .functions = struct_type.functions };
@@ -1037,6 +1075,10 @@ fn cloneFunctionSignature(
         .return_type = try cloneExpression(allocator, signature.return_type),
         .self_parameter = signature.self_parameter,
     };
+}
+
+pub fn cloneBlock(allocator: std.mem.Allocator, statements: []const Statement) std.mem.Allocator.Error![]Statement {
+    return cloneStatements(allocator, statements);
 }
 
 fn cloneStatements(allocator: std.mem.Allocator, statements: []const Statement) std.mem.Allocator.Error![]Statement {
@@ -1108,15 +1150,26 @@ fn cloneStatement(allocator: std.mem.Allocator, statement: Statement) std.mem.Al
             .branches = try cloneBranches(allocator, matching.branches),
             .names = try allocator.dupe(ElementName, matching.names),
         } },
-        .@"defer" => |deferred| deferred: {
-            const inner = try allocator.create(Statement);
-            inner.* = try cloneStatement(allocator, deferred.statement.*);
-            break :deferred .{ .@"defer" = .{ .statement = inner, .on_error = deferred.on_error } };
-        },
+        .@"defer" => |deferred| .{ .@"defer" = try cloneDefer(allocator, deferred) },
         .@"break" => |jump| .{ .@"break" = .{ .label = jump.label } },
         .@"continue" => |jump| .{ .@"continue" = .{ .label = jump.label } },
     };
     return .{ .kind = kind, .location = statement.location };
+}
+
+fn cloneDefer(allocator: std.mem.Allocator, deferred: Defer) std.mem.Allocator.Error!Defer {
+    const inner = try allocator.create(Statement);
+    inner.* = try cloneStatement(allocator, deferred.statement.*);
+    return .{ .statement = inner, .on_error = deferred.on_error };
+}
+
+fn cloneRange(allocator: std.mem.Allocator, range: *const Range) std.mem.Allocator.Error!*Range {
+    const cloned = try allocator.create(Range);
+    cloned.* = .{
+        .start = try cloneExpression(allocator, range.start),
+        .end = try cloneOptionalExpression(allocator, range.end),
+    };
+    return cloned;
 }
 
 fn cloneBranches(allocator: std.mem.Allocator, branches: []const Branch) std.mem.Allocator.Error![]Branch {

@@ -145,6 +145,7 @@ pub const Application = struct {
 pub const Constructor = union(enum) {
     variable: Variable,
     function: ast.Resolution.Function,
+    typeclass_function: ast.Resolution.TypeclassFunction,
 };
 
 pub const Argument = union(enum) {

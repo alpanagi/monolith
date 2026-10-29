@@ -45,6 +45,8 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "mn",
     });
 
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(b.path("mn.mn"), .bin, "mn.mn").step);
+
     b.installDirectory(.{
         .source_dir = b.path("plugins/c/runtime"),
         .install_dir = .bin,

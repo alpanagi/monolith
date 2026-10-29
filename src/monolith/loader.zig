@@ -52,9 +52,7 @@ pub const Loader = struct {
         name: []const u8,
     ) LoadError!?Namespace {
         const path = try arena.allocator().dupe([]const u8, &.{name});
-        const namespace = try self.loadNamespace(arena, io, path);
-        if (namespace == null and isLanguageModule(name)) return .{ .path = path, .module = null, .directory = false };
-        return namespace;
+        return self.loadNamespace(arena, io, path);
     }
 
     pub fn loadMember(
@@ -93,7 +91,10 @@ pub const Loader = struct {
         const directory_path = try self.buildDirectoryName(allocator, path);
         const is_file = try isFile(io, file);
         const is_directory = try isDirectory(io, directory_path);
-        if (!is_file and !is_directory) return null;
+        if (!is_file and !is_directory) {
+            if (isLanguageNamespace(path)) return .{ .path = path, .module = null, .directory = false };
+            return null;
+        }
 
         var module: ?usize = null;
         if (is_file) module = try self.loadModule(arena, io, path);
@@ -177,6 +178,11 @@ pub const LoadError = LexError ||
 
 pub fn isLanguageModule(name: []const u8) bool {
     return std.mem.eql(u8, name, "mn");
+}
+
+pub fn isLanguageNamespace(path: ast.Path) bool {
+    if (!isLanguageModule(path[0])) return false;
+    return path.len == 1 or (path.len == 2 and std.mem.eql(u8, path[1], "reflection"));
 }
 
 fn buildSourceFileName(

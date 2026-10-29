@@ -28,6 +28,8 @@ pub const NameResolver = struct {
     typeclass: ?ast.Resolution.Typeclass = null,
     bindings: []const ast.Binding = &.{},
     owner_name: []const u8 = "",
+    signature_typeclass: ?ast.Resolution.Typeclass = null,
+    signature_definition: ?*const ast.FunctionDefinition = null,
     constraints: []const ast.Constraint = &.{},
     dropped_names: []const []const u8 = &.{},
     structs: std.ArrayList(StructCount) = .empty,
@@ -147,6 +149,8 @@ pub const NameResolver = struct {
                 return self.fail(declaration.location, error.DuplicateFunction);
             }
             self.bindings = try self.addOwnTypeBindings(typeclass_bindings, signature.*);
+            self.signature_typeclass = typeclass;
+            defer self.signature_typeclass = null;
             try self.resolveFunctionTypes(signature);
         }
         self.bindings = typeclass_bindings;
@@ -201,6 +205,7 @@ pub const NameResolver = struct {
     }
 
     fn loadImportedModules(self: *NameResolver) ResolveError!void {
+        _ = try self.loadRoot("mn");
         var module_index: usize = 0;
         while (module_index < self.loader.modules.items.len) : (module_index += 1) {
             self.module_index = module_index;
@@ -365,6 +370,9 @@ pub const NameResolver = struct {
         const declaration = module.declarations[index];
         const instance_declaration = &module.declarations[index].kind.instance_declaration;
         const typeclass = try self.expectTypeclass(&instance_declaration.typeclass);
+        if (ast.isTupleTypeclass(self.loader.modules.items, typeclass)) {
+            return self.fail(declaration.location, error.TupleInstance);
+        }
         instance_declaration.resolved = typeclass;
         try self.resolveTypeclass(typeclass);
         try self.resolveInstanceArguments(self.module_index, index);
@@ -386,7 +394,12 @@ pub const NameResolver = struct {
             };
             try self.resolveFunction(self.module_index, function_index);
             const resolved = try self.resolveTemplateSignature(self.module_index, function_index);
-            if (!try matchesSignature(self.arena.allocator(), resolved, expected, instance_arguments)) {
+            const reference: ast.InstanceReference = .{ .module = self.module_index, .declaration = index };
+            const reduced = if (instance_declaration.parameters.len == 0)
+                try self.reduceSignature(function.location, expected, reference)
+            else
+                expected;
+            if (!try matchesSignature(self.arena.allocator(), resolved, reduced, instance_arguments)) {
                 return self.fail(function.location, error.MismatchedTypeclassFunction);
             }
         }
@@ -396,6 +409,67 @@ pub const NameResolver = struct {
         }
         try self.expectRequiredInstances(declaration.location, required.kind.typeclass_definition, instance_arguments);
         for (instance_declaration.defaults) |default_index| try self.resolveFunction(self.module_index, default_index);
+    }
+
+    fn reduceSignature(
+        self: *NameResolver,
+        location: token.Location,
+        signature: ast.FunctionSignature,
+        reference: ast.InstanceReference,
+    ) ResolveError!ast.FunctionSignature {
+        const allocator = self.arena.allocator();
+        var reduced = signature;
+        reduced.parameters = try allocator.dupe(ast.TypedName, signature.parameters);
+        for (reduced.parameters) |*parameter| {
+            parameter.type = try self.buildDenoted(location, parameter.type, reference);
+        }
+        reduced.return_type = try self.buildDenoted(location, signature.return_type, reference);
+        return reduced;
+    }
+
+    fn buildDenoted(
+        self: *NameResolver,
+        location: token.Location,
+        expression: ast.Expression,
+        reference: ast.InstanceReference,
+    ) ResolveError!ast.Expression {
+        var denoted = expression;
+        denoted.denoted = try self.reduceType(location, ast.extractType(expression), reference);
+        return denoted;
+    }
+
+    fn reduceType(
+        self: *NameResolver,
+        location: token.Location,
+        value_type: types.Type,
+        reference: ast.InstanceReference,
+    ) ResolveError!types.Type {
+        const allocator = self.arena.allocator();
+        return switch (value_type) {
+            .application => |application| {
+                if (application.constructor != .typeclass_function) return value_type;
+                const function = application.constructor.typeclass_function;
+                const modules = self.loader.modules.items;
+                const definition = modules[function.typeclass.module].declarations[function.typeclass.declaration].kind.typeclass_definition;
+                const name = definition.functions[function.function].name;
+                const member = ast.findInstanceMember(modules, reference, name) orelse {
+                    return self.fail(location, error.MissingTypeclassFunction);
+                };
+                var call: ast.Expression = .{
+                    .kind = .{ .call = .{ .callee = .{ .identifier = .{ .name = name, .resolution = .{ .function = member } } }, .arguments = &.{} } },
+                    .location = location,
+                };
+                return self.evaluateType(&call);
+            },
+            .optional => |optional| .{ .optional = try self.types.addOptional(allocator, try self.reduceType(location, optional.child, reference)) },
+            .pointer => |pointer| .{ .pointer = try self.types.addPointer(allocator, .{
+                .target = try self.reduceType(location, pointer.target, reference),
+                .many = pointer.many,
+                .constant = pointer.constant,
+            }) },
+            .slice => |slice| .{ .slice = try self.types.addSlice(allocator, try self.reduceType(location, slice.element, reference), slice.constant) },
+            else => value_type,
+        };
     }
 
     fn resolveTemplateSignature(self: *NameResolver, module_index: usize, index: usize) ResolveError!ast.FunctionSignature {
@@ -538,6 +612,9 @@ pub const NameResolver = struct {
             if (unique) try self.expectUniqueMethod(module_index, index, receiver_type);
         }
         try self.resolveConstraints(signature);
+        const caller_signature_definition = self.signature_definition;
+        defer self.signature_definition = caller_signature_definition;
+        self.signature_definition = if (definition.instance != null) definition else null;
         if (!ast.isGeneric(signature.*)) try self.resolveFunctionTypes(signature);
         signature.progress = .done;
     }
@@ -1076,8 +1153,11 @@ pub const NameResolver = struct {
         var constraints: std.ArrayList(ast.Constraint) = .empty;
         var dependency: Dependency = .{};
         try bindings.appendSlice(allocator, initial_bindings);
+        const modules = self.loader.modules.items;
         for (copy.signature.parameters) |parameter| {
-            if (parameter.kind == .type and parameter.constraint == null) try dependency.roots.append(allocator, parameter.name);
+            const tuple = parameter.constraint != null and ast.isTupleTypeclass(modules, parameter.constraint.?);
+            if (parameter.kind == .type and (parameter.constraint == null or tuple)) try dependency.roots.append(allocator, parameter.name);
+            if (parameter.kind == .implicit and tuple) try dependency.roots.append(allocator, parameter.name);
         }
         for (copy.signature.parameters, 0..) |parameter, index| {
             const variable: types.Type = .{ .variable = .{ .scope = .function, .index = index } };
@@ -1099,10 +1179,15 @@ pub const NameResolver = struct {
                 },
                 .type => {
                     const typeclass = parameter.constraint orelse continue;
+                    if (ast.isTupleTypeclass(modules, typeclass)) continue;
                     try bindings.append(allocator, .{ .name = parameter.name, .target = .{ .type = variable } });
                     try constraints.append(allocator, .{ .typeclass = typeclass, .arguments = arguments });
                 },
                 .implicit => {
+                    if (ast.isTupleTypeclass(modules, parameter.constraint.?)) {
+                        dependency.removed = true;
+                        continue;
+                    }
                     var implicit = parameter;
                     implicit.kind = .run_time;
                     implicit.type.denoted = variable;
@@ -1184,7 +1269,194 @@ pub const NameResolver = struct {
             .expandConstraints = expandConstraintsForChecker,
             .beginStruct = beginStructForChecker,
             .finishStruct = finishStructForChecker,
+            .expandTupleLoop = expandTupleLoopForChecker,
         };
+    }
+
+    fn expandTupleLoopForChecker(
+        context: *anyopaque,
+        function: ast.Resolution.Function,
+        statement: *ast.Statement,
+        count: usize,
+    ) AnalyzeError!void {
+        const self: *NameResolver = @ptrCast(@alignCast(context));
+        return self.expandTupleLoop(function, statement, count);
+    }
+
+    fn expandTupleLoop(
+        self: *NameResolver,
+        function: ast.Resolution.Function,
+        statement: *ast.Statement,
+        count: usize,
+    ) ResolveError!void {
+        const allocator = self.arena.allocator();
+        const module = self.loader.modules.items[function.module];
+        const definition = &ast.findDeclaration(module, function.declaration).kind.function_definition;
+        const caller_module_index = self.module_index;
+        const caller_self_type = self.self_type;
+        const caller_self_name = self.self_name;
+        const caller_typeclass = self.typeclass;
+        const caller_bindings = self.bindings;
+        const caller_constraints = self.constraints;
+        const caller_dropped_names = self.dropped_names;
+        defer self.module_index = caller_module_index;
+        defer self.self_type = caller_self_type;
+        defer self.self_name = caller_self_name;
+        defer self.typeclass = caller_typeclass;
+        defer self.bindings = caller_bindings;
+        defer self.constraints = caller_constraints;
+        defer self.dropped_names = caller_dropped_names;
+        self.module_index = if (definition.default_of) |typeclass| typeclass.module else function.module;
+        self.self_type = if (definition.signature.receiver) |receiver| ast.extractType(receiver) else null;
+        self.self_name = if (definition.instance == null) "Self" else "";
+        self.typeclass = definition.default_of;
+        self.bindings = definition.bindings;
+        self.constraints = definition.constraints;
+        self.dropped_names = definition.dropped_names;
+        const parameters = definition.signature.parameters;
+        const parameter_uses = try allocator.alloc(ast.Use, parameters.len);
+        @memset(parameter_uses, .{});
+        var locals: std.ArrayList(Local) = .empty;
+        var loops: std.ArrayList(Loop) = .empty;
+        const block: Block = .{
+            .parameters = parameters,
+            .parameter_uses = parameter_uses,
+            .locals = &locals,
+            .loops = &loops,
+        };
+        _ = try self.collectScope(block, definition.body, statement);
+        try loops.append(allocator, .{ .statement = statement });
+        const loop = &statement.kind.@"for";
+        const pointer = ast.hasPointerName(loop.names);
+        if (!pointer) {
+            const value = try allocator.create(ast.Statement);
+            value.* = .{
+                .kind = .{ .constant_declaration = .{ .name = "mn_tuple", .value = loop.sequence.value } },
+                .location = statement.location,
+            };
+            loop.expansion_value = value;
+            try locals.append(allocator, .{ .name = "mn_tuple", .target = .{ .local = value }, .statement = value, .location = statement.location });
+        }
+        const expansions = try allocator.alloc([]ast.Statement, count);
+        for (expansions, 0..) |*expansion, position| {
+            const body = try ast.cloneBlock(allocator, loop.body);
+            const element = try self.buildTupleElement(statement, position, pointer);
+            const declarations: []const ast.Statement = if (element) |declaration| &.{declaration} else &.{};
+            expansion.* = try std.mem.concat(allocator, ast.Statement, &.{ declarations, body });
+            try self.resolveNamesInBlock(block, expansion.*);
+        }
+        loop.expansions = expansions;
+    }
+
+    fn buildTupleElement(
+        self: *NameResolver,
+        statement: *const ast.Statement,
+        position: usize,
+        pointer: bool,
+    ) ResolveError!?ast.Statement {
+        const allocator = self.arena.allocator();
+        const loop = statement.kind.@"for";
+        const location = statement.location;
+        const base = try allocator.create(ast.Expression);
+        base.* = if (pointer)
+            try ast.cloneExpression(allocator, loop.sequence.value)
+        else
+            .{ .kind = .{ .identifier = .{ .name = "mn_tuple" } }, .location = location };
+        const index = try allocator.create(ast.Expression);
+        const text = try std.fmt.allocPrint(allocator, "{d}", .{position});
+        index.* = .{ .kind = .{ .integer_literal = .{ .text = text, .suffix = null } }, .location = location };
+        const element: ast.Expression = .{ .kind = .{ .index = .{ .value = base, .index = index } }, .location = location };
+        if (loop.tuple) {
+            const names = try allocator.dupe(ast.ElementName, loop.names);
+            for (names) |*name| name.type = null;
+            return .{ .kind = .{ .tuple_declaration = .{ .names = names, .value = element } }, .location = location };
+        }
+        const name = loop.names[0];
+        if (ast.isDiscardedName(name.name)) return null;
+        var value = element;
+        if (name.pointer) {
+            const operand = try allocator.create(ast.Expression);
+            operand.* = element;
+            value = .{ .kind = .{ .address_of = operand }, .location = location };
+        }
+        return .{ .kind = .{ .constant_declaration = .{ .name = name.name, .value = value } }, .location = name.location };
+    }
+
+    fn collectScope(
+        self: *NameResolver,
+        block: Block,
+        body: []ast.Statement,
+        target: *const ast.Statement,
+    ) ResolveError!bool {
+        const allocator = self.arena.allocator();
+        for (body) |*statement| {
+            if (statement == target) return true;
+            switch (statement.kind) {
+                .@"for" => |*loop| {
+                    for (loop.expansions) |expansion| {
+                        if (!containsTarget(expansion, target)) continue;
+                        try block.loops.append(allocator, .{ .statement = statement });
+                        if (loop.expansion_value) |value| {
+                            try block.locals.append(allocator, .{ .name = "mn_tuple", .target = .{ .local = value }, .statement = value, .location = value.location });
+                        }
+                        return self.collectScope(block, expansion, target);
+                    }
+                    if (containsTarget(loop.body, target)) {
+                        try block.loops.append(allocator, .{ .statement = statement });
+                        try self.appendElements(block, statement);
+                        return self.collectScope(block, loop.body, target);
+                    }
+                    if (loop.else_body) |else_body| {
+                        if (containsTarget(else_body, target)) return self.collectScope(block, else_body, target);
+                    }
+                },
+                .@"while" => |*loop| {
+                    if (containsTarget(loop.body, target)) {
+                        try block.loops.append(allocator, .{ .statement = statement });
+                        return self.collectScope(block, loop.body, target);
+                    }
+                    if (loop.else_body) |else_body| {
+                        if (containsTarget(else_body, target)) return self.collectScope(block, else_body, target);
+                    }
+                },
+                .@"if" => |*conditional| {
+                    if (containsTarget(conditional.body, target)) return self.collectScope(block, conditional.body, target);
+                    if (conditional.else_body) |else_body| {
+                        if (containsTarget(else_body, target)) return self.collectScope(block, else_body, target);
+                    }
+                },
+                .match => |*matching| {
+                    for (matching.branches, matching.names, 0..) |*branch, name, position| {
+                        if (!containsTarget(branch.body, target)) continue;
+                        if (!ast.isDiscardedName(name.name)) {
+                            const element: ast.Resolution.Element = .{ .statement = statement, .position = position };
+                            try block.locals.append(allocator, .{ .name = name.name, .target = .{ .element = element }, .statement = statement, .location = name.location });
+                        }
+                        return self.collectScope(block, branch.body, target);
+                    }
+                },
+                .constant_declaration => |*constant| {
+                    const scope: Scope = .{ .parameters = block.parameters, .parameter_uses = block.parameter_uses, .locals = block.locals.items };
+                    const alias = if (constant.type == null) try self.findAlias(scope, &constant.value) else null;
+                    const local_target: Target = alias orelse .{ .local = statement };
+                    try block.locals.append(allocator, .{ .name = constant.name, .target = local_target, .statement = statement, .location = statement.location });
+                },
+                .variable_declaration => |variable| {
+                    try block.locals.append(allocator, .{ .name = variable.name, .target = .{ .local = statement }, .statement = statement, .location = statement.location });
+                },
+                .tuple_declaration => try self.appendElements(block, statement),
+                .noop, .@"return", .discard, .call, .assignment, .@"defer", .@"break", .@"continue" => {},
+            }
+        }
+        return false;
+    }
+
+    fn appendElements(self: *NameResolver, block: Block, statement: *ast.Statement) ResolveError!void {
+        for (ast.extractElementNames(statement.*), 0..) |name, position| {
+            if (ast.isDiscardedName(name.name)) continue;
+            const element: ast.Resolution.Element = .{ .statement = statement, .position = position };
+            try block.locals.append(self.arena.allocator(), .{ .name = name.name, .target = .{ .element = element }, .statement = statement, .location = name.location });
+        }
     }
 
     fn instantiateInstanceFunctionForChecker(
@@ -1222,9 +1494,7 @@ pub const NameResolver = struct {
     ) AnalyzeError!void {
         const self: *NameResolver = @ptrCast(@alignCast(context));
         const allocator = self.arena.allocator();
-        var bindings: std.ArrayList(ast.Binding) = .empty;
-        try bindings.appendSlice(allocator, struct_type.bindings);
-        try bindings.append(allocator, .{ .name = "Self", .target = .{ .type = value_type } });
+        const bindings = try bindSelf(allocator, struct_type.bindings, value_type);
         const caller_module_index = self.module_index;
         const caller_self_type = self.self_type;
         const caller_self_name = self.self_name;
@@ -1239,13 +1509,21 @@ pub const NameResolver = struct {
         self.self_type = value_type;
         self.self_name = "Self";
         self.typeclass = null;
-        self.bindings = bindings.items;
-        const fields = try allocator.alloc(ast.Field, struct_type.fields.len);
-        for (struct_type.fields, fields) |field, *cloned| cloned.* = try ast.cloneField(allocator, field);
+        self.bindings = bindings;
+        const fields = try cloneFields(allocator, struct_type.fields);
         try self.resolveFields(fields, @constCast(value_type.@"struct".fields));
+        try self.completeStruct(struct_type, value_type, location);
+    }
+
+    fn completeStruct(
+        self: *NameResolver,
+        struct_type: *const ast.StructType,
+        value_type: types.Type,
+        location: token.Location,
+    ) ResolveError!void {
         try self.expectNotContained(value_type.@"struct", location);
-        try self.types.add(allocator, value_type);
-        try self.addStructFunctions(struct_type, bindings.items);
+        try self.types.add(self.arena.allocator(), value_type);
+        try self.addStructFunctions(struct_type, self.bindings);
     }
 
     fn addStructFunctions(
@@ -1331,6 +1609,15 @@ pub const NameResolver = struct {
 
     fn expectType(self: *NameResolver, expression: *ast.Expression) ResolveError!types.Type {
         if (expression.denoted) |denoted| return denoted;
+        if (!isCall(expression)) return self.expectOtherType(expression);
+        if (try self.buildApplication(expression)) |application| {
+            expression.denoted = application;
+            return application;
+        }
+        return self.evaluateType(expression);
+    }
+
+    fn expectOtherType(self: *NameResolver, expression: *ast.Expression) ResolveError!types.Type {
         switch (expression.kind) {
             inline .identifier, .path_expression, .member => |name| {
                 const resolution = name.resolution orelse return self.fail(expression.location, error.TypeMismatch);
@@ -1348,13 +1635,7 @@ pub const NameResolver = struct {
             .optional_type => |optional_type| return optional_type.value.?,
             .tuple_type => |tuple_type| return tuple_type.value.?,
             .function_type => |function_type| return function_type.value.?,
-            .call => {
-                if (try self.buildApplication(expression)) |application| {
-                    expression.denoted = application;
-                    return application;
-                }
-                return self.evaluateType(expression);
-            },
+            .call => unreachable,
             .method_call, .index, .field_access, .unwrap, .dereference, .struct_type => {
                 return self.evaluateType(expression);
             },
@@ -1376,6 +1657,7 @@ pub const NameResolver = struct {
             .composite_literal,
             .slice,
             .@"try",
+            .range,
             => return self.fail(expression.location, error.TypeMismatch),
         }
     }
@@ -1387,6 +1669,9 @@ pub const NameResolver = struct {
             inline .identifier, .path_expression => |name| name.resolution,
             .member => return null,
         };
+        if (resolution != null and resolution.? == .typeclass_function) {
+            return try self.buildTypeclassApplication(expression.location, resolution.?.typeclass_function, call);
+        }
         const constructor: types.Constructor = if (resolution) |resolved| constructor: {
             if (resolved != .function) return null;
             const module = self.loader.modules.items[resolved.function.module];
@@ -1415,17 +1700,45 @@ pub const NameResolver = struct {
         return .{ .application = try self.types.addApplication(allocator, constructor, arguments) };
     }
 
-    fn evaluateType(self: *NameResolver, expression: *ast.Expression) ResolveError!types.Type {
-        if (self.type_checker == null) return self.fail(expression.location, error.TypeMismatch);
-        const type_checker = try self.prepareChecker();
+    fn buildTypeclassApplication(
+        self: *NameResolver,
+        location: token.Location,
+        function: ast.Resolution.TypeclassFunction,
+        call: ast.Call,
+    ) ResolveError!types.Type {
+        if (call.arguments.len != 0) return self.fail(location, error.TypeMismatch);
         const modules = self.loader.modules.items;
-        if (!type_checker.isKnown(modules, expression.*)) return self.fail(expression.location, error.TypeMismatch);
-        const value = type_checker.evaluateKnown(modules, self.module_index, expression, .type) catch |type_error| {
-            if (type_checker.failure) |failure| self.failure = failure;
+        const definition = modules[function.typeclass.module].declarations[function.typeclass.declaration].kind.typeclass_definition;
+        const allocator = self.arena.allocator();
+        const arguments = try allocator.alloc(types.Type, definition.parameters.len);
+        for (arguments, 0..) |*argument, index| argument.* = .{ .variable = .{ .scope = .typeclass, .index = index } };
+        if (self.signature_definition) |instance_function| {
+            const reference = instance_function.instance.?;
+            const instance_arguments = modules[reference.module].declarations[reference.declaration].kind.instance_declaration.resolved_arguments;
+            for (arguments, instance_arguments) |*argument, instance_argument| argument.* = instance_argument.type;
+        }
+        return .{ .application = try self.types.addApplication(allocator, .{ .typeclass_function = function }, arguments) };
+    }
+
+    fn evaluateType(self: *NameResolver, expression: *ast.Expression) ResolveError!types.Type {
+        const type_checker = try self.prepareKnownChecker(expression);
+        const value = type_checker.evaluateKnown(self.loader.modules.items, self.module_index, expression, .type) catch |type_error| {
+            self.adoptCheckerFailure(type_checker);
             return type_error;
         };
         expression.denoted = value.type;
-        return value.type;
+        return expression.denoted.?;
+    }
+
+    fn adoptCheckerFailure(self: *NameResolver, type_checker: *const TypeChecker) void {
+        if (type_checker.failure) |failure| self.failure = failure;
+    }
+
+    fn prepareKnownChecker(self: *NameResolver, expression: *const ast.Expression) ResolveError!*TypeChecker {
+        if (self.type_checker == null) return self.fail(expression.location, error.TypeMismatch);
+        const type_checker = try self.prepareChecker();
+        if (!type_checker.isKnown(self.loader.modules.items, expression.*)) return self.fail(expression.location, error.TypeMismatch);
+        return type_checker;
     }
 
     fn resolveNamesInFunction(
@@ -1538,6 +1851,7 @@ pub const NameResolver = struct {
             },
             .@"if" => |*conditional| {
                 try self.resolveNamesInExpression(scope, &conditional.condition);
+                try self.chooseBlock(conditional);
                 try self.resolveNamesInBlock(block, conditional.body);
                 if (conditional.else_body) |else_body| try self.resolveNamesInBlock(block, else_body);
             },
@@ -1570,6 +1884,31 @@ pub const NameResolver = struct {
             },
         }
         return null;
+    }
+
+    fn chooseBlock(self: *NameResolver, conditional: *ast.If) ResolveError!void {
+        if (self.type_checker == null) return;
+        const modules = self.loader.modules.items;
+        const condition = &conditional.condition;
+        if (!self.type_checker.?.isKnown(modules, condition.*)) return;
+        const type_checker = try self.prepareChecker();
+        const chosen = type_checker.chooseCondition(modules, self.module_index, condition) catch |type_error| {
+            self.adoptCheckerFailure(type_checker);
+            return type_error;
+        } orelse return;
+        const allocator = self.arena.allocator();
+        const dropped = if (chosen) conditional.else_body orelse &.{} else conditional.body;
+        var names: std.ArrayList([]const u8) = .empty;
+        try names.appendSlice(allocator, self.dropped_names);
+        for (dropped) |statement| try collectStatementNames(allocator, &names, statement);
+        self.dropped_names = names.items;
+        condition.kind = .{ .boolean_literal = chosen };
+        conditional.known = chosen;
+        if (chosen) {
+            conditional.else_body = null;
+        } else {
+            conditional.body = &.{};
+        }
     }
 
     fn resolveSequence(self: *NameResolver, scope: Scope, sequence: *ast.Sequence) ResolveError!void {
@@ -1702,7 +2041,7 @@ pub const NameResolver = struct {
         if (!self.type_checker.?.isKnown(modules, value.*)) return .{ .local = statement };
         const type_checker = try self.prepareChecker();
         type_checker.checkKnownConstant(modules, self.module_index, constant) catch |type_error| {
-            if (type_checker.failure) |failure| self.failure = failure;
+            self.adoptCheckerFailure(type_checker);
             return type_error;
         };
         return .{ .local = statement };
@@ -1817,6 +2156,7 @@ pub const NameResolver = struct {
             .struct_type,
             .unwrap,
             .@"try",
+            .range,
             => unreachable,
         }
     }
@@ -1889,6 +2229,18 @@ pub const NameResolver = struct {
         scope: Scope,
         expression: *ast.Expression,
     ) ResolveError!void {
+        switch (expression.kind) {
+            .pointer_type => |*pointer_type| try self.resolvePointerType(scope, expression.location, pointer_type),
+            .optional_type => |*optional_type| try self.resolveOptionalType(scope, optional_type),
+            else => try self.resolveNamesInOtherExpression(scope, expression),
+        }
+    }
+
+    fn resolveNamesInOtherExpression(
+        self: *NameResolver,
+        scope: Scope,
+        expression: *ast.Expression,
+    ) ResolveError!void {
         const location = expression.location;
         switch (expression.kind) {
             .integer_literal, .float_literal, .boolean_literal, .string_literal, .undefined, .null => {},
@@ -1938,12 +2290,12 @@ pub const NameResolver = struct {
                 try self.resolveNamesInExpression(scope, indexing.index);
             },
             .slice => |slice| try self.resolveSlice(scope, slice),
-            .pointer_type => |*pointer_type| try self.resolvePointerType(scope, location, pointer_type),
-            .optional_type => |*optional_type| try self.resolveOptionalType(scope, optional_type),
+            .pointer_type, .optional_type => unreachable,
             .tuple_type => |*tuple_type| try self.resolveTupleType(scope, tuple_type),
             .function_type => |*function_type| try self.resolveFunctionType(scope, function_type),
             .field_access => |access| try self.resolveNamesInExpression(scope, access.value),
             .dereference, .unwrap, .@"try" => |operand| try self.resolveNamesInExpression(scope, operand),
+            .range => |range| try self.resolveRange(scope, location, range),
             .struct_type => |struct_type| {
                 struct_type.module = self.module_index;
                 struct_type.bindings = self.bindings;
@@ -2027,7 +2379,7 @@ pub const NameResolver = struct {
         if (!type_checker.isKnown(modules, expression.*)) return self.fail(expression.location, error.CannotEvaluate);
         const usize_type: types.Type = .{ .number = .usize };
         const value = type_checker.evaluateKnown(modules, self.module_index, expression, usize_type) catch |type_error| {
-            if (type_checker.failure) |failure| self.failure = failure;
+            self.adoptCheckerFailure(type_checker);
             return type_error;
         };
         return @intCast(value.integer);
@@ -2116,6 +2468,23 @@ pub const NameResolver = struct {
         function_type.value = .{ .function = function };
     }
 
+    fn resolveRange(self: *NameResolver, scope: Scope, location: token.Location, range: *ast.Range) ResolveError!void {
+        try self.resolveNamesInExpression(scope, &range.start);
+        if (range.end) |*end| try self.resolveNamesInExpression(scope, end);
+        range.type = try self.resolveLanguageType(location, "Range");
+    }
+
+    fn resolveLanguageType(self: *NameResolver, location: token.Location, name: []const u8) ResolveError!types.Type {
+        const namespace = (try self.loadRoot("mn")) orelse return self.fail(location, error.MissingLanguageDeclaration);
+        const module_index = namespace.module orelse return self.fail(location, error.MissingLanguageDeclaration);
+        const index = findDeclaration(self.loader.modules.items[module_index], name) orelse {
+            return self.fail(location, error.MissingLanguageDeclaration);
+        };
+        const target = try self.resolveDeclaration(module_index, index);
+        if (target != .type) return self.fail(location, error.MissingLanguageDeclaration);
+        return target.type;
+    }
+
     fn resolveIdentifier(
         self: *NameResolver,
         scope: Scope,
@@ -2198,6 +2567,10 @@ pub const NameResolver = struct {
                     identifier.resolution = .{ .parameter = index };
                     return;
                 }
+                if (try self.findSiblingFunction(name)) |sibling| {
+                    identifier.resolution = sibling;
+                    return;
+                }
                 break :target .{ try self.resolveName(location, name), &identifier.resolution };
             },
             .path_expression => |*path_expression| target: {
@@ -2221,6 +2594,30 @@ pub const NameResolver = struct {
             return self.pending.append(self.arena.allocator(), pending);
         }
         resolution.* = try self.expectCallee(location, target);
+    }
+
+    fn findSiblingFunction(self: *NameResolver, name: []const u8) ResolveError!?ast.Resolution {
+        const modules = self.loader.modules.items;
+        if (self.signature_typeclass) |typeclass| {
+            const definition = modules[typeclass.module].declarations[typeclass.declaration].kind.typeclass_definition;
+            const position = findSignaturePosition(definition.functions, name) orelse return null;
+            return .{ .typeclass_function = .{ .typeclass = typeclass, .function = position } };
+        }
+        const definition = self.signature_definition orelse return null;
+        const reference = definition.instance.?;
+        const function = ast.findInstanceMember(modules, reference, name) orelse return null;
+        const instance_declaration = modules[reference.module].declarations[reference.declaration].kind.instance_declaration;
+        const parameters = instance_declaration.parameters;
+        if (parameters.len == 0) return .{ .function = function };
+        if (definition.template == null) {
+            const typeclass = instance_declaration.resolved.?;
+            const functions = modules[typeclass.module].declarations[typeclass.declaration].kind.typeclass_definition.functions;
+            const position = findSignaturePosition(functions, name).?;
+            return .{ .typeclass_function = .{ .typeclass = typeclass, .function = position } };
+        }
+        const assigned = try self.arena.allocator().alloc(types.Argument, parameters.len);
+        for (assigned, definition.bindings[0..parameters.len]) |*argument, binding| argument.* = .{ .type = binding.target.type };
+        return .{ .function = try self.instantiateInstanceFunction(function, assigned) };
     }
 
     fn expectCallee(
@@ -2258,6 +2655,7 @@ pub const NameResolver = struct {
                 .constructor => |constructor| switch (constructor) {
                     .function => |function| .{ .function = function },
                     .variable => .{ .constructor = constructor },
+                    .typeclass_function => unreachable,
                 },
             };
         }
@@ -2407,9 +2805,7 @@ pub const NameResolver = struct {
         namespace: Namespace,
         name: []const u8,
     ) ResolveError!Target {
-        if (namespace.path.len == 1 and isLanguageModule(namespace.path[0])) {
-            if (std.meta.stringToEnum(ast.Builtin, name)) |builtin| return .{ .builtin = builtin };
-        }
+        if (findBuiltin(namespace.path, name)) |builtin| return .{ .builtin = builtin };
         if (namespace.module) |module_index| {
             const module = self.loader.modules.items[module_index];
             if (findMember(module, name)) |index| {
@@ -2533,6 +2929,7 @@ pub const NameResolver = struct {
             .dereference,
             .unwrap,
             .@"try",
+            .range,
             .struct_type,
             .member,
             => {
@@ -2676,15 +3073,7 @@ pub const NameResolver = struct {
             try self.resolveTypedName(field.name, field.location, &field.type);
             if (field.default) |*default| try self.resolveNamesInExpression(.{}, default);
         }
-        for (fields, resolved) |*field, *resolved_field| {
-            resolved_field.* = .{
-                .name = field.name,
-                .type = ast.extractType(field.type),
-                .default = if (field.default) |*default| default else null,
-                .default_value = if (field.default != null) &field.default_value else null,
-                .location = field.location,
-            };
-        }
+        describeFields(fields, resolved);
     }
 
     fn loadRoot(self: *NameResolver, name: []const u8) ResolveError!?Namespace {
@@ -2803,6 +3192,8 @@ pub const NameError = error{
     NotCase,
     EmptyEnum,
     BuiltinUsedAsValue,
+    MissingLanguageDeclaration,
+    TupleInstance,
     DependencyLoop,
 };
 
@@ -2959,8 +3350,14 @@ fn describeError(name_error: NameError) []const u8 {
         error.NotCase => "not a case",
         error.EmptyEnum => "an enum needs at least one case",
         error.BuiltinUsedAsValue => "built-in functions can only be called",
+        error.MissingLanguageDeclaration => "mn is missing a declaration the language needs",
+        error.TupleInstance => "the compiler provides the instances of mn::Tuple",
         error.DependencyLoop => "value depends on itself at compile time",
     };
+}
+
+fn isCall(expression: *const ast.Expression) bool {
+    return expression.kind == .call;
 }
 
 fn isRuntimeType(value_type: types.Type) bool {
@@ -3166,6 +3563,8 @@ fn isDependentExpression(names: Names, expression: ast.Expression, in_type: bool
         .method_call => |call| isDependentExpression(names, call.receiver.*, in_type) or
             areDependentArguments(names, call.arguments, true),
         .negation, .address_of, .dereference, .unwrap, .@"try" => |operand| isDependentExpression(names, operand.*, in_type),
+        .range => |range| isDependentExpression(names, range.start, in_type) or
+            (if (range.end) |end| isDependentExpression(names, end, in_type) else false),
         .unary => |unary| isDependentExpression(names, unary.operand.*, in_type),
         .binary => |binary| isDependentExpression(names, binary.left.*, in_type) or
             isDependentExpression(names, binary.right.*, in_type),
@@ -3303,6 +3702,10 @@ fn collectExpressionNames(
             for (call.arguments) |argument| try collectExpressionNames(allocator, names, argument.value);
         },
         .negation, .address_of, .dereference, .unwrap, .@"try" => |operand| try collectExpressionNames(allocator, names, operand.*),
+        .range => |range| {
+            try collectExpressionNames(allocator, names, range.start);
+            if (range.end) |end| try collectExpressionNames(allocator, names, end);
+        },
         .unary => |unary| try collectExpressionNames(allocator, names, unary.operand.*),
         .binary => |binary| {
             try collectExpressionNames(allocator, names, binary.left.*);
@@ -3374,6 +3777,26 @@ fn hasVariableBindings(bindings: []const ast.Binding) bool {
     return false;
 }
 
+fn containsTarget(body: []const ast.Statement, target: *const ast.Statement) bool {
+    for (body) |*statement| {
+        if (statement == target) return true;
+        var blocks = ast.iterateBlocks(statement.*);
+        while (blocks.next()) |block| {
+            if (containsTarget(block, target)) return true;
+        }
+    }
+    return false;
+}
+
+fn findBuiltin(path: ast.Path, name: []const u8) ?ast.Builtin {
+    if (!isLanguageModule(path[0])) return null;
+    const builtin = std.meta.stringToEnum(ast.Builtin, name) orelse return null;
+    const reflection = builtin == .length or builtin == .join;
+    if (path.len == 1 and !reflection) return builtin;
+    if (path.len == 2 and std.mem.eql(u8, path[1], "reflection") and reflection) return builtin;
+    return null;
+}
+
 fn findCase(receiver: types.Type, name: []const u8) ?ast.Resolution.Case {
     if (receiver != .@"enum" or !types.isDeclaredEnum(receiver.@"enum")) return null;
     for (receiver.@"enum".cases, 0..) |case, index| {
@@ -3414,6 +3837,31 @@ fn reserveFields(allocator: std.mem.Allocator, fields: []const ast.Field) std.me
         placeholder.* = .{ .name = field.name, .type = .void, .location = field.location };
     }
     return reserved;
+}
+
+fn bindSelf(allocator: std.mem.Allocator, bindings: []const ast.Binding, value_type: types.Type) std.mem.Allocator.Error![]ast.Binding {
+    const bound = try allocator.alloc(ast.Binding, bindings.len + 1);
+    @memcpy(bound[0..bindings.len], bindings);
+    bound[bindings.len] = .{ .name = "Self", .target = .{ .type = value_type } };
+    return bound;
+}
+
+fn cloneFields(allocator: std.mem.Allocator, fields: []const ast.Field) std.mem.Allocator.Error![]ast.Field {
+    const cloned = try allocator.alloc(ast.Field, fields.len);
+    for (fields, cloned) |*field, *clone| clone.* = try ast.cloneField(allocator, field.*);
+    return cloned;
+}
+
+fn describeFields(fields: []ast.Field, resolved: []types.Field) void {
+    for (fields, resolved) |*field, *resolved_field| {
+        resolved_field.* = .{
+            .name = field.name,
+            .type = ast.extractType(field.type),
+            .default = if (field.default) |*default| default else null,
+            .default_value = if (field.default != null) &field.default_value else null,
+            .location = field.location,
+        };
+    }
 }
 
 fn addBoundConstant(
@@ -4414,6 +4862,89 @@ test "resolveInstance: rejects a missing function without a default next to a de
 
     try std.testing.expectError(error.MissingTypeclassFunction, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 6, .column = 1 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveInstance: compares next with the Element of the same instance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Countdown:\n    count: u32\ninstance mn::Iterator(Countdown):\n    fn Element() -> type: return [u32]\n    fn next(iterator: *Countdown) -> ?Element():\n        if iterator.count == 0: return null\n        iterator.count -= 1\n        return {iterator.count + 1}\nconst Element = mn::Iterator(Countdown)::Element()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const element = loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.type;
+    try std.testing.expectEqual(types.Type{ .number = .u32 }, element.tuple.elements[0]);
+}
+
+test "resolveInstance: rejects next with another type than Element" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Countdown:\n    count: u32\ninstance mn::Iterator(Countdown):\n    fn Element() -> type: return [u32]\n    fn next(_: *Countdown) -> ?[u8]: return null" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MismatchedTypeclassFunction, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 5 }, analyzer.failure.?.location.?);
+}
+
+test "resolveInstance: rejects an instance of mn::Tuple" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\ninstance mn::Tuple(i32)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TupleInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, analyzer.failure.?.location.?);
+}
+
+test "expandTupleLoop: resolves a copy of the block for each element of a tuple" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count(pair: [i32, bool]) -> usize:\n    var seen: usize = 0\n    for value in pair:\n        const copy = value\n        _ = copy\n        seen += 1\n    return seen\nconst COUNT = count({1, true})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    const expansions = body[1].kind.@"for".expansions;
+    try std.testing.expectEqual(2, expansions.len);
+    const second = expansions[1][1].kind.constant_declaration.value;
+    try std.testing.expectEqual(&expansions[1][0], second.kind.identifier.resolution.?.local);
+    try std.testing.expectEqual(types.Type.boolean, second.type.?);
+    try std.testing.expectEqual(Value{ .integer = 2 }, loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*);
 }
 
 test "expectTypeclass: rejects an instance of something that is not a typeclass" {
@@ -6528,6 +7059,26 @@ test "resolveNamesInStatement: resolves the names of a deferred statement where 
     const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
     const arguments = body[1].kind.@"defer".statement.kind.call.kind.call.arguments;
     try std.testing.expectEqual(&body[0], arguments[0].value.kind.identifier.resolution.?.local);
+}
+
+test "chooseBlock: resolves only the block that a condition depending on a type chooses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn total(type T, comptime index: usize) -> usize:\n    if index == mn::reflection::length(T): return 0\n    else:\n        const Element = T[index]\n        return mn::size(Element) + total(T, index + 1)\nconst TOTAL = total([u8, i32, u16], 0)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .integer = 7 }, known);
 }
 
 test "resolveSequence: resolves a sequence outside the names of its loop" {
@@ -9825,6 +10376,45 @@ test "resolveMember: rejects a built-in function used as a value" {
 
     try std.testing.expectError(error.BuiltinUsedAsValue, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 18 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveMember: resolves the reflection built-ins under mn::reflection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nconst LENGTH = mn::reflection::length([i32, bool])" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const value = loader.modules.items[0].declarations[1].kind.constant_declaration.value;
+    try std.testing.expectEqual(ast.Resolution{ .builtin = .length }, value.kind.call.callee.path_expression.resolution.?);
+}
+
+test "resolveMember: rejects a reflection built-in directly under mn" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nconst LENGTH = mn::length([i32, bool])" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownName, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 16 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveMember: rejects a call that ends at a directory" {

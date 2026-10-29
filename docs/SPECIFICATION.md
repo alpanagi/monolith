@@ -76,6 +76,8 @@
 - A tuple can have any number of elements, e.g. `[i32]` and `[]`. Brackets without a comma that are followed by a type are an array or a slice instead.
 - Tuple types can span multiple lines. A comma after the last element type is allowed.
 - Tuples support indexing with an index known at compile time, starting at 0.
+- Indexing a tuple type with an index known at compile time gives the type of that element, e.g. `T[0]`.
+- Every tuple type has an instance of `mn`'s typeclass `mn::Tuple`, which the compiler provides. A program cannot declare an instance of `mn::Tuple`. A parameter that requires it takes any tuple, e.g. `fn print(format: comptime []const u8, values: mn::Tuple)`, and code that depends on the tuple's elements is checked in each instance of the function.
 
 ### Function Types
 
@@ -167,6 +169,7 @@
 
 - Tuple literals are written as the tuple type followed by the elements in braces, e.g. `[i32, bool]{1, true}`.
 - The type can be left out when it is known from the surrounding code, e.g. `{1, true}`.
+- A tuple literal without a type whose type is not known from the surrounding code takes its type from its elements, e.g. `{count, flag}` is a `[i32, bool]` when `count` is an `i32` and `flag` is a `bool`.
 - Tuple literals can span multiple lines.
 - A comma after the last element is allowed.
 
@@ -356,8 +359,14 @@
 
 ### For
 
-- `for name in sequence:` runs its block once for each element of the sequence, in order, with `name` holding the element. A sequence is an array, a slice, a pointer to an array or a range.
+- `for name in sequence:` runs its block once for each element of the sequence, in order, with `name` holding the element. A sequence is an array, a slice, a pointer to an array, a range, an iterator or a tuple.
 - `start..end` is a range of the `usize` values from `start` up to, but not including, `end`, e.g. `for index in 0..count:`. `start..` is a range without an end. A start after the end is illegal behavior.
+- A range is also a value of the type `mn::Range`, which is an iterator over its values, e.g. as an argument.
+- An iterator is a value whose type has an instance of `mn`'s typeclass `Iterator(I)`. Its `Element() -> type` gives the type of the elements, and its `next(iterator: *I) -> ?Element()` gives the elements until it returns `null`, e.g. `Iterator(Countdown)::Element()`. The loop calls `next` on its own copy of the iterator.
+- An iterator's elements are tuples. A single name without parentheses takes apart a one-element tuple, e.g. `for count in countdown:` over an iterator whose `Element()` is `[u32]` gives each `u32`.
+- Over a tuple, the block is compiled once for each element, with `name` holding that element with its own type, e.g. `for value in values:`.
+- A slice is also an iterator through `mn`'s instances `Iterator([]T)` and `Iterator([]const T)`, whose `next` gives the first element and shortens the slice by one.
+- `mn`'s typeclass `Zip(T)` has the function `zip(iterators: T)`, which takes a tuple of iterators and gives an iterator whose elements join theirs into one tuple, in order. It ends when the shortest iterator ends, e.g. `for (card, index) in Zip::zip({cards[..], 0..}):` with `import mn::Zip`. Its one instance is `instance(type T: mn::Tuple) Zip(T)`.
 - The sequence is evaluated once, before the first run of the block. An array is not copied: the loop goes over the array itself.
 - Names in parentheses take each element apart, e.g. `for (name, score) in pairs:`, and `*name` holds a pointer to each element instead of a copy, e.g. `for *card in cards:`, as in a constant declaration (see Variables and Constants).
 - The names are constants and can be used only in the block.
@@ -414,6 +423,7 @@
 - The program starts at the function `main` in `main.mn`.
 - `mn` is the module that comes with the language. It holds the built-in functions, which the compiler provides, and the standard library. A program's own `mn.mn` or `mn` directory is a compile-time error.
 - The built-in functions are `mn::size(T)` and `mn::alignment(T)`, which give a type's size and alignment in bytes as a `usize`, and `mn::convert(T, value)` and `mn::truncate(T, value)` (see Number Conversions).
+- `mn::reflection` holds the built-in functions that inspect and build types. `mn::reflection::length(T)` gives a tuple type's number of elements as a `usize`. `mn::reflection::join(A, B)` gives the tuple type with the elements of `A` followed by those of `B`, e.g. `mn::reflection::join([Card], [usize])` is `[Card, usize]`.
 - `import path` makes the last name of the path available in the module. The path names a directory, a module or a declaration in a module, e.g. `import mn::io::stdout` allows `stdout::write("hi")`.
 - `import path as name` makes it available as `name` instead, e.g. `import mn::io::stdout as out`.
 - `import` is written at the top level of a module. The name it makes available cannot be the same as another import or top-level declaration of the module.

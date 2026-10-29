@@ -480,13 +480,13 @@ pub const Parser = struct {
         offset: *usize,
     ) ParseError!ast.Sequence {
         var position = offset.*;
-        const value = (try self.parseExpression(allocator, &position)) orelse {
+        const value = (try self.parseOperation(allocator, &position)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
         const sequence: ast.Sequence = if (self.match(&position, .dot_dot) == null)
             .{ .value = value }
         else
-            .{ .range = .{ .start = value, .end = try self.parseExpression(allocator, &position) } };
+            .{ .range = .{ .start = value, .end = try self.parseOperation(allocator, &position) } };
 
         offset.* = position;
         return sequence;
@@ -1107,6 +1107,25 @@ pub const Parser = struct {
     }
 
     fn parseExpression(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.Expression {
+        var position = offset.*;
+        const start = (try self.parseOperation(allocator, &position)) orelse return null;
+        if (self.match(&position, .dot_dot) == null) {
+            offset.* = position;
+            return start;
+        }
+        const end = try self.parseOperation(allocator, &position);
+        const range = try allocator.create(ast.Range);
+        range.* = .{ .start = start, .end = end };
+
+        offset.* = position;
+        return .{ .kind = .{ .range = range }, .location = start.location };
+    }
+
+    fn parseOperation(
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
@@ -1782,7 +1801,7 @@ pub const Parser = struct {
         allocator: std.mem.Allocator,
         offset: *usize,
     ) ParseError!?*ast.Expression {
-        const bound = (try self.parseExpression(allocator, offset)) orelse return null;
+        const bound = (try self.parseOperation(allocator, offset)) orelse return null;
         const stored = try allocator.create(ast.Expression);
         stored.* = bound;
         return stored;
@@ -2816,17 +2835,6 @@ test "parseSequence: rejects a missing sequence" {
 
     try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, parser.failure.?.location.?);
-}
-
-test "parseSequence: leaves a range outside a for unparsed" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    const range = 0..3\n    noop");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.UnexpectedToken, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 20 }, parser.failure.?.location.?);
 }
 
 test "parseMatch: parses branches with several cases, value names and an else" {
@@ -3993,6 +4001,21 @@ test "parseExpression: parses operators in conditions, arguments and literal ele
     try std.testing.expectEqual(ast.BinaryOperator.add, arguments[0].value.kind.binary.operator);
     const element = arguments[1].value.kind.composite_literal.elements[0].value;
     try std.testing.expectEqual(ast.BinaryOperator.multiply, element.kind.binary.operator);
+}
+
+test "parseExpression: parses a range outside a for as a whole expression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    const range = 1 + 2..count\n    const open = start..\n    noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const range = body[0].kind.constant_declaration.value.kind.range;
+    try std.testing.expectEqual(ast.BinaryOperator.add, range.start.kind.binary.operator);
+    try std.testing.expectEqualStrings("count", range.end.?.kind.identifier.name);
+    try std.testing.expectEqual(null, body[1].kind.constant_declaration.value.kind.range.end);
 }
 
 test "parseAnd: binds a prefix operator tighter than and" {

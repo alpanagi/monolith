@@ -26,6 +26,7 @@ pub const TypeChecker = struct {
     compile_time_function: bool = false,
     return_type: ?types.Type = null,
     deferring: bool = false,
+    current_function: ?ast.Resolution.Function = null,
     exact_numbers: bool = false,
     instances: std.ArrayList(Instance) = .empty,
     created: std.ArrayList(ast.Resolution.Function) = .empty,
@@ -122,6 +123,9 @@ pub const TypeChecker = struct {
         const caller_constraints = self.constraints;
         const caller_instance_depth = self.instance_depth;
         const caller_quiet_operations = self.quiet_operations;
+        const caller_current_function = self.current_function;
+        defer self.current_function = caller_current_function;
+        self.current_function = function;
         defer self.module_index = caller_module_index;
         defer self.constraints = caller_constraints;
         defer self.instance_depth = caller_instance_depth;
@@ -159,7 +163,24 @@ pub const TypeChecker = struct {
         defer self.module_index = caller_module_index;
         defer self.compile_time = caller_compile_time;
         try self.checkExpression(&.{}, expression, expected);
-        return self.evaluateValue(expression.*);
+        return self.evaluateValue(expression);
+    }
+
+    pub fn chooseCondition(
+        self: *TypeChecker,
+        modules: []ast.Module,
+        module_index: usize,
+        condition: *ast.Expression,
+    ) TypeError!?bool {
+        self.program.modules = modules;
+        const caller_module_index = self.module_index;
+        self.module_index = module_index;
+        defer self.module_index = caller_module_index;
+        const type_dependencies = self.type_dependencies;
+        try self.checkExpression(&.{}, condition, .boolean);
+        if (self.type_dependencies == type_dependencies) return null;
+        if (!self.evaluator.isKnown(condition.*)) return null;
+        return (try self.evaluateValue(condition)).boolean;
     }
 
     pub fn checkKnownConstant(
@@ -324,14 +345,15 @@ pub const TypeChecker = struct {
                 const else_body = conditional.else_body orelse return mergeFlows(body, flow);
                 return mergeFlows(body, try self.traceBlock(trace, else_body, flow));
             },
-            .@"while", .@"for" => {
-                const body, const else_body = ast.extractBlocks(statement.*);
+            .@"for" => |loop| if (ast.isUnrolled(loop)) {
+                var current = flow;
+                if (loop.expansion_value) |value| current = try self.traceStatement(trace, value, current);
                 try trace.exits.append(self.arena.allocator(), .{ .loop = statement });
-                _ = try self.traceBlock(trace, body, flow);
+                for (loop.expansions) |expansion| _ = try self.traceBlock(trace, expansion, current);
                 const exit = trace.exits.pop().?.flow;
-                const finished: Flow = if (isEndless(statement.*)) .ended else flow;
-                return mergeFlows(try self.traceBlock(trace, else_body, finished), exit);
-            },
+                return mergeFlows(try self.traceBlock(trace, loop.else_body orelse &.{}, current), exit);
+            } else return self.traceLoop(trace, statement, flow),
+            .@"while" => return self.traceLoop(trace, statement, flow),
             .match => |matching| {
                 var merged: Flow = .ended;
                 for (matching.branches) |branch| {
@@ -340,6 +362,20 @@ pub const TypeChecker = struct {
                 return merged;
             },
         }
+    }
+
+    fn traceLoop(
+        self: *TypeChecker,
+        trace: *Trace,
+        statement: *const ast.Statement,
+        flow: Flow,
+    ) TypeError!Flow {
+        const body, const else_body = ast.extractBlocks(statement.*);
+        try trace.exits.append(self.arena.allocator(), .{ .loop = statement });
+        _ = try self.traceBlock(trace, body, flow);
+        const exit = trace.exits.pop().?.flow;
+        const finished: Flow = if (isEndless(statement.*)) .ended else flow;
+        return mergeFlows(try self.traceBlock(trace, else_body, finished), exit);
     }
 
     fn checkDeferredUses(self: *TypeChecker, body: []const ast.Statement) TypeError!void {
@@ -441,7 +477,7 @@ pub const TypeChecker = struct {
                 const value = constant.value;
                 if (!self.evaluator.isKnown(value)) return self.fail(value.location, error.CannotEvaluate);
                 const cell = try self.arena.allocator().create(Value);
-                cell.* = try self.evaluateValue(value);
+                cell.* = try self.evaluateValue(&value);
                 constant.known = cell;
             },
             .tuple_declaration => |*declaration| {
@@ -487,7 +523,10 @@ pub const TypeChecker = struct {
                 if (loop.else_body) |else_body| try self.checkBlock(signature, else_body);
             },
             .@"for" => |*loop| {
-                try self.checkSequence(parameters, &loop.sequence);
+                if (try self.checkSequence(parameters, &loop.sequence)) |value_type| {
+                    if (value_type == .tuple) return self.checkTupleLoop(signature, statement, value_type.tuple.elements.len);
+                    return self.checkIteratorLoop(signature, statement.location, loop, value_type);
+                }
                 const element_type = ast.extractElementType(loop.sequence);
                 switch (loop.sequence) {
                     .value => |value| {
@@ -581,7 +620,7 @@ pub const TypeChecker = struct {
     fn chooseBlock(self: *TypeChecker, conditional: *ast.If) TypeError!void {
         const condition = &conditional.condition;
         if (!self.evaluator.isKnown(condition.*)) return self.fail(condition.location, error.CannotEvaluate);
-        const chosen = (try self.evaluateValue(condition.*)).boolean;
+        const chosen = (try self.evaluateValue(condition)).boolean;
         condition.kind = .{ .boolean_literal = chosen };
         conditional.known = chosen;
         if (chosen) {
@@ -631,34 +670,113 @@ pub const TypeChecker = struct {
         return .{ .pointer = pointer };
     }
 
+    fn checkTupleLoop(
+        self: *TypeChecker,
+        signature: ast.FunctionSignature,
+        statement: *ast.Statement,
+        count: usize,
+    ) TypeError!void {
+        const loop = &statement.kind.@"for";
+        if (loop.expansion_value == null and loop.expansions.len == 0) {
+            const resolver = self.resolver.?;
+            try resolver.expandTupleLoop(resolver.context, self.current_function.?, statement, count);
+        }
+        if (loop.expansion_value) |value| try self.checkStatement(signature, value);
+        for (loop.expansions) |expansion| try self.checkBlock(signature, expansion);
+        if (loop.else_body) |else_body| try self.checkBlock(signature, else_body);
+    }
+
+    fn checkIteratorLoop(
+        self: *TypeChecker,
+        signature: ast.FunctionSignature,
+        location: token.Location,
+        loop: *ast.For,
+        value_type: types.Type,
+    ) TypeError!void {
+        const sequence_location = loop.sequence.value.location;
+        const typeclass = self.findLanguageTypeclass("Iterator") orelse return self.fail(sequence_location, error.NotSequence);
+        const decided = [_]?types.Argument{.{ .type = value_type }};
+        const next = (try self.findInstanceFunction(location, typeclass, &decided, "next")) orelse {
+            return self.fail(sequence_location, error.NotSequence);
+        };
+        const element_function = (try self.findInstanceFunction(location, typeclass, &decided, "Element")).?;
+        try self.prepareFunction(next);
+        const element_type = try self.evaluateFunctionType(location, element_function);
+        if (element_type != .tuple) return self.fail(location, error.ElementNotTuple);
+        const elements = element_type.tuple.elements;
+        loop.iterator = .{ .next = next, .element = element_type };
+        const count: usize = if (loop.tuple) loop.names.len else 1;
+        if (count != elements.len or (!loop.tuple and loop.names.len != 1)) {
+            return self.fail(loop.names[0].location, error.WrongNameCount);
+        }
+        for (loop.names, elements[0..loop.names.len]) |*name, element| {
+            if (name.pointer) return self.fail(name.location, error.PointerOverIterator);
+            name.type = element;
+        }
+        try self.checkBlock(signature, loop.body);
+        if (loop.else_body) |else_body| try self.checkBlock(signature, else_body);
+    }
+
+    fn findLanguageTypeclass(self: *const TypeChecker, name: []const u8) ?ast.Resolution.Typeclass {
+        for (self.program.modules, 0..) |module, module_index| {
+            if (module.path.len != 1 or !std.mem.eql(u8, module.path[0], "mn")) continue;
+            for (module.declarations, 0..) |declaration, index| {
+                if (declaration.kind != .typeclass_definition) continue;
+                if (!std.mem.eql(u8, declaration.kind.typeclass_definition.name, name)) continue;
+                return .{ .module = module_index, .declaration = index };
+            }
+        }
+        return null;
+    }
+
+    fn evaluateFunctionType(
+        self: *TypeChecker,
+        location: token.Location,
+        function: ast.Resolution.Function,
+    ) TypeError!types.Type {
+        const signature = ast.extractFunctionSignature(ast.findDeclaration(self.program.modules[function.module], function.declaration).*);
+        var call: ast.Expression = .{
+            .kind = .{ .call = .{ .callee = .{ .identifier = .{ .name = signature.name, .resolution = .{ .function = function } } }, .arguments = &.{} } },
+            .type = .type,
+            .location = location,
+        };
+        const value = try self.evaluateValue(&call);
+        _ = &call;
+        return value.type;
+    }
+
     fn checkSequence(
         self: *TypeChecker,
         parameters: []const ast.TypedName,
         sequence: *ast.Sequence,
-    ) TypeError!void {
+    ) TypeError!?types.Type {
         switch (sequence.*) {
             .range => |*range| {
                 const bound_type: types.Type = .{ .number = .usize };
                 try self.checkExactExpression(parameters, &range.start, bound_type);
-                if (range.end == null) return;
+                if (range.end == null) return null;
                 const end = &range.end.?;
                 try self.checkExactExpression(parameters, end, bound_type);
-                if (!self.evaluator.isKnownWithoutCalls(range.start) or !self.evaluator.isKnownWithoutCalls(end.*)) return;
-                const first = (try self.evaluateValue(range.start)).integer;
-                const last = (try self.evaluateValue(end.*)).integer;
+                if (!self.evaluator.isKnownWithoutCalls(range.start) or !self.evaluator.isKnownWithoutCalls(end.*)) return null;
+                const first = (try self.evaluateValue(&range.start)).integer;
+                const last = (try self.evaluateValue(end)).integer;
                 if (first > last) return self.fail(range.start.location, error.ReversedRange);
                 range.length = @intCast(last - first);
             },
-            .value => |*value| switch (try self.inferType(parameters, value)) {
-                .array, .slice => {},
-                .pointer => |pointer| {
-                    if (pointer.many or pointer.target != .array) return self.fail(value.location, error.NotSequence);
-                },
-                .number, .boolean, .void, .type, .@"struct", .@"enum", .optional, .result, .tuple, .function, .variable, .application => {
-                    return self.fail(value.location, error.NotSequence);
-                },
+            .value => |*value| {
+                const value_type = try self.inferType(parameters, value);
+                switch (value_type) {
+                    .array, .slice => {},
+                    .pointer => |pointer| {
+                        if (pointer.many or pointer.target != .array) return value_type;
+                    },
+                    .number, .boolean, .void, .type, .@"struct", .@"enum", .optional, .result, .tuple, .function, .variable, .application => {
+                        return value_type;
+                    },
+                }
             },
         }
+        return null;
     }
 
     fn checkBlock(
@@ -735,7 +853,7 @@ pub const TypeChecker = struct {
             },
             .slice => try self.inferSliceType(parameters, expression),
             .field_access => try self.checkFieldAccess(parameters, expression),
-            .index, .address_of, .dereference, .unwrap, .@"try" => try self.inferType(parameters, expression),
+            .index, .address_of, .dereference, .unwrap, .@"try", .range => try self.inferType(parameters, expression),
         };
         if (!isConvertible(value_type, expected)) return self.fail(expression.location, error.TypeMismatch);
         if (exact and isWidened(value_type, expected)) return self.fail(expression.location, error.TypeMismatch);
@@ -751,7 +869,7 @@ pub const TypeChecker = struct {
         const operand_type = binary.left.type orelse return;
         if (!types.isCompileTimeOnly(operand_type)) return;
         if (!self.evaluator.isKnown(expression.*)) return self.fail(expression.location, error.CannotEvaluate);
-        const value = try self.evaluateValue(expression.*);
+        const value = try self.evaluateValue(expression);
         expression.kind = .{ .boolean_literal = value.boolean };
         self.type_dependencies += 1;
     }
@@ -785,19 +903,20 @@ pub const TypeChecker = struct {
             .dereference,
             .unwrap,
             .@"try",
+            .range,
             => {},
         }
     }
 
     fn evaluateIfKnown(self: *TypeChecker, expression: ast.Expression) TypeError!void {
         if (self.quiet_operations > 0 or !self.evaluator.isKnownWithoutCalls(expression)) return;
-        _ = self.evaluateValue(expression) catch |evaluate_error| {
+        _ = self.evaluateValue(&expression) catch |evaluate_error| {
             if (evaluate_error != error.CannotEvaluate) return evaluate_error;
             self.failure = null;
         };
     }
 
-    fn evaluateValue(self: *TypeChecker, expression: ast.Expression) TypeError!Value {
+    fn evaluateValue(self: *TypeChecker, expression: *const ast.Expression) TypeError!Value {
         const caller_module_index = self.evaluator.module_index;
         const caller_steps = self.evaluator.steps;
         defer self.evaluator.module_index = caller_module_index;
@@ -875,7 +994,7 @@ pub const TypeChecker = struct {
         location: token.Location,
     ) AnalyzeError!void {
         const self: *TypeChecker = @ptrCast(@alignCast(context));
-        const resolver = self.resolver.?;
+        const resolver = &self.resolver.?;
         try resolver.finishStruct(resolver.context, struct_type, value_type, location);
         const caller_module_index = self.evaluator.module_index;
         defer self.evaluator.module_index = caller_module_index;
@@ -885,7 +1004,7 @@ pub const TypeChecker = struct {
     fn decidesAlone(self: *TypeChecker, binary: ast.Binary) TypeError!bool {
         if (binary.operator == .@"catch") return false;
         if (!self.evaluator.isKnownWithoutCalls(binary.left.*)) return false;
-        const left = self.evaluateValue(binary.left.*) catch |evaluate_error| {
+        const left = self.evaluateValue(binary.left) catch |evaluate_error| {
             if (evaluate_error != error.CannotEvaluate) return evaluate_error;
             self.failure = null;
             return false;
@@ -1219,19 +1338,26 @@ pub const TypeChecker = struct {
     ) TypeError!types.Type {
         const arguments = expression.kind.call.arguments;
         const count: usize = switch (builtin) {
-            .size, .alignment => 1,
-            .convert, .truncate => 2,
+            .size, .alignment, .length => 1,
+            .convert, .truncate, .join => 2,
         };
         if (arguments.len != count) return self.fail(expression.location, error.ArgumentCountMismatch);
         for (arguments) |argument| {
             if (argument.name != null) return self.fail(argument.location, error.NamedArgument);
         }
         const type_argument = &arguments[0].value;
-        try self.checkExpression(parameters, type_argument, .type);
-        if (!self.evaluator.isKnown(type_argument.*)) return self.fail(type_argument.location, error.CannotEvaluate);
-        const target = (try self.evaluateValue(type_argument.*)).type;
-        type_argument.denoted = target;
+        const target = try self.checkTypeArgument(parameters, type_argument);
         switch (builtin) {
+            .length => {
+                if (target != .tuple) return self.fail(type_argument.location, error.NotTupleType);
+                return .{ .number = .usize };
+            },
+            .join => {
+                if (target != .tuple) return self.fail(type_argument.location, error.NotTupleType);
+                const other = &arguments[1].value;
+                if (try self.checkTypeArgument(parameters, other) != .tuple) return self.fail(other.location, error.NotTupleType);
+                return .type;
+            },
             .size, .alignment => {
                 if (types.isCompileTimeOnly(target) or target == .function) {
                     return self.fail(type_argument.location, error.NoLayout);
@@ -1251,10 +1377,23 @@ pub const TypeChecker = struct {
                     if (!isInteger(value_type)) return self.fail(value.location, error.ExpectedInteger);
                 }
                 expression.type = target;
-                if (self.evaluator.isKnown(expression.*)) _ = try self.evaluateValue(expression.*);
+                if (self.evaluator.isKnown(expression.*)) _ = try self.evaluateValue(expression);
                 return target;
             },
         }
+    }
+
+    fn checkTypeArgument(
+        self: *TypeChecker,
+        parameters: []const ast.TypedName,
+        argument: *ast.Expression,
+    ) TypeError!types.Type {
+        try self.checkExpression(parameters, argument, .type);
+        if (!self.evaluator.isKnown(argument.*)) return self.fail(argument.location, error.CannotEvaluate);
+        const value_type = (try self.evaluateValue(argument)).type;
+        argument.denoted = value_type;
+        self.type_dependencies += 1;
+        return value_type;
     }
 
     fn checkCaseCall(
@@ -1345,7 +1484,7 @@ pub const TypeChecker = struct {
             defer self.compile_time = caller_compile_time;
             try self.checkExpression(parameters, &argument.value, parameter_type);
             if (!self.evaluator.isKnown(argument.value)) return self.fail(argument.location, error.RuntimeArgument);
-            const value = try self.evaluateValue(argument.value);
+            const value = try self.evaluateValue(&argument.value);
             if (parameter.constraint) |constraint| try self.expectInstance(argument.location, constraint, value.type);
             try bounds.append(allocator, .{ .type = parameter_type, .value = value });
             if (types.isCompileTimeOnly(parameter_type)) self.type_dependencies += 1;
@@ -1480,9 +1619,7 @@ pub const TypeChecker = struct {
             },
             .address_of => return self.checkAddressOf(parameters, expression),
             .composite_literal => |literal| {
-                const written = literal.type orelse {
-                    return self.fail(expression.location, error.UnknownValueType);
-                };
+                const written = literal.type orelse return self.inferTupleLiteral(parameters, expression);
                 const value_type = ast.extractType(written.*);
                 const location = expression.location;
                 _ = try self.checkCompositeLiteral(parameters, location, literal, value_type);
@@ -1499,7 +1636,28 @@ pub const TypeChecker = struct {
             .dereference => return self.checkDereference(parameters, expression),
             .unwrap => return self.checkUnwrap(parameters, expression),
             .@"try" => return self.checkTry(parameters, expression),
+            .range => return self.checkRange(parameters, expression),
         }
+    }
+
+    fn checkRange(
+        self: *TypeChecker,
+        parameters: []const ast.TypedName,
+        expression: *ast.Expression,
+    ) TypeError!types.Type {
+        const range = expression.kind.range;
+        const bound_type: types.Type = .{ .number = .usize };
+        try self.checkExactExpression(parameters, &range.start, bound_type);
+        if (range.end) |*end| {
+            try self.checkExactExpression(parameters, end, bound_type);
+            if (self.evaluator.isKnownWithoutCalls(range.start) and self.evaluator.isKnownWithoutCalls(end.*)) {
+                const first = (try self.evaluateValue(&range.start)).integer;
+                const last = (try self.evaluateValue(end)).integer;
+                if (first > last) return self.fail(range.start.location, error.ReversedRange);
+            }
+        }
+        expression.type = range.type.?;
+        return range.type.?;
     }
 
     fn checkBinary(
@@ -1836,6 +1994,23 @@ pub const TypeChecker = struct {
         return expression.type.?;
     }
 
+    fn inferTupleLiteral(
+        self: *TypeChecker,
+        parameters: []const ast.TypedName,
+        expression: *ast.Expression,
+    ) TypeError!types.Type {
+        const elements = expression.kind.composite_literal.elements;
+        if (hasNames(elements)) return self.fail(expression.location, error.UnknownValueType);
+        const element_types = try self.arena.allocator().alloc(types.Type, elements.len);
+        for (elements, element_types) |*element, *element_type| {
+            if (!hasOwnType(element.value)) return self.fail(element.value.location, error.UnknownValueType);
+            element_type.* = try self.inferType(parameters, &element.value);
+        }
+        const value_type: types.Type = .{ .tuple = try self.program.types.addTuple(self.arena.allocator(), element_types) };
+        expression.type = value_type;
+        return value_type;
+    }
+
     fn checkCompositeLiteral(
         self: *TypeChecker,
         parameters: []const ast.TypedName,
@@ -1928,7 +2103,16 @@ pub const TypeChecker = struct {
                 }
                 break :element try self.checkArrayIndex(parameters, index, pointer.target.array);
             },
-            .number, .boolean, .void, .type, .@"struct", .@"enum", .optional, .result, .function, .variable, .application => {
+            .type => element: {
+                const value = indexing.value;
+                if (!self.evaluator.isKnown(value.*)) return self.fail(value.location, error.CannotEvaluate);
+                const indexed = (try self.evaluateValue(value)).type;
+                if (indexed != .tuple) return self.fail(value.location, error.NotTupleType);
+                const position = try self.checkTupleIndex(parameters, index, indexed.tuple);
+                expression.kind.index.position = position;
+                break :element .type;
+            },
+            .number, .boolean, .void, .@"struct", .@"enum", .optional, .result, .function, .variable, .application => {
                 return self.fail(expression.location, error.NotIndexable);
             },
         };
@@ -1945,7 +2129,7 @@ pub const TypeChecker = struct {
         try self.checkExactExpression(parameters, index, .{ .number = .usize });
         if (array.length == 0) return self.fail(index.location, error.IndexOutOfRange);
         if (!self.evaluator.isKnownWithoutCalls(index.*)) return array.element;
-        const position = (try self.evaluateValue(index.*)).integer;
+        const position = (try self.evaluateValue(index)).integer;
         if (position >= array.length) return self.fail(index.location, error.IndexOutOfRange);
         return array.element;
     }
@@ -1958,7 +2142,7 @@ pub const TypeChecker = struct {
     ) TypeError!u64 {
         try self.checkExactExpression(parameters, index, .{ .number = .usize });
         if (!self.evaluator.isKnown(index.*)) return self.fail(index.location, error.UnknownTupleIndex);
-        const position = (try self.evaluateValue(index.*)).integer;
+        const position = (try self.evaluateValue(index)).integer;
         if (position >= tuple.elements.len) return self.fail(index.location, error.IndexOutOfRange);
         return @intCast(position);
     }
@@ -2195,6 +2379,7 @@ pub const TypeChecker = struct {
             .dereference,
             .unwrap,
             .@"try",
+            .range,
             => unreachable,
         };
     }
@@ -2245,6 +2430,7 @@ pub const TypeChecker = struct {
             .dereference,
             .unwrap,
             .@"try",
+            .range,
             => unreachable,
         }
     }
@@ -2423,6 +2609,9 @@ pub const CheckError = error{
     NoLayout,
     ExpectedNumber,
     ExpectedInteger,
+    NotTupleType,
+    ElementNotTuple,
+    PointerOverIterator,
 };
 
 fn describeError(check_error: CheckError) []const u8 {
@@ -2517,6 +2706,9 @@ fn describeError(check_error: CheckError) []const u8 {
         error.NoLayout => "type has no size at run time",
         error.ExpectedNumber => "expected a number",
         error.ExpectedInteger => "expected an integer",
+        error.NotTupleType => "only tuple types can be indexed",
+        error.ElementNotTuple => "an iterator's elements must be tuples",
+        error.PointerOverIterator => "the elements of an iterator cannot be named by pointer",
         error.NoInstance => "type has no instance of the typeclass",
     };
 }
@@ -2558,6 +2750,12 @@ pub const Resolver = struct {
         struct_type: *const ast.StructType,
         value_type: types.Type,
         location: token.Location,
+    ) AnalyzeError!void,
+    expandTupleLoop: *const fn (
+        context: *anyopaque,
+        function: ast.Resolution.Function,
+        statement: *ast.Statement,
+        count: usize,
     ) AnalyzeError!void,
 };
 
@@ -2823,6 +3021,7 @@ fn hasOwnType(expression: ast.Expression) bool {
         .dereference,
         .unwrap,
         .@"try",
+        .range,
         => true,
     };
 }
@@ -3048,6 +3247,12 @@ fn findUse(variable: *const ast.Statement, expression: ast.Expression) Use {
             return findUse(variable, operand.*);
         },
         .dereference, .unwrap, .@"try" => |operand| return findUse(variable, operand.*),
+        .range => |range| {
+            const use = findUse(variable, range.start);
+            if (use != .none) return use;
+            const end = range.end orelse return .none;
+            return findUse(variable, end);
+        },
         .call => |call| {
             const resolution = ast.extractResolution(call.callee);
             if (resolution == .local and resolution.local == variable) {
@@ -3339,7 +3544,7 @@ test "TypeChecker.check: rejects an unused top-level constant of braces without 
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.UnknownValueType, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 17 }, type_checker.failure.?.location.?);
 }
 
 test "TypeChecker.check: rejects an unused top-level constant of another type than its written type" {
@@ -7250,7 +7455,7 @@ test "checkStatement: rejects taking apart a value without a type of its own" {
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
     try std.testing.expectError(error.UnknownValueType, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 28 }, type_checker.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 29 }, type_checker.failure.?.location.?);
 }
 
 test "checkElementNames: gives each name of a tuple declaration the type of its element" {
@@ -7681,6 +7886,101 @@ test "checkSequence: rejects a multiple value pointer" {
 
     try std.testing.expectError(error.NotSequence, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 40 }, type_checker.failure.?.location.?);
+}
+
+test "checkIteratorLoop: rejects a pointer to an element of an iterator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Countdown:\n    count: u32\ninstance mn::Iterator(Countdown):\n    fn Element() -> type: return [u32]\n    fn next(iterator: *Countdown) -> ?Element():\n        if iterator.count == 0: return null\n        iterator.count -= 1\n        return {iterator.count + 1}\nfn total() -> u32:\n    var sum: u32 = 0\n    for *value in Countdown{count = 3}: sum += value.*\n    return sum" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.PointerOverIterator, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 12, .column = 9 }, analyzer.failure.?.location.?);
+}
+
+test "checkIteratorLoop: rejects a single name over elements of several values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Pairs:\n    count: u32\ninstance mn::Iterator(Pairs):\n    fn Element() -> type: return [u32, bool]\n    fn next(_: *Pairs) -> ?Element(): return null\nfn total() -> u32:\n    for value in Pairs{count = 3}: _ = value\n    return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.WrongNameCount, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 8, .column = 9 }, analyzer.failure.?.location.?);
+}
+
+test "checkIteratorLoop: rejects elements that are not tuples" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Numbers:\n    count: u32\ninstance mn::Iterator(Numbers):\n    fn Element() -> type: return u32\n    fn next(_: *Numbers) -> ?Element(): return null\nfn total() -> u32:\n    for value in Numbers{count = 3}: _ = value\n    return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ElementNotTuple, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 8, .column = 5 }, analyzer.failure.?.location.?);
+}
+
+test "checkRange: rejects a range value whose start is known to be after its end" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const range = 5..2\n    _ = range" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ReversedRange, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 19 }, analyzer.failure.?.location.?);
+}
+
+test "checkRange: rejects a range value without mn's Range" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const range = 1..2\n    _ = range" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MissingLanguageDeclaration, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 19 }, analyzer.failure.?.location.?);
 }
 
 test "checkInitialValue: gives a struct literal the written type of a variable" {
@@ -11420,6 +11720,49 @@ test "checkBuiltinCall: gives the size and the alignment of types as C lays them
     }
 }
 
+test "checkBuiltinCall: gives the length of a tuple type and joins tuple types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nconst LENGTH = mn::reflection::length([i32, bool])\nconst Joined = mn::reflection::join([u8], [bool, i32])\nfn third(values: mn::reflection::join([u8], [bool, i32])) -> i32: return values[2]\nconst THIRD = third({1, true, 9})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[1].kind.constant_declaration.known.?.*);
+    const joined = declarations[2].kind.constant_declaration.known.?.type.tuple;
+    try std.testing.expectEqual(3, joined.elements.len);
+    try std.testing.expectEqual(types.Type.boolean, joined.elements[1]);
+    try std.testing.expectEqual(Value{ .integer = 9 }, declarations[4].kind.constant_declaration.known.?.*);
+}
+
+test "checkBuiltinCall: rejects the length of a type that is not a tuple" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nconst LENGTH = mn::reflection::length(i32)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NotTupleType, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 39 }, analyzer.failure.?.location.?);
+}
+
 test "checkBuiltinCall: rejects a type without a size at run time" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -11642,6 +11985,45 @@ test "checkFunctionCall: rejects a call that leaves out an argument" {
 
     try std.testing.expectError(error.ArgumentCountMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 12 }, type_checker.failure.?.location.?);
+}
+
+test "checkFunctionCall: takes any tuple through mn::Tuple and checks the code that depends on it in each instance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn first(values: mn::Tuple) -> i32: return values[0]\nfn second(type T: mn::Tuple, values: T) -> T[1]: return values[1]\nfn run() -> i32:\n    const five: i32 = 5\n    const flag = true\n    const chosen = second([i32, bool], {five, flag})\n    if chosen: return first({five, flag})\n    return 0\nconst RUN = run()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[4].kind.constant_declaration.known.?.*);
+}
+
+test "checkFunctionCall: rejects a value that is not a tuple where mn::Tuple is required" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn first(values: mn::Tuple) -> i32: return values[0]\nfn run() -> i32:\n    const five: i32 = 5\n    return first(five)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NoInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 18 }, analyzer.failure.?.location.?);
 }
 
 test "checkValueCall: gives a struct literal the type of its parameter" {
@@ -12196,6 +12578,29 @@ test "inferType: rejects a struct literal without an expected type" {
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 19 }, type_checker.failure.?.location.?);
 }
 
+test "inferType: gives a tuple literal without a type the types of its elements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pair(count: i32, flag: bool) -> bool:\n    const values = {count, flag}\n    const (number, set) = values\n    return number > 0 and set\nconst PAIR = pair(3, true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    const value_type = body[0].kind.constant_declaration.value.type.?;
+    try std.testing.expectEqual(types.Type{ .number = .i32 }, value_type.tuple.elements[0]);
+    try std.testing.expectEqual(types.Type.boolean, value_type.tuple.elements[1]);
+    try std.testing.expectEqual(Value{ .boolean = true }, loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*);
+}
+
 test "inferType: rejects null without a type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -12307,7 +12712,7 @@ test "inferType: takes the empty tuple type written before empty braces" {
     try std.testing.expectEqual(0, value.type.?.tuple.elements.len);
 }
 
-test "inferType: rejects braces without a type" {
+test "inferType: gives braces of elements with suffixes a tuple type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -12324,8 +12729,11 @@ test "inferType: rejects braces without a type" {
     try name_resolver.resolve();
     var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
 
-    try std.testing.expectError(error.UnknownValueType, type_checker.check());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 20 }, type_checker.failure.?.location.?);
+    try type_checker.check();
+
+    const value = loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.constant_declaration.value;
+    try std.testing.expectEqual(2, value.type.?.tuple.elements.len);
+    try std.testing.expectEqual(types.Type{ .number = .i32 }, value.type.?.tuple.elements[1]);
 }
 
 test "inferType: gives an operation the type of its operands" {
@@ -15130,6 +15538,66 @@ test "checkIndex: rejects an index of another integer type" {
 
     try std.testing.expectError(error.TypeMismatch, type_checker.check());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 68 }, type_checker.failure.?.location.?);
+}
+
+test "checkIndex: gives the type of an element of a tuple type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Pair = [i32, bool]\nconst Second = Pair[1]\nfn flag(value: Second) -> bool: return value\nfn first(type T, values: T) -> T[0]: return values[0]\nconst FIRST = first([u8, bool], {7, false})\nconst FLAG = flag(true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(types.Type.boolean, declarations[1].kind.constant_declaration.known.?.type);
+    try std.testing.expectEqual(Value{ .integer = 7 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .boolean = true }, declarations[5].kind.constant_declaration.known.?.*);
+}
+
+test "checkIndex: rejects indexing a type that is not a tuple" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Wrong = i32[0]" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NotTupleType, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 15 }, analyzer.failure.?.location.?);
+}
+
+test "checkIndex: rejects an index past the elements of a tuple type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Pair = [i32, bool]\nconst Wrong = Pair[2]" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.IndexOutOfRange, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 20 }, analyzer.failure.?.location.?);
 }
 
 test "checkArrayIndex: rejects any index into an array of length zero" {
