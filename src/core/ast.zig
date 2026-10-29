@@ -76,6 +76,7 @@ pub const FunctionSignature = struct {
     receiver: ?Expression = null,
     typeclass: ?Expression = null,
     name: []const u8,
+    declared: []InstanceParameter = &.{},
     parameters: []TypedName,
     return_type: Expression,
     self_parameter: SelfParameter = .none,
@@ -513,6 +514,7 @@ pub const ArrayType = struct {
 pub const CompositeLiteral = struct {
     type: ?*Expression,
     elements: []Argument,
+    known: ?*Value = null,
 };
 
 pub const SliceType = struct {
@@ -681,6 +683,7 @@ pub fn extractFunctionSignature(declaration: Declaration) FunctionSignature {
 }
 
 pub fn isGeneric(signature: FunctionSignature) bool {
+    if (signature.declared.len > 0) return true;
     for (signature.parameters) |parameter| {
         if (parameter.kind != .run_time) return true;
     }
@@ -1273,6 +1276,7 @@ fn cloneFunctionSignature(
         .receiver = try cloneOptionalExpression(allocator, signature.receiver),
         .typeclass = try cloneOptionalExpression(allocator, signature.typeclass),
         .name = signature.name,
+        .declared = signature.declared,
         .parameters = parameters,
         .return_type = try cloneExpression(allocator, signature.return_type),
         .self_parameter = signature.self_parameter,

@@ -153,6 +153,7 @@ pub const Parser = struct {
     ) ParseError!?ast.FunctionSignature {
         var position = offset.*;
         _ = self.match(&position, .keyword_fn) orelse return null;
+        const declared = try self.parseTypeParameters(allocator, &position);
         const name = try self.expectName(&position);
         _ = try self.expect(&position, .left_parenthesis, error.ExpectedLeftParenthesis);
         const parameters = try self.parseParameters(allocator, &position);
@@ -163,6 +164,7 @@ pub const Parser = struct {
         return .{
             .receiver = receiver,
             .name = name,
+            .declared = declared,
             .parameters = parameters,
             .return_type = return_type,
         };
@@ -1108,14 +1110,7 @@ pub const Parser = struct {
     ) ParseError!?ast.InstanceDeclaration {
         var position = offset.*;
         _ = self.match(&position, .keyword_instance) orelse return null;
-        var parameters: std.ArrayList(ast.InstanceParameter) = .empty;
-        if (self.match(&position, .left_parenthesis) != null) {
-            while (true) {
-                try parameters.append(allocator, try self.parseInstanceParameter(allocator, &position));
-                if (self.match(&position, .comma) == null) break;
-            }
-            _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
-        }
+        const parameters = try self.parseTypeParameters(allocator, &position);
         const typeclass = (try self.parseNameExpression(allocator, &position)) orelse {
             return self.fail(position, error.ExpectedIdentifier);
         };
@@ -1148,10 +1143,28 @@ pub const Parser = struct {
         offset.* = position;
         return .{
             .typeclass = typeclass,
-            .parameters = parameters.items,
+            .parameters = parameters,
             .arguments = arguments.items,
             .functions = count,
         };
+    }
+
+    fn parseTypeParameters(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError![]ast.InstanceParameter {
+        var position = offset.*;
+        if (self.match(&position, .left_parenthesis) == null) return &.{};
+        var parameters: std.ArrayList(ast.InstanceParameter) = .empty;
+        while (true) {
+            try parameters.append(allocator, try self.parseInstanceParameter(allocator, &position));
+            if (self.match(&position, .comma) == null) break;
+        }
+        _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
+
+        offset.* = position;
+        return parameters.items;
     }
 
     fn parseInstanceParameter(
@@ -2363,6 +2376,25 @@ test "parseFunctionSignature: accepts a reserved word as the name of a function"
     const module = try parser.parse(&arena);
 
     try std.testing.expectEqualStrings("match", module.declarations[0].kind.function_definition.signature.name);
+}
+
+test "parseFunctionSignature: parses the types a function declares after fn" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("inline fn(type Item, type Other: Show) pair(item: Item, other: Other) -> usize: return 2");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const signature = module.declarations[0].kind.function_definition.signature;
+    try std.testing.expect(signature.@"inline");
+    try std.testing.expectEqualStrings("pair", signature.name);
+    try std.testing.expectEqual(2, signature.declared.len);
+    try std.testing.expectEqualStrings("Item", signature.declared[0].name);
+    try std.testing.expectEqual(null, signature.declared[0].requirement);
+    try std.testing.expectEqualStrings("Other", signature.declared[1].name);
+    try std.testing.expectEqualStrings("Show", signature.declared[1].requirement.?.kind.identifier.name);
+    try std.testing.expectEqual(2, signature.parameters.len);
 }
 
 test "parseFunctionSignature: rejects a reserved word as the name of a parameter" {

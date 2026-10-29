@@ -135,6 +135,7 @@ pub const Scope = enum {
     typeclass,
     instance,
     function,
+    declared,
 };
 
 pub const Application = struct {

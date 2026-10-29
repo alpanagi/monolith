@@ -754,7 +754,18 @@ pub const Evaluator = struct {
                 }
                 return .{ .aggregate = elements };
             },
-            .number, .boolean, .@"enum", .void, .type, .slice, .pointer, .optional, .result, .function, .variable, .application => unreachable,
+            .slice => |slice| {
+                const elements = try allocator.alloc(Value, literal.elements.len);
+                for (literal.elements, elements) |element, *element_value| {
+                    element_value.* = try self.copy(try self.evaluateConverted(&element.value, slice.element));
+                }
+                const root = try allocator.create(Value);
+                root.* = .{ .aggregate = elements };
+                const array = try self.program.types.addArray(allocator, elements.len, slice.element);
+                const pointer: Value.Pointer = .{ .root = root, .root_type = .{ .array = array }, .path = &.{} };
+                return .{ .slice = .{ .array = pointer, .start = 0, .length = elements.len } };
+            },
+            .number, .boolean, .@"enum", .void, .type, .pointer, .optional, .result, .function, .variable, .application => unreachable,
         }
     }
 
@@ -2289,6 +2300,54 @@ test "Xoshiro256: gives the reference numbers and stays inside a range at compil
     try std.testing.expect(declarations[11].kind.constant_declaration.known.?.boolean);
 }
 
+test "Default: is Xoshiro256" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::random\nimport mn::random::Generator\nfn next(generator: *random::Xoshiro256) -> u64: return generator.next()\nfn first() -> u64:\n    var generator = random::Default::new(42)\n    return next(&generator)\nconst FIRST = first()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 1546998764402558742 }, declarations[4].kind.constant_declaration.known.?.*);
+}
+
+test "List: grows in place or by moving and reports running out of memory at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Buffer:\n    bytes: []u8\n    used: usize\n    last: usize\n    resizes: usize\n    frees: usize\ninstance Allocator(Buffer):\n    fn allocate(buffer: *Buffer, size: usize, _: usize) -> memory::Error![]u8:\n        if buffer.used + size > buffer.bytes.length: return memory::Error::out_of_memory\n        buffer.last = buffer.used\n        buffer.used += size\n        return buffer.bytes[buffer.last..buffer.used]\n    fn resize(buffer: *Buffer, bytes: []u8, _: usize, size: usize) -> bool:\n        if bytes.length != buffer.used - buffer.last or buffer.last + size > buffer.bytes.length: return false\n        buffer.used = buffer.last + size\n        buffer.resizes += 1\n        return true\n    fn free(buffer: *Buffer, _: []u8, _: usize): buffer.frees += 1\nfn grow() -> memory::Error![6]usize:\n    var storage: [256]u8 = undefined\n    var buffer = Buffer{bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0}\n    var list = mn::List(u8)::new()\n    for index in 0..20: try list.append(&buffer, mn::truncate(u8, index))\n    const in_place = buffer.resizes\n    _ = try memory::allocate(&buffer, u8, 4)\n    for index in 20..40: try list.append(&buffer, mn::truncate(u8, index))\n    var sum: usize = 0\n    for item in list.items: sum += mn::convert(usize, item)\n    const length = list.items.length\n    list.free(&buffer)\n    return {in_place, buffer.frees, length, sum, list.items.length, list.capacity}\nfn fill(list: *mn::List(u8), buffer: *Buffer, count: usize) -> memory::Error!u8:\n    for _ in 0..count: try list.append(buffer, 3)\n    return 0\nfn exhaust() -> u8:\n    var storage: [8]u8 = undefined\n    var buffer = Buffer{bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0}\n    var list = mn::List(u8)::new()\n    const filled = fill(&list, &buffer, 8) catch return 1\n    const more = fill(&list, &buffer, 1) catch return 2\n    return filled + more\nconst GROW = grow() catch {0, 0, 0, 0, 0, 0}\nconst EXHAUST = exhaust()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    const grown = for (declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "GROW")) break declaration.kind.constant_declaration.known.?.aggregate;
+    } else unreachable;
+    const exhausted = for (declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "EXHAUST")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    const expected = [_]i129{ 2, 2, 40, 780, 0, 0 };
+    for (expected, grown) |value, found| try std.testing.expectEqual(Value{ .integer = value }, found);
+    try std.testing.expectEqual(Value{ .integer = 2 }, exhausted);
+}
+
 test "evaluateBuiltin: converts and truncates numbers at compile time" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2717,6 +2776,46 @@ test "evaluateCompositeLiteral: takes missing fields from their defaults" {
     try std.testing.expectEqual(2, elements.len);
     try std.testing.expectEqual(Value{ .integer = 1 }, elements[0]);
     try std.testing.expectEqual(Value{ .integer = 7 }, elements[1]);
+}
+
+test "evaluateCompositeLiteral: gives empty braces where a slice is expected a slice of length 0" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count() -> usize:\n    const items: []i32 = {}\n    var bytes: []u8 = {}\n    bytes = bytes[0..0]\n    return items.length + bytes.length\nconst COUNT = count()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(Value{ .integer = 0 }, loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*);
+}
+
+test "evaluateCompositeLiteral: makes a read-only slice from braces with elements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const WORDS: []const u8 = {104, 105}\nfn local() -> usize:\n    const values: []const usize = {7, 8, 9}\n    return values.length + values[2]\nconst FIRST = WORDS[1]\nconst LOCAL = local()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 105 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 12 }, declarations[3].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateSlice: slices an array and reads an element" {

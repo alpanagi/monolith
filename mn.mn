@@ -1,3 +1,5 @@
+import mn::memory
+import mn::memory::Allocator
 import mn::reflection
 
 typeclass Tuple(type T)
@@ -70,3 +72,32 @@ fn copyElements(type S, type D, comptime offset: usize, comptime position: usize
     else:
         destination.*[offset + position] = source[position]
         copyElements(S, D, offset, position + 1, source, destination)
+
+fn List(type T) -> type:
+    return struct:
+        items: []T
+        capacity: usize
+
+        fn new() -> Self: return Self{items = {}, capacity = 0}
+
+        fn append(self: *Self, allocator: *memory::Allocator, value: T) -> memory::Error!void:
+            const length = self.items.length
+            if length == self.capacity:
+                var capacity: usize = 8
+                if self.capacity > 0: capacity = self.capacity * 2
+                const bytes = ::cast(*many u8, self.items.pointer)[0..self.capacity * ::size(T)]
+                if self.capacity > 0 and Allocator::resize(allocator, bytes, ::alignment(T), capacity * ::size(T)):
+                    self.capacity = capacity
+                else:
+                    const items = try memory::allocate(allocator, T, capacity)
+                    for index in 0..length: items[index] = self.items[index]
+                    if self.capacity > 0: memory::free(allocator, self.items.pointer[0..self.capacity])
+                    self.items = items[0..length]
+                    self.capacity = capacity
+            self.items = self.items.pointer[0..length + 1]
+            self.items[length] = value
+
+        fn free(self: *Self, allocator: *memory::Allocator):
+            if self.capacity > 0: memory::free(allocator, self.items.pointer[0..self.capacity])
+            self.items = self.items[0..0]
+            self.capacity = 0

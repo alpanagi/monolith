@@ -1068,7 +1068,7 @@ pub const Generator = struct {
     ) WriteError!void {
         for (module.declarations) |declaration| {
             if (!self.isEntryPoint(declaration.kind)) continue;
-            return writer.writeAll("\nchar mn_zero_sized;\n");
+            return writer.writeAll("\nmax_align_t mn_zero_sized;\n");
         }
     }
 
@@ -1200,7 +1200,11 @@ pub const Generator = struct {
                 try writer.writeAll(".items = (");
                 try self.generateType(writer, slice.element);
                 try writer.writeAll(" *)");
-                try self.generateKnownElements(allocator, reached, writer, known.array, known.start);
+                if (known.length == 0 and isZeroSized(known.array.root_type)) {
+                    try writer.writeAll("&mn_zero_sized");
+                } else {
+                    try self.generateKnownElements(allocator, reached, writer, known.array, known.start);
+                }
                 try writer.print(", .length = {d} }}", .{known.length});
             },
             .pointer => |pointer| switch (value) {
@@ -4410,6 +4414,14 @@ pub const Generator = struct {
         const literal_type = expression.type.?;
         if (literal_type == .@"struct") return self.generateFields(allocator, reached, writer, elements, literal_type, form);
         if (literal_type == .tuple) return self.generateTupleElements(allocator, reached, writer, elements, literal_type, form);
+        if (literal_type == .slice) {
+            if (expression.kind.composite_literal.known) |known| {
+                return self.generateKnownValue(allocator, reached, writer, known.*, literal_type, .initializer);
+            }
+            try writer.writeAll("{ .items = (");
+            try self.generateType(writer, literal_type.slice.element);
+            return writer.writeAll(" *)&mn_zero_sized, .length = 0 }");
+        }
         try self.generateElements(allocator, reached, writer, elements, literal_type.array.element, form);
     }
 
@@ -6681,7 +6693,7 @@ test "generateFiles: writes a header and a source file per module" {
     );
     try std.testing.expectEqualStrings("main.c", files[1].path);
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {}\n\nvoid mn_main_two() {}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {}\n\nvoid mn_main_two() {}\n",
         files[1].contents,
     );
 }
@@ -6715,7 +6727,7 @@ test "generateFiles: includes the headers of the modules it calls" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n#include \"utils.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    mn_utils_add(1);\n}\n",
+        "#include \"main.h\"\n#include \"utils.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_utils_add(1);\n}\n",
         files[1].contents,
     );
     try std.testing.expectEqualStrings(
@@ -6786,7 +6798,7 @@ test "generateFiles: writes the standard library at its module path" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n#include \"mn/stdout.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    mn_runtime_stdout_write((mn_slice_u8){ .items = (uint8_t *)\"hi\", .length = 2 });\n}\n",
+        "#include \"main.h\"\n#include \"mn/stdout.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_runtime_stdout_write((mn_slice_u8){ .items = (uint8_t *)\"hi\", .length = 2 });\n}\n",
         files[1].contents,
     );
     try std.testing.expectEqualStrings("mn/stdout.h", files[2].path);
@@ -6829,7 +6841,7 @@ test "generateFiles: calls a standard library function that takes the empty tupl
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n#include \"mn/stdout.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    mn_mn_stdout_println((mn_slice_u8){ .items = (uint8_t *)\"hi\", .length = 2 });\n}\n",
+        "#include \"main.h\"\n#include \"mn/stdout.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_mn_stdout_println((mn_slice_u8){ .items = (uint8_t *)\"hi\", .length = 2 });\n}\n",
         files[1].contents,
     );
     try std.testing.expectEqualStrings(
@@ -7440,7 +7452,7 @@ test "generateStruct: writes each instance of a struct without a name with its f
         files[0].contents,
     );
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nmn_main_List_1 mn_main_make() {\n    return (mn_main_List_1){ .first = 2u, .count = 0u };\n}\n\nint main() {\n    mn_main_List_2 numbers = mn_main_List_2_new(1);\n    mn_main_List_2_grow(&numbers);\n    mn_main_List_2_get(numbers);\n    const mn_main_List_3 flags = (mn_main_List_3){ .first = true, .count = 0u };\n    mn_main_List_3_get(flags);\n    mn_main_make();\n}\n\nmn_main_List_1 mn_main_List_1_new(uint8_t first) {\n    return (mn_main_List_1){ .first = first, .count = 0u };\n}\n\nuint8_t mn_main_List_1_get(mn_main_List_1 self) {\n    return self.first;\n}\n\nvoid mn_main_List_1_grow(struct mn_main_List_1 * self) {\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &self->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n}\n\nmn_main_List_2 mn_main_List_2_new(int32_t first) {\n    return (mn_main_List_2){ .first = first, .count = 0u };\n}\n\nint32_t mn_main_List_2_get(mn_main_List_2 self) {\n    return self.first;\n}\n\nvoid mn_main_List_2_grow(struct mn_main_List_2 * self) {\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &self->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n}\n\nmn_main_List_3 mn_main_List_3_new(bool first) {\n    return (mn_main_List_3){ .first = first, .count = 0u };\n}\n\nbool mn_main_List_3_get(mn_main_List_3 self) {\n    return self.first;\n}\n\nvoid mn_main_List_3_grow(struct mn_main_List_3 * self) {\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &self->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nmn_main_List_1 mn_main_make() {\n    return (mn_main_List_1){ .first = 2u, .count = 0u };\n}\n\nint main() {\n    mn_main_List_2 numbers = mn_main_List_2_new(1);\n    mn_main_List_2_grow(&numbers);\n    mn_main_List_2_get(numbers);\n    const mn_main_List_3 flags = (mn_main_List_3){ .first = true, .count = 0u };\n    mn_main_List_3_get(flags);\n    mn_main_make();\n}\n\nmn_main_List_1 mn_main_List_1_new(uint8_t first) {\n    return (mn_main_List_1){ .first = first, .count = 0u };\n}\n\nuint8_t mn_main_List_1_get(mn_main_List_1 self) {\n    return self.first;\n}\n\nvoid mn_main_List_1_grow(struct mn_main_List_1 * self) {\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &self->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n}\n\nmn_main_List_2 mn_main_List_2_new(int32_t first) {\n    return (mn_main_List_2){ .first = first, .count = 0u };\n}\n\nint32_t mn_main_List_2_get(mn_main_List_2 self) {\n    return self.first;\n}\n\nvoid mn_main_List_2_grow(struct mn_main_List_2 * self) {\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &self->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n}\n\nmn_main_List_3 mn_main_List_3_new(bool first) {\n    return (mn_main_List_3){ .first = first, .count = 0u };\n}\n\nbool mn_main_List_3_get(mn_main_List_3 self) {\n    return self.first;\n}\n\nvoid mn_main_List_3_grow(struct mn_main_List_3 * self) {\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &self->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n}\n",
         files[1].contents,
     );
 }
@@ -8118,7 +8130,7 @@ test "generateZeroSizedObject: defines the shared zero-sized object only in the 
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n#include \"other.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    mn_other_locate();\n}\n",
+        "#include \"main.h\"\n#include \"other.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_other_locate();\n}\n",
         files[1].contents,
     );
     try std.testing.expectEqualStrings(
@@ -8337,7 +8349,7 @@ test "recordCalledFunction: includes the header of a function called in a loop" 
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n#include \"shapes.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    while (false) {\n        mn_shapes_draw();\n    }\n}\n",
+        "#include \"main.h\"\n#include \"shapes.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    while (false) {\n        mn_shapes_draw();\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -8370,7 +8382,7 @@ test "recordCalledFunction: records a function called through a local alias" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_show() {}\n\nint main() {\n    mn_main_show();\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_show() {}\n\nint main() {\n    mn_main_show();\n}\n",
         files[1].contents,
     );
 }
@@ -8460,7 +8472,7 @@ test "recordType: includes the headers of the structs that defaults build" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n#include \"shapes.h\"\n#include \"geometry.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    mn_shapes_draw((mn_shapes_Options){ .size = (mn_geometry_Size){ .width = 1 } });\n}\n",
+        "#include \"main.h\"\n#include \"shapes.h\"\n#include \"geometry.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_shapes_draw((mn_shapes_Options){ .size = (mn_geometry_Size){ .width = 1 } });\n}\n",
         files[1].contents,
     );
 }
@@ -8694,7 +8706,7 @@ test "recordModule: includes the header of a stored slice constant of another mo
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n#include \"data.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nchar mn_zero_sized;\n\nvoid mn_main_take(mn_slice_i32) {}\n\nint main() {\n    mn_main_take(mn_data_items);\n}\n",
+        "#include \"main.h\"\n#include \"data.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_take(mn_slice_i32) {}\n\nint main() {\n    mn_main_take(mn_data_items);\n}\n",
         files[1].contents,
     );
 }
@@ -8727,7 +8739,7 @@ test "generateFunction: generates main as the entry point" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings("#pragma once\n\n#include \"runtime/monolith.h\"\n", files[0].contents);
-    try std.testing.expectEqualStrings("#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {}\n", files[1].contents);
+    try std.testing.expectEqualStrings("#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {}\n", files[1].contents);
 }
 
 test "generateFunction: writes each instance of a function with a type parameter" {
@@ -8755,7 +8767,7 @@ test "generateFunction: writes each instance of a function with a type parameter
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    mn_main_max_1(1, 2);\n    mn_main_max_2(3u, 4u);\n    mn_main_max_1(5, 6);\n}\n\nint32_t mn_main_max_1(int32_t a, int32_t b) {\n    if ((a > b)) {\n        return a;\n    }\n    return b;\n}\n\nuint8_t mn_main_max_2(uint8_t a, uint8_t b) {\n    if ((a > b)) {\n        return a;\n    }\n    return b;\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_main_max_1(1, 2);\n    mn_main_max_2(3u, 4u);\n    mn_main_max_1(5, 6);\n}\n\nint32_t mn_main_max_1(int32_t a, int32_t b) {\n    if ((a > b)) {\n        return a;\n    }\n    return b;\n}\n\nuint8_t mn_main_max_2(uint8_t a, uint8_t b) {\n    if ((a > b)) {\n        return a;\n    }\n    return b;\n}\n",
         files[1].contents,
     );
 }
@@ -8785,7 +8797,7 @@ test "generateFunction: writes each instance of a function with a comptime param
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    mn_main_scale_1(5);\n    mn_main_scale_2(5);\n}\n\nint32_t mn_main_scale_1(int32_t value) {\n    return (value * 2);\n}\n\nint32_t mn_main_scale_2(int32_t value) {\n    return (value * 3);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_main_scale_1(5);\n    mn_main_scale_2(5);\n}\n\nint32_t mn_main_scale_1(int32_t value) {\n    return (value * 2);\n}\n\nint32_t mn_main_scale_2(int32_t value) {\n    return (value * 3);\n}\n",
         files[1].contents,
     );
 }
@@ -8818,7 +8830,7 @@ test "generateFunction: generates a default for each instance that uses it" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_Square_Shape_area(mn_main_Square self) {\n    return (self.side * self.side);\n}\n\nmn_main_Square mn_main_Square_Shape_unit() {\n    return (mn_main_Square){ .side = 1 };\n}\n\nint32_t mn_main_Circle_Shape_area(mn_main_Circle self) {\n    return (self.radius * 3);\n}\n\nmn_main_Circle mn_main_Circle_Shape_unit() {\n    return (mn_main_Circle){ .radius = 1 };\n}\n\nint32_t mn_main_Circle_Shape_double(mn_main_Circle self) {\n    return self.radius;\n}\n\nint main() {\n    const mn_main_Square square = (mn_main_Square){ .side = 2 };\n    mn_main_Square_Shape_double(square);\n    mn_main_Square_Shape_twice();\n    mn_main_Circle_Shape_twice();\n}\n\nint32_t mn_main_Square_Shape_double(mn_main_Square self) {\n    return (mn_main_Square_Shape_area(self) * 2);\n}\n\nint32_t mn_main_Square_Shape_twice() {\n    return mn_main_Square_Shape_double(mn_main_Square_Shape_unit());\n}\n\nint32_t mn_main_Circle_Shape_twice() {\n    return mn_main_Circle_Shape_double(mn_main_Circle_Shape_unit());\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint32_t mn_main_Square_Shape_area(mn_main_Square self) {\n    return (self.side * self.side);\n}\n\nmn_main_Square mn_main_Square_Shape_unit() {\n    return (mn_main_Square){ .side = 1 };\n}\n\nint32_t mn_main_Circle_Shape_area(mn_main_Circle self) {\n    return (self.radius * 3);\n}\n\nmn_main_Circle mn_main_Circle_Shape_unit() {\n    return (mn_main_Circle){ .radius = 1 };\n}\n\nint32_t mn_main_Circle_Shape_double(mn_main_Circle self) {\n    return self.radius;\n}\n\nint main() {\n    const mn_main_Square square = (mn_main_Square){ .side = 2 };\n    mn_main_Square_Shape_double(square);\n    mn_main_Square_Shape_twice();\n    mn_main_Circle_Shape_twice();\n}\n\nint32_t mn_main_Square_Shape_double(mn_main_Square self) {\n    return (mn_main_Square_Shape_area(self) * 2);\n}\n\nint32_t mn_main_Square_Shape_twice() {\n    return mn_main_Square_Shape_double(mn_main_Square_Shape_unit());\n}\n\nint32_t mn_main_Circle_Shape_twice() {\n    return mn_main_Circle_Shape_double(mn_main_Circle_Shape_unit());\n}\n",
         files[1].contents,
     );
 }
@@ -8856,7 +8868,7 @@ test "generateFunction: generates a default in the module of the instance" {
         files[0].contents,
     );
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n#include \"shapes.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_Square_Shape_area(mn_main_Square self) {\n    return self.side;\n}\n\nint main() {\n    const mn_main_Square square = (mn_main_Square){ .side = 2 };\n    mn_main_Square_Shape_double(square);\n}\n\nint32_t mn_main_Square_Shape_double(mn_main_Square self) {\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    return (mn_temporary_1 = mn_main_Square_Shape_area(self), mn_temporary_2 = mn_shapes_scale(), (mn_temporary_1 * mn_temporary_2));\n}\n",
+        "#include \"main.h\"\n#include \"shapes.h\"\n\nmax_align_t mn_zero_sized;\n\nint32_t mn_main_Square_Shape_area(mn_main_Square self) {\n    return self.side;\n}\n\nint main() {\n    const mn_main_Square square = (mn_main_Square){ .side = 2 };\n    mn_main_Square_Shape_double(square);\n}\n\nint32_t mn_main_Square_Shape_double(mn_main_Square self) {\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    return (mn_temporary_1 = mn_main_Square_Shape_area(self), mn_temporary_2 = mn_shapes_scale(), (mn_temporary_1 * mn_temporary_2));\n}\n",
         files[1].contents,
     );
     try std.testing.expectEqualStrings(
@@ -8901,7 +8913,7 @@ test "generateSignature: keeps the names of external functions" {
         files[0].contents,
     );
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    print_((mn_slice_u8){ .items = (uint8_t *)\"hi\", .length = 2 });\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    print_((mn_slice_u8){ .items = (uint8_t *)\"hi\", .length = 2 });\n}\n",
         files[1].contents,
     );
 }
@@ -9160,7 +9172,7 @@ test "generateBlock: writes an empty block for a body of constants" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {}\n",
         files[1].contents,
     );
 }
@@ -9260,7 +9272,7 @@ test "generateStatement: returns zero from main" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    return 0;\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    return 0;\n}\n",
         files[1].contents,
     );
 }
@@ -9320,7 +9332,7 @@ test "generateStatement: writes calls and discards" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_log(int32_t) {}\n\nint32_t mn_main_one() {\n    return 1;\n}\n\nint main() {\n    mn_main_log(mn_main_one());\n    mn_main_one();\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_log(int32_t) {}\n\nint32_t mn_main_one() {\n    return 1;\n}\n\nint main() {\n    mn_main_log(mn_main_one());\n    mn_main_one();\n}\n",
         files[1].contents,
     );
 }
@@ -9468,7 +9480,7 @@ test "generateLocal: declares a local constant in C" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_take(int32_t) {}\n\nint main() {\n    const int32_t limit = 5;\n    mn_main_take(limit);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_take(int32_t) {}\n\nint main() {\n    const int32_t limit = 5;\n    mn_main_take(limit);\n}\n",
         files[1].contents,
     );
 }
@@ -9600,7 +9612,7 @@ test "generateLocal: writes only the calls of a discarded constant" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_make() {\n    return 1;\n}\n\nint main() {\n    mn_main_make();\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint32_t mn_main_make() {\n    return 1;\n}\n\nint main() {\n    mn_main_make();\n}\n",
         files[1].contents,
     );
 }
@@ -9633,7 +9645,7 @@ test "generateLocal: writes only the calls of a zero-sized constant" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_make() {\n    return;\n}\n\nvoid mn_main_use() {}\n\nint main() {\n    mn_main_make();\n    mn_main_use();\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_make() {\n    return;\n}\n\nvoid mn_main_use() {}\n\nint main() {\n    mn_main_make();\n    mn_main_use();\n}\n",
         files[1].contents,
     );
 }
@@ -9666,7 +9678,7 @@ test "generateLocal: writes nothing for a constant of the empty tuple type" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {}\n",
         files[1].contents,
     );
 }
@@ -9699,7 +9711,7 @@ test "generateLocal: writes only the calls of void constants and variables" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_work() {}\n\nint32_t mn_main_keep(int32_t number) {\n    return number;\n}\n\nint main() {\n    mn_main_work();\n    mn_main_work();\n    mn_main_keep(1);\n    mn_main_keep(2);\n    const mn_main_Box box = (mn_main_Box){ .number = 3 };\n    mn_main_keep(box.number);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_work() {}\n\nint32_t mn_main_keep(int32_t number) {\n    return number;\n}\n\nint main() {\n    mn_main_work();\n    mn_main_work();\n    mn_main_keep(1);\n    mn_main_keep(2);\n    const mn_main_Box box = (mn_main_Box){ .number = 3 };\n    mn_main_keep(box.number);\n}\n",
         files[1].contents,
     );
 }
@@ -9762,7 +9774,7 @@ test "generateLocal: writes nothing for local constants that hold types" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    int32_t value = 1;\n    value = (value + 1);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    int32_t value = 1;\n    value = (value + 1);\n}\n",
         files[1].contents,
     );
 }
@@ -9822,7 +9834,7 @@ test "generateLocal: declares a local with its written type" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    int32_t one = 1;\n    int32_t two = 2;\n    int32_t const * pointer = &one;\n    pointer = &two;\n    keep(pointer);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    int32_t one = 1;\n    int32_t two = 2;\n    int32_t const * pointer = &one;\n    pointer = &two;\n    keep(pointer);\n}\n",
         files[1].contents,
     );
 }
@@ -9942,7 +9954,7 @@ test "generateLocal: writes nothing for a discarded variable" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {}\n",
         files[1].contents,
     );
 }
@@ -10008,7 +10020,7 @@ test "generateLocal: numbers a local in a loop that shadows an outer local" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_take(int32_t) {}\n\nint main() {\n    const int32_t value = 1;\n    while (false) {\n        const int32_t value_2 = 2;\n        mn_main_take(value_2);\n    }\n    mn_main_take(value);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_take(int32_t) {}\n\nint main() {\n    const int32_t value = 1;\n    while (false) {\n        const int32_t value_2 = 2;\n        mn_main_take(value_2);\n    }\n    mn_main_take(value);\n}\n",
         files[1].contents,
     );
 }
@@ -10074,7 +10086,7 @@ test "generateTupleDeclaration: evaluates a call once before taking it apart" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_tuple_2_i32_bool_defined\n#define mn_tuple_2_i32_bool_defined\ntypedef struct mn_tuple_2_i32_bool {\n    int32_t _0;\n    bool _1;\n} mn_tuple_2_i32_bool;\n#endif\n\nchar mn_zero_sized;\n\nmn_tuple_2_i32_bool mn_main_make() {\n    return (mn_tuple_2_i32_bool){ ._0 = 1, ._1 = true };\n}\n\nint main() {\n    const mn_tuple_2_i32_bool mn_tuple_value_1 = mn_main_make();\n    const int32_t number = mn_tuple_value_1._0;\n    const bool flag = mn_tuple_value_1._1;\n    take(number);\n    check(flag);\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_tuple_2_i32_bool_defined\n#define mn_tuple_2_i32_bool_defined\ntypedef struct mn_tuple_2_i32_bool {\n    int32_t _0;\n    bool _1;\n} mn_tuple_2_i32_bool;\n#endif\n\nmax_align_t mn_zero_sized;\n\nmn_tuple_2_i32_bool mn_main_make() {\n    return (mn_tuple_2_i32_bool){ ._0 = 1, ._1 = true };\n}\n\nint main() {\n    const mn_tuple_2_i32_bool mn_tuple_value_1 = mn_main_make();\n    const int32_t number = mn_tuple_value_1._0;\n    const bool flag = mn_tuple_value_1._1;\n    take(number);\n    check(flag);\n}\n",
         files[1].contents,
     );
 }
@@ -10107,7 +10119,7 @@ test "generateTupleDeclaration: points to the elements of a variable" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_tuple_2_i32_bool_defined\n#define mn_tuple_2_i32_bool_defined\ntypedef struct mn_tuple_2_i32_bool {\n    int32_t _0;\n    bool _1;\n} mn_tuple_2_i32_bool;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    mn_tuple_2_i32_bool pair = (mn_tuple_2_i32_bool){ ._0 = 1, ._1 = true };\n    int32_t * const number = &pair._0;\n    const bool flag = pair._1;\n    (*number) = 2;\n    check(flag);\n    take(pair._0);\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_tuple_2_i32_bool_defined\n#define mn_tuple_2_i32_bool_defined\ntypedef struct mn_tuple_2_i32_bool {\n    int32_t _0;\n    bool _1;\n} mn_tuple_2_i32_bool;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_tuple_2_i32_bool pair = (mn_tuple_2_i32_bool){ ._0 = 1, ._1 = true };\n    int32_t * const number = &pair._0;\n    const bool flag = pair._1;\n    (*number) = 2;\n    check(flag);\n    take(pair._0);\n}\n",
         files[1].contents,
     );
 }
@@ -10140,7 +10152,7 @@ test "generateTupleDeclaration: stores the address of a value that is not a name
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    mn_main_Holder holder = (mn_main_Holder){ .pair = (mn_tuple_2_i32_bool){ ._0 = 1, ._1 = true } };\n    struct mn_tuple_2_i32_bool * const mn_tuple_value_1 = &holder.pair;\n    int32_t * const number = &mn_tuple_value_1->_0;\n    const bool flag = mn_tuple_value_1->_1;\n    (*number) = 2;\n    check(flag);\n    take(holder.pair._0);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_main_Holder holder = (mn_main_Holder){ .pair = (mn_tuple_2_i32_bool){ ._0 = 1, ._1 = true } };\n    struct mn_tuple_2_i32_bool * const mn_tuple_value_1 = &holder.pair;\n    int32_t * const number = &mn_tuple_value_1->_0;\n    const bool flag = mn_tuple_value_1->_1;\n    (*number) = 2;\n    check(flag);\n    take(holder.pair._0);\n}\n",
         files[1].contents,
     );
 }
@@ -10173,7 +10185,7 @@ test "generateTupleDeclaration: evaluates the address of an element whose index 
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_tuple_2_i32_bool_defined\n#define mn_tuple_2_i32_bool_defined\ntypedef struct mn_tuple_2_i32_bool {\n    int32_t _0;\n    bool _1;\n} mn_tuple_2_i32_bool;\n#endif\n\n#ifndef mn_array_2_tuple_2_i32_bool_defined\n#define mn_array_2_tuple_2_i32_bool_defined\ntypedef struct mn_array_2_tuple_2_i32_bool {\n    mn_tuple_2_i32_bool items[2];\n} mn_array_2_tuple_2_i32_bool;\n#endif\n\nchar mn_zero_sized;\n\nsize_t mn_main_next() {\n    return 0u;\n}\n\nint main() {\n    mn_array_2_tuple_2_i32_bool pairs = (mn_array_2_tuple_2_i32_bool){ .items = { (mn_tuple_2_i32_bool){ ._0 = 1, ._1 = true }, (mn_tuple_2_i32_bool){ ._0 = 2, ._1 = false } } };\n    struct mn_tuple_2_i32_bool * const mn_tuple_value_1 = &pairs.items[mn_main_next()];\n    int32_t * const number = &mn_tuple_value_1->_0;\n    (*number) = 3;\n    take(pairs.items[0u]._0);\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_tuple_2_i32_bool_defined\n#define mn_tuple_2_i32_bool_defined\ntypedef struct mn_tuple_2_i32_bool {\n    int32_t _0;\n    bool _1;\n} mn_tuple_2_i32_bool;\n#endif\n\n#ifndef mn_array_2_tuple_2_i32_bool_defined\n#define mn_array_2_tuple_2_i32_bool_defined\ntypedef struct mn_array_2_tuple_2_i32_bool {\n    mn_tuple_2_i32_bool items[2];\n} mn_array_2_tuple_2_i32_bool;\n#endif\n\nmax_align_t mn_zero_sized;\n\nsize_t mn_main_next() {\n    return 0u;\n}\n\nint main() {\n    mn_array_2_tuple_2_i32_bool pairs = (mn_array_2_tuple_2_i32_bool){ .items = { (mn_tuple_2_i32_bool){ ._0 = 1, ._1 = true }, (mn_tuple_2_i32_bool){ ._0 = 2, ._1 = false } } };\n    struct mn_tuple_2_i32_bool * const mn_tuple_value_1 = &pairs.items[mn_main_next()];\n    int32_t * const number = &mn_tuple_value_1->_0;\n    (*number) = 3;\n    take(pairs.items[0u]._0);\n}\n",
         files[1].contents,
     );
 }
@@ -10206,7 +10218,7 @@ test "generateTupleDeclaration: writes only the calls when no name is declared" 
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_tuple_2_i32_bool_defined\n#define mn_tuple_2_i32_bool_defined\ntypedef struct mn_tuple_2_i32_bool {\n    int32_t _0;\n    bool _1;\n} mn_tuple_2_i32_bool;\n#endif\n\nchar mn_zero_sized;\n\nmn_tuple_2_i32_bool mn_main_make() {\n    return (mn_tuple_2_i32_bool){ ._0 = 1, ._1 = true };\n}\n\nint main() {\n    mn_main_make();\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_tuple_2_i32_bool_defined\n#define mn_tuple_2_i32_bool_defined\ntypedef struct mn_tuple_2_i32_bool {\n    int32_t _0;\n    bool _1;\n} mn_tuple_2_i32_bool;\n#endif\n\nmax_align_t mn_zero_sized;\n\nmn_tuple_2_i32_bool mn_main_make() {\n    return (mn_tuple_2_i32_bool){ ._0 = 1, ._1 = true };\n}\n\nint main() {\n    mn_main_make();\n}\n",
         files[1].contents,
     );
 }
@@ -10272,7 +10284,7 @@ test "generateTupleDeclaration: stores a constant whose element a pointer name p
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_tuple_2_i32_bool_defined\n#define mn_tuple_2_i32_bool_defined\ntypedef struct mn_tuple_2_i32_bool {\n    int32_t _0;\n    bool _1;\n} mn_tuple_2_i32_bool;\n#endif\n\nchar mn_zero_sized;\n\nconst mn_tuple_2_i32_bool mn_main_pair = { ._0 = 1, ._1 = true };\n\nint main() {\n    int32_t const * const number = &mn_main_pair._0;\n    keep(number);\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_tuple_2_i32_bool_defined\n#define mn_tuple_2_i32_bool_defined\ntypedef struct mn_tuple_2_i32_bool {\n    int32_t _0;\n    bool _1;\n} mn_tuple_2_i32_bool;\n#endif\n\nmax_align_t mn_zero_sized;\n\nconst mn_tuple_2_i32_bool mn_main_pair = { ._0 = 1, ._1 = true };\n\nint main() {\n    int32_t const * const number = &mn_main_pair._0;\n    keep(number);\n}\n",
         files[1].contents,
     );
 }
@@ -10510,7 +10522,7 @@ test "generateEntryPoint: reports the error that ends main and ends with a nonze
         files[0].contents,
     );
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_result_main_ParseError_void_defined\n#define mn_result_main_ParseError_void_defined\ntypedef struct mn_result_main_ParseError_void {\n    mn_main_ParseError error;\n} mn_result_main_ParseError_void;\n#endif\n\nchar mn_zero_sized;\n\nvoid mn_runtime_error_report(char const *name);\n\nmn_result_main_ParseError_void mn_main_main() {\n    return (mn_result_main_ParseError_void){ .error = (mn_main_ParseError){ .tag = 1 } };\n}\n\nint main() {\n    mn_result_main_ParseError_void result = mn_main_main();\n    if (result.error.tag == 0) return 0;\n    switch (result.error.tag) {\n    case 1: mn_runtime_error_report(\"missing_end\"); break;\n    case 2: mn_runtime_error_report(\"bad_digit\"); break;\n    }\n    return 1;\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_result_main_ParseError_void_defined\n#define mn_result_main_ParseError_void_defined\ntypedef struct mn_result_main_ParseError_void {\n    mn_main_ParseError error;\n} mn_result_main_ParseError_void;\n#endif\n\nmax_align_t mn_zero_sized;\n\nvoid mn_runtime_error_report(char const *name);\n\nmn_result_main_ParseError_void mn_main_main() {\n    return (mn_result_main_ParseError_void){ .error = (mn_main_ParseError){ .tag = 1 } };\n}\n\nint main() {\n    mn_result_main_ParseError_void result = mn_main_main();\n    if (result.error.tag == 0) return 0;\n    switch (result.error.tag) {\n    case 1: mn_runtime_error_report(\"missing_end\"); break;\n    case 2: mn_runtime_error_report(\"bad_digit\"); break;\n    }\n    return 1;\n}\n",
         files[1].contents,
     );
     try std.testing.expectEqualStrings("mn_runtime_error_report", generator.runtime_functions.items[0]);
@@ -10577,7 +10589,7 @@ test "generateAssignment: writes only the calls when the variable is not declare
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_make() {\n    return 1;\n}\n\nint main() {\n    mn_main_make();\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint32_t mn_main_make() {\n    return 1;\n}\n\nint main() {\n    mn_main_make();\n}\n",
         files[1].contents,
     );
 }
@@ -10664,7 +10676,7 @@ test "generateAssignment: assigns a field through a pointer returned by a call" 
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    locate()->x = 1;\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    locate()->x = 1;\n}\n",
         files[1].contents,
     );
 }
@@ -10880,7 +10892,7 @@ test "generateTargetEffects: runs the calls of a zero-sized target before the va
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    locate(), make();\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    locate(), make();\n}\n",
         files[1].contents,
     );
 }
@@ -10907,7 +10919,7 @@ test "generateTargetEffects: runs the calls of a zero-sized target from left to 
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    locate(), position(), position(), make();\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    locate(), position(), position(), make();\n}\n",
         files[1].contents,
     );
 }
@@ -10934,7 +10946,7 @@ test "generateTarget: evaluates the calls of the target before the calls of the 
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    struct mn_main_Point * mn_temporary_1;\n    mn_temporary_1 = locate(), mn_temporary_1->x = make();\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    struct mn_main_Point * mn_temporary_1;\n    mn_temporary_1 = locate(), mn_temporary_1->x = make();\n}\n",
         files[1].contents,
     );
 }
@@ -10961,7 +10973,7 @@ test "generateTarget: evaluates the calls in a target from left to right" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    int32_t * mn_temporary_1;\n    size_t mn_temporary_2;\n    mn_temporary_1 = locate(), mn_temporary_2 = position(), mn_temporary_1[mn_temporary_2] = 1;\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    int32_t * mn_temporary_1;\n    size_t mn_temporary_2;\n    mn_temporary_1 = locate(), mn_temporary_2 = position(), mn_temporary_1[mn_temporary_2] = 1;\n}\n",
         files[1].contents,
     );
 }
@@ -10988,7 +11000,7 @@ test "generateIf: writes the condition, the body and the else block" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_run(bool ready) {\n    if (ready) {\n        step();\n    } else {\n        stop();\n    }\n}\n\nint main() {\n    mn_main_run(true);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_run(bool ready) {\n    if (ready) {\n        step();\n    } else {\n        stop();\n    }\n}\n\nint main() {\n    mn_main_run(true);\n}\n",
         files[1].contents,
     );
 }
@@ -11018,7 +11030,7 @@ test "generateIf: writes only the block that each instance chooses" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    mn_main_describe_1(true);\n    mn_main_describe_2(2);\n}\n\nint32_t mn_main_describe_1([[maybe_unused]] bool value) {\n    {\n        if (value) {\n            return 1;\n        }\n        return 0;\n    }\n}\n\nint32_t mn_main_describe_2([[maybe_unused]] int32_t value) {\n    {\n        return value;\n    }\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_main_describe_1(true);\n    mn_main_describe_2(2);\n}\n\nint32_t mn_main_describe_1([[maybe_unused]] bool value) {\n    {\n        if (value) {\n            return 1;\n        }\n        return 0;\n    }\n}\n\nint32_t mn_main_describe_2([[maybe_unused]] int32_t value) {\n    {\n        return value;\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -11045,7 +11057,7 @@ test "generateIf: chains an else if" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_run(bool one, bool two) {\n    if (one) {\n        step();\n    } else if (two) {\n        stop();\n    } else {\n        step();\n    }\n}\n\nint main() {\n    mn_main_run(true, false);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_run(bool one, bool two) {\n    if (one) {\n        step();\n    } else if (two) {\n        stop();\n    } else {\n        step();\n    }\n}\n\nint main() {\n    mn_main_run(true, false);\n}\n",
         files[1].contents,
     );
 }
@@ -11072,7 +11084,7 @@ test "generateIf: declares the temporaries of an else if condition in the else b
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_run(bool ready) {\n    if (ready) {\n        step();\n    } else {\n        int32_t mn_temporary_1;\n        int32_t mn_temporary_2;\n        if ((mn_temporary_1 = one(), mn_temporary_2 = two(), (mn_temporary_1 < mn_temporary_2))) {\n            step();\n        }\n    }\n}\n\nint main() {\n    mn_main_run(true);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_run(bool ready) {\n    if (ready) {\n        step();\n    } else {\n        int32_t mn_temporary_1;\n        int32_t mn_temporary_2;\n        if ((mn_temporary_1 = one(), mn_temporary_2 = two(), (mn_temporary_1 < mn_temporary_2))) {\n            step();\n        }\n    }\n}\n\nint main() {\n    mn_main_run(true);\n}\n",
         files[1].contents,
     );
 }
@@ -11139,7 +11151,7 @@ test "generateWhile: writes the condition and the body" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_step() {}\n\nint main() {\n    bool running = true;\n    while (running) {\n        mn_main_step();\n        running = false;\n    }\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_step() {}\n\nint main() {\n    bool running = true;\n    while (running) {\n        mn_main_step();\n        running = false;\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -11166,7 +11178,7 @@ test "generateWhile: evaluates the temporaries of the condition in each iteratio
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    while ((mn_temporary_1 = one(), mn_temporary_2 = two(), (mn_temporary_1 < mn_temporary_2))) {\n        step();\n    }\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    while ((mn_temporary_1 = one(), mn_temporary_2 = two(), (mn_temporary_1 < mn_temporary_2))) {\n        step();\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -11193,7 +11205,7 @@ test "generateWhile: writes the else block after the loop and jumps over it on b
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_run(bool running) {\n    while (running) {\n        if (step()) {\n            goto mn_break_1;\n        }\n    }\n    stop();\n    mn_break_1:;\n}\n\nint main() {\n    mn_main_run(true);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_run(bool running) {\n    while (running) {\n        if (step()) {\n            goto mn_break_1;\n        }\n    }\n    stop();\n    mn_break_1:;\n}\n\nint main() {\n    mn_main_run(true);\n}\n",
         files[1].contents,
     );
 }
@@ -11220,7 +11232,7 @@ test "generateWhile: writes no label for a loop with an else block and no break"
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_run(bool running) {\n    while (running) {\n        step();\n    }\n    stop();\n}\n\nint main() {\n    mn_main_run(true);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_run(bool running) {\n    while (running) {\n        step();\n    }\n    stop();\n}\n\nint main() {\n    mn_main_run(true);\n}\n",
         files[1].contents,
     );
 }
@@ -11287,7 +11299,7 @@ test "generateFor: counts over the length of an array" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_array_3_i32_defined\n#define mn_array_3_i32_defined\ntypedef struct mn_array_3_i32 {\n    int32_t items[3];\n} mn_array_3_i32;\n#endif\n\nchar mn_zero_sized;\n\nvoid mn_main_take(int32_t) {}\n\nint main() {\n    const mn_array_3_i32 items = (mn_array_3_i32){ .items = { 1, 2, 3 } };\n    for (size_t mn_index_1 = 0; mn_index_1 < 3; mn_index_1 += 1) {\n        const int32_t item = items.items[mn_index_1];\n        mn_main_take(item);\n    }\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_array_3_i32_defined\n#define mn_array_3_i32_defined\ntypedef struct mn_array_3_i32 {\n    int32_t items[3];\n} mn_array_3_i32;\n#endif\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_take(int32_t) {}\n\nint main() {\n    const mn_array_3_i32 items = (mn_array_3_i32){ .items = { 1, 2, 3 } };\n    for (size_t mn_index_1 = 0; mn_index_1 < 3; mn_index_1 += 1) {\n        const int32_t item = items.items[mn_index_1];\n        mn_main_take(item);\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -11353,7 +11365,7 @@ test "generateFor: loops without a condition over a range without an end" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    for (size_t mn_index_1 = 0; ; mn_index_1 += 1) {\n        const size_t index = 1u + mn_index_1;\n        take(index);\n    }\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    for (size_t mn_index_1 = 0; ; mn_index_1 += 1) {\n        const size_t index = 1u + mn_index_1;\n        take(index);\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -11419,7 +11431,7 @@ test "generateFor: reads a variable array in place" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    mn_array_2_i32 items = (mn_array_2_i32){ .items = { 1, 2 } };\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        const int32_t item = items.items[mn_index_1];\n        items.items[1u] = item;\n        take(item);\n    }\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_array_2_i32 items = (mn_array_2_i32){ .items = { 1, 2 } };\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        const int32_t item = items.items[mn_index_1];\n        items.items[1u] = item;\n        take(item);\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -11485,7 +11497,7 @@ test "generateFor: evaluates the start of a range without an end once before the
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    const size_t mn_start_1 = first();\n    for (size_t mn_index_1 = 0; ; mn_index_1 += 1) {\n        const size_t index = mn_start_1 + mn_index_1;\n        take(index);\n    }\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    const size_t mn_start_1 = first();\n    for (size_t mn_index_1 = 0; ; mn_index_1 += 1) {\n        const size_t index = mn_start_1 + mn_index_1;\n        take(index);\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -11518,7 +11530,7 @@ test "generateFor: continues with the next elements" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    for (size_t mn_index_1 = 0; mn_index_1 < 3u; mn_index_1 += 1) {\n        const size_t index = mn_index_1;\n        if (step(index)) {\n            continue;\n        }\n        while (step(index)) {\n            goto mn_continue_1;\n        }\n        mn_continue_1:;\n    }\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    for (size_t mn_index_1 = 0; mn_index_1 < 3u; mn_index_1 += 1) {\n        const size_t index = mn_index_1;\n        if (step(index)) {\n            continue;\n        }\n        while (step(index)) {\n            goto mn_continue_1;\n        }\n        mn_continue_1:;\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -11584,7 +11596,7 @@ test "generateFor: leaves out the loop over a range whose bounds are equal" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    stop();\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    stop();\n}\n",
         files[1].contents,
     );
 }
@@ -11614,7 +11626,7 @@ test "generateFor: leaves out the loop over a range whose bounds known at compil
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    const size_t mn_end_2 = (0u + 1u);\n    for (size_t mn_index_2 = 0; mn_index_2 < mn_end_2; mn_index_2 += 1) {\n        step();\n    }\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    const size_t mn_end_2 = (0u + 1u);\n    for (size_t mn_index_2 = 0; mn_index_2 < mn_end_2; mn_index_2 += 1) {\n        step();\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -11678,7 +11690,7 @@ test "generateFunction: writes an instance for each type of the argument to an a
         files[0].contents,
     );
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_array_2_u8_defined\n#define mn_array_2_u8_defined\ntypedef struct mn_array_2_u8 {\n    uint8_t items[2];\n} mn_array_2_u8;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    mn_array_2_u8 array = (mn_array_2_u8){ .items = { 1u, 2u } };\n    array.items[0u] = mn_main_first_1(array);\n    mn_main_count_1((mn_slice_u8){ .items = (uint8_t *)\"ab\", .length = 2 });\n    mn_main_count_2(array);\n    mn_main_count_3(&array);\n}\n\nuint8_t mn_main_first_1(mn_array_2_u8 values) {\n    return values.items[0u];\n}\n\nsize_t mn_main_count_1(mn_slice_u8 values) {\n    return values.length;\n}\n\nsize_t mn_main_count_2([[maybe_unused]] mn_array_2_u8 values) {\n    return 2u;\n}\n\nsize_t mn_main_count_3([[maybe_unused]] struct mn_array_2_u8 * values) {\n    return 2u;\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_array_2_u8_defined\n#define mn_array_2_u8_defined\ntypedef struct mn_array_2_u8 {\n    uint8_t items[2];\n} mn_array_2_u8;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_array_2_u8 array = (mn_array_2_u8){ .items = { 1u, 2u } };\n    array.items[0u] = mn_main_first_1(array);\n    mn_main_count_1((mn_slice_u8){ .items = (uint8_t *)\"ab\", .length = 2 });\n    mn_main_count_2(array);\n    mn_main_count_3(&array);\n}\n\nuint8_t mn_main_first_1(mn_array_2_u8 values) {\n    return values.items[0u];\n}\n\nsize_t mn_main_count_1(mn_slice_u8 values) {\n    return values.length;\n}\n\nsize_t mn_main_count_2([[maybe_unused]] mn_array_2_u8 values) {\n    return 2u;\n}\n\nsize_t mn_main_count_3([[maybe_unused]] struct mn_array_2_u8 * values) {\n    return 2u;\n}\n",
         files[1].contents,
     );
 }
@@ -11911,11 +11923,11 @@ test "generateFunction: compares slices through mn::memory::equal" {
         files[3].contents,
     );
     try std.testing.expectEqualStrings(
-        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\ntypedef struct mn_slice_u8 mn_slice_u8;\n\nbool mn_mn_memory_equal(mn_slice_u8 one, mn_slice_u8 two);\n",
+        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\ntypedef struct mn_mn_memory_Error {\n    uint32_t tag;\n} mn_mn_memory_Error;\n\ntypedef struct mn_slice_u8 mn_slice_u8;\ntypedef struct mn_result_mn_memory_Error_slice_u8 mn_result_mn_memory_Error_slice_u8;\n\nuint8_t * mn_runtime_memory_allocate(size_t size, size_t alignment);\nvoid mn_runtime_memory_free(uint8_t * pointer);\n\nbool mn_mn_memory_equal(mn_slice_u8 one, mn_slice_u8 two);\nmn_result_mn_memory_Error_slice_u8 mn_mn_memory_System_Allocator_allocate(void *, size_t size, size_t alignment);\nbool mn_mn_memory_System_Allocator_resize(void *, mn_slice_u8 bytes, size_t, size_t size);\nvoid mn_mn_memory_System_Allocator_free(void *, mn_slice_u8 bytes, size_t);\n",
         files[4].contents,
     );
     try std.testing.expectEqualStrings(
-        "#include \"memory.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nbool mn_mn_memory_equal(mn_slice_u8 one, mn_slice_u8 two) {\n    if ((one.length != two.length)) {\n        return false;\n    }\n    const size_t mn_end_1 = one.length;\n    for (size_t mn_index_1 = 0; mn_index_1 < mn_end_1; mn_index_1 += 1) {\n        const size_t index = mn_index_1;\n        if ((one.items[index] != two.items[index])) {\n            return false;\n        }\n    }\n    return true;\n}\n",
+        "#include \"memory.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_result_mn_memory_Error_slice_u8_defined\n#define mn_result_mn_memory_Error_slice_u8_defined\ntypedef struct mn_result_mn_memory_Error_slice_u8 {\n    mn_mn_memory_Error error;\n    mn_slice_u8 value;\n} mn_result_mn_memory_Error_slice_u8;\n#endif\n\nbool mn_mn_memory_equal(mn_slice_u8 one, mn_slice_u8 two) {\n    if ((one.length != two.length)) {\n        return false;\n    }\n    const size_t mn_end_1 = one.length;\n    for (size_t mn_index_1 = 0; mn_index_1 < mn_end_1; mn_index_1 += 1) {\n        const size_t index = mn_index_1;\n        if ((one.items[index] != two.items[index])) {\n            return false;\n        }\n    }\n    return true;\n}\n\nmn_result_mn_memory_Error_slice_u8 mn_mn_memory_System_Allocator_allocate(void *, size_t size, size_t alignment) {\n    uint8_t * mn_temporary_1;\n    uint8_t * mn_temporary_2;\n    mn_temporary_1 = mn_runtime_memory_allocate(size, alignment);\n    if (!(mn_temporary_1 != NULL)) {\n        return (mn_result_mn_memory_Error_slice_u8){ .error = (mn_mn_memory_Error){ .tag = 1 } };\n    } else {\n        mn_temporary_2 = mn_temporary_1;\n    }\n    uint8_t * const pointer = mn_temporary_2;\n    return (mn_result_mn_memory_Error_slice_u8){ .error.tag = 0, .value = (mn_slice_u8){ .items = pointer + 0u, .length = size - 0u } };\n}\n\nbool mn_mn_memory_System_Allocator_resize(void *, mn_slice_u8 bytes, size_t, size_t size) {\n    return (size <= bytes.length);\n}\n\nvoid mn_mn_memory_System_Allocator_free(void *, mn_slice_u8 bytes, size_t) {\n    mn_runtime_memory_free(bytes.items);\n}\n",
         files[5].contents,
     );
 }
@@ -12020,7 +12032,7 @@ test "generatePart: stores a sequence that needs temporaries" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    const mn_slice_i32 mn_sequence_1 = (mn_temporary_1 = one(), mn_temporary_2 = two(), pick(mn_temporary_1, mn_temporary_2));\n    for (size_t mn_index_1 = 0; mn_index_1 < mn_sequence_1.length; mn_index_1 += 1) {\n        const int32_t item = mn_sequence_1.items[mn_index_1];\n        take(item);\n    }\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    const mn_slice_i32 mn_sequence_1 = (mn_temporary_1 = one(), mn_temporary_2 = two(), pick(mn_temporary_1, mn_temporary_2));\n    for (size_t mn_index_1 = 0; mn_index_1 < mn_sequence_1.length; mn_index_1 += 1) {\n        const int32_t item = mn_sequence_1.items[mn_index_1];\n        take(item);\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -12053,7 +12065,7 @@ test "generatePart: evaluates a sequence without a name only for its effects" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    make();\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        step();\n    }\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    make();\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        step();\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -12119,7 +12131,7 @@ test "generatePart: stores an array that has no storage of its own" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    const mn_array_2_i32 mn_sequence_1 = make();\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        const int32_t item = mn_sequence_1.items[mn_index_1];\n        take(item);\n    }\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    const mn_array_2_i32 mn_sequence_1 = make();\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        const int32_t item = mn_sequence_1.items[mn_index_1];\n        take(item);\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -12185,7 +12197,7 @@ test "generatePart: stores a writable address of an array that a pointer name mo
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    mn_main_Hand hand = (mn_main_Hand){ .cards = (mn_array_2_i32){ .items = { 1, 2 } } };\n    struct mn_array_2_i32 * const mn_sequence_1 = &hand.cards;\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        int32_t * const card = &mn_sequence_1->items[mn_index_1];\n        (*card) = 0;\n    }\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_main_Hand hand = (mn_main_Hand){ .cards = (mn_array_2_i32){ .items = { 1, 2 } } };\n    struct mn_array_2_i32 * const mn_sequence_1 = &hand.cards;\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        int32_t * const card = &mn_sequence_1->items[mn_index_1];\n        (*card) = 0;\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -12317,7 +12329,7 @@ test "generateElementDeclarations: points a pointer name to each element" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    mn_array_2_i32 cards = (mn_array_2_i32){ .items = { 1, 2 } };\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        int32_t * const card = &cards.items[mn_index_1];\n        (*card) = 0;\n    }\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_array_2_i32 cards = (mn_array_2_i32){ .items = { 1, 2 } };\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        int32_t * const card = &cards.items[mn_index_1];\n        (*card) = 0;\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -12383,7 +12395,7 @@ test "generateElementDeclarations: points a pointer name to each element of a co
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    const mn_array_2_i32 cards = (mn_array_2_i32){ .items = { 1, 2 } };\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        int32_t const * const card = &cards.items[mn_index_1];\n        keep(card);\n    }\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    const mn_array_2_i32 cards = (mn_array_2_i32){ .items = { 1, 2 } };\n    for (size_t mn_index_1 = 0; mn_index_1 < 2; mn_index_1 += 1) {\n        int32_t const * const card = &cards.items[mn_index_1];\n        keep(card);\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -12443,7 +12455,7 @@ test "generateJump: writes a jump to the innermost loop as a plain break or cont
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_run(bool running) {\n    while (running) {\n        if (step()) {\n            continue;\n        }\n        break;\n    }\n}\n\nint main() {\n    mn_main_run(true);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_run(bool running) {\n    while (running) {\n        if (step()) {\n            continue;\n        }\n        break;\n    }\n}\n\nint main() {\n    mn_main_run(true);\n}\n",
         files[1].contents,
     );
 }
@@ -12470,7 +12482,7 @@ test "generateJump: jumps to the labels of an outer loop" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_run(bool running) {\n    while (running) {\n        while (step()) {\n            if (step()) {\n                goto mn_continue_1;\n            }\n            goto mn_break_1;\n        }\n        mn_continue_1:;\n    }\n    mn_break_1:;\n}\n\nint main() {\n    mn_main_run(true);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_run(bool running) {\n    while (running) {\n        while (step()) {\n            if (step()) {\n                goto mn_continue_1;\n            }\n            goto mn_break_1;\n        }\n        mn_continue_1:;\n    }\n    mn_break_1:;\n}\n\nint main() {\n    mn_main_run(true);\n}\n",
         files[1].contents,
     );
 }
@@ -12497,7 +12509,7 @@ test "generateJump: breaks from the else block of an inner loop as from the inne
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_run(bool running) {\n    while (running) {\n        while (step()) {}\n        break;\n    }\n}\n\nint main() {\n    mn_main_run(true);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_run(bool running) {\n    while (running) {\n        while (step()) {}\n        break;\n    }\n}\n\nint main() {\n    mn_main_run(true);\n}\n",
         files[1].contents,
     );
 }
@@ -12530,7 +12542,7 @@ test "generateJump: breaks from the else block of a for loop as from the enclosi
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    while (step()) {\n        for (size_t mn_index_2 = 0; mn_index_2 < 3u; mn_index_2 += 1) {}\n        break;\n    }\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    while (step()) {\n        for (size_t mn_index_2 = 0; mn_index_2 < 3u; mn_index_2 += 1) {}\n        break;\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -12908,7 +12920,7 @@ test "generateStatementEffects: runs the calls of a discarded operation from lef
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    (void)(mn_temporary_1 = one(), mn_temporary_2 = two(), (mn_temporary_1 + mn_temporary_2));\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    (void)(mn_temporary_1 = one(), mn_temporary_2 = two(), (mn_temporary_1 + mn_temporary_2));\n}\n",
         files[1].contents,
     );
 }
@@ -12962,7 +12974,7 @@ test "generateSteps: runs a zero-sized call in its place without a temporary" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    (mn_temporary_1 = one(), mark(mn_temporary_1), mn_temporary_2 = one(), use(mn_temporary_2));\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    (mn_temporary_1 = one(), mark(mn_temporary_1), mn_temporary_2 = one(), use(mn_temporary_2));\n}\n",
         files[1].contents,
     );
 }
@@ -13186,6 +13198,62 @@ test "generateExpression: adds a decimal point to a float written without one" {
     );
 }
 
+test "generateLiteralElements: points an empty slice at the shared zero-sized object" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    value: u128\nconst NOTHING: []const u8 = {}\nfn cards() -> []Card: return {}\nfn names() -> []const u8:\n    const empty: []const u8 = {}\n    return empty\nfn nothing() -> []const u8: return NOTHING" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_Card {\n    uint128_t value;\n} mn_main_Card;\n\ntypedef struct mn_slice_u8 mn_slice_u8;\ntypedef struct mn_slice_main_Card mn_slice_main_Card;\n\nextern const mn_slice_u8 mn_main_NOTHING;\n\nmn_slice_main_Card mn_main_cards();\nmn_slice_u8 mn_main_names();\nmn_slice_u8 mn_main_nothing();\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_slice_main_Card_defined\n#define mn_slice_main_Card_defined\ntypedef struct mn_slice_main_Card {\n    struct mn_main_Card *items;\n    size_t length;\n} mn_slice_main_Card;\n#endif\n\nconst mn_slice_u8 mn_main_NOTHING = { .items = (uint8_t *)&mn_zero_sized, .length = 0 };\n\nmn_slice_main_Card mn_main_cards() {\n    return (mn_slice_main_Card){ .items = (mn_main_Card *)&mn_zero_sized, .length = 0 };\n}\n\nmn_slice_u8 mn_main_names() {\n    const mn_slice_u8 empty = (mn_slice_u8){ .items = (uint8_t *)&mn_zero_sized, .length = 0 };\n    return empty;\n}\n\nmn_slice_u8 mn_main_nothing() {\n    return mn_main_NOTHING;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateLiteralElements: puts the elements of a read-only slice literal in static storage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const PRIMES: []const i32 = {2, 3, 5}\nfn sum(values: []const i32) -> i32:\n    var total: i32 = 0\n    for value in values: total += value\n    return total\nfn local() -> i32:\n    const squares: []const i32 = {1, 4, 9}\n    return sum(squares) + sum(PRIMES)\nfn argument() -> i32: return sum({10, 20})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_slice_i32 mn_slice_i32;\n\nextern const mn_slice_i32 mn_main_PRIMES;\n\nint32_t mn_main_sum(mn_slice_i32 values);\nint32_t mn_main_local();\nint32_t mn_main_argument();\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\n#ifndef mn_array_3_i32_defined\n#define mn_array_3_i32_defined\ntypedef struct mn_array_3_i32 {\n    int32_t items[3];\n} mn_array_3_i32;\n#endif\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nstatic mn_array_3_i32 mn_static_1;\nstatic mn_array_3_i32 mn_static_2;\nstatic mn_array_2_i32 mn_static_3;\nstatic mn_array_3_i32 mn_static_1 = { .items = { 2, 3, 5 } };\nstatic mn_array_3_i32 mn_static_2 = { .items = { 1, 4, 9 } };\nstatic mn_array_2_i32 mn_static_3 = { .items = { 10, 20 } };\n\nconst mn_slice_i32 mn_main_PRIMES = { .items = (int32_t *)mn_static_1.items, .length = 3 };\n\nint32_t mn_main_sum(mn_slice_i32 values) {\n    int32_t total = 0;\n    for (size_t mn_index_1 = 0; mn_index_1 < values.length; mn_index_1 += 1) {\n        const int32_t value = values.items[mn_index_1];\n        total = (total + value);\n    }\n    return total;\n}\n\nint32_t mn_main_local() {\n    const mn_slice_i32 squares = (mn_slice_i32){ .items = (int32_t *)mn_static_2.items, .length = 3 };\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    return (mn_temporary_1 = mn_main_sum(squares), mn_temporary_2 = mn_main_sum(mn_main_PRIMES), (mn_temporary_1 + mn_temporary_2));\n}\n\nint32_t mn_main_argument() {\n    return mn_main_sum((mn_slice_i32){ .items = (int32_t *)mn_static_3.items, .length = 2 });\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateExpression: writes a negative float" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -13247,7 +13315,7 @@ test "generateExpression: marks unsigned arguments" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_small(uint8_t) {}\n\nint main() {\n    mn_main_small(255u);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_small(uint8_t) {}\n\nint main() {\n    mn_main_small(255u);\n}\n",
         files[1].contents,
     );
 }
@@ -13455,7 +13523,7 @@ test "generateExpression: takes the address of a variable, an element and a fiel
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\n#ifndef mn_tuple_2_i32_bool_defined\n#define mn_tuple_2_i32_bool_defined\ntypedef struct mn_tuple_2_i32_bool {\n    int32_t _0;\n    bool _1;\n} mn_tuple_2_i32_bool;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    int32_t value = 1;\n    mn_array_2_i32 values = (mn_array_2_i32){ .items = { 1, 2 } };\n    mn_main_Point point = (mn_main_Point){ .x = 1 };\n    mn_tuple_2_i32_bool pair = (mn_tuple_2_i32_bool){ ._0 = 1, ._1 = true };\n    keep(&value);\n    keep(&values.items[1u]);\n    keep(&point.x);\n    keep(&pair._0);\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\n#ifndef mn_tuple_2_i32_bool_defined\n#define mn_tuple_2_i32_bool_defined\ntypedef struct mn_tuple_2_i32_bool {\n    int32_t _0;\n    bool _1;\n} mn_tuple_2_i32_bool;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    int32_t value = 1;\n    mn_array_2_i32 values = (mn_array_2_i32){ .items = { 1, 2 } };\n    mn_main_Point point = (mn_main_Point){ .x = 1 };\n    mn_tuple_2_i32_bool pair = (mn_tuple_2_i32_bool){ ._0 = 1, ._1 = true };\n    keep(&value);\n    keep(&values.items[1u]);\n    keep(&point.x);\n    keep(&pair._0);\n}\n",
         files[1].contents,
     );
 }
@@ -13590,7 +13658,7 @@ test "generateExpression: writes through a local constant pointer" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    int32_t value = 1;\n    int32_t * const pointer = &value;\n    (*pointer) = 2;\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    int32_t value = 1;\n    int32_t * const pointer = &value;\n    (*pointer) = 2;\n}\n",
         files[1].contents,
     );
 }
@@ -13623,7 +13691,7 @@ test "generateExpression: writes a struct literal as a compound literal" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_draw(mn_main_Point point) {\n    return point.x;\n}\n\nint main() {\n    mn_main_draw((mn_main_Point){ .x = 1, .y = 0 });\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint32_t mn_main_draw(mn_main_Point point) {\n    return point.x;\n}\n\nint main() {\n    mn_main_draw((mn_main_Point){ .x = 1, .y = 0 });\n}\n",
         files[1].contents,
     );
 }
@@ -13755,7 +13823,7 @@ test "generateExpression: leaves out a struct literal of a zero-sized struct" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_use() {}\n\nint main() {\n    mn_main_use();\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_use() {}\n\nint main() {\n    mn_main_use();\n}\n",
         files[1].contents,
     );
 }
@@ -13941,7 +14009,7 @@ test "generateExpression: runs the calls of an unwrapped zero-sized value" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_optional_main_Marker_defined\n#define mn_optional_main_Marker_defined\ntypedef struct mn_optional_main_Marker {\n    bool present;\n} mn_optional_main_Marker;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    (find(), keep());\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_optional_main_Marker_defined\n#define mn_optional_main_Marker_defined\ntypedef struct mn_optional_main_Marker {\n    bool present;\n} mn_optional_main_Marker;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    (find(), keep());\n}\n",
         files[1].contents,
     );
 }
@@ -14622,7 +14690,7 @@ test "generateNull: writes NULL for an optional pointer" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t * mn_main_nothing() {\n    return NULL;\n}\n\nvoid mn_main_take(int32_t *) {}\n\nint main() {\n    int32_t * const value = NULL;\n    mn_main_take(value);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint32_t * mn_main_nothing() {\n    return NULL;\n}\n\nvoid mn_main_take(int32_t *) {}\n\nint main() {\n    int32_t * const value = NULL;\n    mn_main_take(value);\n}\n",
         files[1].contents,
     );
 }
@@ -14721,7 +14789,7 @@ test "generateFunctionName: writes the name of a function to point to" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_double(int32_t value) {\n    return value;\n}\n\nvoid mn_main_apply(typeof(int32_t (*)(int32_t))) {}\n\nint main() {\n    typeof(int32_t (*)(int32_t)) const other = mn_main_double;\n    mn_main_apply(mn_main_double);\n    mn_main_apply(other);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint32_t mn_main_double(int32_t value) {\n    return value;\n}\n\nvoid mn_main_apply(typeof(int32_t (*)(int32_t))) {}\n\nint main() {\n    typeof(int32_t (*)(int32_t)) const other = mn_main_double;\n    mn_main_apply(mn_main_double);\n    mn_main_apply(other);\n}\n",
         files[1].contents,
     );
 }
@@ -14787,7 +14855,7 @@ test "generateFunctionName: writes the name of a method or an external function 
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nchar mn_zero_sized;\n\nfloat mn_main_Point_length(mn_main_Point self) {\n    return self.x;\n}\n\nvoid mn_main_apply(typeof(float (*)(struct mn_main_Point)), typeof(void (*)(struct mn_slice_u8))) {}\n\nint main() {\n    mn_main_apply(mn_main_Point_length, write_text);\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nmax_align_t mn_zero_sized;\n\nfloat mn_main_Point_length(mn_main_Point self) {\n    return self.x;\n}\n\nvoid mn_main_apply(typeof(float (*)(struct mn_main_Point)), typeof(void (*)(struct mn_slice_u8))) {}\n\nint main() {\n    mn_main_apply(mn_main_Point_length, write_text);\n}\n",
         files[1].contents,
     );
 }
@@ -15090,7 +15158,7 @@ test "generateSlice: writes a slice of a variable" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_array_4_u8_defined\n#define mn_array_4_u8_defined\ntypedef struct mn_array_4_u8 {\n    uint8_t items[4];\n} mn_array_4_u8;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    mn_array_4_u8 buffer;\n    fill((mn_slice_u8){ .items = buffer.items, .length = 4 });\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_array_4_u8_defined\n#define mn_array_4_u8_defined\ntypedef struct mn_array_4_u8 {\n    uint8_t items[4];\n} mn_array_4_u8;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_array_4_u8 buffer;\n    fill((mn_slice_u8){ .items = buffer.items, .length = 4 });\n}\n",
         files[1].contents,
     );
 }
@@ -15123,7 +15191,7 @@ test "generateSlice: casts a slice of a constant to a writable pointer" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nchar mn_zero_sized;\n\nvoid mn_main_take(mn_slice_i32) {}\n\nint main() {\n    const mn_array_2_i32 values = (mn_array_2_i32){ .items = { 1, 2 } };\n    mn_main_take((mn_slice_i32){ .items = (int32_t *)values.items, .length = 2 });\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_take(mn_slice_i32) {}\n\nint main() {\n    const mn_array_2_i32 values = (mn_array_2_i32){ .items = { 1, 2 } };\n    mn_main_take((mn_slice_i32){ .items = (int32_t *)values.items, .length = 2 });\n}\n",
         files[1].contents,
     );
 }
@@ -15189,7 +15257,7 @@ test "generateSlice: writes only the length of a zero-sized array" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_slice_main_Marker_defined\n#define mn_slice_main_Marker_defined\ntypedef struct mn_slice_main_Marker {\n    void *items;\n    size_t length;\n} mn_slice_main_Marker;\n#endif\n\nchar mn_zero_sized;\n\nvoid mn_main_take(mn_slice_main_Marker) {}\n\nint main() {\n    mn_main_take((mn_slice_main_Marker){ .length = 2 });\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_slice_main_Marker_defined\n#define mn_slice_main_Marker_defined\ntypedef struct mn_slice_main_Marker {\n    void *items;\n    size_t length;\n} mn_slice_main_Marker;\n#endif\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_take(mn_slice_main_Marker) {}\n\nint main() {\n    mn_main_take((mn_slice_main_Marker){ .length = 2 });\n}\n",
         files[1].contents,
     );
 }
@@ -15243,7 +15311,7 @@ test "generateSlice: slices an array up to an end" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_array_4_u8_defined\n#define mn_array_4_u8_defined\ntypedef struct mn_array_4_u8 {\n    uint8_t items[4];\n} mn_array_4_u8;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    mn_array_4_u8 buffer;\n    fill((mn_slice_u8){ .items = buffer.items, .length = 2u });\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_array_4_u8_defined\n#define mn_array_4_u8_defined\ntypedef struct mn_array_4_u8 {\n    uint8_t items[4];\n} mn_array_4_u8;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_array_4_u8 buffer;\n    fill((mn_slice_u8){ .items = buffer.items, .length = 2u });\n}\n",
         files[1].contents,
     );
 }
@@ -15378,7 +15446,7 @@ test "generateSlice: offsets a slice of a stored constant" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\n#ifndef mn_array_3_i32_defined\n#define mn_array_3_i32_defined\ntypedef struct mn_array_3_i32 {\n    int32_t items[3];\n} mn_array_3_i32;\n#endif\n\nchar mn_zero_sized;\n\nconst mn_array_3_i32 mn_main_values = { .items = { 1, 2, 3 } };\n\nint main() {\n    take((mn_slice_i32){ .items = (int32_t *)mn_main_values.items + 1u, .length = 3 - 1u });\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\n#ifndef mn_array_3_i32_defined\n#define mn_array_3_i32_defined\ntypedef struct mn_array_3_i32 {\n    int32_t items[3];\n} mn_array_3_i32;\n#endif\n\nmax_align_t mn_zero_sized;\n\nconst mn_array_3_i32 mn_main_values = { .items = { 1, 2, 3 } };\n\nint main() {\n    take((mn_slice_i32){ .items = (int32_t *)mn_main_values.items + 1u, .length = 3 - 1u });\n}\n",
         files[1].contents,
     );
 }
@@ -15405,7 +15473,7 @@ test "generateSliceOf: converts a pointer to an array of length zero to its leng
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    read((mn_slice_u8){ .length = 0 });\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    read((mn_slice_u8){ .length = 0 });\n}\n",
         files[1].contents,
     );
 }
@@ -15432,7 +15500,7 @@ test "generateSliceOf: runs the calls of a sliced value of length zero" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    take((locate(), (mn_slice_i32){ .length = 0 }));\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    take((locate(), (mn_slice_i32){ .length = 0 }));\n}\n",
         files[1].contents,
     );
 }
@@ -15459,7 +15527,7 @@ test "generateSliceOf: runs the calls of a converted value of length zero" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    take((locate(), (mn_slice_i32){ .length = 0 }));\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    take((locate(), (mn_slice_i32){ .length = 0 }));\n}\n",
         files[1].contents,
     );
 }
@@ -15712,6 +15780,57 @@ test "generateBuiltinCall: casts pointers and aligns a multiple value pointer th
     );
 }
 
+test "generateFunction: allocates through mn::memory with System, Arena and List" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nstruct Card:\n    value: i64\n    wide: u128\nfn run() -> memory::Error!i64:\n    var system = memory::System{}\n    const cards = try memory::allocate(&system, Card, 4)\n    cards[0] = Card{value = 1, wide = 2}\n    const card = try memory::create(&system, Card)\n    card.* = cards[0]\n    var arena = memory::Arena(memory::System)::new(system)\n    const bytes = try memory::allocate(&arena, u8, 100)\n    const more = try memory::allocate(&arena, Card, 300)\n    var list = mn::List(i64)::new()\n    for index in 0..20: try list.append(&system, mn::convert(i64, index))\n    var arena_list = mn::List(Card)::new()\n    try arena_list.append(&arena, card.*)\n    const total = list.items[19] + mn::convert(i64, bytes.length) + arena_list.items[0].value\n    list.free(&system)\n    arena_list.free(&arena)\n    memory::free(&arena, more)\n    memory::free(&system, cards)\n    memory::destroy(&system, card)\n    arena.free_all()\n    return total\nfn main():\n    _ = run() catch 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+    try std.testing.expectEqualStrings("main.h", files[0].path);
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_Card {\n    int64_t value;\n    uint128_t wide;\n} mn_main_Card;\n\ntypedef struct mn_result_mn_memory_Error_i64 mn_result_mn_memory_Error_i64;\n\nmn_result_mn_memory_Error_i64 mn_main_run();\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings("main.c", files[1].path);
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n#include \"mn/memory.h\"\n#include \"mn.h\"\n\n#ifndef mn_slice_main_Card_defined\n#define mn_slice_main_Card_defined\ntypedef struct mn_slice_main_Card {\n    struct mn_main_Card *items;\n    size_t length;\n} mn_slice_main_Card;\n#endif\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_slice_i64_defined\n#define mn_slice_i64_defined\ntypedef struct mn_slice_i64 {\n    int64_t *items;\n    size_t length;\n} mn_slice_i64;\n#endif\n\n#ifndef mn_result_mn_memory_Error_i64_defined\n#define mn_result_mn_memory_Error_i64_defined\ntypedef struct mn_result_mn_memory_Error_i64 {\n    mn_mn_memory_Error error;\n    int64_t value;\n} mn_result_mn_memory_Error_i64;\n#endif\n\n#ifndef mn_result_mn_memory_Error_slice_main_Card_defined\n#define mn_result_mn_memory_Error_slice_main_Card_defined\ntypedef struct mn_result_mn_memory_Error_slice_main_Card {\n    mn_mn_memory_Error error;\n    mn_slice_main_Card value;\n} mn_result_mn_memory_Error_slice_main_Card;\n#endif\n\n#ifndef mn_result_mn_memory_Error_pointer_main_Card_defined\n#define mn_result_mn_memory_Error_pointer_main_Card_defined\ntypedef struct mn_result_mn_memory_Error_pointer_main_Card {\n    mn_mn_memory_Error error;\n    struct mn_main_Card * value;\n} mn_result_mn_memory_Error_pointer_main_Card;\n#endif\n\n#ifndef mn_result_mn_memory_Error_slice_u8_defined\n#define mn_result_mn_memory_Error_slice_u8_defined\ntypedef struct mn_result_mn_memory_Error_slice_u8 {\n    mn_mn_memory_Error error;\n    mn_slice_u8 value;\n} mn_result_mn_memory_Error_slice_u8;\n#endif\n\n#ifndef mn_result_mn_memory_Error_void_defined\n#define mn_result_mn_memory_Error_void_defined\ntypedef struct mn_result_mn_memory_Error_void {\n    mn_mn_memory_Error error;\n} mn_result_mn_memory_Error_void;\n#endif\n\nmax_align_t mn_zero_sized;\n\nmn_result_mn_memory_Error_i64 mn_main_run() {\n    mn_result_mn_memory_Error_slice_main_Card mn_temporary_1;\n    mn_slice_main_Card mn_temporary_2;\n    mn_temporary_1 = mn_mn_memory_allocate_1(((void *)&mn_zero_sized), 4u);\n    if (mn_temporary_1.error.tag != 0) return (mn_result_mn_memory_Error_i64){ .error = mn_temporary_1.error };\n    mn_temporary_2 = mn_temporary_1.value;\n    const mn_slice_main_Card cards = mn_temporary_2;\n    cards.items[0u] = (mn_main_Card){ .value = 1, .wide = ((uint128_t)0x0u << 64 | 0x2u) };\n    mn_result_mn_memory_Error_pointer_main_Card mn_temporary_3;\n    struct mn_main_Card * mn_temporary_4;\n    mn_temporary_3 = mn_mn_memory_create_1(((void *)&mn_zero_sized));\n    if (mn_temporary_3.error.tag != 0) return (mn_result_mn_memory_Error_i64){ .error = mn_temporary_3.error };\n    mn_temporary_4 = mn_temporary_3.value;\n    struct mn_main_Card * const card = mn_temporary_4;\n    (*card) = cards.items[0u];\n    mn_mn_memory_Arena_1 arena = mn_mn_memory_Arena_1_new();\n    mn_result_mn_memory_Error_slice_u8 mn_temporary_5;\n    mn_slice_u8 mn_temporary_6;\n    mn_temporary_5 = mn_mn_memory_allocate_2(&arena, 100u);\n    if (mn_temporary_5.error.tag != 0) return (mn_result_mn_memory_Error_i64){ .error = mn_temporary_5.error };\n    mn_temporary_6 = mn_temporary_5.value;\n    const mn_slice_u8 bytes = mn_temporary_6;\n    mn_result_mn_memory_Error_slice_main_Card mn_temporary_7;\n    mn_slice_main_Card mn_temporary_8;\n    mn_temporary_7 = mn_mn_memory_allocate_3(&arena, 300u);\n    if (mn_temporary_7.error.tag != 0) return (mn_result_mn_memory_Error_i64){ .error = mn_temporary_7.error };\n    mn_temporary_8 = mn_temporary_7.value;\n    const mn_slice_main_Card more = mn_temporary_8;\n    mn_mn_List_1 list = mn_mn_List_1_new();\n    for (size_t mn_index_1 = 0; mn_index_1 < 20u; mn_index_1 += 1) {\n        const size_t index = mn_index_1;\n        int64_t mn_temporary_9;\n        mn_result_mn_memory_Error_void mn_temporary_10;\n        mn_temporary_9 = ((int64_t)index);\n        mn_temporary_10 = mn_mn_List_1_append_1(&list, ((void *)&mn_zero_sized), mn_temporary_9);\n        if (mn_temporary_10.error.tag != 0) return (mn_result_mn_memory_Error_i64){ .error = mn_temporary_10.error };\n    }\n    mn_mn_List_2 arena_list = mn_mn_List_2_new();\n    mn_result_mn_memory_Error_void mn_temporary_11;\n    mn_temporary_11 = mn_mn_List_2_append_1(&arena_list, &arena, (*card));\n    if (mn_temporary_11.error.tag != 0) return (mn_result_mn_memory_Error_i64){ .error = mn_temporary_11.error };\n    int64_t mn_temporary_12;\n    int64_t mn_temporary_13;\n    const int64_t total = (mn_temporary_12 = list.items.items[19u], mn_temporary_13 = ((int64_t)bytes.length), ((mn_temporary_12 + mn_temporary_13) + arena_list.items.items[0u].value));\n    mn_mn_List_1_free_1(&list, ((void *)&mn_zero_sized));\n    mn_mn_List_2_free_1(&arena_list, &arena);\n    mn_mn_memory_free_1(&arena, more);\n    mn_mn_memory_free_2(((void *)&mn_zero_sized), cards);\n    mn_mn_memory_destroy_1(((void *)&mn_zero_sized), card);\n    mn_mn_memory_Arena_1_free_all(&arena);\n    return (mn_result_mn_memory_Error_i64){ .error.tag = 0, .value = total };\n}\n\nint main() {\n    mn_result_mn_memory_Error_i64 mn_temporary_1;\n    (void)((mn_temporary_1 = mn_main_run(), (mn_temporary_1.error.tag == 0 ? mn_temporary_1.value : 0)));\n}\n",
+        files[1].contents,
+    );
+    try std.testing.expectEqualStrings("mn.h", files[2].path);
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\ntypedef struct mn_mn_Range {\n    size_t start;\n    mn_optional_usize end;\n} mn_mn_Range;\n\n#ifndef mn_slice_i64_defined\n#define mn_slice_i64_defined\ntypedef struct mn_slice_i64 {\n    int64_t *items;\n    size_t length;\n} mn_slice_i64;\n#endif\n\ntypedef struct mn_mn_List_1 {\n    mn_slice_i64 items;\n    size_t capacity;\n} mn_mn_List_1;\n\n#ifndef mn_slice_main_Card_defined\n#define mn_slice_main_Card_defined\ntypedef struct mn_slice_main_Card {\n    struct mn_main_Card *items;\n    size_t length;\n} mn_slice_main_Card;\n#endif\n\ntypedef struct mn_mn_List_2 {\n    mn_slice_main_Card items;\n    size_t capacity;\n} mn_mn_List_2;\n\ntypedef struct mn_optional_tuple_1_usize mn_optional_tuple_1_usize;\ntypedef struct mn_result_mn_memory_Error_void mn_result_mn_memory_Error_void;\ntypedef struct mn_mn_memory_Arena_1 mn_mn_memory_Arena_1;\ntypedef struct mn_main_Card mn_main_Card;\n\nmn_optional_tuple_1_usize mn_mn_Range_Iterator_next(struct mn_mn_Range * iterator);\nmn_mn_List_1 mn_mn_List_1_new();\nmn_mn_List_2 mn_mn_List_2_new();\nmn_result_mn_memory_Error_void mn_mn_List_1_append_1(struct mn_mn_List_1 * self, void * allocator, int64_t value);\nmn_result_mn_memory_Error_void mn_mn_List_2_append_1(struct mn_mn_List_2 * self, struct mn_mn_memory_Arena_1 * allocator, mn_main_Card value);\nvoid mn_mn_List_1_free_1(struct mn_mn_List_1 * self, void * allocator);\nvoid mn_mn_List_2_free_1(struct mn_mn_List_2 * self, struct mn_mn_memory_Arena_1 * allocator);\n",
+        files[2].contents,
+    );
+    try std.testing.expectEqualStrings("mn.c", files[3].path);
+    try std.testing.expectEqualStrings(
+        "#include \"mn.h\"\n#include \"mn/memory.h\"\n#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_tuple_1_usize_defined\n#define mn_tuple_1_usize_defined\ntypedef struct mn_tuple_1_usize {\n    size_t _0;\n} mn_tuple_1_usize;\n#endif\n\n#ifndef mn_optional_tuple_1_usize_defined\n#define mn_optional_tuple_1_usize_defined\ntypedef struct mn_optional_tuple_1_usize {\n    mn_tuple_1_usize value;\n    bool present;\n} mn_optional_tuple_1_usize;\n#endif\n\n#ifndef mn_result_mn_memory_Error_void_defined\n#define mn_result_mn_memory_Error_void_defined\ntypedef struct mn_result_mn_memory_Error_void {\n    mn_mn_memory_Error error;\n} mn_result_mn_memory_Error_void;\n#endif\n\n#ifndef mn_result_mn_memory_Error_slice_i64_defined\n#define mn_result_mn_memory_Error_slice_i64_defined\ntypedef struct mn_result_mn_memory_Error_slice_i64 {\n    mn_mn_memory_Error error;\n    mn_slice_i64 value;\n} mn_result_mn_memory_Error_slice_i64;\n#endif\n\n#ifndef mn_result_mn_memory_Error_slice_main_Card_defined\n#define mn_result_mn_memory_Error_slice_main_Card_defined\ntypedef struct mn_result_mn_memory_Error_slice_main_Card {\n    mn_mn_memory_Error error;\n    mn_slice_main_Card value;\n} mn_result_mn_memory_Error_slice_main_Card;\n#endif\n\nmn_optional_tuple_1_usize mn_mn_Range_Iterator_next(struct mn_mn_Range * iterator) {\n    if (((iterator->end.present) && (iterator->start >= iterator->end.value))) {\n        return (mn_optional_tuple_1_usize){ .present = false };\n    }\n    const size_t value = iterator->start;\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &iterator->start, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n    return (mn_optional_tuple_1_usize){ .value = (mn_tuple_1_usize){ ._0 = value }, .present = true };\n}\n\nmn_mn_List_1 mn_mn_List_1_new() {\n    return (mn_mn_List_1){ .items = (mn_slice_i64){ .items = (int64_t *)&mn_zero_sized, .length = 0 }, .capacity = 0u };\n}\n\nmn_mn_List_2 mn_mn_List_2_new() {\n    return (mn_mn_List_2){ .items = (mn_slice_main_Card){ .items = (mn_main_Card *)&mn_zero_sized, .length = 0 }, .capacity = 0u };\n}\n\nmn_result_mn_memory_Error_void mn_mn_List_1_append_1(struct mn_mn_List_1 * self, void * allocator, int64_t value) {\n    const size_t length = self->items.length;\n    if ((length == self->capacity)) {\n        size_t capacity = 8u;\n        if ((self->capacity > 0u)) {\n            capacity = (self->capacity * 2u);\n        }\n        uint8_t * mn_temporary_1;\n        size_t mn_temporary_2;\n        size_t mn_temporary_3;\n        const mn_slice_u8 bytes = (mn_temporary_1 = ((uint8_t *)self->items.items), mn_temporary_2 = self->capacity, mn_temporary_3 = 8u, (mn_slice_u8){ .items = mn_temporary_1 + 0u, .length = (mn_temporary_2 * mn_temporary_3) - 0u });\n        size_t mn_temporary_4;\n        size_t mn_temporary_5;\n        size_t mn_temporary_6;\n        if (((self->capacity > 0u) && (mn_temporary_4 = 8u, mn_temporary_5 = capacity, mn_temporary_6 = 8u, mn_mn_memory_System_Allocator_resize(allocator, bytes, mn_temporary_4, (mn_temporary_5 * mn_temporary_6))))) {\n            self->capacity = capacity;\n        } else {\n            mn_result_mn_memory_Error_slice_i64 mn_temporary_7;\n            mn_slice_i64 mn_temporary_8;\n            mn_temporary_7 = mn_mn_memory_allocate_6(allocator, capacity);\n            if (mn_temporary_7.error.tag != 0) return (mn_result_mn_memory_Error_void){ .error = mn_temporary_7.error };\n            mn_temporary_8 = mn_temporary_7.value;\n            const mn_slice_i64 items = mn_temporary_8;\n            for (size_t mn_index_1 = 0; mn_index_1 < length; mn_index_1 += 1) {\n                const size_t index = mn_index_1;\n                items.items[index] = self->items.items[index];\n            }\n            if ((self->capacity > 0u)) {\n                mn_mn_memory_free_5(allocator, (mn_slice_i64){ .items = self->items.items + 0u, .length = self->capacity - 0u });\n            }\n            self->items = (mn_slice_i64){ .items = items.items + 0u, .length = length - 0u };\n            self->capacity = capacity;\n        }\n    }\n    self->items = (mn_slice_i64){ .items = self->items.items + 0u, .length = (length + 1u) - 0u };\n    self->items.items[length] = value;\n    return (mn_result_mn_memory_Error_void){ .error.tag = 0 };\n}\n\nmn_result_mn_memory_Error_void mn_mn_List_2_append_1(struct mn_mn_List_2 * self, struct mn_mn_memory_Arena_1 * allocator, mn_main_Card value) {\n    const size_t length = self->items.length;\n    if ((length == self->capacity)) {\n        size_t capacity = 8u;\n        if ((self->capacity > 0u)) {\n            capacity = (self->capacity * 2u);\n        }\n        uint8_t * mn_temporary_1;\n        size_t mn_temporary_2;\n        size_t mn_temporary_3;\n        const mn_slice_u8 bytes = (mn_temporary_1 = ((uint8_t *)self->items.items), mn_temporary_2 = self->capacity, mn_temporary_3 = 32u, (mn_slice_u8){ .items = mn_temporary_1 + 0u, .length = (mn_temporary_2 * mn_temporary_3) - 0u });\n        size_t mn_temporary_4;\n        size_t mn_temporary_5;\n        size_t mn_temporary_6;\n        if (((self->capacity > 0u) && (mn_temporary_4 = 16u, mn_temporary_5 = capacity, mn_temporary_6 = 32u, mn_mn_memory_Arena_1_Allocator_resize(allocator, bytes, mn_temporary_4, (mn_temporary_5 * mn_temporary_6))))) {\n            self->capacity = capacity;\n        } else {\n            mn_result_mn_memory_Error_slice_main_Card mn_temporary_7;\n            mn_slice_main_Card mn_temporary_8;\n            mn_temporary_7 = mn_mn_memory_allocate_3(allocator, capacity);\n            if (mn_temporary_7.error.tag != 0) return (mn_result_mn_memory_Error_void){ .error = mn_temporary_7.error };\n            mn_temporary_8 = mn_temporary_7.value;\n            const mn_slice_main_Card items = mn_temporary_8;\n            for (size_t mn_index_1 = 0; mn_index_1 < length; mn_index_1 += 1) {\n                const size_t index = mn_index_1;\n                items.items[index] = self->items.items[index];\n            }\n            if ((self->capacity > 0u)) {\n                mn_mn_memory_free_1(allocator, (mn_slice_main_Card){ .items = self->items.items + 0u, .length = self->capacity - 0u });\n            }\n            self->items = (mn_slice_main_Card){ .items = items.items + 0u, .length = length - 0u };\n            self->capacity = capacity;\n        }\n    }\n    self->items = (mn_slice_main_Card){ .items = self->items.items + 0u, .length = (length + 1u) - 0u };\n    self->items.items[length] = value;\n    return (mn_result_mn_memory_Error_void){ .error.tag = 0 };\n}\n\nvoid mn_mn_List_1_free_1(struct mn_mn_List_1 * self, void * allocator) {\n    if ((self->capacity > 0u)) {\n        mn_mn_memory_free_5(allocator, (mn_slice_i64){ .items = self->items.items + 0u, .length = self->capacity - 0u });\n    }\n    self->items = (mn_slice_i64){ .items = self->items.items + 0u, .length = 0u - 0u };\n    self->capacity = 0u;\n}\n\nvoid mn_mn_List_2_free_1(struct mn_mn_List_2 * self, struct mn_mn_memory_Arena_1 * allocator) {\n    if ((self->capacity > 0u)) {\n        mn_mn_memory_free_1(allocator, (mn_slice_main_Card){ .items = self->items.items + 0u, .length = self->capacity - 0u });\n    }\n    self->items = (mn_slice_main_Card){ .items = self->items.items + 0u, .length = 0u - 0u };\n    self->capacity = 0u;\n}\n",
+        files[3].contents,
+    );
+    try std.testing.expectEqualStrings("mn/memory.h", files[4].path);
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\ntypedef struct mn_mn_memory_Error {\n    uint32_t tag;\n} mn_mn_memory_Error;\n\ntypedef struct mn_mn_memory_Arena_1 {\n    uint8_t * block;\n    size_t used;\n    size_t capacity;\n    size_t last;\n} mn_mn_memory_Arena_1;\n\ntypedef struct mn_mn_memory_ArenaBlock {\n    uint8_t * previous;\n    size_t size;\n} mn_mn_memory_ArenaBlock;\n\ntypedef struct mn_slice_u8 mn_slice_u8;\ntypedef struct mn_result_mn_memory_Error_slice_u8 mn_result_mn_memory_Error_slice_u8;\ntypedef struct mn_result_mn_memory_Error_slice_main_Card mn_result_mn_memory_Error_slice_main_Card;\ntypedef struct mn_result_mn_memory_Error_pointer_main_Card mn_result_mn_memory_Error_pointer_main_Card;\ntypedef struct mn_slice_main_Card mn_slice_main_Card;\ntypedef struct mn_main_Card mn_main_Card;\ntypedef struct mn_result_mn_memory_Error_slice_i64 mn_result_mn_memory_Error_slice_i64;\ntypedef struct mn_slice_i64 mn_slice_i64;\n\nuint8_t * mn_runtime_memory_allocate(size_t size, size_t alignment);\nvoid mn_runtime_memory_free(uint8_t * pointer);\n\nbool mn_mn_memory_equal(mn_slice_u8 one, mn_slice_u8 two);\nmn_result_mn_memory_Error_slice_u8 mn_mn_memory_System_Allocator_allocate(void *, size_t size, size_t alignment);\nbool mn_mn_memory_System_Allocator_resize(void *, mn_slice_u8 bytes, size_t, size_t size);\nvoid mn_mn_memory_System_Allocator_free(void *, mn_slice_u8 bytes, size_t);\nmn_mn_memory_Arena_1 mn_mn_memory_Arena_1_new();\nvoid mn_mn_memory_Arena_1_free_all(struct mn_mn_memory_Arena_1 * self);\nmn_result_mn_memory_Error_slice_main_Card mn_mn_memory_allocate_1(void * allocator, size_t count);\nmn_result_mn_memory_Error_pointer_main_Card mn_mn_memory_create_1(void * allocator);\nmn_result_mn_memory_Error_slice_u8 mn_mn_memory_allocate_2(struct mn_mn_memory_Arena_1 * allocator, size_t count);\nmn_result_mn_memory_Error_slice_main_Card mn_mn_memory_allocate_3(struct mn_mn_memory_Arena_1 * allocator, size_t count);\nvoid mn_mn_memory_free_1(struct mn_mn_memory_Arena_1 * allocator, mn_slice_main_Card items);\nvoid mn_mn_memory_free_2(void * allocator, mn_slice_main_Card items);\nvoid mn_mn_memory_destroy_1(void * allocator, struct mn_main_Card const * pointer);\nmn_result_mn_memory_Error_slice_u8 mn_mn_memory_Arena_1_Allocator_allocate(struct mn_mn_memory_Arena_1 * arena, size_t size, size_t alignment);\nmn_result_mn_memory_Error_slice_i64 mn_mn_memory_allocate_6(void * allocator, size_t count);\nvoid mn_mn_memory_free_5(void * allocator, mn_slice_i64 items);\nbool mn_mn_memory_Arena_1_Allocator_resize(struct mn_mn_memory_Arena_1 * arena, mn_slice_u8 bytes, size_t, size_t size);\nvoid mn_mn_memory_Arena_1_Allocator_free(struct mn_mn_memory_Arena_1 *, mn_slice_u8, size_t);\n",
+        files[4].contents,
+    );
+    try std.testing.expectEqualStrings("mn/memory.c", files[5].path);
+    try std.testing.expectEqualStrings(
+        "#include \"memory.h\"\n#include \"../main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_slice_main_Card_defined\n#define mn_slice_main_Card_defined\ntypedef struct mn_slice_main_Card {\n    struct mn_main_Card *items;\n    size_t length;\n} mn_slice_main_Card;\n#endif\n\n#ifndef mn_slice_i64_defined\n#define mn_slice_i64_defined\ntypedef struct mn_slice_i64 {\n    int64_t *items;\n    size_t length;\n} mn_slice_i64;\n#endif\n\n#ifndef mn_result_mn_memory_Error_slice_u8_defined\n#define mn_result_mn_memory_Error_slice_u8_defined\ntypedef struct mn_result_mn_memory_Error_slice_u8 {\n    mn_mn_memory_Error error;\n    mn_slice_u8 value;\n} mn_result_mn_memory_Error_slice_u8;\n#endif\n\n#ifndef mn_result_mn_memory_Error_slice_main_Card_defined\n#define mn_result_mn_memory_Error_slice_main_Card_defined\ntypedef struct mn_result_mn_memory_Error_slice_main_Card {\n    mn_mn_memory_Error error;\n    mn_slice_main_Card value;\n} mn_result_mn_memory_Error_slice_main_Card;\n#endif\n\n#ifndef mn_result_mn_memory_Error_pointer_main_Card_defined\n#define mn_result_mn_memory_Error_pointer_main_Card_defined\ntypedef struct mn_result_mn_memory_Error_pointer_main_Card {\n    mn_mn_memory_Error error;\n    struct mn_main_Card * value;\n} mn_result_mn_memory_Error_pointer_main_Card;\n#endif\n\n#ifndef mn_result_mn_memory_Error_slice_i64_defined\n#define mn_result_mn_memory_Error_slice_i64_defined\ntypedef struct mn_result_mn_memory_Error_slice_i64 {\n    mn_mn_memory_Error error;\n    mn_slice_i64 value;\n} mn_result_mn_memory_Error_slice_i64;\n#endif\n\nbool mn_mn_memory_equal(mn_slice_u8 one, mn_slice_u8 two) {\n    if ((one.length != two.length)) {\n        return false;\n    }\n    const size_t mn_end_1 = one.length;\n    for (size_t mn_index_1 = 0; mn_index_1 < mn_end_1; mn_index_1 += 1) {\n        const size_t index = mn_index_1;\n        if ((one.items[index] != two.items[index])) {\n            return false;\n        }\n    }\n    return true;\n}\n\nmn_result_mn_memory_Error_slice_u8 mn_mn_memory_System_Allocator_allocate(void *, size_t size, size_t alignment) {\n    uint8_t * mn_temporary_1;\n    uint8_t * mn_temporary_2;\n    mn_temporary_1 = mn_runtime_memory_allocate(size, alignment);\n    if (!(mn_temporary_1 != NULL)) {\n        return (mn_result_mn_memory_Error_slice_u8){ .error = (mn_mn_memory_Error){ .tag = 1 } };\n    } else {\n        mn_temporary_2 = mn_temporary_1;\n    }\n    uint8_t * const pointer = mn_temporary_2;\n    return (mn_result_mn_memory_Error_slice_u8){ .error.tag = 0, .value = (mn_slice_u8){ .items = pointer + 0u, .length = size - 0u } };\n}\n\nbool mn_mn_memory_System_Allocator_resize(void *, mn_slice_u8 bytes, size_t, size_t size) {\n    return (size <= bytes.length);\n}\n\nvoid mn_mn_memory_System_Allocator_free(void *, mn_slice_u8 bytes, size_t) {\n    mn_runtime_memory_free(bytes.items);\n}\n\nmn_mn_memory_Arena_1 mn_mn_memory_Arena_1_new() {\n    return (mn_mn_memory_Arena_1){ .block = NULL, .used = 0u, .capacity = 0u, .last = 0u };\n}\n\nvoid mn_mn_memory_Arena_1_free_all(struct mn_mn_memory_Arena_1 * self) {\n    while (true) {\n        uint8_t * const mn_while_value_1 = self->block;\n        if (mn_while_value_1 == NULL) break;\n        {\n            uint8_t * const block = mn_while_value_1;\n            struct mn_mn_memory_ArenaBlock * const header = ((struct mn_mn_memory_ArenaBlock *)block);\n            self->block = header->previous;\n            size_t mn_temporary_1;\n            size_t mn_temporary_2;\n            (mn_temporary_1 = header->size, mn_temporary_2 = 8u, mn_mn_memory_System_Allocator_free(((void *)&mn_zero_sized), (mn_slice_u8){ .items = block + 0u, .length = mn_temporary_1 - 0u }, mn_temporary_2));\n        }\n    }\n    self->used = 0u;\n    self->capacity = 0u;\n    self->last = 0u;\n}\n\nmn_result_mn_memory_Error_slice_main_Card mn_mn_memory_allocate_1(void * allocator, size_t count) {\n    size_t mn_temporary_1;\n    size_t mn_temporary_2;\n    mn_result_mn_memory_Error_slice_u8 mn_temporary_3;\n    mn_slice_u8 mn_temporary_4;\n    mn_temporary_1 = 32u;\n    mn_temporary_2 = 16u;\n    mn_temporary_3 = mn_mn_memory_System_Allocator_allocate(allocator, (mn_temporary_1 * count), mn_temporary_2);\n    if (mn_temporary_3.error.tag != 0) return (mn_result_mn_memory_Error_slice_main_Card){ .error = mn_temporary_3.error };\n    mn_temporary_4 = mn_temporary_3.value;\n    const mn_slice_u8 bytes = mn_temporary_4;\n    return (mn_result_mn_memory_Error_slice_main_Card){ .error.tag = 0, .value = (mn_slice_main_Card){ .items = ((struct mn_main_Card *)bytes.items) + 0u, .length = count - 0u } };\n}\n\nmn_result_mn_memory_Error_pointer_main_Card mn_mn_memory_create_1(void * allocator) {\n    size_t mn_temporary_1;\n    size_t mn_temporary_2;\n    mn_result_mn_memory_Error_slice_u8 mn_temporary_3;\n    mn_slice_u8 mn_temporary_4;\n    mn_temporary_1 = 32u;\n    mn_temporary_2 = 16u;\n    mn_temporary_3 = mn_mn_memory_System_Allocator_allocate(allocator, mn_temporary_1, mn_temporary_2);\n    if (mn_temporary_3.error.tag != 0) return (mn_result_mn_memory_Error_pointer_main_Card){ .error = mn_temporary_3.error };\n    mn_temporary_4 = mn_temporary_3.value;\n    const mn_slice_u8 bytes = mn_temporary_4;\n    return (mn_result_mn_memory_Error_pointer_main_Card){ .error.tag = 0, .value = ((struct mn_main_Card *)bytes.items) };\n}\n\nmn_result_mn_memory_Error_slice_u8 mn_mn_memory_allocate_2(struct mn_mn_memory_Arena_1 * allocator, size_t count) {\n    size_t mn_temporary_1;\n    size_t mn_temporary_2;\n    mn_result_mn_memory_Error_slice_u8 mn_temporary_3;\n    mn_slice_u8 mn_temporary_4;\n    mn_temporary_1 = 1u;\n    mn_temporary_2 = 1u;\n    mn_temporary_3 = mn_mn_memory_Arena_1_Allocator_allocate(allocator, (mn_temporary_1 * count), mn_temporary_2);\n    if (mn_temporary_3.error.tag != 0) return (mn_result_mn_memory_Error_slice_u8){ .error = mn_temporary_3.error };\n    mn_temporary_4 = mn_temporary_3.value;\n    const mn_slice_u8 bytes = mn_temporary_4;\n    return (mn_result_mn_memory_Error_slice_u8){ .error.tag = 0, .value = (mn_slice_u8){ .items = ((uint8_t *)bytes.items) + 0u, .length = count - 0u } };\n}\n\nmn_result_mn_memory_Error_slice_main_Card mn_mn_memory_allocate_3(struct mn_mn_memory_Arena_1 * allocator, size_t count) {\n    size_t mn_temporary_1;\n    size_t mn_temporary_2;\n    mn_result_mn_memory_Error_slice_u8 mn_temporary_3;\n    mn_slice_u8 mn_temporary_4;\n    mn_temporary_1 = 32u;\n    mn_temporary_2 = 16u;\n    mn_temporary_3 = mn_mn_memory_Arena_1_Allocator_allocate(allocator, (mn_temporary_1 * count), mn_temporary_2);\n    if (mn_temporary_3.error.tag != 0) return (mn_result_mn_memory_Error_slice_main_Card){ .error = mn_temporary_3.error };\n    mn_temporary_4 = mn_temporary_3.value;\n    const mn_slice_u8 bytes = mn_temporary_4;\n    return (mn_result_mn_memory_Error_slice_main_Card){ .error.tag = 0, .value = (mn_slice_main_Card){ .items = ((struct mn_main_Card *)bytes.items) + 0u, .length = count - 0u } };\n}\n\nvoid mn_mn_memory_free_1(struct mn_mn_memory_Arena_1 * allocator, mn_slice_main_Card items) {\n    uint8_t * mn_temporary_1;\n    size_t mn_temporary_2;\n    const mn_slice_u8 bytes = (mn_temporary_1 = ((uint8_t *)items.items), mn_temporary_2 = 32u, (mn_slice_u8){ .items = mn_temporary_1 + 0u, .length = (items.length * mn_temporary_2) - 0u });\n    mn_mn_memory_Arena_1_Allocator_free(allocator, bytes, 16u);\n}\n\nvoid mn_mn_memory_free_2(void * allocator, mn_slice_main_Card items) {\n    uint8_t * mn_temporary_1;\n    size_t mn_temporary_2;\n    const mn_slice_u8 bytes = (mn_temporary_1 = ((uint8_t *)items.items), mn_temporary_2 = 32u, (mn_slice_u8){ .items = mn_temporary_1 + 0u, .length = (items.length * mn_temporary_2) - 0u });\n    mn_mn_memory_System_Allocator_free(allocator, bytes, 16u);\n}\n\nvoid mn_mn_memory_destroy_1(void * allocator, struct mn_main_Card const * pointer) {\n    uint8_t * mn_temporary_1;\n    size_t mn_temporary_2;\n    const mn_slice_u8 bytes = (mn_temporary_1 = ((uint8_t *)pointer), mn_temporary_2 = 32u, (mn_slice_u8){ .items = mn_temporary_1 + 0u, .length = mn_temporary_2 - 0u });\n    mn_mn_memory_System_Allocator_free(allocator, bytes, 16u);\n}\n\nmn_result_mn_memory_Error_slice_u8 mn_mn_memory_Arena_1_Allocator_allocate(struct mn_mn_memory_Arena_1 * arena, size_t size, size_t alignment) {\n    uint8_t * const mn_if_value_1 = arena->block;\n    if (mn_if_value_1 != NULL) {\n        uint8_t * const block = mn_if_value_1;\n        uint8_t * const start = ((uint8_t *)mn_align_address((uintptr_t)(block + arena->used), alignment));\n        const size_t offset = ((size_t)((ptrdiff_t)(start - block)));\n        if (((offset + size) <= arena->capacity)) {\n            arena->last = offset;\n            arena->used = (offset + size);\n            return (mn_result_mn_memory_Error_slice_u8){ .error.tag = 0, .value = (mn_slice_u8){ .items = start + 0u, .length = size - 0u } };\n        }\n    }\n    const size_t header_size = 16u;\n    size_t capacity = ((header_size + size) + alignment);\n    if ((capacity < 4096u)) {\n        capacity = 4096u;\n    }\n    size_t mn_temporary_1;\n    size_t mn_temporary_2;\n    mn_result_mn_memory_Error_slice_u8 mn_temporary_3;\n    mn_slice_u8 mn_temporary_4;\n    mn_temporary_1 = capacity;\n    mn_temporary_2 = 8u;\n    mn_temporary_3 = mn_mn_memory_System_Allocator_allocate(((void *)&mn_zero_sized), mn_temporary_1, mn_temporary_2);\n    if (mn_temporary_3.error.tag != 0) return (mn_result_mn_memory_Error_slice_u8){ .error = mn_temporary_3.error };\n    mn_temporary_4 = mn_temporary_3.value;\n    const mn_slice_u8 bytes = mn_temporary_4;\n    (*((struct mn_mn_memory_ArenaBlock *)bytes.items)) = (mn_mn_memory_ArenaBlock){ .previous = arena->block, .size = capacity };\n    uint8_t * const start_2 = ((uint8_t *)mn_align_address((uintptr_t)(bytes.items + header_size), alignment));\n    const size_t offset_2 = ((size_t)((ptrdiff_t)(start_2 - bytes.items)));\n    arena->block = bytes.items;\n    arena->capacity = capacity;\n    arena->last = offset_2;\n    arena->used = (offset_2 + size);\n    return (mn_result_mn_memory_Error_slice_u8){ .error.tag = 0, .value = (mn_slice_u8){ .items = start_2 + 0u, .length = size - 0u } };\n}\n\nmn_result_mn_memory_Error_slice_i64 mn_mn_memory_allocate_6(void * allocator, size_t count) {\n    size_t mn_temporary_1;\n    size_t mn_temporary_2;\n    mn_result_mn_memory_Error_slice_u8 mn_temporary_3;\n    mn_slice_u8 mn_temporary_4;\n    mn_temporary_1 = 8u;\n    mn_temporary_2 = 8u;\n    mn_temporary_3 = mn_mn_memory_System_Allocator_allocate(allocator, (mn_temporary_1 * count), mn_temporary_2);\n    if (mn_temporary_3.error.tag != 0) return (mn_result_mn_memory_Error_slice_i64){ .error = mn_temporary_3.error };\n    mn_temporary_4 = mn_temporary_3.value;\n    const mn_slice_u8 bytes = mn_temporary_4;\n    return (mn_result_mn_memory_Error_slice_i64){ .error.tag = 0, .value = (mn_slice_i64){ .items = ((int64_t *)bytes.items) + 0u, .length = count - 0u } };\n}\n\nvoid mn_mn_memory_free_5(void * allocator, mn_slice_i64 items) {\n    uint8_t * mn_temporary_1;\n    size_t mn_temporary_2;\n    const mn_slice_u8 bytes = (mn_temporary_1 = ((uint8_t *)items.items), mn_temporary_2 = 8u, (mn_slice_u8){ .items = mn_temporary_1 + 0u, .length = (items.length * mn_temporary_2) - 0u });\n    mn_mn_memory_System_Allocator_free(allocator, bytes, 8u);\n}\n\nbool mn_mn_memory_Arena_1_Allocator_resize(struct mn_mn_memory_Arena_1 * arena, mn_slice_u8 bytes, size_t, size_t size) {\n    if ((size <= bytes.length)) {\n        return true;\n    }\n    uint8_t * mn_temporary_1;\n    uint8_t * mn_temporary_2;\n    mn_temporary_1 = arena->block;\n    if (!(mn_temporary_1 != NULL)) {\n        return false;\n    } else {\n        mn_temporary_2 = mn_temporary_1;\n    }\n    uint8_t * const block = mn_temporary_2;\n    if (((bytes.items != (block + arena->last)) || ((arena->last + size) > arena->capacity))) {\n        return false;\n    }\n    arena->used = (arena->last + size);\n    return true;\n}\n\nvoid mn_mn_memory_Arena_1_Allocator_free(struct mn_mn_memory_Arena_1 *, mn_slice_u8, size_t) {}\n",
+        files[5].contents,
+    );
+    try std.testing.expectEqual(6, files.len);
+    try std.testing.expectEqual(2, generator.runtime_functions.items.len);
+}
+
 test "generateWrapping: computes in the unsigned type of the operands and converts back" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -15765,7 +15884,7 @@ test "generateFunction: generates mn::random with its generator, range and entro
     );
     try std.testing.expectEqualStrings("main.c", files[1].path);
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n#include \"mn/random.h\"\n#include \"mn.h\"\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\nchar mn_zero_sized;\n\nsize_t mn_main_roll(struct mn_mn_random_Xoshiro256 * generator) {\n    return mn_mn_random_Xoshiro256_Generator_range(generator, (mn_mn_Range){ .start = 1u, .end = (mn_optional_usize){ .value = 7u, .present = true } });\n}\n\nint main() {\n    mn_mn_random_Xoshiro256 generator = mn_mn_random_Xoshiro256_new(mn_runtime_random_entropy());\n    mn_main_roll(&generator);\n    mn_mn_random_Xoshiro256_Generator_next(&generator);\n}\n",
+        "#include \"main.h\"\n#include \"mn/random.h\"\n#include \"mn.h\"\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\nmax_align_t mn_zero_sized;\n\nsize_t mn_main_roll(struct mn_mn_random_Xoshiro256 * generator) {\n    return mn_mn_random_Xoshiro256_Generator_range(generator, (mn_mn_Range){ .start = 1u, .end = (mn_optional_usize){ .value = 7u, .present = true } });\n}\n\nint main() {\n    mn_mn_random_Xoshiro256 generator = mn_mn_random_Xoshiro256_new(mn_runtime_random_entropy());\n    mn_main_roll(&generator);\n    mn_mn_random_Xoshiro256_Generator_next(&generator);\n}\n",
         files[1].contents,
     );
     try std.testing.expectEqualStrings("mn.h", files[2].path);
@@ -15788,8 +15907,18 @@ test "generateFunction: generates mn::random with its generator, range and entro
         "#include \"random.h\"\n#include \"../mn.h\"\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\nmn_mn_random_Xoshiro256 mn_mn_random_Xoshiro256_new(uint64_t seed) {\n    uint64_t mixer = seed;\n    uint64_t mn_temporary_1;\n    uint64_t mn_temporary_2;\n    uint64_t mn_temporary_3;\n    uint64_t mn_temporary_4;\n    return (mn_temporary_1 = mn_mn_random_splitmix64(&mixer), mn_temporary_2 = mn_mn_random_splitmix64(&mixer), mn_temporary_3 = mn_mn_random_splitmix64(&mixer), mn_temporary_4 = mn_mn_random_splitmix64(&mixer), (mn_mn_random_Xoshiro256){ .state = (mn_array_4_u64){ .items = { mn_temporary_1, mn_temporary_2, mn_temporary_3, mn_temporary_4 } } });\n}\n\nuint64_t mn_mn_random_Xoshiro256_Generator_next(struct mn_mn_random_Xoshiro256 * generator) {\n    struct mn_array_4_u64 * const state = &generator->state;\n    const uint64_t scaled = ((uint64_t)(1u * (uint64_t)(state->items[1u]) * (uint64_t)(5u)));\n    const uint64_t result = ((uint64_t)(1u * (uint64_t)((mn_shift_left_u64(scaled, 7u) | mn_shift_right_u64(scaled, 57u))) * (uint64_t)(9u)));\n    const uint64_t shifted = mn_shift_left_u64(state->items[1u], 17u);\n    uint64_t * mn_temporary_1;\n    mn_temporary_1 = &state->items[2u], (*mn_temporary_1) = ((*mn_temporary_1) ^ state->items[0u]);\n    uint64_t * mn_temporary_2;\n    mn_temporary_2 = &state->items[3u], (*mn_temporary_2) = ((*mn_temporary_2) ^ state->items[1u]);\n    uint64_t * mn_temporary_3;\n    mn_temporary_3 = &state->items[1u], (*mn_temporary_3) = ((*mn_temporary_3) ^ state->items[2u]);\n    uint64_t * mn_temporary_4;\n    mn_temporary_4 = &state->items[0u], (*mn_temporary_4) = ((*mn_temporary_4) ^ state->items[3u]);\n    uint64_t * mn_temporary_5;\n    mn_temporary_5 = &state->items[2u], (*mn_temporary_5) = ((*mn_temporary_5) ^ shifted);\n    state->items[3u] = (mn_shift_left_u64(state->items[3u], 45u) | mn_shift_right_u64(state->items[3u], 19u));\n    return result;\n}\n\nuint64_t mn_mn_random_splitmix64(uint64_t * state) {\n    (*state) = ((uint64_t)(1u * (uint64_t)((*state)) + (uint64_t)(0x9e3779b97f4a7c15u)));\n    const uint64_t mixed = ((uint64_t)(1u * (uint64_t)(((*state) ^ mn_shift_right_u64((*state), 30u))) * (uint64_t)(0xbf58476d1ce4e5b9u)));\n    const uint64_t scrambled = ((uint64_t)(1u * (uint64_t)((mixed ^ mn_shift_right_u64(mixed, 27u))) * (uint64_t)(0x94d049bb133111ebu)));\n    return (scrambled ^ mn_shift_right_u64(scrambled, 31u));\n}\n\nsize_t mn_mn_random_Xoshiro256_Generator_range(struct mn_mn_random_Xoshiro256 * generator, mn_mn_Range range) {\n    const uint64_t count = ((uint64_t)(range.end.value - range.start));\n    const uint64_t threshold = (((uint64_t)(1u * (uint64_t)(0u) - (uint64_t)(count))) % count);\n    while (true) {\n        const uint64_t bits = mn_mn_random_Xoshiro256_Generator_next(generator);\n        if ((bits >= threshold)) {\n            return (range.start + ((size_t)(bits % count)));\n        }\n    }\n}\n",
         files[5].contents,
     );
-    try std.testing.expectEqual(6, files.len);
-    try std.testing.expectEqual(1, generator.runtime_functions.items.len);
+    try std.testing.expectEqualStrings("mn/memory.h", files[6].path);
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\ntypedef struct mn_mn_memory_Error {\n    uint32_t tag;\n} mn_mn_memory_Error;\n\ntypedef struct mn_slice_u8 mn_slice_u8;\ntypedef struct mn_result_mn_memory_Error_slice_u8 mn_result_mn_memory_Error_slice_u8;\n\nuint8_t * mn_runtime_memory_allocate(size_t size, size_t alignment);\nvoid mn_runtime_memory_free(uint8_t * pointer);\n\nbool mn_mn_memory_equal(mn_slice_u8 one, mn_slice_u8 two);\nmn_result_mn_memory_Error_slice_u8 mn_mn_memory_System_Allocator_allocate(void *, size_t size, size_t alignment);\nbool mn_mn_memory_System_Allocator_resize(void *, mn_slice_u8 bytes, size_t, size_t size);\nvoid mn_mn_memory_System_Allocator_free(void *, mn_slice_u8 bytes, size_t);\n",
+        files[6].contents,
+    );
+    try std.testing.expectEqualStrings("mn/memory.c", files[7].path);
+    try std.testing.expectEqualStrings(
+        "#include \"memory.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_result_mn_memory_Error_slice_u8_defined\n#define mn_result_mn_memory_Error_slice_u8_defined\ntypedef struct mn_result_mn_memory_Error_slice_u8 {\n    mn_mn_memory_Error error;\n    mn_slice_u8 value;\n} mn_result_mn_memory_Error_slice_u8;\n#endif\n\nbool mn_mn_memory_equal(mn_slice_u8 one, mn_slice_u8 two) {\n    if ((one.length != two.length)) {\n        return false;\n    }\n    const size_t mn_end_1 = one.length;\n    for (size_t mn_index_1 = 0; mn_index_1 < mn_end_1; mn_index_1 += 1) {\n        const size_t index = mn_index_1;\n        if ((one.items[index] != two.items[index])) {\n            return false;\n        }\n    }\n    return true;\n}\n\nmn_result_mn_memory_Error_slice_u8 mn_mn_memory_System_Allocator_allocate(void *, size_t size, size_t alignment) {\n    uint8_t * mn_temporary_1;\n    uint8_t * mn_temporary_2;\n    mn_temporary_1 = mn_runtime_memory_allocate(size, alignment);\n    if (!(mn_temporary_1 != NULL)) {\n        return (mn_result_mn_memory_Error_slice_u8){ .error = (mn_mn_memory_Error){ .tag = 1 } };\n    } else {\n        mn_temporary_2 = mn_temporary_1;\n    }\n    uint8_t * const pointer = mn_temporary_2;\n    return (mn_result_mn_memory_Error_slice_u8){ .error.tag = 0, .value = (mn_slice_u8){ .items = pointer + 0u, .length = size - 0u } };\n}\n\nbool mn_mn_memory_System_Allocator_resize(void *, mn_slice_u8 bytes, size_t, size_t size) {\n    return (size <= bytes.length);\n}\n\nvoid mn_mn_memory_System_Allocator_free(void *, mn_slice_u8 bytes, size_t) {\n    mn_runtime_memory_free(bytes.items);\n}\n",
+        files[7].contents,
+    );
+    try std.testing.expectEqual(8, files.len);
+    try std.testing.expectEqual(3, generator.runtime_functions.items.len);
     try std.testing.expectEqualStrings("mn_runtime_random_entropy", generator.runtime_functions.items[0]);
 }
 
@@ -15815,7 +15944,7 @@ test "generateFunctionCall: passes a pointer to an array as a slice" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_array_4096_u8_defined\n#define mn_array_4096_u8_defined\ntypedef struct mn_array_4096_u8 {\n    uint8_t items[4096];\n} mn_array_4096_u8;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    mn_array_4096_u8 buffer;\n    read((mn_slice_u8){ .items = (&buffer)->items, .length = 4096 });\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_array_4096_u8_defined\n#define mn_array_4096_u8_defined\ntypedef struct mn_array_4096_u8 {\n    uint8_t items[4096];\n} mn_array_4096_u8;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_array_4096_u8 buffer;\n    read((mn_slice_u8){ .items = (&buffer)->items, .length = 4096 });\n}\n",
         files[1].contents,
     );
 }
@@ -15881,7 +16010,7 @@ test "generateFunctionCall: calls the function of a typeclass through the typecl
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_Square_area(mn_main_Square self) {\n    return self.side;\n}\n\nint32_t mn_main_Square_Shape_area(mn_main_Square self) {\n    return (self.side * self.side);\n}\n\nint main() {\n    const mn_main_Square square = (mn_main_Square){ .side = 2 };\n    mn_main_Square_area(square);\n    mn_main_Square_area(square);\n    mn_main_Square_Shape_area(square);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint32_t mn_main_Square_area(mn_main_Square self) {\n    return self.side;\n}\n\nint32_t mn_main_Square_Shape_area(mn_main_Square self) {\n    return (self.side * self.side);\n}\n\nint main() {\n    const mn_main_Square square = (mn_main_Square){ .side = 2 };\n    mn_main_Square_area(square);\n    mn_main_Square_area(square);\n    mn_main_Square_Shape_area(square);\n}\n",
         files[1].contents,
     );
 }
@@ -15911,7 +16040,7 @@ test "generateFunctionCall: calls a function of a named instance and points to o
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_Square_Shape_area(mn_main_Square shape) {\n    return shape.side;\n}\n\nmn_main_Square mn_main_Square_Shape_unit() {\n    return (mn_main_Square){ .side = 1 };\n}\n\nint main() {\n    const mn_main_Square square = mn_main_Square_Shape_unit();\n    typeof(int32_t (*)(struct mn_main_Square)) const area = mn_main_Square_Shape_area;\n    area(square);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint32_t mn_main_Square_Shape_area(mn_main_Square shape) {\n    return shape.side;\n}\n\nmn_main_Square mn_main_Square_Shape_unit() {\n    return (mn_main_Square){ .side = 1 };\n}\n\nint main() {\n    const mn_main_Square square = mn_main_Square_Shape_unit();\n    typeof(int32_t (*)(struct mn_main_Square)) const area = mn_main_Square_Shape_area;\n    area(square);\n}\n",
         files[1].contents,
     );
 }
@@ -15941,7 +16070,7 @@ test "generateFunctionCall: calls a function of an instance with several argumen
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_tuple_2_usize_bool_defined\n#define mn_tuple_2_usize_bool_defined\ntypedef struct mn_tuple_2_usize_bool {\n    size_t _0;\n    bool _1;\n} mn_tuple_2_usize_bool;\n#endif\n\n#ifndef mn_optional_tuple_2_usize_bool_defined\n#define mn_optional_tuple_2_usize_bool_defined\ntypedef struct mn_optional_tuple_2_usize_bool {\n    mn_tuple_2_usize_bool value;\n    bool present;\n} mn_optional_tuple_2_usize_bool;\n#endif\n\nchar mn_zero_sized;\n\nmn_optional_tuple_2_usize_bool mn_main_Counter_tuple_2_usize_bool_Iterator_next(struct mn_main_Counter * iterator) {\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &iterator->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n    return (mn_optional_tuple_2_usize_bool){ .value = (mn_tuple_2_usize_bool){ ._0 = iterator->count, ._1 = true }, .present = true };\n}\n\nint main() {\n    mn_main_Counter counter = (mn_main_Counter){ .count = 0u };\n    mn_main_Counter_tuple_2_usize_bool_Iterator_next(&counter);\n    mn_main_Counter_tuple_2_usize_bool_Iterator_next(&counter);\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_tuple_2_usize_bool_defined\n#define mn_tuple_2_usize_bool_defined\ntypedef struct mn_tuple_2_usize_bool {\n    size_t _0;\n    bool _1;\n} mn_tuple_2_usize_bool;\n#endif\n\n#ifndef mn_optional_tuple_2_usize_bool_defined\n#define mn_optional_tuple_2_usize_bool_defined\ntypedef struct mn_optional_tuple_2_usize_bool {\n    mn_tuple_2_usize_bool value;\n    bool present;\n} mn_optional_tuple_2_usize_bool;\n#endif\n\nmax_align_t mn_zero_sized;\n\nmn_optional_tuple_2_usize_bool mn_main_Counter_tuple_2_usize_bool_Iterator_next(struct mn_main_Counter * iterator) {\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &iterator->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n    return (mn_optional_tuple_2_usize_bool){ .value = (mn_tuple_2_usize_bool){ ._0 = iterator->count, ._1 = true }, .present = true };\n}\n\nint main() {\n    mn_main_Counter counter = (mn_main_Counter){ .count = 0u };\n    mn_main_Counter_tuple_2_usize_bool_Iterator_next(&counter);\n    mn_main_Counter_tuple_2_usize_bool_Iterator_next(&counter);\n}\n",
         files[1].contents,
     );
 }
@@ -15971,7 +16100,7 @@ test "generateFunctionCall: calls a function of a generic instance for two argum
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_i32_Show_show(int32_t value) {\n    return value;\n}\n\nint main() {\n    mn_main_List_1_Show_show((mn_main_List_1){ .first = 5 });\n    mn_main_List_2_Show_show((mn_main_List_2){ .first = (mn_main_List_1){ .first = 5 } });\n}\n\nint32_t mn_main_i32_Show_twice(int32_t value) {\n    return (mn_main_i32_Show_show(value) * 2);\n}\n\nint32_t mn_main_List_1_Show_show(mn_main_List_1 value) {\n    return (mn_main_i32_Show_show(value.first) + 1);\n}\n\nint32_t mn_main_List_2_Show_show(mn_main_List_2 value) {\n    return (mn_main_List_1_Show_show(value.first) + 1);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint32_t mn_main_i32_Show_show(int32_t value) {\n    return value;\n}\n\nint main() {\n    mn_main_List_1_Show_show((mn_main_List_1){ .first = 5 });\n    mn_main_List_2_Show_show((mn_main_List_2){ .first = (mn_main_List_1){ .first = 5 } });\n}\n\nint32_t mn_main_i32_Show_twice(int32_t value) {\n    return (mn_main_i32_Show_show(value) * 2);\n}\n\nint32_t mn_main_List_1_Show_show(mn_main_List_1 value) {\n    return (mn_main_i32_Show_show(value.first) + 1);\n}\n\nint32_t mn_main_List_2_Show_show(mn_main_List_2 value) {\n    return (mn_main_List_1_Show_show(value.first) + 1);\n}\n",
         files[1].contents,
     );
 }
@@ -16001,7 +16130,7 @@ test "generateFunctionCall: calls a typeclass function with its own type paramet
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nbool mn_main_positive(int32_t value) {\n    return (value > 0);\n}\n\nint main() {\n    mn_main_Box_Mapper_map_1((mn_main_Box_1){ .value = 3 }, mn_main_positive);\n}\n\nmn_main_Box_2 mn_main_Box_Mapper_map_1(mn_main_Box_1 value, typeof(bool (*)(int32_t)) function) {\n    return (mn_main_Box_2){ .value = function(value.value) };\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nbool mn_main_positive(int32_t value) {\n    return (value > 0);\n}\n\nint main() {\n    mn_main_Box_Mapper_map_1((mn_main_Box_1){ .value = 3 }, mn_main_positive);\n}\n\nmn_main_Box_2 mn_main_Box_Mapper_map_1(mn_main_Box_1 value, typeof(bool (*)(int32_t)) function) {\n    return (mn_main_Box_2){ .value = function(value.value) };\n}\n",
         files[1].contents,
     );
 }
@@ -16031,7 +16160,7 @@ test "generateFunctionCall: calls the instance of a function with a parameter of
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_i32_Show_show(int32_t value) {\n    return value;\n}\n\nint32_t mn_main_bool_Show_show(bool value) {\n    if (value) {\n        return 1;\n    }\n    return 0;\n}\n\nint main() {\n    mn_main_report_1(5);\n    mn_main_report_2(true);\n}\n\nint32_t mn_main_report_1(int32_t value) {\n    return (mn_main_i32_Show_show(value) + 1);\n}\n\nint32_t mn_main_report_2(bool value) {\n    return (mn_main_bool_Show_show(value) + 1);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint32_t mn_main_i32_Show_show(int32_t value) {\n    return value;\n}\n\nint32_t mn_main_bool_Show_show(bool value) {\n    if (value) {\n        return 1;\n    }\n    return 0;\n}\n\nint main() {\n    mn_main_report_1(5);\n    mn_main_report_2(true);\n}\n\nint32_t mn_main_report_1(int32_t value) {\n    return (mn_main_i32_Show_show(value) + 1);\n}\n\nint32_t mn_main_report_2(bool value) {\n    return (mn_main_bool_Show_show(value) + 1);\n}\n",
         files[1].contents,
     );
 }
@@ -16061,7 +16190,7 @@ test "generateFunctionCall: wraps a converted value in an optional" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_take(mn_optional_i32 value) {\n    return (value.present ? value.value : 0);\n}\n\nmn_optional_i32 mn_main_wrap(int32_t value) {\n    return (mn_optional_i32){ .value = value, .present = true };\n}\n\nint32_t mn_main_read(mn_main_Box box) {\n    mn_optional_i32 mn_temporary_1;\n    return (mn_temporary_1 = box.value, (mn_temporary_1.present ? mn_temporary_1.value : 0));\n}\n\nint main() {\n    mn_optional_i32 count = (mn_optional_i32){ .value = 5, .present = true };\n    count = (mn_optional_i32){ .value = 6, .present = true };\n    mn_main_read((mn_main_Box){ .value = (mn_optional_i32){ .value = 7, .present = true } });\n    mn_main_wrap(1);\n    mn_main_take((mn_optional_i32){ .value = 3, .present = true });\n    mn_main_take(count);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint32_t mn_main_take(mn_optional_i32 value) {\n    return (value.present ? value.value : 0);\n}\n\nmn_optional_i32 mn_main_wrap(int32_t value) {\n    return (mn_optional_i32){ .value = value, .present = true };\n}\n\nint32_t mn_main_read(mn_main_Box box) {\n    mn_optional_i32 mn_temporary_1;\n    return (mn_temporary_1 = box.value, (mn_temporary_1.present ? mn_temporary_1.value : 0));\n}\n\nint main() {\n    mn_optional_i32 count = (mn_optional_i32){ .value = 5, .present = true };\n    count = (mn_optional_i32){ .value = 6, .present = true };\n    mn_main_read((mn_main_Box){ .value = (mn_optional_i32){ .value = 7, .present = true } });\n    mn_main_wrap(1);\n    mn_main_take((mn_optional_i32){ .value = 3, .present = true });\n    mn_main_take(count);\n}\n",
         files[1].contents,
     );
 }
@@ -16124,7 +16253,7 @@ test "generateFunctionCall: passes the pointer written as the first argument of 
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_Square_Shape_grow(struct mn_main_Square * self) {\n    int32_t * mn_temporary_1;\n    mn_temporary_1 = &self->side, (*mn_temporary_1) = ((*mn_temporary_1) + 1);\n}\n\nint32_t mn_main_Square_Shape_measure(struct mn_main_Square const * self) {\n    return self->side;\n}\n\nint main() {\n    mn_main_Square square = (mn_main_Square){ .side = 1 };\n    mn_main_Square_Shape_grow(&square);\n    mn_main_Square_Shape_measure(&square);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_Square_Shape_grow(struct mn_main_Square * self) {\n    int32_t * mn_temporary_1;\n    mn_temporary_1 = &self->side, (*mn_temporary_1) = ((*mn_temporary_1) + 1);\n}\n\nint32_t mn_main_Square_Shape_measure(struct mn_main_Square const * self) {\n    return self->side;\n}\n\nint main() {\n    mn_main_Square square = (mn_main_Square){ .side = 1 };\n    mn_main_Square_Shape_grow(&square);\n    mn_main_Square_Shape_measure(&square);\n}\n",
         files[1].contents,
     );
 }
@@ -16157,7 +16286,7 @@ test "generateFunctionCall: takes the address of the receiver once for a pointer
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_array_2_main_Counter_defined\n#define mn_array_2_main_Counter_defined\ntypedef struct mn_array_2_main_Counter {\n    mn_main_Counter items[2];\n} mn_array_2_main_Counter;\n#endif\n\nchar mn_zero_sized;\n\nint32_t mn_main_Counter_read(mn_main_Counter self) {\n    return self.count;\n}\n\nvoid mn_main_Counter_increment(struct mn_main_Counter * self) {\n    int32_t * mn_temporary_1;\n    mn_temporary_1 = &self->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1);\n}\n\nsize_t mn_main_next() {\n    return 0u;\n}\n\nint main() {\n    mn_array_2_main_Counter counters = (mn_array_2_main_Counter){ .items = { (mn_main_Counter){ .count = 0 }, (mn_main_Counter){ .count = 1 } } };\n    mn_main_Counter_increment(&counters.items[mn_main_next()]);\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_array_2_main_Counter_defined\n#define mn_array_2_main_Counter_defined\ntypedef struct mn_array_2_main_Counter {\n    mn_main_Counter items[2];\n} mn_array_2_main_Counter;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint32_t mn_main_Counter_read(mn_main_Counter self) {\n    return self.count;\n}\n\nvoid mn_main_Counter_increment(struct mn_main_Counter * self) {\n    int32_t * mn_temporary_1;\n    mn_temporary_1 = &self->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1);\n}\n\nsize_t mn_main_next() {\n    return 0u;\n}\n\nint main() {\n    mn_array_2_main_Counter counters = (mn_array_2_main_Counter){ .items = { (mn_main_Counter){ .count = 0 }, (mn_main_Counter){ .count = 1 } } };\n    mn_main_Counter_increment(&counters.items[mn_main_next()]);\n}\n",
         files[1].contents,
     );
 }
@@ -16190,7 +16319,7 @@ test "generateFunctionCall: dereferences a pointer once for a value receiver" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_Counter_read(mn_main_Counter self) {\n    return self.count;\n}\n\nvoid mn_main_Counter_increment(struct mn_main_Counter * self) {\n    int32_t * mn_temporary_1;\n    mn_temporary_1 = &self->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1);\n}\n\nint main() {\n    mn_main_Counter_read((*locate()));\n    mn_main_Counter_increment(locate());\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint32_t mn_main_Counter_read(mn_main_Counter self) {\n    return self.count;\n}\n\nvoid mn_main_Counter_increment(struct mn_main_Counter * self) {\n    int32_t * mn_temporary_1;\n    mn_temporary_1 = &self->count, (*mn_temporary_1) = ((*mn_temporary_1) + 1);\n}\n\nint main() {\n    mn_main_Counter_read((*locate()));\n    mn_main_Counter_increment(locate());\n}\n",
         files[1].contents,
     );
 }
@@ -16223,7 +16352,7 @@ test "generateFunctionCall: leaves out a zero-sized receiver" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_Marker_go() {}\n\nint main() {\n    mn_main_Marker_go();\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_Marker_go() {}\n\nint main() {\n    mn_main_Marker_go();\n}\n",
         files[1].contents,
     );
 }
@@ -16256,7 +16385,7 @@ test "generateFunctionCall: leaves out arguments of the empty tuple type" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_make() {\n    return;\n}\n\nvoid mn_main_show(int32_t) {}\n\nvoid mn_main_pass() {\n    mn_main_show(1);\n}\n\nint main() {\n    mn_main_show(2);\n    mn_main_show(3);\n    (mn_main_make(), mn_main_show(4));\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_make() {\n    return;\n}\n\nvoid mn_main_show(int32_t) {}\n\nvoid mn_main_pass() {\n    mn_main_show(1);\n}\n\nint main() {\n    mn_main_show(2);\n    mn_main_show(3);\n    (mn_main_make(), mn_main_show(4));\n}\n",
         files[1].contents,
     );
 }
@@ -16289,7 +16418,7 @@ test "generateValueCall: calls through the function pointer" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_first(int32_t value) {\n    return value;\n}\n\nint32_t mn_main_apply(typeof(int32_t (*)(int32_t)) callback) {\n    return callback(1);\n}\n\nint main() {\n    typeof(int32_t (*)(int32_t)) const step = mn_main_first;\n    step(2);\n    mn_main_apply(mn_main_first);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint32_t mn_main_first(int32_t value) {\n    return value;\n}\n\nint32_t mn_main_apply(typeof(int32_t (*)(int32_t)) callback) {\n    return callback(1);\n}\n\nint main() {\n    typeof(int32_t (*)(int32_t)) const step = mn_main_first;\n    step(2);\n    mn_main_apply(mn_main_first);\n}\n",
         files[1].contents,
     );
 }
@@ -16377,7 +16506,7 @@ test "generateValueCall: calls through a constant of another module" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n#include \"steps.h\"\n\nchar mn_zero_sized;\n\nint main() {\n    mn_steps_first(1);\n}\n",
+        "#include \"main.h\"\n#include \"steps.h\"\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    mn_steps_first(1);\n}\n",
         files[1].contents,
     );
 }
@@ -16431,7 +16560,7 @@ test "generateValueCall: calls through a constant without a written type" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_first() {}\n\nint main() {\n    mn_main_first();\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_first() {}\n\nint main() {\n    mn_main_first();\n}\n",
         files[1].contents,
     );
 }
@@ -16458,7 +16587,7 @@ test "generateValueCall: calls a method through a constant" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nfloat mn_main_Point_length(mn_main_Point self) {\n    return self.x;\n}\n\nint main() {\n    mn_main_Point_length((mn_main_Point){ .x = 1.0f });\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nfloat mn_main_Point_length(mn_main_Point self) {\n    return self.x;\n}\n\nint main() {\n    mn_main_Point_length((mn_main_Point){ .x = 1.0f });\n}\n",
         files[1].contents,
     );
 }
@@ -16764,7 +16893,7 @@ test "generateValue: writes the value of an operation in a stored constant" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nconst int32_t mn_main_limit = 5;\n\nint main() {\n    keep(&mn_main_limit);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nconst int32_t mn_main_limit = 5;\n\nint main() {\n    keep(&mn_main_limit);\n}\n",
         files[1].contents,
     );
 }
@@ -17022,7 +17151,7 @@ test "generateEffects: runs the calls of a zero-sized field" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_use(int32_t) {}\n\nvoid mn_main_take(mn_main_Holder holder) {\n    return;\n}\n\nvoid mn_main_get() {\n    make();\n    return;\n}\n\nint main() {\n    (make(), mn_main_use(1));\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_use(int32_t) {}\n\nvoid mn_main_take(mn_main_Holder holder) {\n    return;\n}\n\nvoid mn_main_get() {\n    make();\n    return;\n}\n\nint main() {\n    (make(), mn_main_use(1));\n}\n",
         files[1].contents,
     );
 }
@@ -17049,7 +17178,7 @@ test "generateEffects: runs the calls in a zero-sized construction" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_mark() {\n    return;\n}\n\nvoid mn_main_use(int32_t) {}\n\nint main() {\n    (mn_main_mark(), mn_main_use(1));\n    mn_main_use(2);\n}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_mark() {\n    return;\n}\n\nvoid mn_main_use(int32_t) {}\n\nint main() {\n    (mn_main_mark(), mn_main_use(1));\n    mn_main_use(2);\n}\n",
         files[1].contents,
     );
 }
@@ -17103,7 +17232,7 @@ test "isStored: stores a constant whose address is taken in one object" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_tuple_2_i32_bool_defined\n#define mn_tuple_2_i32_bool_defined\ntypedef struct mn_tuple_2_i32_bool {\n    int32_t _0;\n    bool _1;\n} mn_tuple_2_i32_bool;\n#endif\n\nchar mn_zero_sized;\n\nconst int32_t mn_main_limit = 10;\nconst mn_tuple_2_i32_bool mn_main_pair = { ._0 = 1, ._1 = true };\n\nint main() {\n    keep(&mn_main_limit);\n    keep(&mn_main_limit);\n    keep(&mn_main_pair._0);\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_tuple_2_i32_bool_defined\n#define mn_tuple_2_i32_bool_defined\ntypedef struct mn_tuple_2_i32_bool {\n    int32_t _0;\n    bool _1;\n} mn_tuple_2_i32_bool;\n#endif\n\nmax_align_t mn_zero_sized;\n\nconst int32_t mn_main_limit = 10;\nconst mn_tuple_2_i32_bool mn_main_pair = { ._0 = 1, ._1 = true };\n\nint main() {\n    keep(&mn_main_limit);\n    keep(&mn_main_limit);\n    keep(&mn_main_pair._0);\n}\n",
         files[1].contents,
     );
 }
@@ -17169,7 +17298,7 @@ test "buildCName: keeps main only for the entry point" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\nchar mn_zero_sized;\n\nint32_t mn_main_Card_main(mn_main_Card self) {\n    return self.points;\n}\n\nint main() {}\n",
+        "#include \"main.h\"\n\nmax_align_t mn_zero_sized;\n\nint32_t mn_main_Card_main(mn_main_Card self) {\n    return self.points;\n}\n\nint main() {}\n",
         files[1].contents,
     );
 }
@@ -17430,7 +17559,7 @@ test "isStoredAsConstant: casts a slice of an element of a constant array" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\n#ifndef mn_array_2_array_2_i32_defined\n#define mn_array_2_array_2_i32_defined\ntypedef struct mn_array_2_array_2_i32 {\n    mn_array_2_i32 items[2];\n} mn_array_2_array_2_i32;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    const mn_array_2_array_2_i32 grid = (mn_array_2_array_2_i32){ .items = { (mn_array_2_i32){ .items = { 1, 2 } }, (mn_array_2_i32){ .items = { 3, 4 } } } };\n    take((mn_slice_i32){ .items = (int32_t *)grid.items[1u].items, .length = 2 });\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\n#ifndef mn_array_2_array_2_i32_defined\n#define mn_array_2_array_2_i32_defined\ntypedef struct mn_array_2_array_2_i32 {\n    mn_array_2_i32 items[2];\n} mn_array_2_array_2_i32;\n#endif\n\nmax_align_t mn_zero_sized;\n\nint main() {\n    const mn_array_2_array_2_i32 grid = (mn_array_2_array_2_i32){ .items = { (mn_array_2_i32){ .items = { 1, 2 } }, (mn_array_2_i32){ .items = { 3, 4 } } } };\n    take((mn_slice_i32){ .items = (int32_t *)grid.items[1u].items, .length = 2 });\n}\n",
         files[1].contents,
     );
 }
@@ -17658,7 +17787,7 @@ test "containsType: treats slices that differ only in mutability as one C type" 
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_array_4_u8_defined\n#define mn_array_4_u8_defined\ntypedef struct mn_array_4_u8 {\n    uint8_t items[4];\n} mn_array_4_u8;\n#endif\n\nchar mn_zero_sized;\n\nvoid mn_main_take(mn_slice_u8) {}\n\nint main() {\n    mn_array_4_u8 buffer;\n    mn_slice_u8 bytes = (mn_slice_u8){ .items = buffer.items, .length = 4 };\n    bytes = (mn_slice_u8){ .items = buffer.items, .length = 4 };\n    mn_main_take(bytes);\n}\n",
+        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_array_4_u8_defined\n#define mn_array_4_u8_defined\ntypedef struct mn_array_4_u8 {\n    uint8_t items[4];\n} mn_array_4_u8;\n#endif\n\nmax_align_t mn_zero_sized;\n\nvoid mn_main_take(mn_slice_u8) {}\n\nint main() {\n    mn_array_4_u8 buffer;\n    mn_slice_u8 bytes = (mn_slice_u8){ .items = buffer.items, .length = 4 };\n    bytes = (mn_slice_u8){ .items = buffer.items, .length = 4 };\n    mn_main_take(bytes);\n}\n",
         files[1].contents,
     );
 }

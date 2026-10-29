@@ -163,6 +163,7 @@
 - The type can be left out when it is known from the surrounding code, e.g. `{1, 2, 3}`.
 - `_` takes the length from the literal, e.g. `[_]i32{1, 2, 3}`.
 - A braced literal can initialize a read-only slice when its elements are known at compile time, e.g. `const primes: []const i32 = {2, 3, 5}`.
+- `{}` where a slice is expected gives a slice of length 0, read-only or not, e.g. `items = {}` for a field of type `[]T`. It needs no storage, since it has no elements to read or write.
 - The number of elements must match the array's length. A mismatch is a compile-time error.
 - Array literals can span multiple lines.
 - A comma after the last element is allowed.
@@ -256,7 +257,7 @@
 ### Pointer Casts
 
 - `mn::cast(T, pointer)` gives the pointer as the pointer type `T`, with the same address. It changes the target type or switches between single and multiple value pointers, e.g. `mn::cast(*const Header, buffer.pointer)`.
-- A cast that removes `const` is a compile-time error.
+- A cast can remove `const`, e.g. `mn::cast(*many u8, items.pointer)` for an `items` of type `[]const Card`. Writing through it to memory that cannot be modified, such as a string literal, is illegal behavior.
 - An address that is not a multiple of the target type's alignment is illegal behavior.
 - `mn::align(pointer, alignment)` moves a multiple value pointer forward to the next address that is a multiple of `alignment`, e.g. `mn::align(next, mn::alignment(Card))`. An alignment that is not a power of two is illegal behavior.
 
@@ -367,7 +368,7 @@
 - `if condition:` runs its block when the condition is true. The condition is a `bool`.
 - `else:` runs its block when the condition is false. It is on the line after the `if` block, at the same indentation as `if`.
 - `else if condition:` checks another condition when the previous ones are false, e.g. `if a:` followed by `else if b:` and `else:`.
-- A condition that depends on a `type` or `comptime` parameter is evaluated at compile time, and only the block it chooses is checked and compiled, e.g. `if T == i32:` in a function with a `type T` parameter or `if format[0] == '{':` in a function with a `comptime format: []const u8` parameter.
+- A condition that is known at compile time as a whole is evaluated at compile time, and only the block it chooses is checked and compiled, e.g. `if T == i32:` in a function with a `type T` parameter or `if format[0] == '{':` in a function with a `comptime format: []const u8` parameter. Any other condition is evaluated at run time and every block is checked, e.g. `if T == i32 and flag:` with a run-time `flag`.
 - `if optional as name:` runs its block when the optional is not `null`, with `name` holding its value, e.g. `if found as card:`. `*name` holds a pointer to the value instead of a copy. The name can be used only in the block.
 
 ### While
@@ -492,8 +493,10 @@
 - Top-level constants are evaluated at compile time.
 - A parameter written `type T` takes a type, e.g. `fn List(type T) -> type`. A parameter marked `comptime` takes a value known at compile time, e.g. `comptime format: []const u8`. Their arguments are evaluated at compile time.
 - A parameter whose type is `any` takes a value of any type, e.g. `fn equal(one: any, two: any) -> bool`. `any` can only be the type of a parameter.
-- A function gets its own instance for each different set of arguments to its `type` and `comptime` parameters, and for each different set of types of the arguments to its `any` parameters.
-- A function with `type`, `comptime` or `any` parameters is checked for everything that does not depend on them, even if it is never called.
+- A function can declare types in parentheses after `fn`, written like an instance's parameters, e.g. `fn(type Item) free(allocator: *Allocator, items: []const Item)`. They are not passed: each is taken from the types of the arguments, e.g. `free(&system, cards)` for a `[]Card` `cards` gives `Item` as `Card`. Arguments convert implicitly as for any parameter, so a `*[4]Card` also gives `Card`.
+- Each declared type must appear in a parameter's type. Arguments that give a declared type two different types, or that do not fit the parameter's type, are a compile-time error.
+- A function gets its own instance for each different set of arguments to its `type` and `comptime` parameters, for each different set of types of the arguments to its `any` parameters, and for each different set of its declared types.
+- A function with `type`, `comptime` or `any` parameters or declared types is checked for everything that does not depend on them, even if it is never called.
 - `struct:` followed by an indented block, written like a struct's, is a struct without a name, e.g. `return struct:` followed by `items: []T`.
 - A call evaluated at compile time gives the same result for the same arguments, e.g. `List(i32)` is the same type everywhere.
 - Any function can be evaluated at compile time, unless it reaches an external function.

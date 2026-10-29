@@ -7,7 +7,7 @@
 __extension__ typedef __int128 int128_t;
 __extension__ typedef unsigned __int128 uint128_t;
 
-extern char mn_zero_sized;
+extern max_align_t mn_zero_sized;
 
 #define MN_SIGNED_HELPERS(name, type, unsigned_type, width) \
     static inline type mn_shift_left_##name(type value, size_t amount) { \

@@ -31,6 +31,8 @@ instance Generator(Xoshiro256):
         state[3] = (state[3] << 45) | (state[3] >> 19)
         return result
 
+const Default = Xoshiro256
+
 fn splitmix64(state: *u64) -> u64:
     state.* = math::add_wrapping(state.*, 0x9e3779b97f4a7c15)
     const mixed = math::multiply_wrapping(state.* ^ (state.* >> 30), 0xbf58476d1ce4e5b9)
