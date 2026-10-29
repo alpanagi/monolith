@@ -2184,6 +2184,34 @@ test "evaluateCall: evaluates a call with any arguments at compile time" {
     try std.testing.expectEqual(Value{ .integer = 7 }, loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.*);
 }
 
+test "evaluateCall: strips one line ending with mn::text::strip at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::text\nconst NEWLINE = memory::equal(text::strip(\"y\\n\"), \"y\")\nconst CARRIAGE = memory::equal(text::strip(\"y\\r\\n\"), \"y\")\nconst PLAIN = memory::equal(text::strip(\"y\"), \"y\")\nconst EMPTY = memory::equal(text::strip(\"\"), \"\")\nconst ALONE = memory::equal(text::strip(\"\\n\"), \"\")\nconst DOUBLE = memory::equal(text::strip(\"y\\n\\n\"), \"y\\n\")\nconst RETURN = memory::equal(text::strip(\"y\\r\"), \"y\\r\")\nfn mutable() -> bool:\n    var buffer: [2]u8 = {'y', '\\n'}\n    buffer[0] = 'y'\n    return memory::equal(text::strip(buffer[..]), \"y\")\nconst MUTABLE = mutable()\nconst LENGTH = text::strip(\"y\\n\\n\").length" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expect(declarations[2].kind.constant_declaration.known.?.boolean);
+    try std.testing.expect(declarations[3].kind.constant_declaration.known.?.boolean);
+    try std.testing.expect(declarations[4].kind.constant_declaration.known.?.boolean);
+    try std.testing.expect(declarations[5].kind.constant_declaration.known.?.boolean);
+    try std.testing.expect(declarations[6].kind.constant_declaration.known.?.boolean);
+    try std.testing.expect(declarations[7].kind.constant_declaration.known.?.boolean);
+    try std.testing.expect(declarations[8].kind.constant_declaration.known.?.boolean);
+    try std.testing.expect(declarations[10].kind.constant_declaration.known.?.boolean);
+    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[11].kind.constant_declaration.known.?.*);
+}
+
 test "evaluateBuiltin: converts and truncates numbers at compile time" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2671,6 +2699,27 @@ test "evaluateTry: returns the error of a result from the function" {
     const declarations = loader.modules.items[0].declarations;
     try std.testing.expectEqual(Value{ .integer = 3 }, declarations[4].kind.constant_declaration.known.?.*);
     try std.testing.expectEqual(Value{ .integer = 99 }, declarations[5].kind.constant_declaration.known.?.*);
+}
+
+test "evaluateCall: evaluates an inline function at compile time like any function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline fn double(value: i32) -> i32: return value * 2\nfn log(count: *i32): count.* += 10\ninline fn deferred(count: *i32) -> i32:\n    defer log(count)\n    return count.*\nfn run() -> i32:\n    var count: i32 = 1\n    const before = deferred(&count)\n    return before + count\nconst FOUR = double(2)\nconst RUN = run()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 4 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 12 }, declarations[5].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateCall: runs a function at compile time" {

@@ -2208,6 +2208,7 @@ pub const NameResolver = struct {
             },
             else => return null,
         };
+        try self.expectNotInline(value.location, target);
         return switch (target) {
             .function, .type, .method, .typeclass => target,
             .namespace => self.fail(value.location, error.ModuleInConstant),
@@ -3038,11 +3039,13 @@ pub const NameResolver = struct {
         return switch (value.kind) {
             .identifier => |identifier| {
                 const target = try self.resolveName(declaration.location, identifier.name);
+                try self.expectNotInline(value.location, target);
                 return self.expectHeldByConstant(declaration.location, target);
             },
             .path_expression => |path_expression| {
                 const path = path_expression.path;
                 const target = try self.resolvePath(.{}, declaration.location, path);
+                try self.expectNotInline(value.location, target);
                 return self.expectHeldByConstant(declaration.location, target);
             },
             .integer_literal, .float_literal, .boolean_literal, .string_literal, .undefined, .null => own,
@@ -3074,6 +3077,14 @@ pub const NameResolver = struct {
                 return own;
             },
         };
+    }
+
+    fn expectNotInline(self: *NameResolver, location: token.Location, target: Target) NameError!void {
+        if (target != .function) return;
+        const module = self.loader.modules.items[target.function.module];
+        const declaration = ast.findDeclaration(module, target.function.declaration);
+        if (declaration.kind != .function_definition) return;
+        if (declaration.kind.function_definition.signature.@"inline") return self.fail(location, error.InlineValue);
     }
 
     fn expectHeldByConstant(
@@ -3290,6 +3301,7 @@ pub const NameError = error{
     StructContainsItself,
     CallInArrayLength,
     AnyInExternalFunction,
+    InlineValue,
     ReservedImport,
     NotExternalField,
     InternalStructInExternalFunction,
@@ -3463,6 +3475,7 @@ fn describeError(name_error: NameError) []const u8 {
         error.ModuleNotFound => "module not found",
         error.ConstantRefersToItself => "constant refers to itself",
         error.StructContainsItself => "struct contains itself",
+        error.InlineValue => "an inline function cannot be used as a value",
         error.AnyInExternalFunction => "an external function cannot have an 'any' parameter",
         error.CallInArrayLength => "the length of an array in a type cannot come from a call, since nothing runs there",
         error.ReservedImport => "an import cannot make a reserved name available, use 'as' to name it",

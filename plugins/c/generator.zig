@@ -25,8 +25,14 @@ pub const Generator = struct {
     frames: std.ArrayList(Frame) = .empty,
     unrolled: std.ArrayList(Unrolled) = .empty,
     parameters: []const ast.TypedName = &.{},
+    parameter_names: []const []const u8 = &.{},
     return_type: types.Type = .void,
     sequenced: bool = false,
+    loop_base: usize = 0,
+    label_count: usize = 0,
+    temporary_end: usize = 0,
+    inline_count: usize = 0,
+    inline_exit: ?InlineExit = null,
     statics: std.ArrayList(Static) = .empty,
     module_index: usize = 0,
     depth: usize = 0,
@@ -717,7 +723,7 @@ pub const Generator = struct {
                 const value_type = ast.extractDeclaredType(constant.type, constant.value);
                 try self.collectForwardType(allocator, &forward, value_type);
             }
-            if (isCompileTimeFunction(declaration)) continue;
+            if (isCompileTimeFunction(declaration) or isInlineFunction(declaration)) continue;
             const signature = switch (declaration.kind) {
                 .function_definition => |function| function.signature,
                 .function_declaration => |function_declaration| function_declaration,
@@ -808,7 +814,7 @@ pub const Generator = struct {
         var declared = false;
         for (module.declarations, 0..) |declaration, index| {
             if (declaration.kind != kind or self.isEntryPoint(declaration.kind)) continue;
-            if (isCompileTimeFunction(declaration)) continue;
+            if (isCompileTimeFunction(declaration) or isInlineFunction(declaration)) continue;
             if (!declared) try writer.writeByte('\n');
             try self.generateSignature(writer, declaration.kind, index);
             try writer.writeAll(";\n");
@@ -833,7 +839,7 @@ pub const Generator = struct {
             if (self.isStored(self.module_index, index)) {
                 try self.generateConstantDefinition(allocator, &reached, &constants.writer, declaration, index);
             }
-            if (isCompileTimeFunction(declaration)) continue;
+            if (isCompileTimeFunction(declaration) or isInlineFunction(declaration)) continue;
             const function = switch (declaration.kind) {
                 .function_definition => |function| function,
                 .function_declaration, .constant_declaration, .struct_definition, .enum_definition => continue,
@@ -1460,7 +1466,13 @@ pub const Generator = struct {
         self.matches = try collectKind(allocator, function.body, .match);
         self.conditionals = try collectKind(allocator, function.body, .@"if");
         self.parameters = function.signature.parameters;
+        self.parameter_names = &.{};
         self.return_type = ast.extractType(function.signature.return_type);
+        self.loop_base = 0;
+        self.label_count = self.loops.len;
+        self.temporary_end = countTemporaries(self.steps);
+        self.inline_count = 0;
+        self.inline_exit = null;
         const kind: ast.DeclarationKind = .{ .function_definition = function };
         self.in_main = self.isEntryPoint(kind) and !isResultMain(kind);
         try self.generateSignature(writer, kind, index);
@@ -1503,7 +1515,9 @@ pub const Generator = struct {
             .none;
         try self.generateUnwound(allocator, reached, writer, null, errors);
         try self.generateIndentation(writer);
-        try writer.print("return {s};\n", .{name});
+        try self.generateReturnStart(writer);
+        try writer.writeAll(name);
+        try self.generateReturnEnd(writer);
     }
 
     fn generateSuccessReturn(
@@ -1514,9 +1528,28 @@ pub const Generator = struct {
     ) WriteError!void {
         try self.recordType(allocator, reached, self.return_type);
         try self.generateIndentation(writer);
-        try writer.writeAll("return ");
+        try self.generateReturnStart(writer);
         try self.generateCompoundStart(writer, self.return_type, .expression);
-        try writer.writeAll(".error.tag = 0 };\n");
+        try writer.writeAll(".error.tag = 0 }");
+        try self.generateReturnEnd(writer);
+    }
+
+    fn generateReturnStart(self: *Generator, writer: *std.Io.Writer) WriteError!void {
+        const exit = self.inline_exit orelse return writer.writeAll("return ");
+        if (exit.temporary) |number| return writer.print("mn_temporary_{d} = ", .{number});
+        try writer.writeAll("(void)(");
+    }
+
+    fn generateReturnEnd(self: *Generator, writer: *std.Io.Writer) WriteError!void {
+        const exit = self.inline_exit orelse return writer.writeAll(";\n");
+        try writer.writeAll(if (exit.temporary == null) ");\n" else ";\n");
+        try self.generateInlineJump(writer);
+    }
+
+    fn generateInlineJump(self: *Generator, writer: *std.Io.Writer) WriteError!void {
+        self.inline_exit.?.jumped = true;
+        try self.generateIndentation(writer);
+        try writer.print("goto mn_inline_end_{d};\n", .{self.inline_exit.?.label});
     }
 
     fn generateEntryPoint(
@@ -1764,6 +1797,7 @@ pub const Generator = struct {
                 const returned = findStatementExpression(statement) orelse {
                     try self.generateUnwound(allocator, reached, writer, null, .none);
                     if (self.return_type == .result) return self.generateSuccessReturn(allocator, reached, writer);
+                    if (self.inline_exit != null) return self.generateInlineJump(writer);
                     try self.generateIndentation(writer);
                     return writer.writeAll(if (self.in_main) "return 0;\n" else "return;\n");
                 };
@@ -1774,14 +1808,15 @@ pub const Generator = struct {
                         try writer.writeAll(";\n");
                     }
                     try self.generateUnwound(allocator, reached, writer, null, .none);
+                    if (self.inline_exit != null) return self.generateInlineJump(writer);
                     try self.generateIndentation(writer);
                     return writer.writeAll("return;\n");
                 }
                 if (self.hasDeferred()) return self.generateDeferredReturn(allocator, reached, writer, returned);
                 try self.generateIndentation(writer);
-                try writer.writeAll("return ");
+                try self.generateReturnStart(writer);
                 try self.generateFullValue(allocator, reached, writer, returned, self.return_type);
-                try writer.writeAll(";\n");
+                try self.generateReturnEnd(writer);
             },
             .discard, .call => |*expression| {
                 if (self.isLiftedRoot(expression)) return;
@@ -2912,7 +2947,7 @@ pub const Generator = struct {
     }
 
     fn findLoopNumber(self: *const Generator, loop: *const ast.Statement) usize {
-        return std.mem.findScalar(*const ast.Statement, self.loops, loop).? + 1;
+        return std.mem.findScalar(*const ast.Statement, self.loops, loop).? + 1 + self.loop_base;
     }
 
     fn generateIndentation(self: *Generator, writer: *std.Io.Writer) WriteError!void {
@@ -3031,6 +3066,7 @@ pub const Generator = struct {
     ) WriteError!void {
         const expression = step.expression;
         if (step.address == null and expression.kind == .@"try") return self.generateLiftedTry(allocator, reached, writer, step);
+        if (step.address == null and isInlineCall(expression.*)) return self.generateInlinedCall(allocator, reached, writer, step);
         if (step.address == null and self.isLiftedShortCircuit(expression)) {
             return self.generateLiftedShortCircuit(allocator, reached, writer, step);
         }
@@ -3046,6 +3082,119 @@ pub const Generator = struct {
         try writer.writeAll(";\n");
     }
 
+    fn generateInlinedCall(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        step: *const Step,
+    ) WriteError!void {
+        const call = step.expression.kind.call;
+        const function = ast.extractResolution(call.callee).function;
+        const definition = ast.findDeclaration(self.program.modules[function.module], function.declaration).kind.function_definition;
+        self.inline_count += 1;
+        const number = self.inline_count;
+        const parameters = definition.signature.parameters;
+        const names = try allocator.alloc([]const u8, parameters.len);
+        try self.generateIndentation(writer);
+        try writer.writeAll("{\n");
+        self.depth += 1;
+        for (parameters, call.arguments, names) |parameter, *argument, *name| {
+            name.* = try std.fmt.allocPrint(allocator, "mn_inline_{d}_{s}", .{ number, parameter.name });
+            const parameter_type = ast.extractType(parameter.type);
+            if (ast.isDiscardedName(parameter.name) or isZeroSized(parameter_type)) continue;
+            try self.recordType(allocator, reached, parameter_type);
+            try self.generateIndentation(writer);
+            try writer.writeAll("[[maybe_unused]] ");
+            try self.generateLocalType(writer, parameter_type, true);
+            try writer.print(" {s} = ", .{name.*});
+            try self.generateConvertedOperand(allocator, reached, writer, &argument.value, parameter_type);
+            try writer.writeAll(";\n");
+        }
+        const caller = self.saveContext();
+        try self.enterInlineContext(allocator, definition, names, .{ .temporary = step.temporary, .label = number });
+        try self.generateStatements(allocator, reached, writer, definition.body, null);
+        if (needsFinalReturn(self.return_type, definition.body)) try self.generateSuccessReturn(allocator, reached, writer);
+        const jumped = self.inline_exit.?.jumped;
+        self.restoreContext(caller);
+        self.depth -= 1;
+        try self.generateIndentation(writer);
+        try writer.writeAll("}\n");
+        if (!jumped) return;
+        try self.generateIndentation(writer);
+        try writer.print("mn_inline_end_{d}:;\n", .{number});
+    }
+
+    fn saveContext(self: *const Generator) Context {
+        return .{
+            .local_names = self.local_names,
+            .steps = self.steps,
+            .loops = self.loops,
+            .tuple_declarations = self.tuple_declarations,
+            .matches = self.matches,
+            .conditionals = self.conditionals,
+            .innermost_loop = self.innermost_loop,
+            .frames = self.frames,
+            .parameters = self.parameters,
+            .parameter_names = self.parameter_names,
+            .return_type = self.return_type,
+            .sequenced = self.sequenced,
+            .in_main = self.in_main,
+            .loop_base = self.loop_base,
+            .temporary_end = self.temporary_end,
+            .inline_exit = self.inline_exit,
+        };
+    }
+
+    fn restoreContext(self: *Generator, context: Context) void {
+        self.local_names = context.local_names;
+        self.steps = context.steps;
+        self.loops = context.loops;
+        self.tuple_declarations = context.tuple_declarations;
+        self.matches = context.matches;
+        self.conditionals = context.conditionals;
+        self.innermost_loop = context.innermost_loop;
+        self.frames = context.frames;
+        self.parameters = context.parameters;
+        self.parameter_names = context.parameter_names;
+        self.return_type = context.return_type;
+        self.sequenced = context.sequenced;
+        self.in_main = context.in_main;
+        self.loop_base = context.loop_base;
+        self.temporary_end = context.temporary_end;
+        self.inline_exit = context.inline_exit;
+    }
+
+    fn enterInlineContext(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        definition: ast.FunctionDefinition,
+        names: []const []const u8,
+        exit: InlineExit,
+    ) WriteError!void {
+        const steps = try allocator.dupe(Step, try self.collectSteps(allocator, definition));
+        for (steps) |*step| {
+            if (step.temporary) |number| step.temporary = number + self.temporary_end;
+        }
+        self.temporary_end += countTemporaries(steps);
+        self.local_names = try buildLocalNames(allocator, definition);
+        self.steps = steps;
+        self.loops = try collectLoops(allocator, definition.body);
+        self.loop_base = self.label_count;
+        self.label_count += self.loops.len;
+        self.tuple_declarations = try collectKind(allocator, definition.body, .tuple_declaration);
+        self.matches = try collectKind(allocator, definition.body, .match);
+        self.conditionals = try collectKind(allocator, definition.body, .@"if");
+        self.innermost_loop = null;
+        self.frames = .empty;
+        self.parameters = definition.signature.parameters;
+        self.parameter_names = names;
+        self.return_type = ast.extractType(definition.signature.return_type);
+        self.sequenced = false;
+        self.in_main = false;
+        self.inline_exit = exit;
+    }
+
     fn generateLiftedTry(
         self: *Generator,
         allocator: std.mem.Allocator,
@@ -3058,17 +3207,18 @@ pub const Generator = struct {
         try self.recordType(allocator, reached, result_type);
         try self.recordType(allocator, reached, self.return_type);
         const deferred = self.hasDeferred();
+        const braced = deferred or self.inline_exit != null;
         try self.generateIndentation(writer);
         try writer.writeAll("if (");
         try self.generateOperand(allocator, reached, writer, operand);
         try writer.writeAll(".error.tag != 0) ");
-        if (deferred) {
+        if (braced) {
             try writer.writeAll("{\n");
             self.depth += 1;
-            try self.generateUnwound(allocator, reached, writer, null, .all);
+            if (deferred) try self.generateUnwound(allocator, reached, writer, null, .all);
             try self.generateIndentation(writer);
         }
-        try writer.writeAll("return ");
+        try self.generateReturnStart(writer);
         try self.generateCompoundStart(writer, self.return_type, .expression);
         try writer.writeAll(".error = ");
         const source: types.Type = .{ .@"enum" = result_type.result.error_set };
@@ -3083,8 +3233,9 @@ pub const Generator = struct {
             try self.generateOperand(allocator, reached, writer, operand);
             try writer.writeAll(".error)");
         }
-        try writer.writeAll(" };\n");
-        if (deferred) {
+        try writer.writeAll(" }");
+        try self.generateReturnEnd(writer);
+        if (braced) {
             self.depth -= 1;
             try self.generateIndentation(writer);
             try writer.writeAll("}\n");
@@ -3432,7 +3583,7 @@ pub const Generator = struct {
             .undefined => unreachable,
             .null => try self.generateNull(writer, expression.type.?, .expression),
             .identifier => |identifier| switch (identifier.resolution.?) {
-                .parameter => try writer.writeAll(identifier.name),
+                .parameter => |index| try writer.writeAll(if (index < self.parameter_names.len) self.parameter_names[index] else identifier.name),
                 .constant => |constant| try self.generateConstant(allocator, reached, writer, constant),
                 .local, .element => try writer.writeAll(self.findLocalName(identifier.resolution.?).?),
                 .function => |function| try self.generateFunctionName(allocator, reached, writer, function),
@@ -4646,6 +4797,31 @@ const Errors = union(enum) {
     dynamic: []const u8,
 };
 
+const InlineExit = struct {
+    temporary: ?usize,
+    label: usize,
+    jumped: bool = false,
+};
+
+const Context = struct {
+    local_names: []const LocalName,
+    steps: []const Step,
+    loops: []const *const ast.Statement,
+    tuple_declarations: []const *const ast.Statement,
+    matches: []const *const ast.Statement,
+    conditionals: []const *const ast.Statement,
+    innermost_loop: ?*const ast.Statement,
+    frames: std.ArrayList(Frame),
+    parameters: []const ast.TypedName,
+    parameter_names: []const []const u8,
+    return_type: types.Type,
+    sequenced: bool,
+    in_main: bool,
+    loop_base: usize,
+    temporary_end: usize,
+    inline_exit: ?InlineExit,
+};
+
 const Step = struct {
     expression: *const ast.Expression,
     scope: *const ast.Expression,
@@ -5205,12 +5381,13 @@ fn collectScopeSteps(
     statement: *const ast.Statement,
     scope: *const ast.Expression,
 ) std.mem.Allocator.Error!void {
-    const tried = try containsTry(allocator, scope);
+    const tried = try containsLift(allocator, scope);
     if (tried or try needsSequence(allocator, scope)) {
         const consumed = isUnit(scope.*) or !isZeroSized(scope.type.?);
         try collectUnitSteps(allocator, steps, statement, scope, scope, consumed, false);
     }
-    if (tried and (scope.kind == .@"try" or (scope.kind == .binary and isShortCircuit(scope.kind.binary.operator)))) {
+    const lifted_root = scope.kind == .@"try" or isInlineCall(scope.*) or (scope.kind == .binary and isShortCircuit(scope.kind.binary.operator));
+    if (tried and lifted_root) {
         const stored = !isZeroSized(scope.type.?) and statement.kind != .discard;
         try steps.append(allocator, .{
             .expression = scope,
@@ -5224,21 +5401,25 @@ fn collectScopeSteps(
 
 fn liftSteps(allocator: std.mem.Allocator, steps: []Step) std.mem.Allocator.Error!void {
     const tried = for (steps) |step| {
-        if (step.expression.kind == .@"try") break true;
+        if (step.expression.kind == .@"try" or isInlineCall(step.expression.*)) break true;
     } else false;
     if (!tried) return;
-    for (steps) |*step| step.lifted = !step.lazy or try containsTry(allocator, step.scope);
+    for (steps) |*step| step.lifted = !step.lazy or try containsLift(allocator, step.scope);
 }
 
-fn containsTry(allocator: std.mem.Allocator, expression: *const ast.Expression) std.mem.Allocator.Error!bool {
-    if (expression.kind == .@"try") return true;
+fn containsLift(allocator: std.mem.Allocator, expression: *const ast.Expression) std.mem.Allocator.Error!bool {
+    if (expression.kind == .@"try" or isInlineCall(expression.*)) return true;
     if (expression.kind == .binary and isShortCircuit(expression.kind.binary.operator)) {
-        if (try containsTry(allocator, expression.kind.binary.right)) return true;
+        if (try containsLift(allocator, expression.kind.binary.right)) return true;
     }
     for (try collectScopeChildren(allocator, expression)) |child| {
-        if (try containsTry(allocator, child)) return true;
+        if (try containsLift(allocator, child)) return true;
     }
     return false;
+}
+
+fn isInlineCall(expression: ast.Expression) bool {
+    return expression.kind == .call and expression.kind.call.@"inline";
 }
 
 fn needsSequence(
@@ -5894,6 +6075,10 @@ fn generateKnownFloat(writer: *std.Io.Writer, number: types.NumberType, value: f
 fn generateKnownByte(writer: *std.Io.Writer, byte: u8) WriteError!void {
     if (byte >= 0x20 and byte < 0x7f and byte != '"' and byte != '\\' and byte != '?') return writer.writeByte(byte);
     try writer.print("\\{o:0>3}", .{byte});
+}
+
+fn isInlineFunction(declaration: ast.Declaration) bool {
+    return declaration.kind == .function_definition and declaration.kind.function_definition.signature.@"inline";
 }
 
 fn isCompileTimeFunction(declaration: ast.Declaration) bool {
@@ -11332,6 +11517,86 @@ test "generateFunction: writes an instance for each type of the argument to an a
     );
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_array_2_u8_defined\n#define mn_array_2_u8_defined\ntypedef struct mn_array_2_u8 {\n    uint8_t items[2];\n} mn_array_2_u8;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    mn_array_2_u8 array = (mn_array_2_u8){ .items = { 1u, 2u } };\n    array.items[0u] = mn_main_first_1(array);\n    mn_main_count_1((mn_slice_u8){ .items = (uint8_t *)\"ab\", .length = 2 });\n    mn_main_count_2(array);\n    mn_main_count_3(&array);\n}\n\nuint8_t mn_main_first_1(mn_array_2_u8 values) {\n    return values.items[0u];\n}\n\nsize_t mn_main_count_1(mn_slice_u8 values) {\n    return values.length;\n}\n\nsize_t mn_main_count_2([[maybe_unused]] mn_array_2_u8 values) {\n    return 2u;\n}\n\nsize_t mn_main_count_3([[maybe_unused]] struct mn_array_2_u8 * values) {\n    return 2u;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateInlinedCall: writes the body of an inline function at each call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nerror Failure:\n    bad\nfn next(counter: *i32) -> i32:\n    counter.* += 1\n    return counter.*\nfn log(counter: *i32, amount: i32): counter.* += amount\ninline fn double(value: i32) -> i32: return value * 2\ninline fn quadruple(value: i32) -> i32: return double(double(value))\ninline fn clamp(value: i32) -> i32:\n    if value > 10: return 10\n    return value\ninline fn checked(value: i32) -> Failure!i32:\n    if value < 0: return Failure::bad\n    return value\ninline fn parse(value: i32) -> Failure!i32:\n    const result = try checked(value)\n    return result + 1\ninline fn deferred(counter: *i32) -> i32:\n    defer log(counter, 100)\n    return counter.*\ninline fn guarded(counter: *i32, fail: bool) -> Failure!i32:\n    errdefer log(counter, 1000)\n    if fail: return Failure::bad\n    return 1\nstruct Box:\n    value: i32\n    inline fn get(self: Self) -> i32: return self.value\ninline fn first(type T, values: []const T) -> T: return values[0]\nfn run(counter: *i32) -> Failure!i32:\n    const value: i32 = 3\n    const doubled = double(next(counter)) + clamp(value * 5)\n    const box = Box{value = 7}\n    const values: [2]u8 = {4, 5}\n    const total = doubled + quadruple(box.get()) + deferred(counter) + mn::convert(i32, first(u8, &values))\n    const guard = try guarded(counter, total > 100)\n    return try parse(total + guard)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_Failure {\n    uint32_t tag;\n} mn_main_Failure;\n\ntypedef struct mn_main_Box {\n    int32_t value;\n} mn_main_Box;\n\ntypedef struct mn_result_main_Failure_i32 mn_result_main_Failure_i32;\n\nint32_t mn_main_next(int32_t * counter);\nvoid mn_main_log(int32_t * counter, int32_t amount);\nmn_result_main_Failure_i32 mn_main_run(int32_t * counter);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_result_main_Failure_i32_defined\n#define mn_result_main_Failure_i32_defined\ntypedef struct mn_result_main_Failure_i32 {\n    mn_main_Failure error;\n    int32_t value;\n} mn_result_main_Failure_i32;\n#endif\n\n#ifndef mn_array_2_u8_defined\n#define mn_array_2_u8_defined\ntypedef struct mn_array_2_u8 {\n    uint8_t items[2];\n} mn_array_2_u8;\n#endif\n\nint32_t mn_main_next(int32_t * counter) {\n    int32_t * mn_temporary_1;\n    mn_temporary_1 = &(*counter), (*mn_temporary_1) = ((*mn_temporary_1) + 1);\n    return (*counter);\n}\n\nvoid mn_main_log(int32_t * counter, int32_t amount) {\n    int32_t * mn_temporary_1;\n    mn_temporary_1 = &(*counter), (*mn_temporary_1) = ((*mn_temporary_1) + amount);\n}\n\nmn_result_main_Failure_i32 mn_main_run(int32_t * counter) {\n    const int32_t value = 3;\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    int32_t mn_temporary_3;\n    mn_temporary_1 = mn_main_next(counter);\n    {\n        [[maybe_unused]] const int32_t mn_inline_1_value = mn_temporary_1;\n        mn_temporary_2 = (mn_inline_1_value * 2);\n        goto mn_inline_end_1;\n    }\n    mn_inline_end_1:;\n    {\n        [[maybe_unused]] const int32_t mn_inline_2_value = (value * 5);\n        if ((mn_inline_2_value > 10)) {\n            mn_temporary_3 = 10;\n            goto mn_inline_end_2;\n        }\n        mn_temporary_3 = mn_inline_2_value;\n        goto mn_inline_end_2;\n    }\n    mn_inline_end_2:;\n    const int32_t doubled = (mn_temporary_2 + mn_temporary_3);\n    const mn_main_Box box = (mn_main_Box){ .value = 7 };\n    const mn_array_2_u8 values = (mn_array_2_u8){ .items = { 4u, 5u } };\n    int32_t mn_temporary_4;\n    int32_t mn_temporary_5;\n    int32_t mn_temporary_6;\n    uint8_t mn_temporary_7;\n    int32_t mn_temporary_8;\n    {\n        [[maybe_unused]] const mn_main_Box mn_inline_3_self = box;\n        mn_temporary_4 = mn_inline_3_self.value;\n        goto mn_inline_end_3;\n    }\n    mn_inline_end_3:;\n    {\n        [[maybe_unused]] const int32_t mn_inline_4_value = mn_temporary_4;\n        int32_t mn_temporary_13;\n        int32_t mn_temporary_14;\n        {\n            [[maybe_unused]] const int32_t mn_inline_5_value = mn_inline_4_value;\n            mn_temporary_13 = (mn_inline_5_value * 2);\n            goto mn_inline_end_5;\n        }\n        mn_inline_end_5:;\n        {\n            [[maybe_unused]] const int32_t mn_inline_6_value = mn_temporary_13;\n            mn_temporary_14 = (mn_inline_6_value * 2);\n            goto mn_inline_end_6;\n        }\n        mn_inline_end_6:;\n        mn_temporary_5 = mn_temporary_14;\n        goto mn_inline_end_4;\n    }\n    mn_inline_end_4:;\n    {\n        [[maybe_unused]] int32_t * const mn_inline_7_counter = counter;\n        const int32_t mn_returned = (*mn_inline_7_counter);\n        mn_main_log(mn_inline_7_counter, 100);\n        mn_temporary_6 = mn_returned;\n        goto mn_inline_end_7;\n    }\n    mn_inline_end_7:;\n    {\n        [[maybe_unused]] const mn_slice_u8 mn_inline_8_values = (mn_slice_u8){ .items = (uint8_t *)(&values)->items, .length = 2 };\n        mn_temporary_7 = mn_inline_8_values.items[0u];\n        goto mn_inline_end_8;\n    }\n    mn_inline_end_8:;\n    mn_temporary_8 = ((int32_t)mn_temporary_7);\n    const int32_t total = (((doubled + mn_temporary_5) + mn_temporary_6) + mn_temporary_8);\n    mn_result_main_Failure_i32 mn_temporary_9;\n    int32_t mn_temporary_10;\n    {\n        [[maybe_unused]] int32_t * const mn_inline_9_counter = counter;\n        [[maybe_unused]] const bool mn_inline_9_fail = (total > 100);\n        if (mn_inline_9_fail) {\n            const mn_result_main_Failure_i32 mn_returned = (mn_result_main_Failure_i32){ .error = (mn_main_Failure){ .tag = 1 } };\n            mn_main_log(mn_inline_9_counter, 1000);\n            mn_temporary_9 = mn_returned;\n            goto mn_inline_end_9;\n        }\n        const mn_result_main_Failure_i32 mn_returned = (mn_result_main_Failure_i32){ .error.tag = 0, .value = 1 };\n        mn_temporary_9 = mn_returned;\n        goto mn_inline_end_9;\n    }\n    mn_inline_end_9:;\n    if (mn_temporary_9.error.tag != 0) return (mn_result_main_Failure_i32){ .error = mn_temporary_9.error };\n    mn_temporary_10 = mn_temporary_9.value;\n    const int32_t guard = mn_temporary_10;\n    mn_result_main_Failure_i32 mn_temporary_11;\n    int32_t mn_temporary_12;\n    {\n        [[maybe_unused]] const int32_t mn_inline_10_value = (total + guard);\n        mn_result_main_Failure_i32 mn_temporary_13;\n        int32_t mn_temporary_14;\n        {\n            [[maybe_unused]] const int32_t mn_inline_11_value = mn_inline_10_value;\n            if ((mn_inline_11_value < 0)) {\n                mn_temporary_13 = (mn_result_main_Failure_i32){ .error = (mn_main_Failure){ .tag = 1 } };\n                goto mn_inline_end_11;\n            }\n            mn_temporary_13 = (mn_result_main_Failure_i32){ .error.tag = 0, .value = mn_inline_11_value };\n            goto mn_inline_end_11;\n        }\n        mn_inline_end_11:;\n        if (mn_temporary_13.error.tag != 0) {\n            mn_temporary_11 = (mn_result_main_Failure_i32){ .error = mn_temporary_13.error };\n            goto mn_inline_end_10;\n        }\n        mn_temporary_14 = mn_temporary_13.value;\n        const int32_t result = mn_temporary_14;\n        mn_temporary_11 = (mn_result_main_Failure_i32){ .error.tag = 0, .value = (result + 1) };\n        goto mn_inline_end_10;\n    }\n    mn_inline_end_10:;\n    if (mn_temporary_11.error.tag != 0) return (mn_result_main_Failure_i32){ .error = mn_temporary_11.error };\n    mn_temporary_12 = mn_temporary_11.value;\n    return (mn_result_main_Failure_i32){ .error.tag = 0, .value = mn_temporary_12 };\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateInlinedCall: writes the body in a loop condition and on the right of a short-circuit operator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline fn positive(value: i32) -> bool: return value > 0\nfn count(start: i32, flag: bool) -> i32:\n    var current = start\n    while positive(current): current -= 1\n    if flag and positive(start): return 1\n    return current" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_count(int32_t start, bool flag) {\n    int32_t current = start;\n    bool mn_temporary_1;\n    while (true) {\n        {\n            [[maybe_unused]] const int32_t mn_inline_1_value = current;\n            mn_temporary_1 = (mn_inline_1_value > 0);\n            goto mn_inline_end_1;\n        }\n        mn_inline_end_1:;\n        if (!mn_temporary_1) break;\n        {\n            current = (current - 1);\n        }\n    }\n    bool mn_temporary_2;\n    bool mn_temporary_3;\n    if ((flag)) {\n        {\n            [[maybe_unused]] const int32_t mn_inline_2_value = start;\n            mn_temporary_3 = (mn_inline_2_value > 0);\n            goto mn_inline_end_2;\n        }\n        mn_inline_end_2:;\n        mn_temporary_2 = mn_temporary_3;\n    } else {\n        mn_temporary_2 = flag;\n    }\n    if (mn_temporary_2) {\n        return 1;\n    }\n    return current;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateInlinedCall: writes the body of inline instance functions and inline default implementations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T):\n    fn show(value: T) -> i32\n    inline fn twice(value: T) -> i32: return Show::show(value) * 2\nstruct Card:\n    rank: i32\ninstance Show(Card):\n    inline fn show(card: Card) -> i32: return card.rank\ninstance Show(i32):\n    fn show(value: i32) -> i32: return value\n    inline fn twice(value: i32) -> i32: return value * 4\nfn run(card: Card) -> i32:\n    return Show::show(card) + card.show() + Show::twice(card) + Show::twice(3i32) + Show::show(5i32)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_Card {\n    int32_t rank;\n} mn_main_Card;\n\nint32_t mn_main_i32_Show_show(int32_t value);\nint32_t mn_main_run(mn_main_Card card);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nint32_t mn_main_i32_Show_show(int32_t value) {\n    return value;\n}\n\nint32_t mn_main_run(mn_main_Card card) {\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    int32_t mn_temporary_3;\n    int32_t mn_temporary_4;\n    int32_t mn_temporary_5;\n    {\n        [[maybe_unused]] const mn_main_Card mn_inline_1_card = card;\n        mn_temporary_1 = mn_inline_1_card.rank;\n        goto mn_inline_end_1;\n    }\n    mn_inline_end_1:;\n    {\n        [[maybe_unused]] const mn_main_Card mn_inline_2_card = card;\n        mn_temporary_2 = mn_inline_2_card.rank;\n        goto mn_inline_end_2;\n    }\n    mn_inline_end_2:;\n    {\n        [[maybe_unused]] const mn_main_Card mn_inline_3_value = card;\n        int32_t mn_temporary_6;\n        {\n            [[maybe_unused]] const mn_main_Card mn_inline_4_card = mn_inline_3_value;\n            mn_temporary_6 = mn_inline_4_card.rank;\n            goto mn_inline_end_4;\n        }\n        mn_inline_end_4:;\n        mn_temporary_3 = (mn_temporary_6 * 2);\n        goto mn_inline_end_3;\n    }\n    mn_inline_end_3:;\n    {\n        [[maybe_unused]] const int32_t mn_inline_5_value = 3;\n        mn_temporary_4 = (mn_inline_5_value * 4);\n        goto mn_inline_end_5;\n    }\n    mn_inline_end_5:;\n    mn_temporary_5 = mn_main_i32_Show_show(5);\n    return ((((mn_temporary_1 + mn_temporary_2) + mn_temporary_3) + mn_temporary_4) + mn_temporary_5);\n}\n",
         files[1].contents,
     );
 }
@@ -17076,7 +17341,7 @@ test "integration: checks a run-time condition that calls a function with a type
     );
     var loader = @import("monolith").Loader.init(program_path, ".");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "cards.mn", .data = "struct Card:\n    question: []const u8\n    answer:   []const u8\n\nconst cards: [_]Card = {\n    { question = \"Question 1\", answer = \"Answer 1\" },\n    { question = \"Question 2\", answer = \"Answer 2\" },\n}\n" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io::stdout\nimport mn::io::stdin\nimport mn::memory\n\nimport cards::cards\n\n\nfn main():\n    var input_buffer: [4096]u8 = undefined\n    var byte_count: usize = 0\n    var card_index: usize = 0\n\n    while card_index < cards.length:\n        stdout::println(cards[card_index].question, {})\n        byte_count = stdin::read(&input_buffer)\n        if byte_count == 0: break\n\n        stdout::println(cards[card_index].answer, {})\n        byte_count = stdin::read(&input_buffer)\n        if byte_count == 0: break\n\n        if memory::equal(input_buffer[..byte_count], \"y\\n\"):\n           card_index += 1\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io::stdout\nimport mn::io::stdin\nimport mn::memory\nimport mn::text\n\nimport cards::cards\n\n\nfn main():\n    var input_buffer: [4096]u8 = undefined\n    var byte_count: usize = 0\n    var card_index: usize = 0\n\n    while card_index < cards.length:\n        stdout::println(cards[card_index].question, {})\n        byte_count = stdin::read(&input_buffer)\n        if byte_count == 0: break\n\n        stdout::println(cards[card_index].answer, {})\n        byte_count = stdin::read(&input_buffer)\n        if byte_count == 0: break\n\n        if memory::equal(text::strip(input_buffer[..byte_count]), \"y\"):\n           card_index += 1\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -17084,11 +17349,11 @@ test "integration: checks a run-time condition that calls a function with a type
     var generator = Generator.init(program);
     const files = try generator.generateFiles(arena.allocator());
 
-    try std.testing.expectEqual(11, files.len);
+    try std.testing.expectEqual(13, files.len);
     var main_file: []const u8 = "";
     for (files) |file| {
         if (std.mem.eql(u8, file.path, "main.c")) main_file = file.contents;
     }
     try std.testing.expect(std.mem.indexOf(u8, main_file, "while ((card_index < 2u)) {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, main_file, "if (mn_mn_memory_equal((mn_slice_u8){ .items = input_buffer.items, .length = byte_count }, (mn_slice_u8){ .items = (uint8_t *)\"y\\n\", .length = 2 })) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, main_file, "if (mn_mn_memory_equal(mn_mn_text_strip((mn_slice_u8){ .items = input_buffer.items, .length = byte_count }), (mn_slice_u8){ .items = (uint8_t *)\"y\", .length = 1 })) {") != null);
 }

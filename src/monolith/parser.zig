@@ -111,6 +111,7 @@ pub const Parser = struct {
         var position = offset.*;
         _ = self.match(&position, .keyword_external) orelse return null;
         if (self.tokens[position].kind == .keyword_struct) return null;
+        if (self.tokens[position].kind == .keyword_inline) return self.fail(position, error.InlineExternal);
         const signature = (try self.parseFunctionSignature(allocator, &position, null)) orelse {
             return self.fail(position, error.ExpectedFunctionKeyword);
         };
@@ -130,9 +131,13 @@ pub const Parser = struct {
         depth: usize,
     ) ParseError!?ast.FunctionDefinition {
         var position = offset.*;
-        const signature = (try self.parseFunctionSignature(allocator, &position, receiver)) orelse {
+        const inlined = self.match(&position, .keyword_inline) != null;
+        if (inlined and self.tokens[position].kind == .keyword_external) return self.fail(position, error.InlineExternal);
+        var signature = (try self.parseFunctionSignature(allocator, &position, receiver)) orelse {
+            if (inlined) return self.fail(position, error.ExpectedFunctionKeyword);
             return null;
         };
+        signature.@"inline" = inlined;
         _ = try self.expect(&position, .colon, error.ExpectedColon);
         const body = try self.parseBlock(allocator, &position, depth);
 
@@ -1034,13 +1039,17 @@ pub const Parser = struct {
         if (self.match(&position, .colon) != null) {
             const depth = try self.expectBlock(position, 0);
             while (try self.matchBlockLine(&position, depth, 0)) {
+                const start = position;
+                const inlined = self.match(&position, .keyword_inline) != null;
                 const parsed = try self.parseFunctionSignature(allocator, &position, null);
                 var signature = parsed orelse {
                     return self.fail(position, error.ExpectedFunctionKeyword);
                 };
                 signature.self_parameter = findTypeclassSelfParameter(signature, parameters.items);
+                signature.@"inline" = inlined;
                 try functions.append(allocator, signature);
                 if (self.match(&position, .colon) == null) {
+                    if (inlined) return self.fail(start, error.InlineSignature);
                     try defaults.append(allocator, null);
                     continue;
                 }
@@ -1999,6 +2008,8 @@ pub const ParseError = error{
     NamedCases,
     LabelWithoutSigil,
     MisplacedAny,
+    InlineExternal,
+    InlineSignature,
     RangeOperand,
     DiscardedValueName,
     ExpectedDeferredStatement,
@@ -2142,6 +2153,8 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.NamedCases => "a branch with several cases cannot name a value",
         error.LabelWithoutSigil => "a label is written '@' and a name, e.g. '@outer while'",
         error.MisplacedAny => "'any' can only be the type of a parameter",
+        error.InlineExternal => "an external function cannot be inline",
+        error.InlineSignature => "a typeclass function without a body cannot be inline",
         error.RangeOperand => "a range cannot be an operand",
         error.DiscardedValueName => "'as' needs a name, leave it out to leave the value without a name",
         error.ExpectedDeferredStatement => "expected a call, an assignment or a discard",
@@ -2262,6 +2275,41 @@ test "parseFunctionDefinition: parses an indented body" {
     try std.testing.expectEqual(1, module.declarations[0].kind.function_definition.body.len);
     try std.testing.expect(module.declarations[0].kind.function_definition.body[0].kind == .noop);
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, module.declarations[0].kind.function_definition.body[0].location);
+}
+
+test "parseFunctionDefinition: parses an inline function at the top level and in a struct" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("inline fn double(value: i32) -> i32: return value * 2\nfn plain(): noop\nstruct Box:\n    value: i32\n    inline fn get(self: Self) -> i32: return self.value");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    try std.testing.expect(module.declarations[0].kind.function_definition.signature.@"inline");
+    try std.testing.expect(!module.declarations[1].kind.function_definition.signature.@"inline");
+    try std.testing.expect(module.declarations[3].kind.function_definition.signature.@"inline");
+}
+
+test "parseFunctionDefinition: rejects an inline external function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("inline external fn write()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.InlineExternal, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 8 }, parser.failure.?.location.?);
+}
+
+test "parseFunctionDeclaration: rejects an external inline function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("external inline fn write()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.InlineExternal, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 10 }, parser.failure.?.location.?);
 }
 
 test "parseFunctionDefinition: parses an inline body" {
@@ -4205,6 +4253,31 @@ test "parseTypeclassDefinition: parses a function with a body as a default" {
     try std.testing.expectEqualStrings("double", default.template.signature.name);
 }
 
+test "parseTypeclassDefinition: parses an inline default implementation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Show(type T):\n    fn show(value: T) -> i32\n    inline fn twice(value: T) -> i32: return 2");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const definition = module.declarations[0].kind.typeclass_definition;
+    try std.testing.expect(!definition.functions[0].@"inline");
+    try std.testing.expect(definition.functions[1].@"inline");
+    try std.testing.expect(definition.defaults[1].?.template.signature.@"inline");
+}
+
+test "parseTypeclassDefinition: rejects an inline function without a body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Show(type T):\n    inline fn show(value: T) -> i32");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.InlineSignature, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, parser.failure.?.location.?);
+}
+
 test "parseInstance: lists the functions of an instance as declarations" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4220,6 +4293,17 @@ test "parseInstance: lists the functions of an instance as declarations" {
     const signature = module.declarations[1].kind.function_definition.signature;
     try std.testing.expectEqualStrings("Shape", signature.typeclass.?.kind.identifier.name);
     try std.testing.expectEqual(null, signature.receiver);
+}
+
+test "parseInstance: parses an inline function in an instance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Show(type T):\n    fn show(value: T) -> i32\ninstance Show(i32):\n    inline fn show(value: i32) -> i32: return value");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    try std.testing.expect(module.declarations[2].kind.function_definition.signature.@"inline");
 }
 
 test "parseInstance: parses the typeclass and the type in parentheses" {

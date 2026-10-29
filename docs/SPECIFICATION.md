@@ -22,7 +22,7 @@
 - Identifiers are case-sensitive. By convention only types and type constructors start with a capital letter.
 - The single character `_` is reserved and cannot be used as an identifier by the user.
 - The following identifier names are reserved and cannot be used as identifiers by the user:
-    `and`, `any`, `as`, `break`, `case`, `catch`, `comptime`, `const`, `continue`, `defer`, `else`, `enum`, `errdefer`, `error`, `external`, `false`, `fn`, `for`, `if`, `import`, `in`, `instance`, `many`, `match`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `true`, `try`, `typeclass`, `undefined`, `var`, `void`, `while`
+    `and`, `any`, `as`, `break`, `case`, `catch`, `comptime`, `const`, `continue`, `defer`, `else`, `enum`, `errdefer`, `error`, `external`, `false`, `fn`, `for`, `if`, `import`, `in`, `inline`, `instance`, `many`, `match`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `true`, `try`, `typeclass`, `undefined`, `var`, `void`, `while`
 - A reserved name can be the name of a function, struct, enum or error set, and a name after `::`, e.g. `fn match(pattern: []const u8) -> bool` called as `parser::match(pattern)`. Elsewhere it is reached through a path.
 
 ## Built-In Types
@@ -424,7 +424,9 @@
 - `&name` gives a pointer to a function, e.g. to pass it as an argument. A pointer to a function is called like a function.
 - `external fn` declares a function defined outside the program, without a body, e.g. `external fn write(text: []const u8)`.
 - A struct in an external function's parameters or return type, directly or through pointers or arrays, must be an external struct.
-- `main` has no parameters and either no return type or a result without a value, e.g. `ParseError!void`. It cannot be called, used as a value or be external.
+- `inline fn` declares a function whose every call is replaced by its body, e.g. `inline fn is_answer(input: []const u8) -> bool`. It is called like any other function and behaves the same.
+- An inline function that calls itself, directly or through other functions, is a compile-time error. Using one as a value is a compile-time error, e.g. `&is_answer`. An external function cannot be inline.
+- `main` has no parameters and either no return type or a result without a value, e.g. `ParseError!void`. It cannot be called, used as a value, be external or be inline.
 - An error that ends `main` writes the case's name to the standard error stream and ends the program with a nonzero status.
 
 ## Errors

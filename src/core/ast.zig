@@ -80,6 +80,7 @@ pub const FunctionSignature = struct {
     return_type: Expression,
     self_parameter: SelfParameter = .none,
     progress: Progress = .pending,
+    @"inline": bool = false,
 };
 
 pub const SelfParameter = enum {
@@ -366,6 +367,7 @@ pub const Call = struct {
     callee: Name,
     arguments: []Argument,
     typeclass_arguments: []const types.Argument = &.{},
+    @"inline": bool = false,
 };
 
 pub const Name = union(enum) {
@@ -1151,6 +1153,7 @@ fn cloneFunctionSignature(
         .parameters = parameters,
         .return_type = try cloneExpression(allocator, signature.return_type),
         .self_parameter = signature.self_parameter,
+        .@"inline" = signature.@"inline",
     };
 }
 

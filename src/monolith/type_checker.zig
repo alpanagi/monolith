@@ -105,6 +105,51 @@ pub const TypeChecker = struct {
         while (created_index < self.created.items.len) : (created_index += 1) {
             try self.prepareFunction(self.created.items[created_index]);
         }
+        try self.checkInlineRecursion();
+    }
+
+    fn checkInlineRecursion(self: *TypeChecker) TypeError!void {
+        const allocator = self.arena.allocator();
+        for (self.program.modules, 0..) |module, module_index| {
+            for (0..module.declarations.len + module.instances.items.len) |declaration_index| {
+                const declaration = ast.findDeclaration(module, declaration_index);
+                if (declaration.kind != .function_definition) continue;
+                const definition = &declaration.kind.function_definition;
+                if (!definition.signature.@"inline" or definition.check_progress != .done) continue;
+                const start: ast.Resolution.Function = .{ .module = module_index, .declaration = declaration_index };
+                var calls: std.ArrayList(FunctionCall) = .empty;
+                try appendBlockCalls(allocator, &calls, definition.body);
+                for (calls.items) |call| {
+                    var visited: std.ArrayList(ast.Resolution.Function) = .empty;
+                    if (!std.meta.eql(call.function, start) and !try self.reachesFunction(&visited, call.function, start)) continue;
+                    self.module_index = module_index;
+                    self.current_function = start;
+                    return self.fail(call.location, error.InlineRecursion);
+                }
+            }
+        }
+    }
+
+    fn reachesFunction(
+        self: *TypeChecker,
+        visited: *std.ArrayList(ast.Resolution.Function),
+        from: ast.Resolution.Function,
+        target: ast.Resolution.Function,
+    ) std.mem.Allocator.Error!bool {
+        for (visited.items) |earlier| {
+            if (std.meta.eql(earlier, from)) return false;
+        }
+        const allocator = self.arena.allocator();
+        try visited.append(allocator, from);
+        const declaration = ast.findDeclaration(self.program.modules[from.module], from.declaration);
+        if (declaration.kind != .function_definition) return false;
+        var calls: std.ArrayList(FunctionCall) = .empty;
+        try appendBlockCalls(allocator, &calls, declaration.kind.function_definition.body);
+        for (calls.items) |call| {
+            if (std.meta.eql(call.function, target)) return true;
+            if (try self.reachesFunction(visited, call.function, target)) return true;
+        }
+        return false;
     }
 
     pub fn findCreatingCall(self: *const TypeChecker, function: ast.Resolution.Function) ?InstanceCall {
@@ -127,6 +172,10 @@ pub const TypeChecker = struct {
                 return self.fail(declaration.location, error.DependencyLoop);
             },
             .pending => {},
+        }
+        if (definition.signature.@"inline" and ast.isMain(definition.signature)) {
+            self.module_index = function.module;
+            return self.fail(declaration.location, error.InlineMain);
         }
         if (self.resolver) |resolver| try resolver.resolve(resolver.context, function);
         definition.check_progress = .running;
@@ -1781,6 +1830,7 @@ pub const TypeChecker = struct {
             const parameter_type = try self.substituteTypeclass(ast.extractType(parameter.type), call.typeclass_arguments);
             try self.checkExpression(parameters, &argument.value, parameter_type);
         }
+        expression.kind.call.@"inline" = callee.@"inline" and ast.extractResolution(call.callee) == .function;
         return self.substituteTypeclass(ast.extractType(callee.return_type), call.typeclass_arguments);
     }
 
@@ -2367,6 +2417,9 @@ pub const TypeChecker = struct {
         const operand = expression.kind.address_of;
         if (function == .function and ast.isGeneric(self.extractSignature(function))) {
             return self.fail(operand.location, error.GenericValue);
+        }
+        if (function == .function and self.extractSignature(function).@"inline") {
+            return self.fail(operand.location, error.InlineValue);
         }
         operand.type = try self.computeFunctionType(function);
         const pointer = try self.program.types.addPointer(self.arena.allocator(), .{
@@ -2963,6 +3016,9 @@ pub const CheckError = error{
     CastRemovesConstant,
     ComptimeError,
     ComptimeErrorAsValue,
+    InlineMain,
+    InlineValue,
+    InlineRecursion,
     UnknownMethod,
     AmbiguousMethod,
     NoSelf,
@@ -3070,6 +3126,9 @@ fn describeError(check_error: CheckError) []const u8 {
         error.ExpectedManyPointer => "expected a multiple value pointer",
         error.CastRemovesConstant => "a cast cannot remove const",
         error.ComptimeError => "compile-time error",
+        error.InlineMain => "main cannot be inline",
+        error.InlineValue => "an inline function cannot be used as a value",
+        error.InlineRecursion => "an inline function cannot call itself, directly or through other functions",
         error.ComptimeErrorAsValue => "mn::comptime::error can only be used as a statement",
         error.UnknownMethod => "unknown method",
         error.AmbiguousMethod => "method is found in more than one place",
@@ -3173,6 +3232,11 @@ pub const Resolver = struct {
 pub const Bound = struct {
     type: types.Type,
     value: Value,
+};
+
+const FunctionCall = struct {
+    function: ast.Resolution.Function,
+    location: token.Location,
 };
 
 const Instance = struct {
@@ -3597,6 +3661,102 @@ fn isBoundName(bindings: []const ast.Binding, name: []const u8, resolution: ?ast
         if (std.mem.eql(u8, binding.name, name)) return true;
     }
     return false;
+}
+
+fn appendBlockCalls(
+    allocator: std.mem.Allocator,
+    calls: *std.ArrayList(FunctionCall),
+    statements: []const ast.Statement,
+) std.mem.Allocator.Error!void {
+    for (statements) |statement| {
+        switch (statement.kind) {
+            .@"return" => |value| if (value) |returned| try appendExpressionCalls(allocator, calls, returned),
+            .discard, .call => |expression| try appendExpressionCalls(allocator, calls, expression),
+            .constant_declaration => |constant| try appendExpressionCalls(allocator, calls, constant.value),
+            .variable_declaration => |variable| try appendExpressionCalls(allocator, calls, variable.value),
+            .tuple_declaration => |declaration| try appendExpressionCalls(allocator, calls, declaration.value),
+            .assignment => |assignment| {
+                try appendExpressionCalls(allocator, calls, assignment.target);
+                try appendExpressionCalls(allocator, calls, assignment.value);
+            },
+            .@"if" => |conditional| try appendExpressionCalls(allocator, calls, conditional.condition),
+            .@"while" => |loop| try appendExpressionCalls(allocator, calls, loop.condition),
+            .@"for" => |loop| switch (loop.sequence) {
+                .value => |value| try appendExpressionCalls(allocator, calls, value),
+                .range => |range| {
+                    try appendExpressionCalls(allocator, calls, range.start);
+                    if (range.end) |end| try appendExpressionCalls(allocator, calls, end);
+                },
+            },
+            .match => |matching| try appendExpressionCalls(allocator, calls, matching.value),
+            .@"defer" => |deferred| try appendBlockCalls(allocator, calls, deferred.statement[0..1]),
+            .noop, .@"break", .@"continue" => {},
+        }
+        var blocks = ast.iterateBlocks(statement);
+        while (blocks.next()) |block| try appendBlockCalls(allocator, calls, block);
+    }
+}
+
+fn appendExpressionCalls(
+    allocator: std.mem.Allocator,
+    calls: *std.ArrayList(FunctionCall),
+    expression: ast.Expression,
+) std.mem.Allocator.Error!void {
+    switch (expression.kind) {
+        .call => |call| {
+            const resolution: ?ast.Resolution = switch (call.callee) {
+                inline else => |name| name.resolution,
+            };
+            if (resolution) |resolved| {
+                if (resolved == .function) try calls.append(allocator, .{ .function = resolved.function, .location = expression.location });
+            }
+            for (call.arguments) |argument| try appendExpressionCalls(allocator, calls, argument.value);
+        },
+        .method_call => |call| {
+            try appendExpressionCalls(allocator, calls, call.receiver.*);
+            for (call.arguments) |argument| try appendExpressionCalls(allocator, calls, argument.value);
+        },
+        .composite_literal => |literal| {
+            for (literal.elements) |element| try appendExpressionCalls(allocator, calls, element.value);
+        },
+        .binary => |binary| {
+            try appendExpressionCalls(allocator, calls, binary.left.*);
+            try appendExpressionCalls(allocator, calls, binary.right.*);
+        },
+        .unary => |unary| try appendExpressionCalls(allocator, calls, unary.operand.*),
+        .negation, .address_of, .dereference, .unwrap, .@"try" => |operand| try appendExpressionCalls(allocator, calls, operand.*),
+        .index => |indexing| {
+            try appendExpressionCalls(allocator, calls, indexing.value.*);
+            try appendExpressionCalls(allocator, calls, indexing.index.*);
+        },
+        .slice => |slice| {
+            try appendExpressionCalls(allocator, calls, slice.value.*);
+            if (slice.start) |start| try appendExpressionCalls(allocator, calls, start.*);
+            if (slice.end) |end| try appendExpressionCalls(allocator, calls, end.*);
+        },
+        .field_access => |access| try appendExpressionCalls(allocator, calls, access.value.*),
+        .range => |range| {
+            try appendExpressionCalls(allocator, calls, range.start);
+            if (range.end) |end| try appendExpressionCalls(allocator, calls, end);
+        },
+        .integer_literal,
+        .float_literal,
+        .boolean_literal,
+        .string_literal,
+        .undefined,
+        .null,
+        .identifier,
+        .path_expression,
+        .member,
+        .array_type,
+        .slice_type,
+        .pointer_type,
+        .optional_type,
+        .tuple_type,
+        .function_type,
+        .struct_type,
+        => {},
+    }
 }
 
 fn containsCall(expression: ast.Expression) bool {
@@ -4336,6 +4496,196 @@ test "checkFunction: rejects a parameter that holds a type" {
 
     try std.testing.expectError(error.TypeParameter, analyzer.analyze());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 9 }, analyzer.failure.?.location.?);
+}
+
+test "prepareFunction: rejects an inline main" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline fn main(): noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InlineMain, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, analyzer.failure.?.location.?);
+}
+
+test "checkFunctionAddress: rejects the address of an inline function passed as an argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline fn one() -> i32: return 1\nfn take(function: *fn() -> i32) -> i32: return function()\nfn main(): _ = take(&one)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InlineValue, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 22 }, analyzer.failure.?.location.?);
+}
+
+test "checkFunctionAddress: rejects storing the address of an inline function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline fn one() -> i32: return 1\nfn main():\n    const stored = &one\n    _ = stored()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InlineValue, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 21 }, analyzer.failure.?.location.?);
+}
+
+test "checkInlineRecursion: rejects an inline function that calls itself" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline fn loop(count: i32) -> i32:\n    if count == 0: return 0\n    return loop(count - 1)\nfn main(): _ = loop(3)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InlineRecursion, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 12 }, analyzer.failure.?.location.?);
+}
+
+test "checkInlineRecursion: rejects an inline function that calls itself through another inline function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline fn ping(count: i32) -> i32: return pong(count)\ninline fn pong(count: i32) -> i32: return ping(count)\nfn main(): _ = ping(1)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InlineRecursion, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 43 }, analyzer.failure.?.location.?);
+}
+
+test "checkInlineRecursion: rejects an inline function that calls itself through a function that is not inline" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline fn ping(count: i32) -> i32: return pong(count)\nfn pong(count: i32) -> i32: return ping(count)\nfn main(): _ = ping(1)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InlineRecursion, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 43 }, analyzer.failure.?.location.?);
+}
+
+test "checkInlineRecursion: accepts recursion that does not reach an inline function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline fn double(value: i32) -> i32: return value * 2\nfn down(count: i32) -> i32:\n    if count == 0: return double(1)\n    return down(count - 1)\nfn main(): _ = down(3)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expect(loader.modules.items[0].declarations[0].kind.function_definition.signature.@"inline");
+}
+
+test "expectNotInline: rejects a top-level constant that names an inline function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline fn double(value: i32) -> i32: return value * 2\nconst twice = double\nfn main(): _ = twice(1)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InlineValue, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 15 }, analyzer.failure.?.location.?);
+}
+
+test "expectNotInline: rejects a local constant that names an inline function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline fn double(value: i32) -> i32: return value * 2\nfn main():\n    const twice = double\n    _ = twice(1)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InlineValue, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 19 }, analyzer.failure.?.location.?);
+}
+
+test "checkInlineRecursion: rejects an inline instance function that calls itself through its typeclass" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Loop(type T):\n    fn step(value: T) -> i32\ninstance Loop(i32):\n    inline fn step(value: i32) -> i32: return Loop::step(value)\nfn main(): _ = Loop::step(1i32)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InlineRecursion, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 47 }, analyzer.failure.?.location.?);
 }
 
 test "check: leaves out a function with compile-time parameters that is never called" {

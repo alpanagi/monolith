@@ -1,0 +1,5 @@
+fn strip(bytes: []const u8) -> []const u8:
+    const length = bytes.length
+    if length >= 2 and bytes[length - 2] == '\r' and bytes[length - 1] == '\n': return bytes[..length - 2]
+    if length >= 1 and bytes[length - 1] == '\n': return bytes[..length - 1]
+    return bytes
