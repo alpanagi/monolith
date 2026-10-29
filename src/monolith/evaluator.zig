@@ -3320,6 +3320,31 @@ test "executeWhile: rejects a loop that does not end" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, analyzer.failure.?.location.?);
 }
 
+test "executeFor: compares slices with mn::memory::equal at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nconst BUFFER: [4]u8 = {'y', 'e', 's', '\\n'}\nconst ONE: [3]i32 = {1, 2, 3}\nconst TWO: [3]i32 = {1, 2, 3}\nconst THREE: [3]i32 = {1, 2, 4}\nconst LITERAL = memory::equal(u8, &BUFFER, \"yes\\n\")\nconst UNEQUAL = memory::equal(u8, \"yes\", \"yet\")\nconst SHORTER = memory::equal(u8, \"ye\", \"yes\")\nconst EMPTY = memory::equal(u8, \"\", \"\")\nconst ARRAYS = memory::equal(i32, &ONE, &TWO)\nconst DIFFERENT = memory::equal(i32, &ONE, &THREE)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expect(declarations[5].kind.constant_declaration.known.?.boolean == true);
+    try std.testing.expect(declarations[6].kind.constant_declaration.known.?.boolean == false);
+    try std.testing.expect(declarations[7].kind.constant_declaration.known.?.boolean == false);
+    try std.testing.expect(declarations[8].kind.constant_declaration.known.?.boolean == true);
+    try std.testing.expect(declarations[9].kind.constant_declaration.known.?.boolean == true);
+    try std.testing.expect(declarations[10].kind.constant_declaration.known.?.boolean == false);
+}
+
 test "executeFor: writes each element through a pointer name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

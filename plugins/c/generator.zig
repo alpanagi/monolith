@@ -11291,6 +11291,51 @@ test "generateUnrolled: writes the block of a loop over a tuple once for each el
     );
 }
 
+test "generateFunction: compares slices through mn::memory::equal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn same(buffer: []const u8, length: usize) -> bool: return memory::equal(u8, buffer[0..length], \"yes\\n\")\nfn arrays(one: [3]i32, two: [3]i32) -> bool: return memory::equal(i32, &one, &two)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqual(6, files.len);
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_slice_u8 mn_slice_u8;\ntypedef struct mn_array_3_i32 mn_array_3_i32;\n\nbool mn_main_same(mn_slice_u8 buffer, size_t length);\nbool mn_main_arrays(mn_array_3_i32 one, mn_array_3_i32 two);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n#include \"mn/memory.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\n#ifndef mn_array_3_i32_defined\n#define mn_array_3_i32_defined\ntypedef struct mn_array_3_i32 {\n    int32_t items[3];\n} mn_array_3_i32;\n#endif\n\nbool mn_main_same(mn_slice_u8 buffer, size_t length) {\n    return mn_mn_memory_equal_1((mn_slice_u8){ .items = buffer.items + 0u, .length = length - 0u }, (mn_slice_u8){ .items = (uint8_t *)\"yes\\n\", .length = 4 });\n}\n\nbool mn_main_arrays(mn_array_3_i32 one, mn_array_3_i32 two) {\n    return mn_mn_memory_equal_2((mn_slice_i32){ .items = (int32_t *)(&one)->items, .length = 3 }, (mn_slice_i32){ .items = (int32_t *)(&two)->items, .length = 3 });\n}\n",
+        files[1].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\ntypedef struct mn_mn_Range {\n    size_t start;\n    mn_optional_usize end;\n} mn_mn_Range;\n\ntypedef struct mn_optional_tuple_1_usize mn_optional_tuple_1_usize;\n\nmn_optional_tuple_1_usize mn_mn_Range_Iterator_next(struct mn_mn_Range * iterator);\n",
+        files[2].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"mn.h\"\n\n#ifndef mn_tuple_1_usize_defined\n#define mn_tuple_1_usize_defined\ntypedef struct mn_tuple_1_usize {\n    size_t _0;\n} mn_tuple_1_usize;\n#endif\n\n#ifndef mn_optional_tuple_1_usize_defined\n#define mn_optional_tuple_1_usize_defined\ntypedef struct mn_optional_tuple_1_usize {\n    mn_tuple_1_usize value;\n    bool present;\n} mn_optional_tuple_1_usize;\n#endif\n\nmn_optional_tuple_1_usize mn_mn_Range_Iterator_next(struct mn_mn_Range * iterator) {\n    if (((iterator->end.present) && (iterator->start >= iterator->end.value))) {\n        return (mn_optional_tuple_1_usize){ .present = false };\n    }\n    const size_t value = iterator->start;\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &iterator->start, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n    return (mn_optional_tuple_1_usize){ .value = (mn_tuple_1_usize){ ._0 = value }, .present = true };\n}\n",
+        files[3].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\ntypedef struct mn_slice_u8 mn_slice_u8;\ntypedef struct mn_slice_i32 mn_slice_i32;\n\nbool mn_mn_memory_equal_1(mn_slice_u8 one, mn_slice_u8 two);\nbool mn_mn_memory_equal_2(mn_slice_i32 one, mn_slice_i32 two);\n",
+        files[4].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"memory.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nbool mn_mn_memory_equal_1(mn_slice_u8 one, mn_slice_u8 two) {\n    if ((one.length != two.length)) {\n        return false;\n    }\n    const size_t mn_end_1 = one.length;\n    for (size_t mn_index_1 = 0; mn_index_1 < mn_end_1; mn_index_1 += 1) {\n        const size_t index = mn_index_1;\n        if ((one.items[index] != two.items[index])) {\n            return false;\n        }\n    }\n    return true;\n}\n\nbool mn_mn_memory_equal_2(mn_slice_i32 one, mn_slice_i32 two) {\n    if ((one.length != two.length)) {\n        return false;\n    }\n    const size_t mn_end_1 = one.length;\n    for (size_t mn_index_1 = 0; mn_index_1 < mn_end_1; mn_index_1 += 1) {\n        const size_t index = mn_index_1;\n        if ((one.items[index] != two.items[index])) {\n            return false;\n        }\n    }\n    return true;\n}\n",
+        files[5].contents,
+    );
+}
+
 test "generateIteration: copies the iterator and calls next until it gives null" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

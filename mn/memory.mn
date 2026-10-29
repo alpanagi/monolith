@@ -1,0 +1,5 @@
+fn equal(type T, one: []const T, two: []const T) -> bool:
+    if one.length != two.length: return false
+    for index in 0..one.length:
+        if one[index] != two[index]: return false
+    return true
