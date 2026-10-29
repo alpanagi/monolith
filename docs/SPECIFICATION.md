@@ -480,6 +480,7 @@
 - A typeclass's function whose first parameter's type is a parameter of the typeclass, or a pointer to one, can also be called as a method, e.g. `card.show(output)` (see Structs).
 - A function in a struct's block shadows a typeclass's function with the same name. A method that a type gets from two typeclasses cannot be called as `value.name()`.
 - A parameter whose type is a typeclass with one parameter takes a value of any type with an instance, e.g. `fn report(value: Show)` called as `report(card)`. Each different type gets its own instance of the function.
+- A parameter whose type is a pointer to such a typeclass, `*Class` or `*const Class`, takes a pointer to a value of any type with an instance, e.g. `fn allocate(allocator: *Allocator, type T, count: usize)` called as `allocate(&system, Card, 10)`. Each different type gets its own instance of the function.
 - A `type` parameter can require instances, e.g. `fn parse(type T: Parse, text: []const u8) -> T`.
 - A function with such parameters is checked once, before any instance, and can use them only through the functions of the typeclasses they require.
 

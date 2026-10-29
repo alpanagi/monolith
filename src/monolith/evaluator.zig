@@ -164,7 +164,10 @@ pub const Evaluator = struct {
             .field_access => |access| self.isKnownWith(access.value.*, calls),
             .call => |call| {
                 if (!calls) return false;
-                const resolution = ast.extractResolution(call.callee);
+                const callee_resolution = switch (call.callee) {
+                    inline else => |name| name.resolution,
+                };
+                const resolution = callee_resolution orelse return false;
                 if (resolution != .function and !self.isKnownResolution(resolution, calls)) return false;
                 return self.areKnown(call.arguments, calls);
             },

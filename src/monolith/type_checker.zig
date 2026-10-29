@@ -103,7 +103,14 @@ pub const TypeChecker = struct {
         }
         var created_index: usize = 0;
         while (created_index < self.created.items.len) : (created_index += 1) {
-            try self.prepareFunction(self.created.items[created_index]);
+            const function = self.created.items[created_index];
+            const declaration = ast.findDeclaration(self.program.modules[function.module], function.declaration);
+            if (!ast.isGeneric(declaration.kind.function_definition.signature)) {
+                try self.prepareFunction(function);
+                continue;
+            }
+            const resolver = self.resolver orelse continue;
+            try self.prepareFunction(try resolver.createCheckCopy(resolver.context, function));
         }
         try self.checkInlineRecursion();
     }
@@ -1984,8 +1991,8 @@ pub const TypeChecker = struct {
                 },
                 .implicit => {
                     const argument_type = try self.inferType(parameters, &argument.value);
-                    try self.expectInstance(argument.location, parameter.constraint.?, argument_type);
-                    try bounds.append(allocator, .{ .type = .type, .value = .{ .type = argument_type } });
+                    const bound = try self.checkImplicitArgument(argument, parameter, argument_type);
+                    try bounds.append(allocator, .{ .type = .type, .value = .{ .type = bound } });
                     try arguments.append(allocator, argument.*);
                     continue;
                 },
@@ -2007,6 +2014,25 @@ pub const TypeChecker = struct {
             inline else => |*name| name.resolution = .{ .function = instance },
         }
         call.arguments = arguments.items;
+    }
+
+    fn checkImplicitArgument(
+        self: *TypeChecker,
+        argument: *const ast.Argument,
+        parameter: ast.TypedName,
+        argument_type: types.Type,
+    ) TypeError!types.Type {
+        if (parameter.type.kind != .pointer_type) {
+            try self.expectInstance(argument.location, parameter.constraint.?, argument_type);
+            return argument_type;
+        }
+        const constant = parameter.type.kind.pointer_type.constant;
+        if (argument_type != .pointer or argument_type.pointer.many) return self.fail(argument.location, error.TypeMismatch);
+        if (argument_type.pointer.constant and !constant) return self.fail(argument.location, error.TypeMismatch);
+        const target = argument_type.pointer.target;
+        try self.expectInstance(argument.location, parameter.constraint.?, target);
+        const pointer = try self.program.types.addPointer(self.arena.allocator(), .{ .target = target, .many = false, .constant = constant });
+        return .{ .pointer = pointer };
     }
 
     fn findInstance(
@@ -4403,6 +4429,44 @@ test "TypeChecker.check: sets the type of calls, arguments and names" {
     const call = loader.modules.items[0].declarations[1].kind.function_definition.body[0].kind.discard;
     try std.testing.expectEqual(types.Type{ .number = .i32 }, call.type);
     try std.testing.expectEqual(types.Type{ .number = .i32 }, call.kind.call.arguments[0].value.type);
+}
+
+test "TypeChecker.check: checks a method with an any parameter in a struct that a type constructor gives" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Counter(type T) -> type:\n    return struct:\n        count: usize\n        fn add(self: *Self, value: any, item: T) -> usize:\n            _ = value\n            _ = item\n            self.count += 1\n            return self.count\nfn run() -> usize:\n    var counter = Counter(i32){count = 0}\n    _ = counter.add(5u8, 1)\n    return counter.add(true, 2)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(null, analyzer.failure);
+}
+
+test "TypeChecker.check: rejects an error in a method with an any parameter that is never called" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Counter(type T) -> type:\n    return struct:\n        count: usize\n        fn add(self: *Self, value: any, item: T):\n            _ = value\n            _ = item\n            self.count += true\nfn run() -> usize:\n    const counter = Counter(i32){count = 0}\n    return counter.count" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MismatchedOperands, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 7, .column = 24 }, analyzer.failure.?.location.?);
 }
 
 test "TypeChecker.check: rejects an unused top-level constant of an unsuffixed literal without a written type" {
@@ -14039,6 +14103,118 @@ test "instantiateCall: instantiates functions in the block of a struct" {
 
     const known = loader.modules.items[0].declarations[3].kind.constant_declaration.known.?.*;
     try std.testing.expectEqual(Value{ .integer = 9 }, known);
+}
+
+test "checkImplicitArgument: takes a pointer to a value of each type with an instance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type M):\n    fn measure(value: *M) -> usize\n    fn peek(value: *const M) -> usize\nstruct Box:\n    size: usize\nstruct Crate:\n    weight: usize\ninstance Measure(Box):\n    fn measure(value: *Box) -> usize:\n        value.size += 1\n        return value.size\n    fn peek(value: *const Box) -> usize: return value.size\ninstance Measure(Crate):\n    fn measure(value: *Crate) -> usize:\n        value.weight += 10\n        return value.weight\n    fn peek(value: *const Crate) -> usize: return value.weight\nfn grow(measured: *Measure) -> usize: return Measure::measure(measured)\nfn look(measured: *const Measure) -> usize: return measured.peek()\nfn run() -> usize:\n    var box = Box{size = 1}\n    var crate = Crate{weight = 2}\n    const first = grow(&box) + grow(&crate)\n    const second = grow(&box) * 100 + look(&box) * 1000 + look(&crate) * 10000\n    return first + second\nconst RESULT = run()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    const result = for (declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = 2 + 12 + 300 + 3000 + 120000 }, result);
+    const body = for (declarations) |declaration| {
+        if (declaration.kind == .function_definition and std.mem.eql(u8, declaration.kind.function_definition.signature.name, "run")) break declaration.kind.function_definition.body;
+    } else unreachable;
+    const sum = body[2].kind.constant_declaration.value.kind.binary;
+    const box_instance = sum.left.kind.call.callee.identifier.resolution.?.function;
+    const crate_instance = sum.right.kind.call.callee.identifier.resolution.?.function;
+    try std.testing.expect(!std.meta.eql(box_instance, crate_instance));
+    const again = body[3].kind.constant_declaration.value.kind.binary.left.kind.binary.left.kind.binary.left.kind.call;
+    try std.testing.expectEqual(box_instance, again.callee.identifier.resolution.?.function);
+}
+
+test "checkImplicitArgument: rejects a pointer to a type without an instance at the argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type M):\n    fn measure(value: *M) -> usize\n    fn peek(value: *const M) -> usize\nstruct Box:\n    size: usize\nstruct Crate:\n    weight: usize\ninstance Measure(Box):\n    fn measure(value: *Box) -> usize:\n        value.size += 1\n        return value.size\n    fn peek(value: *const Box) -> usize: return value.size\ninstance Measure(Crate):\n    fn measure(value: *Crate) -> usize:\n        value.weight += 10\n        return value.weight\n    fn peek(value: *const Crate) -> usize: return value.weight\nfn grow(measured: *Measure) -> usize: return Measure::measure(measured)\nfn look(measured: *const Measure) -> usize: return measured.peek()\nstruct Plain:\n    size: usize\nfn run() -> usize:\n    var plain = Plain{size = 1}\n    return grow(&plain)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NoInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 24, .column = 17 }, analyzer.failure.?.location.?);
+}
+
+test "checkImplicitArgument: rejects a value instead of a pointer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type M):\n    fn measure(value: *M) -> usize\n    fn peek(value: *const M) -> usize\nstruct Box:\n    size: usize\nstruct Crate:\n    weight: usize\ninstance Measure(Box):\n    fn measure(value: *Box) -> usize:\n        value.size += 1\n        return value.size\n    fn peek(value: *const Box) -> usize: return value.size\ninstance Measure(Crate):\n    fn measure(value: *Crate) -> usize:\n        value.weight += 10\n        return value.weight\n    fn peek(value: *const Crate) -> usize: return value.weight\nfn grow(measured: *Measure) -> usize: return Measure::measure(measured)\nfn look(measured: *const Measure) -> usize: return measured.peek()\nfn run() -> usize:\n    var box = Box{size = 1}\n    return grow(box) + grow(&box)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 22, .column = 17 }, analyzer.failure.?.location.?);
+}
+
+test "checkImplicitArgument: rejects a read-only pointer for a modifiable one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type M):\n    fn measure(value: *M) -> usize\n    fn peek(value: *const M) -> usize\nstruct Box:\n    size: usize\nstruct Crate:\n    weight: usize\ninstance Measure(Box):\n    fn measure(value: *Box) -> usize:\n        value.size += 1\n        return value.size\n    fn peek(value: *const Box) -> usize: return value.size\ninstance Measure(Crate):\n    fn measure(value: *Crate) -> usize:\n        value.weight += 10\n        return value.weight\n    fn peek(value: *const Crate) -> usize: return value.weight\nfn grow(measured: *Measure) -> usize: return Measure::measure(measured)\nfn look(measured: *const Measure) -> usize: return measured.peek()\nfn run() -> usize:\n    const box = Box{size = 1}\n    return look(&box) + grow(&box)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 22, .column = 30 }, analyzer.failure.?.location.?);
+}
+
+test "checkImplicitArgument: takes pointers in a method of a type constructor's struct and beside a type parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\ntypeclass Measure(type M):\n    fn measure(value: *M) -> usize\n    fn peek(value: *const M) -> usize\nstruct Box:\n    size: usize\nstruct Crate:\n    weight: usize\ninstance Measure(Box):\n    fn measure(value: *Box) -> usize:\n        value.size += 1\n        return value.size\n    fn peek(value: *const Box) -> usize: return value.size\ninstance Measure(Crate):\n    fn measure(value: *Crate) -> usize:\n        value.weight += 10\n        return value.weight\n    fn peek(value: *const Crate) -> usize: return value.weight\nfn grow(measured: *Measure) -> usize: return Measure::measure(measured)\nfn look(measured: *const Measure) -> usize: return measured.peek()\nfn Stack(type T) -> type:\n    return struct:\n        count: usize\n        fn push(self: *Self, measured: *Measure, item: T) -> usize:\n            _ = item\n            self.count += Measure::measure(measured)\n            return self.count\nfn sized(measured: *const Measure, type T) -> usize: return mn::size(T) + look(measured)\nfn run() -> usize:\n    var box = Box{size = 1}\n    var crate = Crate{weight = 2}\n    var stack = Stack(i32){count = 0}\n    _ = stack.push(&box, 5)\n    return stack.push(&crate, 6) + sized(&box, u64) * 100\nconst RESULT = run()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    const result = for (declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = 14 + 10 * 100 }, result);
 }
 
 test "findInstance: rejects instances that nest without end" {

@@ -656,18 +656,24 @@ pub const NameResolver = struct {
                 },
                 .run_time => {
                     if (parameter.type.denoted != null) continue;
-                    const target = switch (parameter.type.kind) {
+                    const written: *ast.Expression = written: {
+                        if (parameter.type.kind != .pointer_type) break :written &parameter.type;
+                        const pointer_type = parameter.type.kind.pointer_type;
+                        if (pointer_type.many) continue;
+                        break :written pointer_type.target;
+                    };
+                    const target = switch (written.kind) {
                         .identifier => |identifier| target: {
                             if (findBinding(self.bindings, identifier.name) != null) continue;
                             const module = self.loader.modules.items[self.module_index];
                             const index = findDeclaration(module, identifier.name) orelse continue;
                             break :target try self.resolveDeclaration(self.module_index, index);
                         },
-                        .path_expression => |path_expression| try self.resolvePath(.{}, parameter.type.location, path_expression.path),
+                        .path_expression => |path_expression| try self.resolvePath(.{}, written.location, path_expression.path),
                         else => continue,
                     };
                     if (target != .typeclass) continue;
-                    parameter.constraint = try self.expectOneParameterTypeclass(&parameter.type);
+                    parameter.constraint = try self.expectOneParameterTypeclass(written);
                     parameter.kind = .implicit;
                 },
                 .compile_time, .implicit, .any => {},
@@ -1210,7 +1216,7 @@ pub const NameResolver = struct {
                     }
                     var implicit = parameter;
                     implicit.kind = .run_time;
-                    implicit.type.denoted = variable;
+                    implicit.type.denoted = try self.buildImplicitType(parameter, variable);
                     try parameters.append(allocator, implicit);
                     try constraints.append(allocator, .{ .typeclass = parameter.constraint.?, .arguments = arguments });
                 },
@@ -1230,6 +1236,16 @@ pub const NameResolver = struct {
         copy.dropped_names = dependency.dropped.items;
         copy.lenient = dependency.returns or dependency.dropped.items.len > 0 or dependency.removed;
         return copy;
+    }
+
+    fn buildImplicitType(self: *NameResolver, parameter: ast.TypedName, target: types.Type) ResolveError!types.Type {
+        if (parameter.type.kind != .pointer_type) return target;
+        const pointer = try self.types.addPointer(self.arena.allocator(), .{
+            .target = target,
+            .many = false,
+            .constant = parameter.type.kind.pointer_type.constant,
+        });
+        return .{ .pointer = pointer };
     }
 
     fn addCheckCopy(
@@ -8123,6 +8139,104 @@ test "resolveLocalConstant: rejects a reserved name" {
 
     try std.testing.expectError(error.ReservedName, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveLocalConstant: leaves a call to a struct's function through a path for later and sees the import it shadows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "tools.mn", .data = "struct Maker:\n    value: u64\n    fn new(seed: u64) -> Maker: return Maker{value = seed}\nfn seed() -> u64: return 5" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import tools\nfn main():\n    const tools = tools::Maker::new(tools::seed())\n    _ = tools.value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(null, analyzer.failure);
+}
+
+test "resolveLocalConstant: accepts a struct's function through a path in a variable and a typed constant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "tools.mn", .data = "struct Maker:\n    value: u64\n    fn new(seed: u64) -> Maker: return Maker{value = seed}\nfn seed() -> u64: return 5" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import tools\nfn main():\n    var made = tools::Maker::new(tools::seed())\n    made.value += 1\n    const typed: tools::Maker = tools::Maker::new(made.value)\n    _ = typed.value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(null, analyzer.failure);
+}
+
+test "resolveLocalConstant: evaluates a top-level constant made by a struct's function through a path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "tools.mn", .data = "struct Maker:\n    value: u64\n    fn new(seed: u64) -> Maker: return Maker{value = seed}\nfn seed() -> u64: return 5" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import tools\nconst MADE = tools::Maker::new(7)\nfn main(): _ = MADE.value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(Value{ .integer = 7 }, loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.aggregate[0]);
+}
+
+test "resolveLocalConstant: reports calling a pointer method on a constant made through a path instead of crashing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::random\nimport mn::random::Generator\nfn main():\n    const random = random::Xoshiro256::new(random::entropy())\n    _ = random.range(0..10)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NotWritable, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 9 }, analyzer.failure.?.location.?);
+}
+
+test "resolveLocalConstant: reports a method of a typeclass that is not imported on a constant made through a path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::random\nfn main():\n    const random = random::Xoshiro256::new(random::entropy())\n    _ = random.range(0..10)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownMethod, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 16 }, analyzer.failure.?.location.?);
 }
 
 test "resolveLocalConstant: accepts a parameter as the value" {
