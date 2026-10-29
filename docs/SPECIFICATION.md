@@ -197,7 +197,6 @@
 ### Undefined
 
 - `undefined` can be the initial value of a variable of any type whose value isn't known yet.
-- Reading a variable on a path where it has not been assigned is a compile-time error.
 - Reading memory that is `undefined` is illegal behavior.
 
 ## Variables and Constants

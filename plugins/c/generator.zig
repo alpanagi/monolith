@@ -11271,6 +11271,34 @@ test "generateNamedWhile: evaluates the optional before each run and leaves the 
     );
 }
 
+test "generateFor: fills an undefined array element by element before reading it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    value: i32\nfn total(cards: [3]Card) -> i32:\n    var pending: [cards.length]*const Card = undefined\n    for index in 0..cards.length: pending[index] = &cards[index]\n    return pending[0].value + pending[2].value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_Card {\n    int32_t value;\n} mn_main_Card;\n\ntypedef struct mn_array_3_main_Card mn_array_3_main_Card;\n\nint32_t mn_main_total([[maybe_unused]] mn_array_3_main_Card cards);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_array_3_main_Card_defined\n#define mn_array_3_main_Card_defined\ntypedef struct mn_array_3_main_Card {\n    mn_main_Card items[3];\n} mn_array_3_main_Card;\n#endif\n\n#ifndef mn_array_3_pointer_const_main_Card_defined\n#define mn_array_3_pointer_const_main_Card_defined\ntypedef struct mn_array_3_pointer_const_main_Card {\n    struct mn_main_Card const * items[3];\n} mn_array_3_pointer_const_main_Card;\n#endif\n\nint32_t mn_main_total([[maybe_unused]] mn_array_3_main_Card cards) {\n    mn_array_3_pointer_const_main_Card pending;\n    for (size_t mn_index_1 = 0; mn_index_1 < 3u; mn_index_1 += 1) {\n        const size_t index = mn_index_1;\n        pending.items[index] = &cards.items[index];\n    }\n    return (pending.items[0u]->value + pending.items[2u]->value);\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateFor: counts over the length of an array" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
