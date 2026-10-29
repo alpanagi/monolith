@@ -133,6 +133,7 @@ pub const ElementName = struct {
 
 pub const StructDefinition = struct {
     name: []const u8,
+    external: bool = false,
     fields: []Field,
     value: ?types.Type = null,
 };
@@ -226,6 +227,7 @@ pub const CompoundOperator = struct {
 
 pub const If = struct {
     condition: Expression,
+    names: []ElementName = &.{},
     body: []Statement,
     else_body: ?[]Statement = null,
     known: ?bool = null,
@@ -234,6 +236,7 @@ pub const If = struct {
 pub const While = struct {
     label: ?[]const u8 = null,
     condition: Expression,
+    names: []ElementName = &.{},
     body: []Statement,
     else_body: ?[]Statement = null,
 };
@@ -268,14 +271,32 @@ pub const Match = struct {
 
 pub const Branch = struct {
     cases: []BranchCase,
-    named: bool = false,
+    naming: Naming = .none,
     body: []Statement,
     location: token.Location,
 };
 
 pub const BranchCase = struct {
-    name: Expression,
+    pattern: Expression,
+    end: ?Expression = null,
+    range: bool = false,
+    kind: CaseKind = .case,
     index: ?usize = null,
+    minimum: i129 = 0,
+    maximum: i129 = 0,
+};
+
+pub const Naming = enum {
+    none,
+    payload,
+    value,
+};
+
+pub const CaseKind = enum {
+    case,
+    value,
+    null,
+    integer,
 };
 
 pub const Sequence = union(enum) {
@@ -421,6 +442,8 @@ pub const Builtin = enum {
     alignment,
     convert,
     truncate,
+    cast,
+    @"align",
     length,
     join,
 };
@@ -859,6 +882,8 @@ pub fn extractElementNames(statement: Statement) []ElementName {
         .@"for" => |loop| loop.names,
         .tuple_declaration => |declaration| declaration.names,
         .match => |matching| matching.names,
+        .@"if" => |conditional| conditional.names,
+        .@"while" => |loop| loop.names,
         .noop,
         .@"return",
         .discard,
@@ -866,8 +891,6 @@ pub fn extractElementNames(statement: Statement) []ElementName {
         .constant_declaration,
         .variable_declaration,
         .assignment,
-        .@"if",
-        .@"while",
         .@"defer",
         .@"break",
         .@"continue",
@@ -1122,12 +1145,14 @@ fn cloneStatement(allocator: std.mem.Allocator, statement: Statement) std.mem.Al
         } },
         .@"if" => |conditional| .{ .@"if" = .{
             .condition = try cloneExpression(allocator, conditional.condition),
+            .names = try allocator.dupe(ElementName, conditional.names),
             .body = try cloneStatements(allocator, conditional.body),
             .else_body = try cloneOptionalStatements(allocator, conditional.else_body),
         } },
         .@"while" => |loop| .{ .@"while" = .{
             .label = loop.label,
             .condition = try cloneExpression(allocator, loop.condition),
+            .names = try allocator.dupe(ElementName, loop.names),
             .body = try cloneStatements(allocator, loop.body),
             .else_body = try cloneOptionalStatements(allocator, loop.else_body),
         } },
@@ -1177,11 +1202,15 @@ fn cloneBranches(allocator: std.mem.Allocator, branches: []const Branch) std.mem
     for (branches, cloned) |branch, *copy| {
         const cases = try allocator.alloc(BranchCase, branch.cases.len);
         for (branch.cases, cases) |case, *case_copy| {
-            case_copy.* = .{ .name = try cloneExpression(allocator, case.name) };
+            case_copy.* = .{
+                .pattern = try cloneExpression(allocator, case.pattern),
+                .end = try cloneOptionalExpression(allocator, case.end),
+                .range = case.range,
+            };
         }
         copy.* = .{
             .cases = cases,
-            .named = branch.named,
+            .naming = branch.naming,
             .body = try cloneStatements(allocator, branch.body),
             .location = branch.location,
         };

@@ -20,6 +20,7 @@ pub const Generator = struct {
     loops: []const *const ast.Statement = &.{},
     tuple_declarations: []const *const ast.Statement = &.{},
     matches: []const *const ast.Statement = &.{},
+    conditionals: []const *const ast.Statement = &.{},
     innermost_loop: ?*const ast.Statement = null,
     frames: std.ArrayList(Frame) = .empty,
     unrolled: std.ArrayList(Unrolled) = .empty,
@@ -1457,6 +1458,7 @@ pub const Generator = struct {
         self.loops = try collectLoops(allocator, function.body);
         self.tuple_declarations = try collectKind(allocator, function.body, .tuple_declaration);
         self.matches = try collectKind(allocator, function.body, .match);
+        self.conditionals = try collectKind(allocator, function.body, .@"if");
         self.parameters = function.signature.parameters;
         self.return_type = ast.extractType(function.signature.return_type);
         const kind: ast.DeclarationKind = .{ .function_definition = function };
@@ -1790,9 +1792,10 @@ pub const Generator = struct {
             },
             .tuple_declaration => try self.generateTupleDeclaration(allocator, reached, writer, statement),
             .assignment => |*assignment| try self.generateAssignment(allocator, reached, writer, assignment),
-            .@"if" => |*conditional| {
+            .@"if" => {
+                try self.generateStoredValue(allocator, reached, writer, self.buildConditionAccess(statement));
                 try self.generateIndentation(writer);
-                try self.generateIf(allocator, reached, writer, conditional);
+                try self.generateIf(allocator, reached, writer, statement);
                 try writer.writeByte('\n');
             },
             .@"while" => try self.generateWhile(allocator, reached, writer, statement),
@@ -1953,42 +1956,39 @@ pub const Generator = struct {
         const value = &matching.value;
         const value_type = value.type.?;
         try self.recordType(allocator, reached, value_type);
-        const stored = !isPlainName(value.*) and self.readsElements(statement);
-        const addressed = self.addressesElements(statement);
-        if (stored) {
-            try self.generateIndentation(writer);
-            if (addressed) {
-                try self.generateTaggedType(writer, value_type);
-                const writable = hasWritablePointerName(matching.names);
-                try writer.writeAll(if (writable) " * const " else " const * const ");
-                try self.generateMatchValueName(writer, statement);
-                try writer.writeAll(" = ");
-                try self.generateAddress(allocator, reached, writer, value);
-            } else {
-                try self.generateLocalType(writer, value_type, true);
-                try writer.writeByte(' ');
-                try self.generateMatchValueName(writer, statement);
-                try writer.writeAll(" = ");
-                try self.generateFullValue(allocator, reached, writer, value, value_type);
-            }
-            try writer.writeAll(";\n");
-        }
-        try self.generateIndentation(writer);
-        try writer.writeAll("switch (");
-        if (stored) {
-            try self.generateMatchValueName(writer, statement);
-            try writer.writeAll(if (addressed) "->tag" else ".tag");
-        } else {
-            try self.generateFullExpression(allocator, reached, writer, value);
-            try writer.writeAll(".tag");
-        }
-        try writer.writeAll(") {\n");
+        const access: Access = .{
+            .statement = statement,
+            .value = value,
+            .stored = !isPlainName(value.*) and (self.readsElements(statement) or value_type == .number),
+            .addressed = self.addressesElements(statement),
+        };
+        try self.generateStoredValue(allocator, reached, writer, access);
         const enclosing_loop = self.innermost_loop;
         self.innermost_loop = null;
-        for (0..matching.branches.len) |position| {
-            try self.generateBranch(allocator, reached, writer, statement, position, stored, addressed);
+        if (value_type == .optional or value_type == .number) {
+            try self.generateChainedMatch(allocator, reached, writer, access);
+        } else {
+            try self.generateSwitchedMatch(allocator, reached, writer, access);
         }
         self.innermost_loop = enclosing_loop;
+    }
+
+    fn generateSwitchedMatch(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        access: Access,
+    ) WriteError!void {
+        const matching = &access.statement.kind.match;
+        const member = if (access.value.type.? == .result) "error.tag" else "tag";
+        try self.generateIndentation(writer);
+        try writer.writeAll("switch (");
+        try self.generateAccessMember(allocator, reached, writer, access, member);
+        try writer.writeAll(") {\n");
+        for (0..matching.branches.len) |position| {
+            try self.generateBranch(allocator, reached, writer, access, position);
+        }
         try self.generateIndentation(writer);
         try writer.writeAll("}\n");
     }
@@ -1998,20 +1998,12 @@ pub const Generator = struct {
         allocator: std.mem.Allocator,
         reached: *Reached,
         writer: *std.Io.Writer,
-        statement: *const ast.Statement,
+        access: Access,
         position: usize,
-        stored: bool,
-        addressed: bool,
     ) WriteError!void {
-        const matching = &statement.kind.match;
+        const matching = &access.statement.kind.match;
         const branch = matching.branches[position];
-        const enumeration = matching.value.type.?.@"enum";
         const last = position + 1 == matching.branches.len;
-        const element: ast.Resolution.Element = .{ .statement = statement, .position = position };
-        const local_name = self.findLocalName(.{ .element = element });
-        const empty = local_name == null and for (branch.body) |*inner| {
-            if (self.hasOutput(inner)) break false;
-        } else true;
         if (last) {
             try self.generateIndentation(writer);
             try writer.writeAll("default: ");
@@ -2019,29 +2011,14 @@ pub const Generator = struct {
             for (branch.cases, 0..) |case, index| {
                 if (index > 0) try writer.writeByte('\n');
                 try self.generateIndentation(writer);
-                try writer.print("case {d}:", .{enumeration.cases[case.index.?].tag});
+                try writer.print("case {d}:", .{findCaseTag(matching.value.type.?, case)});
             }
             try writer.writeByte(' ');
         }
-        if (empty) return writer.writeAll("break;\n");
+        if (self.isEmptyBranch(access, position)) return writer.writeAll("break;\n");
         try writer.writeAll("{\n");
         self.depth += 1;
-        if (local_name) |declared_name| {
-            const name = matching.names[position];
-            try self.generateElementName(allocator, reached, writer, name, declared_name);
-            if (!isZeroSizedPointer(name)) {
-                if (name.pointer) try writer.writeByte('&');
-                if (stored) {
-                    try self.generateMatchValueName(writer, statement);
-                    try writer.writeAll(if (addressed) "->value." else ".value.");
-                } else {
-                    try self.generateExpression(allocator, reached, writer, matching.value);
-                    try writer.writeAll(".value.");
-                }
-                try self.generateCaseMember(writer, enumeration, enumeration.cases[branch.cases[0].index.?]);
-            }
-            try writer.writeAll(";\n");
-        }
+        try self.generateBranchName(allocator, reached, writer, access, position);
         try self.generateStatements(allocator, reached, writer, branch.body, null);
         if (!last and !endsWithJump(branch.body)) {
             try self.generateIndentation(writer);
@@ -2052,13 +2029,233 @@ pub const Generator = struct {
         try writer.writeAll("}\n");
     }
 
-    fn generateMatchValueName(
+    fn isEmptyBranch(self: *const Generator, access: Access, position: usize) bool {
+        const element: ast.Resolution.Element = .{ .statement = access.statement, .position = position };
+        if (self.findLocalName(.{ .element = element }) != null) return false;
+        for (access.statement.kind.match.branches[position].body) |*inner| {
+            if (self.hasOutput(inner)) return false;
+        }
+        return true;
+    }
+
+    fn generateBranchName(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        access: Access,
+        position: usize,
+    ) WriteError!void {
+        const matching = &access.statement.kind.match;
+        const element: ast.Resolution.Element = .{ .statement = access.statement, .position = position };
+        const declared_name = self.findLocalName(.{ .element = element }) orelse return;
+        const name = matching.names[position];
+        try self.generateElementName(allocator, reached, writer, name, declared_name);
+        if (!isZeroSizedPointer(name)) {
+            if (name.pointer) try writer.writeByte('&');
+            try self.generateBranchValue(allocator, reached, writer, access, matching.branches[position].cases[0]);
+        }
+        try writer.writeAll(";\n");
+    }
+
+    fn generateBranchValue(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        access: Access,
+        case: ast.BranchCase,
+    ) WriteError!void {
+        const value_type = access.value.type.?;
+        switch (value_type) {
+            .@"enum" => |enumeration| {
+                try self.generateAccessMember(allocator, reached, writer, access, "value.");
+                try self.generateCaseMember(writer, enumeration, enumeration.cases[case.index.?]);
+            },
+            .result => |result| {
+                if (case.kind == .value) return self.generateAccessMember(allocator, reached, writer, access, "value");
+                try self.generateAccessMember(allocator, reached, writer, access, "error.value.");
+                try self.generateCaseMember(writer, result.error_set, result.error_set.cases[case.index.?]);
+            },
+            .optional => try self.generateOptionalValue(allocator, reached, writer, access),
+            .number, .boolean, .void, .type, .@"struct", .array, .slice, .pointer, .tuple, .function, .variable, .application => {
+                unreachable;
+            },
+        }
+    }
+
+    fn generateAccessMember(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        access: Access,
+        member: []const u8,
+    ) WriteError!void {
+        if (!access.stored) {
+            try self.generateFullExpression(allocator, reached, writer, access.value);
+            return writer.print(".{s}", .{member});
+        }
+        try self.generateStoredValueName(writer, access.statement);
+        try writer.print("{s}{s}", .{ if (access.addressed) "->" else ".", member });
+    }
+
+    fn generateAccessValue(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        access: Access,
+    ) WriteError!void {
+        if (!access.stored) return self.generateFullExpression(allocator, reached, writer, access.value);
+        if (access.addressed) try writer.writeAll("(*");
+        try self.generateStoredValueName(writer, access.statement);
+        if (access.addressed) try writer.writeByte(')');
+    }
+
+    fn generateStoredValue(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        access: Access,
+    ) WriteError!void {
+        if (!access.stored) return;
+        const value_type = access.value.type.?;
+        try self.generateIndentation(writer);
+        if (access.addressed) {
+            try self.generateTaggedType(writer, value_type);
+            const writable = hasWritablePointerName(ast.extractElementNames(access.statement.*));
+            try writer.writeAll(if (writable) " * const " else " const * const ");
+            try self.generateStoredValueName(writer, access.statement);
+            try writer.writeAll(" = ");
+            try self.generateAddress(allocator, reached, writer, access.value);
+        } else {
+            try self.generateLocalType(writer, value_type, true);
+            try writer.writeByte(' ');
+            try self.generateStoredValueName(writer, access.statement);
+            try writer.writeAll(" = ");
+            try self.generateFullValue(allocator, reached, writer, access.value, value_type);
+        }
+        try writer.writeAll(";\n");
+    }
+
+    fn generatePresence(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        access: Access,
+        present: bool,
+    ) WriteError!void {
+        if (isPointerOptional(access.value.type.?)) {
+            try self.generateAccessValue(allocator, reached, writer, access);
+            return writer.writeAll(if (present) " != NULL" else " == NULL");
+        }
+        if (!present) try writer.writeByte('!');
+        try self.generateAccessMember(allocator, reached, writer, access, "present");
+    }
+
+    fn generateOptionalValue(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        access: Access,
+    ) WriteError!void {
+        if (isPointerOptional(access.value.type.?)) return self.generateAccessValue(allocator, reached, writer, access);
+        try self.generateAccessMember(allocator, reached, writer, access, "value");
+    }
+
+    fn generateChainedMatch(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        access: Access,
+    ) WriteError!void {
+        const branches = access.statement.kind.match.branches;
+        try self.generateIndentation(writer);
+        for (branches, 0..) |branch, position| {
+            const last = position + 1 == branches.len;
+            if (last and position > 0 and self.isEmptyBranch(access, position)) break;
+            if (position > 0) try writer.writeAll(" else ");
+            if (!last) {
+                try writer.writeAll("if (");
+                for (branch.cases, 0..) |case, index| {
+                    if (index > 0) try writer.writeAll(" || ");
+                    try self.generateCaseCondition(allocator, reached, writer, access, case);
+                }
+                try writer.writeAll(") ");
+            }
+            if (self.isEmptyBranch(access, position)) {
+                try writer.writeAll("{}");
+                continue;
+            }
+            try writer.writeAll("{\n");
+            self.depth += 1;
+            try self.generateBranchName(allocator, reached, writer, access, position);
+            try self.generateStatements(allocator, reached, writer, branch.body, null);
+            self.depth -= 1;
+            try self.generateIndentation(writer);
+            try writer.writeByte('}');
+        }
+        try writer.writeByte('\n');
+    }
+
+    fn generateCaseCondition(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        access: Access,
+        case: ast.BranchCase,
+    ) WriteError!void {
+        const value_type = access.value.type.?;
+        if (value_type == .optional) return self.generatePresence(allocator, reached, writer, access, case.kind != .null);
+        const number = value_type.number;
+        if (case.minimum == case.maximum) {
+            try writer.writeByte('(');
+            try self.generateAccessValue(allocator, reached, writer, access);
+            try writer.writeAll(" == ");
+            try self.generateKnownInteger(writer, number, case.minimum);
+            return writer.writeByte(')');
+        }
+        const lower = case.minimum > findMinimum(number);
+        const upper = case.maximum < findMaximum(number);
+        if (!lower and !upper) return writer.writeAll("true");
+        try writer.writeByte('(');
+        if (lower) {
+            try self.generateAccessValue(allocator, reached, writer, access);
+            try writer.writeAll(" >= ");
+            try self.generateKnownInteger(writer, number, case.minimum);
+        }
+        if (lower and upper) try writer.writeAll(" && ");
+        if (upper) {
+            try self.generateAccessValue(allocator, reached, writer, access);
+            try writer.writeAll(" <= ");
+            try self.generateKnownInteger(writer, number, case.maximum);
+        }
+        try writer.writeByte(')');
+    }
+
+    fn generateStoredValueName(
         self: *Generator,
         writer: *std.Io.Writer,
         statement: *const ast.Statement,
     ) WriteError!void {
-        const number = std.mem.findScalar(*const ast.Statement, self.matches, statement).? + 1;
-        try writer.print("mn_match_value_{d}", .{number});
+        switch (statement.kind) {
+            .match => {
+                const number = std.mem.findScalar(*const ast.Statement, self.matches, statement).? + 1;
+                try writer.print("mn_match_value_{d}", .{number});
+            },
+            .@"if" => {
+                const number = std.mem.findScalar(*const ast.Statement, self.conditionals, statement).? + 1;
+                try writer.print("mn_if_value_{d}", .{number});
+            },
+            .@"while" => try writer.print("mn_while_value_{d}", .{self.findLoopNumber(statement)}),
+            else => unreachable,
+        }
     }
 
     fn readsElements(self: *const Generator, statement: *const ast.Statement) bool {
@@ -2219,23 +2416,85 @@ pub const Generator = struct {
         allocator: std.mem.Allocator,
         reached: *Reached,
         writer: *std.Io.Writer,
-        conditional: *const ast.If,
+        statement: *const ast.Statement,
     ) WriteError!void {
+        const conditional = &statement.kind.@"if";
         if (conditional.known) |chosen| {
             const block = if (chosen) conditional.body else conditional.else_body orelse &.{};
             return self.generateBlock(allocator, reached, writer, block, null);
         }
         try writer.writeAll("if (");
-        try self.generateFullExpression(allocator, reached, writer, &conditional.condition);
+        if (conditional.names.len == 0) {
+            try self.generateFullExpression(allocator, reached, writer, &conditional.condition);
+        } else {
+            try self.generatePresence(allocator, reached, writer, self.buildConditionAccess(statement), true);
+        }
         try writer.writeAll(") ");
-        try self.generateBlock(allocator, reached, writer, conditional.body, null);
+        if (self.declaresElements(statement)) {
+            try self.generateNamedBlock(allocator, reached, writer, statement);
+        } else {
+            try self.generateBlock(allocator, reached, writer, conditional.body, null);
+        }
         const else_body = conditional.else_body orelse return;
         try writer.writeAll(" else ");
-        const chained = else_body.len == 1 and else_body[0].kind == .@"if";
-        if (chained and !self.hasTemporaries(&else_body[0]) and !self.isLiftedStatement(&else_body[0])) {
-            return self.generateIf(allocator, reached, writer, &else_body[0].kind.@"if");
-        }
+        if (self.isChainedIf(else_body)) return self.generateIf(allocator, reached, writer, &else_body[0]);
         try self.generateBlock(allocator, reached, writer, else_body, null);
+    }
+
+    fn isChainedIf(self: *const Generator, else_body: []const ast.Statement) bool {
+        if (else_body.len != 1 or else_body[0].kind != .@"if") return false;
+        const chained = &else_body[0];
+        if (self.hasTemporaries(chained) or self.isLiftedStatement(chained)) return false;
+        return !self.buildConditionAccess(chained).stored;
+    }
+
+    fn buildConditionAccess(self: *const Generator, statement: *const ast.Statement) Access {
+        const condition = switch (statement.kind) {
+            .@"if" => |*conditional| &conditional.condition,
+            .@"while" => |*loop| &loop.condition,
+            else => unreachable,
+        };
+        const named = ast.extractElementNames(statement.*).len > 0;
+        return .{
+            .statement = statement,
+            .value = condition,
+            .stored = named and !isPlainName(condition.*) and self.readsElements(statement),
+            .addressed = named and self.addressesElements(statement),
+        };
+    }
+
+    fn generateNamedBlock(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+    ) WriteError!void {
+        try writer.writeAll("{\n");
+        self.depth += 1;
+        try self.generateConditionNames(allocator, reached, writer, statement);
+        try self.generateStatements(allocator, reached, writer, statement.kind.@"if".body, null);
+        self.depth -= 1;
+        try self.generateIndentation(writer);
+        try writer.writeByte('}');
+    }
+
+    fn generateConditionNames(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+    ) WriteError!void {
+        const element: ast.Resolution.Element = .{ .statement = statement, .position = 0 };
+        const local_name = self.findLocalName(.{ .element = element }) orelse return;
+        const name = ast.extractElementNames(statement.*)[0];
+        try self.generateElementName(allocator, reached, writer, name, local_name);
+        if (!isZeroSizedPointer(name)) {
+            if (name.pointer) try writer.writeByte('&');
+            try self.generateOptionalValue(allocator, reached, writer, self.buildConditionAccess(statement));
+        }
+        try writer.writeAll(";\n");
     }
 
     fn generateWhile(
@@ -2246,6 +2505,7 @@ pub const Generator = struct {
         statement: *const ast.Statement,
     ) WriteError!void {
         const loop = &statement.kind.@"while";
+        if (loop.names.len > 0) return self.generateNamedWhile(allocator, reached, writer, statement);
         try self.generateIndentation(writer);
         if (self.isLiftedStatement(statement)) {
             try writer.writeAll("while (true) {\n");
@@ -2266,6 +2526,31 @@ pub const Generator = struct {
         try self.generateFullExpression(allocator, reached, writer, &loop.condition);
         try writer.writeAll(") ");
         try self.generateLoopBody(allocator, reached, writer, statement);
+        try self.generateLoopEnd(allocator, reached, writer, statement);
+    }
+
+    fn generateNamedWhile(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+    ) WriteError!void {
+        const access = self.buildConditionAccess(statement);
+        try self.generateIndentation(writer);
+        try writer.writeAll("while (true) {\n");
+        self.depth += 1;
+        if (self.isLiftedStatement(statement)) try self.generateLiftedSteps(allocator, reached, writer, statement);
+        try self.generateStoredValue(allocator, reached, writer, access);
+        try self.generateIndentation(writer);
+        try writer.writeAll("if (");
+        try self.generatePresence(allocator, reached, writer, access, false);
+        try writer.writeAll(") break;\n");
+        try self.generateIndentation(writer);
+        try self.generateLoopBody(allocator, reached, writer, statement);
+        self.depth -= 1;
+        try self.generateIndentation(writer);
+        try writer.writeAll("}\n");
         try self.generateLoopEnd(allocator, reached, writer, statement);
     }
 
@@ -2495,7 +2780,10 @@ pub const Generator = struct {
     }
 
     fn declaresElements(self: *const Generator, statement: *const ast.Statement) bool {
-        if (statement.kind != .@"for" and statement.kind != .tuple_declaration) return false;
+        switch (statement.kind) {
+            .@"for", .tuple_declaration, .@"if", .@"while" => {},
+            else => return false,
+        }
         for (0..ast.extractElementNames(statement.*).len) |position| {
             const element: ast.Resolution.Element = .{ .statement = statement, .position = position };
             if (self.findLocalName(.{ .element = element }) != null) return true;
@@ -2510,6 +2798,7 @@ pub const Generator = struct {
         writer: *std.Io.Writer,
         statement: *const ast.Statement,
     ) WriteError!void {
+        if (statement.kind == .@"while") return self.generateConditionNames(allocator, reached, writer, statement);
         const loop = &statement.kind.@"for";
         if (loop.iterator != null) return self.generateIterationNames(allocator, reached, writer, statement);
         try self.recordType(allocator, reached, ast.extractElementType(loop.sequence));
@@ -3213,7 +3502,9 @@ pub const Generator = struct {
                 try self.recordPointerTarget(allocator, reached, access.value.type.?);
                 try self.generateBase(allocator, reached, writer, access.value);
                 const separator = if (access.value.type.? == .pointer) "->" else ".";
-                try writer.print("{s}{s}", .{ separator, access.field });
+                const slice = followPointer(access.value.type.?) == .slice;
+                const field = if (slice and std.mem.eql(u8, access.field, "pointer")) "items" else access.field;
+                try writer.print("{s}{s}", .{ separator, field });
             },
             .dereference => |operand| {
                 try self.recordPointerTarget(allocator, reached, operand.type.?);
@@ -3272,20 +3563,41 @@ pub const Generator = struct {
         call: ast.Call,
         builtin: ast.Builtin,
     ) WriteError!void {
+        if (builtin == .@"align") return self.generateAlign(allocator, reached, writer, call);
         const target = ast.extractType(call.arguments[0].value);
         switch (builtin) {
             .size => try self.generateKnownInteger(writer, .usize, types.findLayout(target).size),
             .alignment => try self.generateKnownInteger(writer, .usize, types.findLayout(target).alignment),
             .length => try self.generateKnownInteger(writer, .usize, target.tuple.elements.len),
             .join => unreachable,
-            .convert, .truncate => {
+            .convert, .truncate, .cast => {
+                try self.recordType(allocator, reached, target);
                 try writer.writeAll("((");
                 try self.generateType(writer, target);
                 try writer.writeByte(')');
                 try self.generateOperand(allocator, reached, writer, &call.arguments[1].value);
                 try writer.writeByte(')');
             },
+            .@"align" => unreachable,
         }
+    }
+
+    fn generateAlign(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        call: ast.Call,
+    ) WriteError!void {
+        const pointer = &call.arguments[0].value;
+        try self.recordType(allocator, reached, pointer.type.?);
+        try writer.writeAll("((");
+        try self.generateType(writer, pointer.type.?);
+        try writer.writeAll(")mn_align_address((uintptr_t)");
+        try self.generateOperand(allocator, reached, writer, pointer);
+        try writer.writeAll(", ");
+        try self.generateOperand(allocator, reached, writer, &call.arguments[1].value);
+        try writer.writeAll("))");
     }
 
     fn generateBinary(
@@ -4352,6 +4664,13 @@ const Role = enum {
     end,
 };
 
+const Access = struct {
+    statement: *const ast.Statement,
+    value: *const ast.Expression,
+    stored: bool,
+    addressed: bool,
+};
+
 fn buildCNames(
     allocator: std.mem.Allocator,
     program: ast.Program,
@@ -5176,6 +5495,8 @@ fn buildLocalNames(
                 const element: ast.Resolution.Element = .{ .statement = statement, .position = position };
                 const scope = switch (statement.kind) {
                     .@"for" => |loop| loop.body,
+                    .@"if" => |conditional| conditional.body,
+                    .@"while" => |loop| loop.body,
                     .match => |matching| matching.branches[position].body,
                     else => body,
                 };
@@ -5198,8 +5519,11 @@ fn buildLocalNames(
 }
 
 fn declaresNames(statement: ast.Statement) bool {
-    if (statement.kind == .@"for") return !ast.isUnrolled(statement.kind.@"for");
-    return statement.kind == .tuple_declaration or statement.kind == .match;
+    return switch (statement.kind) {
+        .@"for" => |loop| !ast.isUnrolled(loop),
+        .tuple_declaration, .match, .@"if", .@"while" => true,
+        .noop, .@"return", .discard, .call, .constant_declaration, .variable_declaration, .assignment, .@"defer", .@"break", .@"continue" => false,
+    };
 }
 
 fn reserveName(
@@ -5633,6 +5957,42 @@ fn findFieldType(fields: []const types.Field, name: []const u8) types.Type {
         if (std.mem.eql(u8, field.name, name)) return field.type;
     }
     unreachable;
+}
+
+fn findCaseTag(value_type: types.Type, case: ast.BranchCase) usize {
+    return switch (value_type) {
+        .@"enum" => |enumeration| enumeration.cases[case.index.?].tag,
+        .result => |result| if (case.kind == .value) 0 else result.error_set.cases[case.index.?].tag,
+        else => unreachable,
+    };
+}
+
+fn findMinimum(number: types.NumberType) i129 {
+    return switch (number) {
+        .i8 => std.math.minInt(i8),
+        .i16 => std.math.minInt(i16),
+        .i32 => std.math.minInt(i32),
+        .i64, .isize => std.math.minInt(i64),
+        .i128 => std.math.minInt(i128),
+        .u8, .u16, .u32, .u64, .u128, .usize => 0,
+        .f16, .f32, .f64, .f128 => unreachable,
+    };
+}
+
+fn findMaximum(number: types.NumberType) i129 {
+    return switch (number) {
+        .i8 => std.math.maxInt(i8),
+        .i16 => std.math.maxInt(i16),
+        .i32 => std.math.maxInt(i32),
+        .i64, .isize => std.math.maxInt(i64),
+        .i128 => std.math.maxInt(i128),
+        .u8 => std.math.maxInt(u8),
+        .u16 => std.math.maxInt(u16),
+        .u32 => std.math.maxInt(u32),
+        .u64, .usize => std.math.maxInt(u64),
+        .u128 => std.math.maxInt(u128),
+        .f16, .f32, .f64, .f128 => unreachable,
+    };
 }
 
 fn isPointerOptional(value_type: types.Type) bool {
@@ -6155,7 +6515,7 @@ test "generateFiles: includes the headers of the modules a field access reaches"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Line:\n    width: i32\nexternal fn make() -> Line" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "external struct Line:\n    width: i32\nexternal fn make() -> Line" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn width() -> i32: return shapes::make().width" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7655,7 +8015,7 @@ test "recordCalledFunction: records the runtime functions that a field access ca
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "mn");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/clock.mn", .data = "struct Time:\n    seconds: i64\nexternal fn mn_runtime_clock_now() -> Time\nconst now = mn_runtime_clock_now" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/clock.mn", .data = "external struct Time:\n    seconds: i64\nexternal fn mn_runtime_clock_now() -> Time\nconst now = mn_runtime_clock_now" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -9471,7 +9831,7 @@ test "generateTupleDeclaration: points a pointer name to a zero-sized element at
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nexternal fn keep(marker: *const Marker)\nfn show(pair: [Marker, i32]):\n    const (*marker, _) = pair\n    keep(marker)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal fn keep(marker: *const Marker)\nfn show(pair: [Marker, i32]):\n    const (*marker, _) = pair\n    keep(marker)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9537,7 +9897,7 @@ test "generateMatch: writes a switch on the tag that binds the values of the cas
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    flag: bool\n    end\n    other\nerror ParseError:\n    missing_end\n    bad_digit: u8\nerror FileError:\n    missing_end\nfn total(token: Token) -> i64:\n    match token:\n        number(digits): return digits\n        flag, end: return 1\n        else: return 0\nfn bump(token: *Token):\n    match token.*:\n        number(*digits): digits.* += 1\n        flag(_): noop\n        end, other: noop\nfn sum(tokens: []const Token) -> i64:\n    var result: i64 = 0\n    for token in tokens:\n        match token:\n            end: break\n            other: continue\n            number(digits): result += digits\n            flag: noop\n    return result\nfn first(tokens: []const Token) -> i64:\n    match tokens[0]:\n        number(digits): return digits\n        else: return 0\nfn code(failure: ParseError || FileError) -> u8:\n    match failure:\n        ParseError::missing_end: return 1\n        FileError::missing_end: return 2\n        bad_digit(digit): return digit" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    flag: bool\n    end\n    other\nerror ParseError:\n    missing_end\n    bad_digit: u8\nerror FileError:\n    missing_end\nfn total(token: Token) -> i64:\n    match token:\n        case number(digits): return digits\n        case flag, end: return 1\n        else: return 0\nfn bump(token: *Token):\n    match token.*:\n        case number(*digits): digits.* += 1\n        case flag(_): noop\n        case end, other: noop\nfn sum(tokens: []const Token) -> i64:\n    var result: i64 = 0\n    for token in tokens:\n        match token:\n            case end: break\n            case other: continue\n            case number(digits): result += digits\n            case flag: noop\n    return result\nfn first(tokens: []const Token) -> i64:\n    match tokens[0]:\n        case number(digits): return digits\n        else: return 0\nfn code(failure: ParseError || FileError) -> u8:\n    match failure:\n        case ParseError::missing_end: return 1\n        case FileError::missing_end: return 2\n        case bad_digit(digit): return digit" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9571,7 +9931,7 @@ test "generateBranch: points into a constant and a zero-sized value and leaves l
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    empty: [0]u8\n    end\nconst ORIGIN = Token::number(7)\nfn make() -> Token: return Token::end\nfn origin() -> i64:\n    match ORIGIN:\n        number(*digits): return digits.*\n        else: return 0\nfn kind() -> i64:\n    match make():\n        number: return 1\n        else: return 0\nfn take(bytes: *const [0]u8): _ = bytes\nfn hollow(token: Token):\n    match token:\n        empty(*bytes): take(bytes)\n        else: noop\nfn scan(tokens: []const Token) -> i64:\n    var count: i64 = 0\n    while count < 10:\n        for token in tokens:\n            match token:\n                end: break\n                else: match make():\n                    number(digits): count += digits\n                    else: continue\n    else: count = 1\n    return count" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    empty: [0]u8\n    end\nconst ORIGIN = Token::number(7)\nfn make() -> Token: return Token::end\nfn origin() -> i64:\n    match ORIGIN:\n        case number(*digits): return digits.*\n        else: return 0\nfn kind() -> i64:\n    match make():\n        case number: return 1\n        else: return 0\nfn take(bytes: *const [0]u8): _ = bytes\nfn hollow(token: Token):\n    match token:\n        case empty(*bytes): take(bytes)\n        else: noop\nfn scan(tokens: []const Token) -> i64:\n    var count: i64 = 0\n    while count < 10:\n        for token in tokens:\n            match token:\n                case end: break\n                else: match make():\n                    case number(digits): count += digits\n                    else: continue\n    else: count = 1\n    return count" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9585,6 +9945,108 @@ test "generateBranch: points into a constant and a zero-sized value and leaves l
     );
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\n#ifndef mn_slice_main_Token_defined\n#define mn_slice_main_Token_defined\ntypedef struct mn_slice_main_Token {\n    struct mn_main_Token *items;\n    size_t length;\n} mn_slice_main_Token;\n#endif\n\nmn_main_Token mn_main_make() {\n    return (mn_main_Token){ .tag = 2 };\n}\n\nint64_t mn_main_origin() {\n    switch ((mn_main_Token){ .tag = 0, .value = { .number = 7 } }.tag) {\n    case 0: {\n        int64_t const * const digits = &(mn_main_Token){ .tag = 0, .value = { .number = 7 } }.value.number;\n        return (*digits);\n    }\n    default: {\n        return 0;\n    }\n    }\n}\n\nint64_t mn_main_kind() {\n    switch (mn_main_make().tag) {\n    case 0: {\n        return 1;\n    }\n    default: {\n        return 0;\n    }\n    }\n}\n\nvoid mn_main_take(void const *) {}\n\nvoid mn_main_hollow(mn_main_Token token) {\n    switch (token.tag) {\n    case 1: {\n        void const * const bytes = ((void const *)&mn_zero_sized);\n        mn_main_take(bytes);\n        break;\n    }\n    default: break;\n    }\n}\n\nint64_t mn_main_scan(mn_slice_main_Token tokens) {\n    int64_t count = 0;\n    while ((count < 10)) {\n        for (size_t mn_index_2 = 0; mn_index_2 < tokens.length; mn_index_2 += 1) {\n            const mn_main_Token token = tokens.items[mn_index_2];\n            switch (token.tag) {\n            case 2: {\n                goto mn_break_2;\n            }\n            default: {\n                const mn_main_Token mn_match_value_2 = mn_main_make();\n                switch (mn_match_value_2.tag) {\n                case 0: {\n                    const int64_t digits = mn_match_value_2.value.number;\n                    count = (count + digits);\n                    break;\n                }\n                default: {\n                    goto mn_continue_2;\n                }\n                }\n            }\n            }\n            mn_continue_2:;\n        }\n        mn_break_2:;\n    }\n    count = 1;\n    return count;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateSwitchedMatch: switches on the error of a result and binds its value and the value of an error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing_end\n    bad_digit: u8\nfn parse(text: u8) -> ParseError!i64:\n    if text == 0: return ParseError::missing_end\n    return 4\nfn score(text: u8) -> i64:\n    match parse(text):\n        case i64 as value: return value\n        case bad_digit(digit):\n            _ = digit\n            return 2\n        case missing_end: return 3" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_ParseError {\n    uint32_t tag;\n    union {\n        uint8_t bad_digit;\n    } value;\n} mn_main_ParseError;\n\ntypedef struct mn_result_main_ParseError_i64 mn_result_main_ParseError_i64;\n\nmn_result_main_ParseError_i64 mn_main_parse(uint8_t text);\nint64_t mn_main_score(uint8_t text);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_result_main_ParseError_i64_defined\n#define mn_result_main_ParseError_i64_defined\ntypedef struct mn_result_main_ParseError_i64 {\n    mn_main_ParseError error;\n    int64_t value;\n} mn_result_main_ParseError_i64;\n#endif\n\nmn_result_main_ParseError_i64 mn_main_parse(uint8_t text) {\n    if ((text == 0u)) {\n        return (mn_result_main_ParseError_i64){ .error = (mn_main_ParseError){ .tag = 1 } };\n    }\n    return (mn_result_main_ParseError_i64){ .error.tag = 0, .value = 4 };\n}\n\nint64_t mn_main_score(uint8_t text) {\n    const mn_result_main_ParseError_i64 mn_match_value_1 = mn_main_parse(text);\n    switch (mn_match_value_1.error.tag) {\n    case 0: {\n        const int64_t value = mn_match_value_1.value;\n        return value;\n    }\n    case 2: {\n        return 2;\n    }\n    default: {\n        return 3;\n    }\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateChainedMatch: tests the presence of an optional and of an optional pointer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?i64, pointer: ?*i64) -> i64:\n    match value:\n        case i64 as found: return found\n        case null: noop\n    match pointer:\n        case null: return 0\n        case *i64 as target: return target.*" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_optional_i64 mn_optional_i64;\n\nint64_t mn_main_pick(mn_optional_i64 value, int64_t * pointer);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_optional_i64_defined\n#define mn_optional_i64_defined\ntypedef struct mn_optional_i64 {\n    int64_t value;\n    bool present;\n} mn_optional_i64;\n#endif\n\nint64_t mn_main_pick(mn_optional_i64 value, int64_t * pointer) {\n    if (value.present) {\n        const int64_t found = value.value;\n        return found;\n    }\n    if (pointer == NULL) {\n        return 0;\n    } else {\n        int64_t * const target = pointer;\n        return (*target);\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateCaseCondition: compares an integer with values and the bounds of ranges inside its type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn kind(value: u8) -> u8:\n    match value:\n        case 0: return 1\n        case 3..10, 200..: return 2\n        else: return 3\nfn sign(value: i8) -> u8:\n    match value + 1:\n        case -128..0: return 1\n        case 0: return 2\n        else: return 3" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\nuint8_t mn_main_kind(uint8_t value);\nuint8_t mn_main_sign(int8_t value);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nuint8_t mn_main_kind(uint8_t value) {\n    if ((value == 0u)) {\n        return 1u;\n    } else if ((value >= 3u && value <= 9u) || (value >= 200u)) {\n        return 2u;\n    } else {\n        return 3u;\n    }\n}\n\nuint8_t mn_main_sign(int8_t value) {\n    const int8_t mn_match_value_1 = ((int8_t)(value + 1));\n    if ((mn_match_value_1 <= -1)) {\n        return 1u;\n    } else if ((mn_match_value_1 == 0)) {\n        return 2u;\n    } else {\n        return 3u;\n    }\n}\n",
         files[1].contents,
     );
 }
@@ -9794,7 +10256,7 @@ test "generateAssignment: assigns a field through a pointer returned by a call" 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nexternal fn locate() -> *Point\nfn main(): locate().x = 1" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Point:\n    x: i32\nexternal fn locate() -> *Point\nfn main(): locate().x = 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10010,7 +10472,7 @@ test "generateTargetEffects: runs the calls of a zero-sized target before the va
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nstruct Data:\n    marker: Marker\n    value: i32\nexternal fn locate() -> *Data\nexternal fn make() -> Marker\nfn main(): locate().marker = make()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal struct Data:\n    marker: Marker\n    value: i32\nexternal fn locate() -> *Data\nexternal fn make() -> Marker\nfn main(): locate().marker = make()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10037,7 +10499,7 @@ test "generateTargetEffects: runs the calls of a zero-sized target from left to 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nexternal fn locate() -> *many [2]Marker\nexternal fn position() -> usize\nexternal fn make() -> Marker\nfn main(): locate()[position()][position()] = make()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal fn locate() -> *many [2]Marker\nexternal fn position() -> usize\nexternal fn make() -> Marker\nfn main(): locate()[position()][position()] = make()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10064,7 +10526,7 @@ test "generateTarget: evaluates the calls of the target before the calls of the 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nexternal fn locate() -> *Point\nexternal fn make() -> i32\nfn main(): locate().x = make()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Point:\n    x: i32\nexternal fn locate() -> *Point\nexternal fn make() -> i32\nfn main(): locate().x = make()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10219,6 +10681,40 @@ test "generateIf: declares the temporaries of an else if condition in the else b
     );
 }
 
+test "generateIf: binds the value of an optional and stores a condition that is not a name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn find() -> ?i64: return null\nfn pick(value: ?i64) -> i64:\n    if value as found: return found\n    else if find() as other: return other\n    return 0\nfn bump(value: ?i64) -> i64:\n    var stored = value\n    if stored as *found: found.* += 1\n    return stored orelse 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_optional_i64 mn_optional_i64;\n\nmn_optional_i64 mn_main_find();\nint64_t mn_main_pick(mn_optional_i64 value);\nint64_t mn_main_bump(mn_optional_i64 value);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_optional_i64_defined\n#define mn_optional_i64_defined\ntypedef struct mn_optional_i64 {\n    int64_t value;\n    bool present;\n} mn_optional_i64;\n#endif\n\nmn_optional_i64 mn_main_find() {\n    return (mn_optional_i64){ .present = false };\n}\n\nint64_t mn_main_pick(mn_optional_i64 value) {\n    if (value.present) {\n        const int64_t found = value.value;\n        return found;\n    } else {\n        const mn_optional_i64 mn_if_value_2 = mn_main_find();\n        if (mn_if_value_2.present) {\n            const int64_t other = mn_if_value_2.value;\n            return other;\n        }\n    }\n    return 0;\n}\n\nint64_t mn_main_bump(mn_optional_i64 value) {\n    mn_optional_i64 stored = value;\n    if (stored.present) {\n        int64_t * const found = &stored.value;\n        int64_t * mn_temporary_1;\n        mn_temporary_1 = &(*found), (*mn_temporary_1) = ((*mn_temporary_1) + 1);\n    }\n    return (stored.present ? stored.value : 0);\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateWhile: writes the condition and the body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -10329,6 +10825,40 @@ test "generateWhile: writes no label for a loop with an else block and no break"
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\nchar mn_zero_sized;\n\nvoid mn_main_run(bool running) {\n    while (running) {\n        step();\n    }\n    stop();\n}\n\nint main() {\n    mn_main_run(true);\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateNamedWhile: evaluates the optional before each run and leaves the loop on null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next(count: *u8) -> ?u8:\n    if count.* == 0: return null\n    count.* -= 1\n    return count.*\nfn total(start: u8) -> u8:\n    var count = start\n    var sum: u8 = 0\n    while next(&count) as value:\n        if value == 5: break\n        sum += value\n    else: sum += 1\n    return sum" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_optional_u8 mn_optional_u8;\n\nmn_optional_u8 mn_main_next(uint8_t * count);\nuint8_t mn_main_total(uint8_t start);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_optional_u8_defined\n#define mn_optional_u8_defined\ntypedef struct mn_optional_u8 {\n    uint8_t value;\n    bool present;\n} mn_optional_u8;\n#endif\n\nmn_optional_u8 mn_main_next(uint8_t * count) {\n    if (((*count) == 0u)) {\n        return (mn_optional_u8){ .present = false };\n    }\n    uint8_t * mn_temporary_1;\n    mn_temporary_1 = &(*count), (*mn_temporary_1) = ((uint8_t)((*mn_temporary_1) - 1u));\n    return (mn_optional_u8){ .value = (*count), .present = true };\n}\n\nuint8_t mn_main_total(uint8_t start) {\n    uint8_t count = start;\n    uint8_t sum = 0u;\n    while (true) {\n        const mn_optional_u8 mn_while_value_1 = mn_main_next(&count);\n        if (!mn_while_value_1.present) break;\n        {\n            const uint8_t value = mn_while_value_1.value;\n            if ((value == 5u)) {\n                goto mn_break_1;\n            }\n            sum = ((uint8_t)(sum + value));\n        }\n    }\n    sum = ((uint8_t)(sum + 1u));\n    mn_break_1:;\n    return sum;\n}\n",
         files[1].contents,
     );
 }
@@ -11732,7 +12262,7 @@ test "generateStatementEffects: runs the calls of a zero-sized value without sto
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nstruct Holder:\n    marker: Marker\n    value: i32\nexternal fn one() -> i32\nexternal fn make(left: i32, right: i32) -> Holder\nfn get() -> Marker: return make(one(), one()).marker" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal struct Holder:\n    marker: Marker\n    value: i32\nexternal fn one() -> i32\nexternal fn make(left: i32, right: i32) -> Holder\nfn get() -> Marker: return make(one(), one()).marker" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11759,7 +12289,7 @@ test "generateSteps: runs a zero-sized call in its place without a temporary" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nexternal fn one() -> i32\nexternal fn mark(value: i32) -> Marker\nexternal fn use(marker: Marker, value: i32)\nfn main(): use(mark(one()), one())" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal fn one() -> i32\nexternal fn mark(value: i32) -> Marker\nexternal fn use(marker: Marker, value: i32)\nfn main(): use(mark(one()), one())" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11786,7 +12316,7 @@ test "generateOperand: replaces a call in a field access by its temporary" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nexternal fn make() -> Point\nfn sum() -> i32: return make().x + make().x" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Point:\n    x: i32\nexternal fn make() -> Point\nfn sum() -> i32: return make().x + make().x" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12197,7 +12727,7 @@ test "generateExpression: writes field accesses" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nstruct Line:\n    start: Point\nexternal fn make() -> Line\nfn read(line: Line) -> i32: return line.start.x\nfn first() -> i32: return make().start.x" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Point:\n    x: i32\nexternal struct Line:\n    start: Point\nexternal fn make() -> Line\nfn read(line: Line) -> i32: return line.start.x\nfn first() -> i32: return make().start.x" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12710,7 +13240,7 @@ test "generateExpression: runs the calls of an unwrapped zero-sized value" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nexternal fn find() -> ?Marker\nexternal fn keep(marker: Marker)\nfn main(): keep(find().?)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal fn find() -> ?Marker\nexternal fn keep(marker: Marker)\nfn main(): keep(find().?)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13115,7 +13645,7 @@ test "generateOrElse: runs the calls of a zero-sized fallback only without a val
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nexternal fn make() -> Marker\nfn run(maybe: ?Marker):\n    const marker = maybe orelse make()\n    _ = marker" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal fn make() -> Marker\nfn run(maybe: ?Marker):\n    const marker = maybe orelse make()\n    _ = marker" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13331,7 +13861,7 @@ test "generateZeroSizedAddress: points the addresses of zero-sized values to one
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nexternal fn keep(marker: *const Marker)\nfn show(marker: Marker):\n    var markers: [2]Marker = undefined\n    keep(&marker)\n    keep(&markers[1])" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal fn keep(marker: *const Marker)\nfn show(marker: Marker):\n    var markers: [2]Marker = undefined\n    keep(&marker)\n    keep(&markers[1])" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13358,7 +13888,7 @@ test "generateZeroSizedAddress: runs the calls of a zero-sized value before its 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nexternal fn keep(marker: *const Marker)\nexternal fn position() -> usize\nfn show(markers: [2]Marker): keep(&markers[position()])" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal fn keep(marker: *const Marker)\nexternal fn position() -> usize\nfn show(markers: [2]Marker): keep(&markers[position()])" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14459,6 +14989,40 @@ test "generateBuiltinCall: writes sizes and alignments as constants and conversi
     );
 }
 
+test "generateBuiltinCall: casts pointers and aligns a multiple value pointer through the runtime" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nexternal struct Header:\n    size: u32\n    flags: [2]u8\nfn read(buffer: []const u8) -> *const Header: return mn::cast(*const Header, buffer.pointer)\nfn next(buffer: []u8, alignment: usize) -> *many u8: return mn::align(buffer.pointer, alignment)\nfn count(buffer: *[]u8) -> usize: return buffer.length\nexternal fn keep(pointer: *const void)\nfn hide(header: *Header):\n    keep(header)\n    keep(mn::cast(*many const u8, header))" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\n#ifndef mn_array_2_u8_defined\n#define mn_array_2_u8_defined\ntypedef struct mn_array_2_u8 {\n    uint8_t items[2];\n} mn_array_2_u8;\n#endif\n\ntypedef struct mn_main_Header {\n    uint32_t size;\n    mn_array_2_u8 flags;\n} mn_main_Header;\n\ntypedef struct mn_slice_u8 mn_slice_u8;\n\nvoid keep(void const * pointer);\n\nstruct mn_main_Header const * mn_main_read(mn_slice_u8 buffer);\nuint8_t * mn_main_next(mn_slice_u8 buffer, size_t alignment);\nsize_t mn_main_count(struct mn_slice_u8 * buffer);\nvoid mn_main_hide(struct mn_main_Header * header);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nstruct mn_main_Header const * mn_main_read(mn_slice_u8 buffer) {\n    return ((struct mn_main_Header const *)buffer.items);\n}\n\nuint8_t * mn_main_next(mn_slice_u8 buffer, size_t alignment) {\n    return ((uint8_t *)mn_align_address((uintptr_t)buffer.items, alignment));\n}\n\nsize_t mn_main_count(struct mn_slice_u8 * buffer) {\n    return buffer->length;\n}\n\nvoid mn_main_hide(struct mn_main_Header * header) {\n    keep(header);\n    keep(((uint8_t const *)header));\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateFunctionCall: passes a pointer to an array as a slice" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -14748,7 +15312,7 @@ test "generateFunctionCall: runs a zero-sized value that is wrapped in an option
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nexternal fn make() -> Marker\nfn wrap() -> ?Marker: return make()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal fn make() -> Marker\nfn wrap() -> ?Marker: return make()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14844,7 +15408,7 @@ test "generateFunctionCall: dereferences a pointer once for a value receiver" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter:\n    count: i32\n    fn read(self: Self) -> i32: return self.count\n    fn increment(self: *Self): self.count += 1\nexternal fn locate() -> *Counter\nfn main():\n    _ = locate().read()\n    locate().increment()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Counter:\n    count: i32\n    fn read(self: Self) -> i32: return self.count\n    fn increment(self: *Self): self.count += 1\nexternal fn locate() -> *Counter\nfn main():\n    _ = locate().read()\n    locate().increment()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15676,7 +16240,7 @@ test "generateEffects: runs the calls of a zero-sized field" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nstruct Holder:\n    marker: Marker\n    value: i32\nexternal fn make() -> Holder\nfn use(marker: Marker, value: i32):\n    _ = marker\n    _ = value\nfn take(holder: Holder) -> Marker: return holder.marker\nfn get() -> Marker: return make().marker\nfn main(): use(make().marker, 1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal struct Holder:\n    marker: Marker\n    value: i32\nexternal fn make() -> Holder\nfn use(marker: Marker, value: i32):\n    _ = marker\n    _ = value\nfn take(holder: Holder) -> Marker: return holder.marker\nfn get() -> Marker: return make().marker\nfn main(): use(make().marker, 1)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);

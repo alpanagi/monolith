@@ -971,6 +971,15 @@ pub const NameResolver = struct {
         defer self.module_index = caller_module_index;
         defer self.bindings = caller_bindings;
         try self.resolveFunctionTypes(signature);
+        for (signature.parameters) |parameter| {
+            if (containsInternalStruct(ast.extractType(parameter.type))) {
+                return self.fail(parameter.type.location, error.InternalStructInExternalFunction);
+            }
+        }
+        const return_type = signature.return_type;
+        if (containsInternalStruct(ast.extractType(return_type))) {
+            return self.fail(return_type.location, error.InternalStructInExternalFunction);
+        }
         signature.progress = .done;
     }
 
@@ -1413,6 +1422,7 @@ pub const NameResolver = struct {
                 .@"while" => |*loop| {
                     if (containsTarget(loop.body, target)) {
                         try block.loops.append(allocator, .{ .statement = statement });
+                        try self.appendElements(block, statement);
                         return self.collectScope(block, loop.body, target);
                     }
                     if (loop.else_body) |else_body| {
@@ -1420,7 +1430,10 @@ pub const NameResolver = struct {
                     }
                 },
                 .@"if" => |*conditional| {
-                    if (containsTarget(conditional.body, target)) return self.collectScope(block, conditional.body, target);
+                    if (containsTarget(conditional.body, target)) {
+                        try self.appendElements(block, statement);
+                        return self.collectScope(block, conditional.body, target);
+                    }
                     if (conditional.else_body) |else_body| {
                         if (containsTarget(else_body, target)) return self.collectScope(block, else_body, target);
                     }
@@ -1851,12 +1864,18 @@ pub const NameResolver = struct {
             },
             .@"if" => |*conditional| {
                 try self.resolveNamesInExpression(scope, &conditional.condition);
-                try self.chooseBlock(conditional);
-                try self.resolveNamesInBlock(block, conditional.body);
+                if (conditional.names.len == 0) {
+                    try self.chooseBlock(conditional);
+                    try self.resolveNamesInBlock(block, conditional.body);
+                } else {
+                    if (ast.hasPointerName(conditional.names)) recordModifiedVariable(scope, findStorageRoot(conditional.condition));
+                    try self.resolveNamedBody(block, statement);
+                }
                 if (conditional.else_body) |else_body| try self.resolveNamesInBlock(block, else_body);
             },
             .@"while" => |*loop| {
                 try self.resolveNamesInExpression(scope, &loop.condition);
+                if (ast.hasPointerName(loop.names)) recordModifiedVariable(scope, findStorageRoot(loop.condition));
                 try self.resolveLoop(block, statement);
                 if (loop.else_body) |else_body| try self.resolveNamesInBlock(block, else_body);
             },
@@ -1911,6 +1930,17 @@ pub const NameResolver = struct {
         }
     }
 
+    fn resolveNamedBody(self: *NameResolver, block: Block, statement: *ast.Statement) ResolveError!void {
+        const start = block.locals.items.len;
+        try self.declareElements(block, statement);
+        try self.resolveNamesInBlock(block, statement.kind.@"if".body);
+        for (block.locals.items[start..]) |local| {
+            if (self.isDroppedName(local.name)) continue;
+            try self.expectUsed(local.use, local.location, error.UnusedValueName);
+        }
+        block.locals.shrinkRetainingCapacity(start);
+    }
+
     fn resolveSequence(self: *NameResolver, scope: Scope, sequence: *ast.Sequence) ResolveError!void {
         switch (sequence.*) {
             .value => |*value| try self.resolveNamesInExpression(scope, value),
@@ -1932,12 +1962,10 @@ pub const NameResolver = struct {
         }
         try block.loops.append(self.arena.allocator(), .{ .statement = statement });
         const start = block.locals.items.len;
+        try self.declareElements(block, statement);
         const body = switch (statement.kind) {
             .@"while" => |loop| loop.body,
-            .@"for" => |loop| body: {
-                try self.declareElements(block, statement);
-                break :body loop.body;
-            },
+            .@"for" => |loop| loop.body,
             else => unreachable,
         };
         try self.resolveNamesInBlock(block, body);
@@ -1971,20 +1999,18 @@ pub const NameResolver = struct {
     fn resolveBranches(self: *NameResolver, block: Block, statement: *ast.Statement) ResolveError!void {
         const module = self.loader.modules.items[self.module_index];
         const matching = &statement.kind.match;
-        for (matching.branches, matching.names, 0..) |*branch, name, position| {
+        for (matching.branches, matching.names, 0..) |*branch, *name, position| {
             const scope: Scope = .{
                 .parameters = block.parameters,
                 .parameter_uses = block.parameter_uses,
                 .locals = block.locals.items,
             };
-            for (branch.cases) |*case| {
-                if (case.name.kind != .path_expression) continue;
-                try self.resolveNamesInExpression(scope, &case.name);
-                const resolution = case.name.kind.path_expression.resolution orelse {
-                    return self.fail(case.name.location, error.NotCase);
-                };
-                if (resolution != .case) return self.fail(case.name.location, error.NotCase);
+            if (branch.naming == .payload and try self.isTypeApplication(scope, branch.cases[0].pattern, name.*)) {
+                branch.cases[0].pattern = try self.buildTypeApplication(branch.cases[0].pattern, name.*);
+                branch.naming = .none;
+                name.* = .{ .name = "_", .location = name.location };
             }
+            for (branch.cases) |*case| try self.resolveBranchCase(scope, case);
             const start = block.locals.items.len;
             if (!ast.isDiscardedName(name.name)) {
                 if (isReservedName(module.path, name.name)) return self.fail(name.location, error.ReservedName);
@@ -2002,6 +2028,79 @@ pub const NameResolver = struct {
             }
             block.locals.shrinkRetainingCapacity(start);
         }
+    }
+
+    fn isTypeApplication(self: *NameResolver, scope: Scope, pattern: ast.Expression, name: ast.ElementName) ResolveError!bool {
+        if (ast.isDiscardedName(name.name)) return false;
+        const head = switch (pattern.kind) {
+            .identifier => |identifier| if (isVisibleName(scope, identifier.name)) null else try self.findDeclaredTarget(pattern.location, identifier.name),
+            .path_expression => |path_expression| try self.resolvePath(scope, pattern.location, path_expression.path),
+            else => null,
+        };
+        if (head) |target| {
+            if (target == .function or target == .constructor) return true;
+        }
+        if (findTypedName(scope.parameters, name.name)) |index| return scope.parameters[index].kind == .type;
+        if (findLocal(scope.locals, name.name) != null) return false;
+        const inner = try self.findDeclaredTarget(name.location, name.name) orelse return false;
+        return inner == .type;
+    }
+
+    fn buildTypeApplication(self: *NameResolver, pattern: ast.Expression, name: ast.ElementName) ResolveError!ast.Expression {
+        const allocator = self.arena.allocator();
+        const callee: ast.Name = switch (pattern.kind) {
+            .identifier => |identifier| .{ .identifier = identifier },
+            .path_expression => |path_expression| .{ .path_expression = path_expression },
+            else => unreachable,
+        };
+        var argument: ast.Expression = .{ .kind = .{ .identifier = .{ .name = name.name } }, .location = name.location };
+        if (name.pointer) {
+            const target = try allocator.create(ast.Expression);
+            target.* = argument;
+            argument = .{ .kind = .{ .pointer_type = .{ .many = false, .constant = false, .target = target } }, .location = name.location };
+        }
+        const arguments = try allocator.dupe(ast.Argument, &.{.{ .name = null, .value = argument, .location = name.location }});
+        return .{ .kind = .{ .call = .{ .callee = callee, .arguments = arguments } }, .location = pattern.location };
+    }
+
+    fn resolveBranchCase(self: *NameResolver, scope: Scope, case: *ast.BranchCase) ResolveError!void {
+        const pattern = &case.pattern;
+        switch (pattern.kind) {
+            .identifier => |*identifier| try self.resolveCaseName(scope, pattern.location, identifier),
+            .path_expression => |*path_expression| {
+                try self.resolveNamesInExpression(scope, pattern);
+                const resolution = path_expression.resolution orelse return self.fail(pattern.location, error.NotCase);
+                switch (resolution) {
+                    .case, .type, .constant => {},
+                    .parameter, .local, .function, .element, .typeclass_function, .typeclass_method, .builtin => {
+                        return self.fail(pattern.location, error.NotCase);
+                    },
+                }
+            },
+            else => try self.resolveNamesInExpression(scope, pattern),
+        }
+        if (case.end) |*end| try self.resolveNamesInExpression(scope, end);
+    }
+
+    fn resolveCaseName(
+        self: *NameResolver,
+        scope: Scope,
+        location: token.Location,
+        identifier: *ast.Identifier,
+    ) ResolveError!void {
+        if (!isVisibleName(scope, identifier.name)) {
+            _ = try self.findDeclaredTarget(location, identifier.name) orelse return;
+        }
+        try self.resolveIdentifier(scope, location, identifier);
+    }
+
+    fn findDeclaredTarget(self: *NameResolver, location: token.Location, name: []const u8) ResolveError!?Target {
+        const target = self.resolveName(location, name) catch |resolve_error| {
+            if (resolve_error != error.UnknownName) return resolve_error;
+            self.failure = null;
+            return null;
+        };
+        return target;
     }
 
     fn resolveJump(
@@ -2416,6 +2515,7 @@ pub const NameResolver = struct {
             if (pointer_type.many) return self.fail(location, error.ManyFunctionPointer);
             if (pointer_type.constant) return self.fail(location, error.ConstantFunctionPointer);
         }
+        if (target == .void and pointer_type.many) return self.fail(location, error.ManyVoidPointer);
         const pointer = try self.types.addPointer(self.arena.allocator(), .{
             .target = target,
             .many = pointer_type.many,
@@ -3043,15 +3143,27 @@ pub const NameResolver = struct {
         defer self.typeclass = caller_typeclass;
         defer self.bindings = caller_bindings;
         const resolved = try reserveFields(self.arena.allocator(), definition.fields);
-        const struct_type: types.Struct = .{ .module = module_index, .name = definition.name, .fields = resolved };
+        const struct_type: types.Struct = .{
+            .module = module_index,
+            .name = definition.name,
+            .external = definition.external,
+            .fields = resolved,
+        };
         const value_type: types.Type = .{ .@"struct" = struct_type };
         definition.value = value_type;
         self.self_type = value_type;
         self.self_name = "Self";
         try self.resolveFields(definition.fields, resolved);
+        if (definition.external) try self.expectExternalFields(definition.fields);
         try self.expectNotContained(struct_type, declaration.location);
         try self.types.add(self.arena.allocator(), value_type);
         return value_type;
+    }
+
+    fn expectExternalFields(self: *NameResolver, fields: []const ast.Field) NameError!void {
+        for (fields) |field| {
+            if (!isExternalFieldType(ast.extractType(field.type))) return self.fail(field.type.location, error.NotExternalField);
+        }
     }
 
     fn expectNotContained(self: *NameResolver, struct_type: types.Struct, location: token.Location) NameError!void {
@@ -3142,6 +3254,9 @@ pub const NameError = error{
     ModuleNotFound,
     ConstantRefersToItself,
     StructContainsItself,
+    NotExternalField,
+    InternalStructInExternalFunction,
+    ManyVoidPointer,
     NotAssignable,
     MethodIsField,
     MethodIsCase,
@@ -3300,6 +3415,9 @@ fn describeError(name_error: NameError) []const u8 {
         error.ModuleNotFound => "module not found",
         error.ConstantRefersToItself => "constant refers to itself",
         error.StructContainsItself => "struct contains itself",
+        error.NotExternalField => "an external struct's fields must be numbers, bool, pointers, optional pointers, function pointers, arrays of these or external structs",
+        error.InternalStructInExternalFunction => "a struct in an external function's parameters or return type must be an external struct",
+        error.ManyVoidPointer => "a pointer to void cannot point to multiple values",
         error.NotAssignable => "only variables and their fields can be assigned",
         error.MethodIsCase => "function has the name of a case",
         error.DuplicateCase => "case is already defined",
@@ -3354,6 +3472,31 @@ fn describeError(name_error: NameError) []const u8 {
         error.TupleInstance => "the compiler provides the instances of mn::Tuple",
         error.DependencyLoop => "value depends on itself at compile time",
     };
+}
+
+fn isExternalFieldType(value_type: types.Type) bool {
+    return switch (value_type) {
+        .number, .boolean, .pointer => true,
+        .optional => |optional| optional.child == .pointer,
+        .array => |array| isExternalFieldType(array.element),
+        .@"struct" => |struct_type| struct_type.external,
+        .void, .type, .@"enum", .slice, .result, .tuple, .function, .variable, .application => false,
+    };
+}
+
+fn containsInternalStruct(value_type: types.Type) bool {
+    return switch (value_type) {
+        .@"struct" => |struct_type| !struct_type.external,
+        .pointer => |pointer| containsInternalStruct(pointer.target),
+        .array => |array| containsInternalStruct(array.element),
+        .slice => |slice| containsInternalStruct(slice.element),
+        .optional => |optional| optional.child == .pointer and containsInternalStruct(optional.child),
+        .number, .boolean, .void, .type, .@"enum", .result, .tuple, .function, .variable, .application => false,
+    };
+}
+
+fn isVisibleName(scope: Scope, name: []const u8) bool {
+    return findLocal(scope.locals, name) != null or findTypedName(scope.parameters, name) != null;
 }
 
 fn isCall(expression: *const ast.Expression) bool {
@@ -3533,7 +3676,10 @@ fn isDependentStatement(dependency: Dependency, statement: ast.Statement) bool {
 fn isDependentMatch(names: Names, matching: ast.Match) bool {
     for (matching.branches) |branch| {
         for (branch.cases) |case| {
-            if (case.name.kind == .path_expression and isDependentExpression(names, case.name, false)) return true;
+            if (case.pattern.kind != .identifier and isDependentExpression(names, case.pattern, false)) return true;
+            if (case.end) |end| {
+                if (isDependentExpression(names, end, false)) return true;
+            }
         }
     }
     return false;
@@ -3671,7 +3817,8 @@ fn collectStatementNames(
             try collectExpressionNames(allocator, names, matching.value);
             for (matching.branches) |branch| {
                 for (branch.cases) |case| {
-                    if (case.name.kind == .path_expression) try collectExpressionNames(allocator, names, case.name);
+                    if (case.pattern.kind != .identifier) try collectExpressionNames(allocator, names, case.pattern);
+                    if (case.end) |end| try collectExpressionNames(allocator, names, end);
                 }
                 for (branch.body) |inner| try collectStatementNames(allocator, names, inner);
             }
@@ -7081,6 +7228,44 @@ test "chooseBlock: resolves only the block that a condition depending on a type 
     try std.testing.expectEqual(Value{ .integer = 7 }, known);
 }
 
+test "resolveNamedBody: keeps the name of an if inside its block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?i64) -> i64:\n    if value as found: return found\n    else: return found" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownName, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 18 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveNamedBody: rejects an unused name of an if" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?i64):\n    if value as found: noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnusedValueName, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 17 }, name_resolver.failure.?.location.?);
+}
+
 test "resolveSequence: resolves a sequence outside the names of its loop" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -7403,6 +7588,25 @@ test "resolveLoop: rejects an unused label of a for loop" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, name_resolver.failure.?.location.?);
 }
 
+test "resolveLoop: rejects an unused name of a while loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn drain(value: ?i64):\n    while value as found: noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnusedLoopName, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 20 }, name_resolver.failure.?.location.?);
+}
+
 test "declareElements: resolves the name to its loop" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -7453,7 +7657,7 @@ test "resolveBranches: resolves a value name to its branch and a case named thro
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    end\nfn take(value: i64): _ = value\nfn show(token: Token):\n    match token:\n        number(digits): take(digits)\n        Token::end: noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    end\nfn take(value: i64): _ = value\nfn show(token: Token):\n    match token:\n        case number(digits): take(digits)\n        case Token::end: noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7464,7 +7668,7 @@ test "resolveBranches: resolves a value name to its branch and a case named thro
     const arguments = branches[0].body[0].kind.call.kind.call.arguments;
     const element: ast.Resolution.Element = .{ .statement = &body[0], .position = 0 };
     try std.testing.expectEqual(element, arguments[0].value.kind.identifier.resolution.?.element);
-    try std.testing.expectEqual(1, branches[1].cases[0].name.kind.path_expression.resolution.?.case.index);
+    try std.testing.expectEqual(1, branches[1].cases[0].pattern.kind.path_expression.resolution.?.case.index);
 }
 
 test "resolveBranches: rejects an unused value name" {
@@ -7477,13 +7681,13 @@ test "resolveBranches: rejects an unused value name" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    end\nfn show(token: Token):\n    match token:\n        number(digits): noop\n        end: noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    end\nfn show(token: Token):\n    match token:\n        case number(digits): noop\n        case end: noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.UnusedValueName, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 6, .column = 16 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 21 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveBranches: keeps a value name inside its branch" {
@@ -7496,13 +7700,13 @@ test "resolveBranches: keeps a value name inside its branch" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    end\nfn take(value: i64): _ = value\nfn show(token: Token):\n    match token:\n        number(digits): take(digits)\n        end: take(digits)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    end\nfn take(value: i64): _ = value\nfn show(token: Token):\n    match token:\n        case number(digits): take(digits)\n        case end: take(digits)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.UnknownName, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 8, .column = 19 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 8, .column = 24 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveBranches: rejects a name through an enum that is not a case" {
@@ -7515,13 +7719,102 @@ test "resolveBranches: rejects a name through an enum that is not a case" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    end\n    fn make() -> Token: return Token::end\nfn show(token: Token):\n    match token:\n        Token::make: noop\n        else: noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    end\n    fn make() -> Token: return Token::end\nfn show(token: Token):\n    match token:\n        case Token::make: noop\n        else: noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.NotCase, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 7, .column = 9 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 7, .column = 14 }, name_resolver.failure.?.location.?);
+}
+
+test "isTypeApplication: reads a type constructor applied to a type as a type, not as a value name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing\nfn Box(type T) -> type:\n    return struct:\n        value: T\nfn parse(ready: bool) -> ParseError!Box(i32):\n    if ready: return Box(i32){value = 3}\n    return ParseError::missing\nfn score(ready: bool) -> i32:\n    match parse(ready):\n        case Box(i32) as box: return box.value\n        case missing: return 0\nfn check(ready: bool) -> i32:\n    match parse(ready):\n        case Box(i32): return 1\n        case missing: return 0\nconst VALUE = score(true)\nconst MISSING = score(false)\nconst CHECKED = check(true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    const unnamed = declarations[4].kind.function_definition.body[0].kind.match;
+    try std.testing.expectEqual(.none, unnamed.branches[0].naming);
+    try std.testing.expectEqualStrings("Box", unnamed.branches[0].cases[0].pattern.kind.call.callee.identifier.name);
+    try std.testing.expectEqualStrings("_", unnamed.names[0].name);
+    const named = declarations[3].kind.function_definition.body[0].kind.match;
+    try std.testing.expectEqual(.value, named.branches[0].naming);
+    try std.testing.expectEqualStrings("box", named.names[0].name);
+}
+
+test "isTypeApplication: keeps a value name of an enum case whose name is not declared and whose value name is not a type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    end\nfn Box(type T) -> type:\n    return struct:\n        value: T\nfn show(token: Token) -> i64:\n    match token:\n        case number(digits): return digits\n        case end: return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const matching = loader.modules.items[0].declarations[2].kind.function_definition.body[0].kind.match;
+    try std.testing.expectEqual(.payload, matching.branches[0].naming);
+    try std.testing.expectEqualStrings("digits", matching.names[0].name);
+}
+
+test "resolveBranchCase: resolves a constant and the end of a range" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const LIMIT: u8 = 10\nfn kind(value: u8) -> u8:\n    match value:\n        case LIMIT: return 1\n        case 0..LIMIT: return 2\n        else: return 3" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const branches = loader.modules.items[0].declarations[1].kind.function_definition.body[0].kind.match.branches;
+    try std.testing.expect(branches[0].cases[0].pattern.kind.identifier.resolution.? == .constant);
+    try std.testing.expect(branches[1].cases[0].end.?.kind.identifier.resolution.? == .constant);
+}
+
+test "resolveCaseName: resolves a type and leaves an undeclared case name to the type checker" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing\nfn parse() -> ParseError!i64: return 1\nfn show():\n    match parse():\n        case i64 as value: _ = value\n        case missing: noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const branches = loader.modules.items[0].declarations[2].kind.function_definition.body[0].kind.match.branches;
+    try std.testing.expectEqual(types.Type{ .number = .i64 }, branches[0].cases[0].pattern.kind.identifier.resolution.?.type);
+    try std.testing.expect(branches[1].cases[0].pattern.kind.identifier.resolution == null);
 }
 
 test "resolveJump: rejects a break outside a loop" {
@@ -9223,6 +9516,25 @@ test "resolvePointerType: rejects a read-only pointer to an alias of a function 
 
     try std.testing.expectError(error.ConstantFunctionPointer, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 20 }, name_resolver.failure.?.location.?);
+}
+
+test "resolvePointerType: rejects a multiple value pointer to void" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(pointer: *many void): _ = pointer" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ManyVoidPointer, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveOptionalType: gives an optional of an optional its own type" {
@@ -11056,6 +11368,63 @@ test "resolveEnum: accepts an enum that points to itself" {
     try std.testing.expectEqual(enumeration, enumeration.cases[1].type.?.pointer.target.@"enum");
 }
 
+test "resolveExternalSignature: rejects a struct that is not external through a slice and a pointer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nexternal fn take(points: []const *Point)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InternalStructInExternalFunction, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 26 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveExternalSignature: rejects a struct that is not external in an array returned" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nexternal fn make() -> [2]Point" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InternalStructInExternalFunction, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 23 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveExternalSignature: accepts external structs and other types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Point:\n    x: i32\nenum Token:\n    end\nexternal fn take(point: *Point, maybe: ?*Point, token: Token, points: []Point) -> [2]Point" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    try std.testing.expect(loader.modules.items[0].declarations[0].kind.struct_definition.value.?.@"struct".external);
+}
+
 test "resolveStruct: resolves a struct used as a type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -11134,6 +11503,84 @@ test "resolveStruct: accepts a pointer to the struct itself" {
 
     const node = ast.extractType(loader.modules.items[0].declarations[1].kind.function_definition.signature.parameters[0].type).@"struct";
     try std.testing.expect(std.meta.eql(node, node.fields[0].type.optional.child.pointer.target.@"struct"));
+}
+
+test "expectExternalFields: accepts numbers, bool, pointers, optional pointers, function pointers, arrays and external structs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Inner:\n    value: f64\nstruct Hidden:\n    value: u8\nexternal struct Outer:\n    count: u128\n    flag: bool\n    pointer: *Hidden\n    maybe: ?*const u8\n    callback: *fn(i32) -> i32\n    values: [4][2]i16\n    inner: Inner\n    inners: [2]Inner\nfn use(outer: Outer): _ = outer" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const outer = loader.modules.items[0].declarations[2].kind.struct_definition.value.?.@"struct";
+    try std.testing.expect(outer.external);
+    try std.testing.expectEqual(8, outer.fields.len);
+}
+
+test "expectExternalFields: rejects a slice field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Text:\n    bytes: []const u8\nfn use(text: Text): _ = text" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NotExternalField, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, name_resolver.failure.?.location.?);
+}
+
+test "expectExternalFields: rejects a struct that is not external" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Inner:\n    value: i32\nexternal struct Outer:\n    inner: Inner\nfn use(outer: Outer): _ = outer" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NotExternalField, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 12 }, name_resolver.failure.?.location.?);
+}
+
+test "expectExternalFields: rejects an optional value that is not a pointer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Outer:\n    maybe: ?i32\nfn use(outer: Outer): _ = outer" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NotExternalField, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveStruct: gives every use of a struct the same type" {

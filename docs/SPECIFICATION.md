@@ -22,7 +22,7 @@
 - Identifiers are case-sensitive. By convention only types and type constructors start with a capital letter.
 - The single character `_` is reserved and cannot be used as an identifier by the user.
 - The following identifier names are reserved and cannot be used as identifiers by the user:
-    `and`, `as`, `break`, `catch`, `comptime`, `const`, `continue`, `defer`, `else`, `enum`, `errdefer`, `error`, `external`, `false`, `fn`, `for`, `if`, `import`, `in`, `instance`, `many`, `match`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `true`, `try`, `typeclass`, `undefined`, `var`, `void`, `while`
+    `and`, `as`, `break`, `case`, `catch`, `comptime`, `const`, `continue`, `defer`, `else`, `enum`, `errdefer`, `error`, `external`, `false`, `fn`, `for`, `if`, `import`, `in`, `instance`, `many`, `match`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `true`, `try`, `typeclass`, `undefined`, `var`, `void`, `while`
 
 ## Built-In Types
 
@@ -43,6 +43,7 @@
 - Pointer arithmetic and indexing are supported only for multiple value pointers.
 - Pointers are never allowed to be `null` but can be `undefined` (see Undefined).
 - A pointer never holds address 0.
+- `*void` is a pointer whose target is unknown, like C's `void *`. It cannot be dereferenced, indexed or moved. Any pointer except a pointer to a function converts implicitly to `*void`, or to `*const void` if it is read-only.
 
 ### Array Types
 
@@ -62,6 +63,7 @@
 - A slice converts implicitly to a read-only slice, e.g. `[]T` to `[]const T`. The reverse is a compile-time error.
 - A pointer to an array converts implicitly to a slice, with the length taken from the array type, e.g. `*[4]u8` to `[]u8`. A read-only pointer gives a read-only slice.
 - Slices support indexing, starting at 0.
+- `slice.pointer` gives a slice's multiple value pointer and `slice.length` its length. They can be read but not assigned.
 
 ### Optional Types
 
@@ -92,6 +94,9 @@
 - Field names must be unique within a struct.
 - A field can have a default value after `=`, e.g. `count: u32 = 0`. The default must be known at compile time.
 - Two structs with the same fields are different types.
+- The compiler chooses the order of a struct's fields in memory.
+- `external struct` declares a struct whose layout the language does not manage: its fields stay in declaration order, and the target the program is generated for decides their alignment and padding, e.g. `external struct Point:`.
+- An external struct's fields are numbers, `bool`, pointers, optional pointers, function pointers, arrays of these and external structs.
 - A struct cannot hold a value of its own type, directly or through other structs, arrays or tuples. A pointer to its own type is allowed, e.g. `next: ?*Node`.
 - Structs are values. Assigning or passing a struct copies all its fields.
 - `value.field` gives a field of a struct.
@@ -244,6 +249,13 @@
 - An integer converted to a float, and a float converted to a smaller float, round to the nearest representable value, ties to even. A float beyond the smaller type's largest finite value becomes an infinity.
 - A float converted to an integer rounds toward zero. A NaN, an infinity, or a value the integer type cannot hold is illegal behavior.
 
+### Pointer Casts
+
+- `mn::cast(T, pointer)` gives the pointer as the pointer type `T`, with the same address. It changes the target type or switches between single and multiple value pointers, e.g. `mn::cast(*const Header, buffer.pointer)`.
+- A cast that removes `const` is a compile-time error.
+- An address that is not a multiple of the target type's alignment is illegal behavior.
+- `mn::align(pointer, alignment)` moves a multiple value pointer forward to the next address that is a multiple of `alignment`, e.g. `mn::align(next, mn::alignment(Card))`. An alignment that is not a power of two is illegal behavior.
+
 ### Arithmetic Operators
 
 - `+`, `-`, `*` and `/` work on integers and floats. `%` works on integers.
@@ -351,10 +363,12 @@
 - `else:` runs its block when the condition is false. It is on the line after the `if` block, at the same indentation as `if`.
 - `else if condition:` checks another condition when the previous ones are false, e.g. `if a:` followed by `else if b:` and `else:`.
 - A condition that depends on a type is evaluated at compile time, and only the block it chooses is checked and compiled, e.g. `if T == i32:` in a function with a `type T` parameter.
+- `if optional as name:` runs its block when the optional is not `null`, with `name` holding its value, e.g. `if found as card:`. `*name` holds a pointer to the value instead of a copy. The name can be used only in the block.
 
 ### While
 
 - `while condition:` runs its block as long as the condition is true. The condition is a `bool`, evaluated before each run of the block.
+- `while optional as name:` runs its block as long as the optional is not `null`, with `name` holding its value, e.g. `while queue.pop() as job:`. The optional is evaluated before each run of the block.
 - `else:` runs its block when the condition is false, but not when the loop is left with `break` or `return`. It is on the line after the `while` block, at the same indentation as `while`. Its block is not part of the loop, so `break` and `continue` in it act on an enclosing loop.
 
 ### For
@@ -365,8 +379,6 @@
 - An iterator is a value whose type has an instance of `mn`'s typeclass `Iterator(I)`. Its `Element() -> type` gives the type of the elements, and its `next(iterator: *I) -> ?Element()` gives the elements until it returns `null`, e.g. `Iterator(Countdown)::Element()`. The loop calls `next` on its own copy of the iterator.
 - An iterator's elements are tuples. A single name without parentheses takes apart a one-element tuple, e.g. `for count in countdown:` over an iterator whose `Element()` is `[u32]` gives each `u32`.
 - Over a tuple, the block is compiled once for each element, with `name` holding that element with its own type, e.g. `for value in values:`.
-- A slice is also an iterator through `mn`'s instances `Iterator([]T)` and `Iterator([]const T)`, whose `next` gives the first element and shortens the slice by one.
-- `mn`'s typeclass `Zip(T)` has the function `zip(iterators: T)`, which takes a tuple of iterators and gives an iterator whose elements join theirs into one tuple, in order. It ends when the shortest iterator ends, e.g. `for (card, index) in Zip::zip({cards[..], 0..}):` with `import mn::Zip`. Its one instance is `instance(type T: mn::Tuple) Zip(T)`.
 - The sequence is evaluated once, before the first run of the block. An array is not copied: the loop goes over the array itself.
 - Names in parentheses take each element apart, e.g. `for (name, score) in pairs:`, and `*name` holds a pointer to each element instead of a copy, e.g. `for *card in cards:`, as in a constant declaration (see Variables and Constants).
 - The names are constants and can be used only in the block.
@@ -376,12 +388,16 @@
 
 ### Match
 
-- `match value:` runs the branch for the value's case. Its branches are in an indented block, each with one or more cases and a block, e.g. `end: noop`.
-- A branch can name the value a case carries, e.g. `number(digits): total += digits`. `*digits` holds a pointer to it instead of a copy, as in a constant declaration (see Variables and Constants), and `_` leaves it without a name.
-- A branch with several cases separated by commas cannot name their values, e.g. `name, end: noop`.
-- A branch can name a case through its enum or error set, e.g. `ParseError::missing_end:`. This is needed when a combined error set has two cases with the same name.
-- The branches must cover every case of the enum exactly once. `else:` as the last branch covers the remaining cases.
-- `match` works on enums and error sets.
+- `match value:` runs the branch that fits the value. Its branches are in an indented block, each written `case` with one or more cases and a block, e.g. `case end: noop`.
+- `match` works on enums, error sets, results, optionals and integers.
+- On an enum, a case is a case name. A branch can name the value a case carries, e.g. `case number(digits): total += digits`. `*digits` holds a pointer to it instead of a copy, as in a constant declaration (see Variables and Constants), and `_` leaves it without a name.
+- On an error set, a case is an error. A branch can name an error through its enum or error set, e.g. `case ParseError::missing_end:`. This is needed when a combined error set has two cases with the same name.
+- On a result, a case is an error, or the value's type, which takes the value, e.g. `case Token as token:` for a `ParseError!Token`.
+- On an optional, a case is `null`, or the value's type, which takes the value, e.g. `case Card as card:` for a `?Card`.
+- `as name` names the value, `as *name` holds a pointer to it instead of a copy, and a value's type without `as` leaves it without a name.
+- On an integer, a case is a value known at compile time or a range, e.g. `case 0:` or `case 3..10:`. Cases cannot overlap.
+- A branch with several cases separated by commas cannot name their values, e.g. `case name, end: noop`.
+- The branches must cover every case exactly once. `else:` as the last branch covers the remaining cases, but never a result's or optional's value. A match on an integer needs `else:` unless its cases cover every value of the type.
 
 ### Break and Continue
 
@@ -401,6 +417,7 @@
 - Arguments are given in the order of the parameters.
 - `&name` gives a pointer to a function, e.g. to pass it as an argument. A pointer to a function is called like a function.
 - `external fn` declares a function defined outside the program, without a body, e.g. `external fn write(text: []const u8)`.
+- A struct in an external function's parameters or return type, directly or through pointers or arrays, must be an external struct.
 - `main` has no parameters and either no return type or a result without a value, e.g. `ParseError!void`. It cannot be called, used as a value or be external.
 - An error that ends `main` writes the case's name to the standard error stream and ends the program with a nonzero status.
 
@@ -422,7 +439,7 @@
 - Each `.mn` file is a module. Its path is its location in the program's directory without the extension, with `::` between names, e.g. `shapes/circle.mn` is `shapes::circle`.
 - The program starts at the function `main` in `main.mn`.
 - `mn` is the module that comes with the language. It holds the built-in functions, which the compiler provides, and the standard library. A program's own `mn.mn` or `mn` directory is a compile-time error.
-- The built-in functions are `mn::size(T)` and `mn::alignment(T)`, which give a type's size and alignment in bytes as a `usize`, and `mn::convert(T, value)` and `mn::truncate(T, value)` (see Number Conversions).
+- The built-in functions are `mn::size(T)` and `mn::alignment(T)`, which give a type's size and alignment in bytes as a `usize`, and `mn::convert(T, value)` and `mn::truncate(T, value)` (see Number Conversions), and `mn::cast(T, pointer)` and `mn::align(pointer, alignment)` (see Pointer Casts).
 - `mn::reflection` holds the built-in functions that inspect and build types. `mn::reflection::length(T)` gives a tuple type's number of elements as a `usize`. `mn::reflection::join(A, B)` gives the tuple type with the elements of `A` followed by those of `B`, e.g. `mn::reflection::join([Card], [usize])` is `[Card, usize]`.
 - `import path` makes the last name of the path available in the module. The path names a directory, a module or a declaration in a module, e.g. `import mn::io::stdout` allows `stdout::write("hi")`.
 - `import path as name` makes it available as `name` instead, e.g. `import mn::io::stdout as out`.

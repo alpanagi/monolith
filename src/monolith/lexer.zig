@@ -967,7 +967,7 @@ test "lexWord: recognizes the for and in keywords" {
 test "lexWord: recognizes the keywords of enums, matches and errors" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("enum match try catch || | error defer errdefer");
+    var lexer = Lexer.init("enum match try catch || | error defer errdefer case");
     try lexer.lex(&arena);
 
     try std.testing.expect(lexer.tokens.items[1].kind == .keyword_enum);
@@ -979,6 +979,7 @@ test "lexWord: recognizes the keywords of enums, matches and errors" {
     try std.testing.expect(lexer.tokens.items[7].kind == .keyword_error);
     try std.testing.expect(lexer.tokens.items[8].kind == .keyword_defer);
     try std.testing.expect(lexer.tokens.items[9].kind == .keyword_errdefer);
+    try std.testing.expect(lexer.tokens.items[10].kind == .keyword_case);
 }
 
 test "lexWord: recognizes the typeclass and instance keywords" {

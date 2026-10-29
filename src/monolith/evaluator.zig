@@ -202,7 +202,8 @@ pub const Evaluator = struct {
             .binary => |binary| self.evaluateBinary(expression.*, binary),
             .composite_literal => |literal| self.evaluateCompositeLiteral(expression.*, literal),
             .index => self.evaluateIndex(expression.*),
-            .field_access, .dereference => self.readPlace(location, try self.findPlace(expression.*)),
+            .field_access => self.evaluateFieldAccess(expression),
+            .dereference => self.readPlace(location, try self.findPlace(expression.*)),
             .slice => |slice| self.evaluateSlice(expression.*, slice),
             .unwrap => |operand| self.evaluateUnwrap(expression.*, operand.*),
             .@"try" => |operand| self.evaluateTry(operand.*),
@@ -215,6 +216,16 @@ pub const Evaluator = struct {
             .method_call => self.fail(location, error.CannotEvaluate),
             .struct_type => unreachable,
         };
+    }
+
+    fn evaluateFieldAccess(self: *Evaluator, expression: *const ast.Expression) EvaluateError!Value {
+        const access = expression.kind.field_access;
+        if (types.followPointer(access.value.type.?) != .slice) return self.readPlace(expression.location, try self.findPlace(expression.*));
+        var slice_value = try self.evaluateExpression(access.value);
+        if (slice_value == .pointer) slice_value = try self.readPlace(access.value.location, slice_value.pointer);
+        const slice = slice_value.slice;
+        if (std.mem.eql(u8, access.field, "length")) return .{ .integer = slice.length };
+        return .{ .many = .{ .array = slice.array, .index = slice.start } };
     }
 
     fn evaluateRange(self: *Evaluator, range: *const ast.Range) EvaluateError!Value {
@@ -470,6 +481,7 @@ pub const Evaluator = struct {
     }
 
     fn evaluateBuiltin(self: *Evaluator, location: token.Location, call: ast.Call, builtin: ast.Builtin) EvaluateError!Value {
+        if (builtin == .@"align") return self.fail(location, error.CannotEvaluate);
         const target = (try self.evaluateExpression(&call.arguments[0].value)).type;
         switch (builtin) {
             .size => return .{ .integer = types.findLayout(target).size },
@@ -486,7 +498,18 @@ pub const Evaluator = struct {
                 if (value == .undefined) return self.fail(argument.location, error.ReadUndefined);
                 return self.convertNumber(location, builtin, value, target.number);
             },
+            .cast => return self.castPointer(location, target.pointer, &call.arguments[1].value),
+            .@"align" => unreachable,
         }
+    }
+
+    fn castPointer(self: *Evaluator, location: token.Location, target: *const types.Pointer, argument: *const ast.Expression) EvaluateError!Value {
+        const value = try self.evaluateExpression(argument);
+        if (value == .undefined) return self.fail(argument.location, error.ReadUndefined);
+        if (target.target == .void) return value;
+        const pointed = findPointedType(value) orelse return self.fail(location, error.CannotEvaluate);
+        if (target.many != (value == .many) or !std.meta.eql(pointed, target.target)) return self.fail(location, error.CannotEvaluate);
+        return value;
     }
 
     fn convertNumber(
@@ -1008,7 +1031,7 @@ pub const Evaluator = struct {
 
     fn executeIf(self: *Evaluator, statement: *const ast.Statement) EvaluateError!Flow {
         const conditional = &statement.kind.@"if";
-        if (try self.evaluateCondition(conditional.condition)) return self.executeBlock(conditional.body);
+        if (try self.enterCondition(statement, conditional.condition)) return self.executeBlock(conditional.body);
         const else_body = conditional.else_body orelse return .next;
         return self.executeBlock(else_body);
     }
@@ -1044,23 +1067,19 @@ pub const Evaluator = struct {
     }
 
     fn executeMatch(self: *Evaluator, statement: *const ast.Statement) EvaluateError!Flow {
-        const matching = statement.kind.match;
+        const matching = &statement.kind.match;
         const value = matching.value;
+        const value_type = value.type.?;
         const place = try self.findPlace(value);
-        const enumeration = (try self.readPlace(value.location, place)).enumeration;
-        for (matching.branches, matching.names, 0..) |branch, name, position| {
-            if (!isChosenBranch(value.type.?.@"enum", branch, enumeration.case.tag)) continue;
-            if (!ast.isDiscardedName(name.name)) {
-                const payload = enumeration.value.?;
-                const bound = if (name.pointer)
-                    Value{ .pointer = .{ .root = payload, .root_type = name.type.?.pointer.target, .path = &.{} } }
-                else
-                    payload.*;
-                try self.declareElement(.{ .statement = statement, .position = position }, bound);
-            }
-            return self.executeBlock(branch.body);
+        const matched = try self.readPlace(value.location, place);
+        const position = findChosenBranch(matching, value_type, matched);
+        const branch = matching.branches[position];
+        const name = matching.names[position];
+        if (branch.naming != .none and !ast.isDiscardedName(name.name)) {
+            const bound = findBranchValue(value_type, name, place, matched);
+            try self.declareElement(.{ .statement = statement, .position = position }, bound);
         }
-        unreachable;
+        return self.executeBlock(branch.body);
     }
 
     fn executeAssignment(self: *Evaluator, assignment: *const ast.Assignment) EvaluateError!void {
@@ -1083,11 +1102,26 @@ pub const Evaluator = struct {
         return (try self.evaluateExpression(&condition)).boolean;
     }
 
+    fn enterCondition(self: *Evaluator, statement: *const ast.Statement, condition: ast.Expression) EvaluateError!bool {
+        const names = ast.extractElementNames(statement.*);
+        if (names.len == 0) return self.evaluateCondition(condition);
+        const element: ast.Resolution.Element = .{ .statement = statement, .position = 0 };
+        if (!names[0].pointer) {
+            const cell = (try self.evaluateExpression(&condition)).optional orelse return false;
+            try self.declareElement(element, cell.*);
+            return true;
+        }
+        const place = try self.findPlace(condition);
+        const cell = (try self.readPlace(condition.location, place)).optional orelse return false;
+        try self.declareElement(element, .{ .pointer = .{ .root = cell, .root_type = names[0].type.?.pointer.target, .path = &.{} } });
+        return true;
+    }
+
     fn executeWhile(self: *Evaluator, statement: *const ast.Statement) EvaluateError!Flow {
         const loop = statement.kind.@"while";
         while (true) {
             try self.step(statement.location);
-            if (!try self.evaluateCondition(loop.condition)) break;
+            if (!try self.enterCondition(statement, loop.condition)) break;
             switch (try self.executeBlock(loop.body)) {
                 .next => {},
                 .broke => |target| {
@@ -1513,6 +1547,33 @@ fn truncateInteger(number: types.NumberType, value: i129) i129 {
     };
 }
 
+fn findPointedType(value: Value) ?types.Type {
+    return switch (value) {
+        .pointer => |pointer| findPlaceType(pointer),
+        .many => |many| {
+            const array = findPlaceType(many.array) orelse return null;
+            if (array != .array) return null;
+            return array.array.element;
+        },
+        else => null,
+    };
+}
+
+fn findPlaceType(pointer: Value.Pointer) ?types.Type {
+    var current = pointer.root_type;
+    for (pointer.path) |position| current = findPartType(current, position) orelse return null;
+    return current;
+}
+
+fn findPartType(container: types.Type, position: usize) ?types.Type {
+    return switch (container) {
+        .array => |array| array.element,
+        .@"struct" => |struct_type| struct_type.fields[position].type,
+        .tuple => |tuple| tuple.elements[position],
+        else => null,
+    };
+}
+
 fn findFunctionCall(expression: *const ast.Expression) ?*const ast.Call {
     return switch (expression.kind) {
         .call => |*call| switch (ast.extractResolution(call.callee)) {
@@ -1564,12 +1625,43 @@ fn isErrorSet(value: Value) bool {
     return value.type == .@"enum" and value.type.@"enum".kind == .error_set;
 }
 
-fn isChosenBranch(enumeration: *const types.Enum, branch: ast.Branch, tag: usize) bool {
-    if (branch.cases.len == 0) return true;
-    for (branch.cases) |case| {
-        if (enumeration.cases[case.index.?].tag == tag) return true;
+fn findChosenBranch(matching: *const ast.Match, value_type: types.Type, matched: Value) usize {
+    for (matching.branches, 0..) |branch, position| {
+        if (branch.cases.len == 0) return position;
+        for (branch.cases) |case| {
+            if (isChosenCase(case, value_type, matched)) return position;
+        }
     }
-    return false;
+    unreachable;
+}
+
+fn isChosenCase(case: ast.BranchCase, value_type: types.Type, matched: Value) bool {
+    return switch (case.kind) {
+        .case => {
+            if (value_type == .result) {
+                if (matched != .failure) return false;
+                return value_type.result.error_set.cases[case.index.?].tag == matched.failure.case.tag;
+            }
+            return value_type.@"enum".cases[case.index.?].tag == matched.enumeration.case.tag;
+        },
+        .value => if (value_type == .result) matched != .failure else matched.optional != null,
+        .null => matched.optional == null,
+        .integer => case.minimum <= matched.integer and matched.integer <= case.maximum,
+    };
+}
+
+fn findBranchValue(value_type: types.Type, name: ast.ElementName, place: Value.Pointer, matched: Value) Value {
+    if (value_type == .result and matched != .failure) {
+        if (name.pointer) return .{ .pointer = place };
+        return matched;
+    }
+    const cell = switch (matched) {
+        .enumeration, .failure => |enumeration| enumeration.value.?,
+        .optional => |optional| optional.?,
+        else => unreachable,
+    };
+    if (name.pointer) return .{ .pointer = .{ .root = cell, .root_type = name.type.?.pointer.target, .path = &.{} } };
+    return cell.*;
 }
 
 fn findFieldPosition(struct_type: types.Struct, name: []const u8) usize {
@@ -1995,6 +2087,26 @@ test "evaluateUnary: inverts the bits of an unsigned integer" {
     try std.testing.expectEqual(Value{ .integer = 250 }, try analyzer.type_checker.evaluator.evaluate(&value));
 }
 
+test "evaluateFieldAccess: reads the pointer and the length of a slice at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn second(values: []const u8) -> u8:\n    const pointer = values.pointer\n    return pointer[1] + mn::convert(u8, values.length)\nconst VALUES: [3]u8 = {1, 2, 3}\nconst SECOND = second(&VALUES)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[3].kind.constant_declaration.known.?.*);
+}
+
 test "evaluateBuiltin: converts and truncates numbers at compile time" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2037,6 +2149,64 @@ test "evaluateBuiltin: rejects a float that the integer type cannot hold" {
 
     try std.testing.expectError(error.ConversionOutOfRange, analyzer.analyze());
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 15 }, analyzer.failure.?.location.?);
+}
+
+test "castPointer: casts a pointer through a pointer to void and back at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn round(value: i32) -> i32:\n    var copy = value\n    const hidden: *void = &copy\n    const back = mn::cast(*i32, hidden)\n    back.* += 1\n    return copy\nconst ROUND = round(4)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[2].kind.constant_declaration.known.?.*);
+}
+
+test "castPointer: rejects a cast to another target type at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn reinterpret(value: i32) -> u8:\n    var copy = value\n    const bytes = mn::cast(*u8, &copy)\n    return bytes.*\nconst BYTE = reinterpret(4)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.CannotEvaluate, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 19 }, analyzer.failure.?.location.?);
+}
+
+test "evaluateBuiltin: rejects aligning a pointer at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn move(values: []const u8) -> usize:\n    const aligned = mn::align(values.pointer, 4)\n    _ = aligned\n    return 0\nconst VALUES: [2]u8 = {1, 2}\nconst MOVED = move(&VALUES)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.CannotEvaluate, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 21 }, analyzer.failure.?.location.?);
 }
 
 test "evaluateBinary: orders the cases of a combined error set by the declarations of its sets" {
@@ -2703,7 +2873,7 @@ test "executeMatch: runs the branch of the case and binds its value" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    flag: bool\n    end\nfn score(token: Token) -> i64:\n    match token:\n        number(digits): return digits\n        flag(on):\n            if on: return 1\n            return 2\n        end: return 3\nconst NUMBER = score(Token::number(40))\nconst FLAG = score(Token::flag(false))\nconst END = score(Token::end)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    flag: bool\n    end\nfn score(token: Token) -> i64:\n    match token:\n        case number(digits): return digits\n        case flag(on):\n            if on: return 1\n            return 2\n        case end: return 3\nconst NUMBER = score(Token::number(40))\nconst FLAG = score(Token::flag(false))\nconst END = score(Token::end)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2725,7 +2895,7 @@ test "executeMatch: writes through a pointer to the value of a case" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    flag: bool\n    end\nfn bump(value: Token) -> Token:\n    var token = value\n    match token:\n        number(*digits): digits.* += 1\n        else: noop\n    return token\nconst BUMPED = bump(Token::number(1))" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    flag: bool\n    end\nfn bump(value: Token) -> Token:\n    var token = value\n    match token:\n        case number(*digits): digits.* += 1\n        else: noop\n    return token\nconst BUMPED = bump(Token::number(1))" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2745,7 +2915,7 @@ test "executeMatch: runs the else branch and a branch that names a case through 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing_end\n    bad_digit: u8\nerror FileError:\n    missing_end\nfn code(failure: ParseError || FileError) -> u8:\n    match failure:\n        FileError::missing_end: return 2\n        else: return 1\nconst PARSE = code(ParseError::missing_end)\nconst FILE = code(FileError::missing_end)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing_end\n    bad_digit: u8\nerror FileError:\n    missing_end\nfn code(failure: ParseError || FileError) -> u8:\n    match failure:\n        case FileError::missing_end: return 2\n        else: return 1\nconst PARSE = code(ParseError::missing_end)\nconst FILE = code(FileError::missing_end)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2766,7 +2936,7 @@ test "executeMatch: runs a match in an instance of a function with a type parame
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    flag: bool\n    end\nfn pick(type T, token: Token, one: T, two: T) -> T:\n    match token:\n        number(digits):\n            if digits > 0: return one\n            return two\n        else: return two\nconst PICKED = pick(i32, Token::number(1), 3, 4)\nconst OTHER = pick(bool, Token::end, true, false)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    flag: bool\n    end\nfn pick(type T, token: Token, one: T, two: T) -> T:\n    match token:\n        case number(digits):\n            if digits > 0: return one\n            return two\n        else: return two\nconst PICKED = pick(i32, Token::number(1), 3, 4)\nconst OTHER = pick(bool, Token::end, true, false)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2775,6 +2945,97 @@ test "executeMatch: runs a match in an instance of a function with a type parame
     const declarations = loader.modules.items[0].declarations;
     try std.testing.expectEqual(Value{ .integer = 3 }, declarations[2].kind.constant_declaration.known.?.*);
     try std.testing.expectEqual(Value{ .boolean = false }, declarations[3].kind.constant_declaration.known.?.*);
+}
+
+test "executeMatch: runs the branch of the error or the value of a result" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing_end\n    bad_digit: u8\nfn parse(text: u8) -> ParseError!i64:\n    if text == 0: return ParseError::missing_end\n    if text == 1: return ParseError::bad_digit(7)\n    return 40\nfn score(text: u8) -> i64:\n    match parse(text):\n        case i64 as value: return value + 2\n        case bad_digit(digit):\n            if digit == 7: return 5\n            return 6\n        case missing_end: return 1\nconst VALUE = score(2)\nconst BAD = score(1)\nconst MISSING = score(0)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 42 }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[5].kind.constant_declaration.known.?.*);
+}
+
+test "executeMatch: takes the value of a result whose type is a type constructor applied to a type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing\nfn Box(type T) -> type:\n    return struct:\n        value: T\nfn parse(ready: bool) -> ParseError!Box(i32):\n    if ready: return Box(i32){value = 3}\n    return ParseError::missing\nfn score(ready: bool) -> i32:\n    match parse(ready):\n        case Box(i32) as box: return box.value\n        case missing: return 0\nfn check(ready: bool) -> i32:\n    match parse(ready):\n        case Box(i32): return 1\n        case missing: return 0\nconst VALUE = score(true)\nconst MISSING = score(false)\nconst CHECKED = check(true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 3 }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 0 }, declarations[6].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[7].kind.constant_declaration.known.?.*);
+}
+
+test "executeMatch: runs the branch of an optional and writes through a pointer to its value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn bump(start: ?i64) -> i64:\n    var value = start\n    match value:\n        case i64 as *count: count.* += 1\n        case null: return 0\n    return value.?\nconst BUMPED = bump(4)\nconst NOTHING = bump(null)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 0 }, declarations[2].kind.constant_declaration.known.?.*);
+}
+
+test "executeMatch: runs the branch whose value or range holds an integer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn kind(value: i16) -> u8:\n    match value:\n        case 0: return 1\n        case 3..10, 20: return 2\n        case 200..: return 3\n        case -5..0: return 5\n        else: return 4\nconst ZERO = kind(0)\nconst NINE = kind(9)\nconst TEN = kind(10)\nconst TWENTY = kind(20)\nconst LAST = kind(32767)\nconst NEGATIVE = kind(-1)\nconst LOW = kind(-6)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 4 }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 3 }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[6].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 4 }, declarations[7].kind.constant_declaration.known.?.*);
 }
 
 test "executeUnrolled: runs the block once for each element of a tuple with its own type" {
@@ -2945,6 +3206,67 @@ test "executeIteration: takes the first element of a slice and shortens it" {
     const taken = loader.modules.items[0].declarations[3].kind.constant_declaration.known.?.aggregate;
     try std.testing.expectEqual(Value{ .integer = 7 }, taken[0]);
     try std.testing.expectEqual(Value{ .integer = 8 }, taken[1]);
+}
+
+test "enterCondition: binds the value of an optional in an if and runs the else for null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?i64) -> i64:\n    if value as found: return found * 2\n    else: return 1\nconst SOME = pick(4)\nconst NONE = pick(null)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 8 }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[2].kind.constant_declaration.known.?.*);
+}
+
+test "enterCondition: writes through a pointer to the value of an optional in an if" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn bump(start: ?i64) -> i64:\n    var value = start\n    if value as *count: count.* += 10\n    return value orelse 0\nconst BUMPED = bump(1)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 11 }, declarations[1].kind.constant_declaration.known.?.*);
+}
+
+test "enterCondition: evaluates the optional of a while loop before each run" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next(count: *u8) -> ?u8:\n    if count.* == 0: return null\n    count.* -= 1\n    return count.*\nfn total(start: u8) -> u8:\n    var count = start\n    var sum: u8 = 0\n    while next(&count) as value: sum += value\n    else: sum += 10\n    return sum\nconst TOTAL = total(4)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 16 }, declarations[2].kind.constant_declaration.known.?.*);
 }
 
 test "executeWhile: runs a loop with compound assignments" {

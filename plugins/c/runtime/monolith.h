@@ -49,4 +49,8 @@ MN_UNSIGNED_HELPERS(usize, size_t, SIZE_WIDTH)
 #undef MN_SIGNED_HELPERS
 #undef MN_UNSIGNED_HELPERS
 
+static inline uintptr_t mn_align_address(uintptr_t address, size_t alignment) {
+    return (address + alignment - 1) & ~(uintptr_t)(alignment - 1);
+}
+
 #endif

@@ -44,6 +44,7 @@ pub const NumberType = enum {
 pub const Struct = struct {
     module: usize,
     name: []const u8,
+    external: bool = false,
     fields: []const Field,
     origin: ?*Origin = null,
 };

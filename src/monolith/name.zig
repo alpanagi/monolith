@@ -32,6 +32,7 @@ pub const keywords = std.StaticStringMap(token.TokenKind).initComptime(.{
     .{ "comptime", .keyword_comptime },
     .{ "enum", .keyword_enum },
     .{ "match", .keyword_match },
+    .{ "case", .keyword_case },
     .{ "try", .keyword_try },
     .{ "catch", .keyword_catch },
     .{ "error", .keyword_error },
