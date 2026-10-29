@@ -1430,9 +1430,11 @@ pub const TypeChecker = struct {
         expression: *ast.Expression,
     ) TypeError!void {
         const call = &expression.kind.call;
-        const callee = &call.callee.path_expression;
-        const method = callee.resolution.?.typeclass_method;
-        const signature = self.extractSignature(callee.resolution.?);
+        const callee_resolution: *?ast.Resolution = switch (call.callee) {
+            inline else => |*name| &name.resolution,
+        };
+        const method = callee_resolution.*.?.typeclass_method;
+        const signature = self.extractSignature(callee_resolution.*.?);
         const module = self.program.modules[self.module_index];
         if (!isTypeclassVisible(module, self.module_index, method.typeclass)) {
             return self.fail(expression.location, error.UnknownMethod);
@@ -1460,7 +1462,7 @@ pub const TypeChecker = struct {
         }
         const location = deciding orelse return self.fail(expression.location, error.UndecidedInstance);
         const found = try self.findTypeclassMethod(location, method, decided, signature.name);
-        callee.resolution = found.resolution;
+        callee_resolution.* = found.resolution;
         call.typeclass_arguments = found.typeclass_arguments;
     }
 
@@ -4667,6 +4669,102 @@ test "expectNotInline: rejects a local constant that names an inline function" {
 
     try std.testing.expectError(error.InlineValue, analyzer.analyze());
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 19 }, analyzer.failure.?.location.?);
+}
+
+test "expectNotInline: rejects a top-level constant that names an inline function of a struct through a path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Box:\n    value: i32\n    inline fn get(self: Self) -> i32: return self.value\nconst get = Box::get\nfn main(): _ = get(Box{value = 1})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InlineValue, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 13 }, analyzer.failure.?.location.?);
+}
+
+test "expectNotInline: rejects a local constant that names an inline function of a struct through a path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Box:\n    value: i32\n    inline fn get(self: Self) -> i32: return self.value\nfn main():\n    const get = Box::get\n    _ = get(Box{value = 1})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InlineValue, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 17 }, analyzer.failure.?.location.?);
+}
+
+test "expectNotInline: rejects a constant that names an inline function of an enum through a path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    end\n    inline fn make() -> Token: return Token::end\nconst make = Token::make\nfn main(): _ = make()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InlineValue, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 14 }, analyzer.failure.?.location.?);
+}
+
+test "resolvePendingMethod: rejects a path to an instance function through the type it is for" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T):\n    fn show(value: T) -> i32\nstruct Card:\n    rank: i32\ninstance Show(Card):\n    inline fn show(card: Card) -> i32: return card.rank\nconst show = Card::show\nfn main(): _ = show(Card{rank = 1})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownMethod, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 7, .column = 14 }, analyzer.failure.?.location.?);
+}
+
+test "resolveTypeclassCall: calls a typeclass function through a constant that names it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T):\n    fn show(value: T) -> i32\nstruct Card:\n    rank: i32\ninstance Show(Card):\n    inline fn show(card: Card) -> i32: return card.rank\nconst show = Show::show\nfn main(): _ = show(Card{rank = 1})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const callee = loader.modules.items[0].declarations[5].kind.function_definition.body[0].kind.discard.kind.call.callee;
+    try std.testing.expect(callee.identifier.resolution.? == .function);
 }
 
 test "checkInlineRecursion: rejects an inline instance function that calls itself through its typeclass" {

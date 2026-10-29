@@ -1595,6 +1595,12 @@ pub const NameResolver = struct {
         const function = ast.findOwnMethod(modules, receiver, name) orelse {
             return self.fail(pending.location, error.UnknownMethod);
         };
+        if (pending.value) {
+            const definition = ast.findDeclaration(modules[function.module], function.declaration);
+            if (definition.kind == .function_definition and definition.kind.function_definition.signature.@"inline") {
+                return self.fail(pending.location, error.InlineValue);
+            }
+        }
         pending.resolution.* = .{ .function = function };
     }
 
@@ -3079,7 +3085,20 @@ pub const NameResolver = struct {
         };
     }
 
-    fn expectNotInline(self: *NameResolver, location: token.Location, target: Target) NameError!void {
+    fn expectNotInline(self: *NameResolver, location: token.Location, target: Target) ResolveError!void {
+        if (target == .method) {
+            const allocator = self.arena.allocator();
+            const resolution = try allocator.create(?ast.Resolution);
+            resolution.* = null;
+            try self.pending.append(allocator, .{
+                .resolution = resolution,
+                .method = target.method,
+                .location = location,
+                .module = self.module_index,
+                .value = true,
+            });
+            return;
+        }
         if (target != .function) return;
         const module = self.loader.modules.items[target.function.module];
         const declaration = ast.findDeclaration(module, target.function.declaration);
@@ -3372,6 +3391,7 @@ const PendingMethod = struct {
     method: Method,
     location: token.Location,
     module: usize,
+    value: bool = false,
 };
 
 const Block = struct {
