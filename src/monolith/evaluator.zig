@@ -3341,7 +3341,7 @@ test "executeFor: leaves an outer loop through its label" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(limit: usize) -> usize:\n    var found = 0usize\n    outer: for row in 0..limit:\n        for column in 0..limit:\n            if row * column == 6:\n                found = row\n                break outer\n    return found\nconst FIRST = first(5)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(limit: usize) -> usize:\n    var found = 0usize\n    @outer for row in 0..limit:\n        for column in 0..limit:\n            if row * column == 6:\n                found = row\n                break @outer\n    return found\nconst FIRST = first(5)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);

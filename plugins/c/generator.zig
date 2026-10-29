@@ -11110,7 +11110,7 @@ test "generateFor: continues with the next elements" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn step(index: usize) -> bool\nfn main():\n    outer: for index in 0..3:\n        if step(index): continue\n        while step(index): continue outer" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn step(index: usize) -> bool\nfn main():\n    @outer for index in 0..3:\n        if step(index): continue\n        while step(index): continue @outer" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11770,7 +11770,7 @@ test "generateJump: writes a jump to the innermost loop as a plain break or cont
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn step() -> bool\nfn run(running: bool):\n    outer: while running:\n        if step(): continue outer\n        break outer\nfn main(): run(true)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn step() -> bool\nfn run(running: bool):\n    @outer while running:\n        if step(): continue @outer\n        break @outer\nfn main(): run(true)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11797,7 +11797,7 @@ test "generateJump: jumps to the labels of an outer loop" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn step() -> bool\nfn run(running: bool):\n    outer: while running:\n        while step():\n            if step(): continue outer\n            break outer\nfn main(): run(true)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn step() -> bool\nfn run(running: bool):\n    @outer while running:\n        while step():\n            if step(): continue @outer\n            break @outer\nfn main(): run(true)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);

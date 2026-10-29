@@ -432,6 +432,7 @@ fn lexSymbols(state: *Lexer, allocator: std.mem.Allocator) LexError!bool {
         '^' => .caret,
         '~' => .tilde,
         '?' => .question_mark,
+        '@' => .at_sign,
         else => return false,
     };
     switch (kind) {
@@ -636,7 +637,7 @@ test "Lexer.lex: rejects lone carriage return" {
 test "Lexer.lex: tracks position on unexpected character" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("fn main():\r\n  @");
+    var lexer = Lexer.init("fn main():\r\n  $");
 
     try std.testing.expectError(error.UnexpectedCharacter, lexer.lex(&arena));
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 3 }, lexer.failure.?.location.?);
@@ -1602,6 +1603,17 @@ test "lexSymbols: lexes adjacent symbols" {
     try std.testing.expect(lexer.tokens.items[4].kind == .dot);
     try std.testing.expect(lexer.tokens.items[5].kind == .equals);
     try std.testing.expect(lexer.tokens.items[6].kind == .right_parenthesis);
+}
+
+test "lexSymbols: lexes an at sign before a name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("@outer");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .at_sign);
+    try std.testing.expectEqualStrings("outer", lexer.tokens.items[2].kind.identifier);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 2 }, lexer.tokens.items[2].location);
 }
 
 test "lexSymbols: lexes two colons as one symbol" {

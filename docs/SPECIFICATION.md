@@ -32,7 +32,7 @@
 - Unsigned integers: `u8`, `u16`, `u32`, `u64`, `u128`, and `usize` which has the target's pointer size.
 - Floating point numbers: `f16`, `f32`, `f64`, `f128` as defined for IEEE 754 binary formats.
 - Booleans: `bool` with `true` and `false` as values.
-- `void`: represents no result, i.e. the result of a function that returns nothing. It has no size and can be used anywhere a type can.
+- `void`: represents no result, i.e. the result of a function that returns nothing. It has no size and can be used anywhere a type can, except as the target of a multiple value pointer. `*void` is a pointer whose target is unknown (see Pointer Types).
 
 ### Pointer Types
 
@@ -90,7 +90,7 @@
 
 - A struct is a type with named fields. It is declared with `struct`, its name, and its fields in an indented block, each with a name and a type, e.g. `struct Point:` followed by the fields `x: i32` and `y: i32`.
 - A struct without fields has no block, e.g. `struct Marker`.
-- Structs are declared at the top level of a module.
+- Named structs are declared at the top level of a module.
 - Field names must be unique within a struct.
 - A field can have a default value after `=`, e.g. `count: u32 = 0`. The default must be known at compile time.
 - Two structs with the same fields are different types.
@@ -117,6 +117,7 @@
 - An enum has at least one case.
 - Enums are declared at the top level of a module. An enum's block can also declare functions, as a struct's can. A function cannot have the name of a case.
 - Enums are values. Assigning or passing an enum copies its case and its value.
+- An enum's case cannot carry a value of the enum's own type, directly or through structs, other enums, arrays or tuples. A pointer to its own type is allowed, e.g. `node: *Tree`.
 
 ## Literals
 
@@ -234,6 +235,7 @@
     13. `or`
 - Operators on the same level are left-associative. Operands and arguments are evaluated left to right. Comparisons cannot be chained, e.g. `a < b < c` is a compile-time error.
 - Parentheses group an expression.
+- A range, `start..end` or `start..`, is a whole expression: `..` binds weaker than every operator, and a range cannot be an operand, e.g. `0..count + 1` ends at `count + 1`.
 
 ### Operand Types
 
@@ -304,7 +306,7 @@
 
 ### Pointer Operations
 
-- `&value` gives a pointer to a variable, constant, element, field or function. The pointer is read-only if the value cannot be modified.
+- `&value` gives a pointer to a variable, constant, parameter, element, field or function. The pointer is read-only if the value cannot be modified.
 - `pointer.*` gives the value a pointer points to.
 - Reading or writing through a pointer to invalid memory, such as a dangling or `undefined` pointer, is illegal behavior.
 - Field access dereferences a pointer automatically, one level only, e.g. `pointer.field`.
@@ -377,7 +379,8 @@
 - `start..end` is a range of the `usize` values from `start` up to, but not including, `end`, e.g. `for index in 0..count:`. `start..` is a range without an end. A start after the end is illegal behavior.
 - A range is also a value of the type `mn::Range`, which is an iterator over its values, e.g. as an argument.
 - An iterator is a value whose type has an instance of `mn`'s typeclass `Iterator(I)`. Its `Element() -> type` gives the type of the elements, and its `next(iterator: *I) -> ?Element()` gives the elements until it returns `null`, e.g. `Iterator(Countdown)::Element()`. The loop calls `next` on its own copy of the iterator.
-- An iterator's elements are tuples. A single name without parentheses takes apart a one-element tuple, e.g. `for count in countdown:` over an iterator whose `Element()` is `[u32]` gives each `u32`.
+- An iterator's elements are tuples. A single name without parentheses takes apart a one-element tuple, e.g. `for count in countdown:` over an iterator whose `Element()` is `[u32]` gives each `u32`. A single name over elements with more than one value is a compile-time error.
+- An iterator gives its elements by value, so `*name` over an iterator is a compile-time error.
 - Over a tuple, the block is compiled once for each element, with `name` holding that element with its own type, e.g. `for value in values:`.
 - The sequence is evaluated once, before the first run of the block. An array is not copied: the loop goes over the array itself.
 - Names in parentheses take each element apart, e.g. `for (name, score) in pairs:`, and `*name` holds a pointer to each element instead of a copy, e.g. `for *card in cards:`, as in a constant declaration (see Variables and Constants).
@@ -402,7 +405,7 @@
 ### Break and Continue
 
 - `break` leaves the innermost loop. `continue` ends the current run of its block: a `while` evaluates its condition again, and a `for` goes on with the next element.
-- A loop can have a label before `while` or `for`, e.g. `outer: while running:`. `break outer` and `continue outer` act on that loop instead of the innermost one.
+- A loop can have a label, written `@` and a name before `while` or `for`, e.g. `@outer while running:`. `break @outer` and `continue @outer` act on that loop instead of the innermost one.
 - A label cannot repeat the label of an enclosing loop. An unused label is a compile-time error.
 - `break` and `continue` outside a loop are a compile-time error.
 

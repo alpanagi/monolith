@@ -4549,7 +4549,7 @@ test "checkFunction: rejects an endless loop that a labeled break of an inner lo
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(running: bool) -> i32:\n    outer: while true:\n        while running: break outer\nfn main(): _ = first(true)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(running: bool) -> i32:\n    @outer while true:\n        while running: break @outer\nfn main(): _ = first(true)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5970,7 +5970,7 @@ test "checkUndefinedVariable: rejects a read after a labeled break that leaves b
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn run(early: bool):\n    var count: i32 = undefined\n    outer: while true:\n        while early: break outer\n        count = 1\n        break\n    const copy = count\n    count = copy\nfn main(): run(true)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn run(early: bool):\n    var count: i32 = undefined\n    @outer while true:\n        while early: break @outer\n        count = 1\n        break\n    const copy = count\n    count = copy\nfn main(): run(true)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);

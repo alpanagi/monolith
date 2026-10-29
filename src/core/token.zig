@@ -83,6 +83,7 @@ pub const TokenKind = union(enum) {
     caret,
     tilde,
     question_mark,
+    at_sign,
     identifier: []const u8,
     integer_literal: NumberLiteral,
     float_literal: NumberLiteral,
