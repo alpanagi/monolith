@@ -192,6 +192,10 @@ pub const Parser = struct {
             offset.* = position;
             return parameter;
         }
+        if (self.parseAnyParameter(&position)) |parameter| {
+            offset.* = position;
+            return parameter;
+        }
         const marker = self.match(&position, .keyword_comptime);
         const underscore = self.match(&position, .underscore);
         var parameter = if (underscore) |discarded|
@@ -209,6 +213,26 @@ pub const Parser = struct {
 
         offset.* = position;
         return parameter;
+    }
+
+    fn parseAnyParameter(self: *Parser, offset: *usize) ?ast.TypedName {
+        const name = self.tokens[offset.*];
+        const written = switch (name.kind) {
+            .identifier => |identifier| identifier,
+            .underscore => "_",
+            else => return null,
+        };
+        if (self.tokens[offset.* + 1].kind != .colon) return null;
+        const marker = self.tokens[offset.* + 2];
+        if (marker.kind != .keyword_any) return null;
+        offset.* += 3;
+        const kind: ast.ExpressionKind = .{ .identifier = .{ .name = "any" } };
+        return .{
+            .name = written,
+            .type = .{ .kind = kind, .location = marker.location },
+            .location = name.location,
+            .kind = .any,
+        };
     }
 
     fn parseTypeParameter(self: *Parser, allocator: std.mem.Allocator, offset: *usize) ParseError!?ast.TypedName {
@@ -1433,6 +1457,7 @@ pub const Parser = struct {
         allocator: std.mem.Allocator,
         offset: *usize,
     ) ParseError!?ast.Expression {
+        if (self.tokens[offset.*].kind == .keyword_any) return self.fail(offset.*, error.MisplacedAny);
         if (self.tokens[offset.*].kind == .left_brace) {
             return try self.parseCompositeLiteral(allocator, offset, null);
         }
@@ -1579,7 +1604,7 @@ pub const Parser = struct {
 
     fn isTypeStart(self: *Parser, offset: usize) bool {
         return switch (self.tokens[offset].kind) {
-            .identifier, .asterisk, .question_mark, .left_parenthesis => true,
+            .identifier, .asterisk, .question_mark, .left_parenthesis, .keyword_any => true,
             .keyword_fn => self.tokens[offset + 1].kind == .left_parenthesis,
             .left_bracket => self.tokens[offset + 1].kind != .dot_dot,
             else => false,
@@ -1973,6 +1998,7 @@ pub const ParseError = error{
     ElseNotLast,
     NamedCases,
     LabelWithoutSigil,
+    MisplacedAny,
     RangeOperand,
     DiscardedValueName,
     ExpectedDeferredStatement,
@@ -2115,6 +2141,7 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.ElseNotLast => "'else' must be the last branch",
         error.NamedCases => "a branch with several cases cannot name a value",
         error.LabelWithoutSigil => "a label is written '@' and a name, e.g. '@outer while'",
+        error.MisplacedAny => "'any' can only be the type of a parameter",
         error.RangeOperand => "a range cannot be an operand",
         error.DiscardedValueName => "'as' needs a name, leave it out to leave the value without a name",
         error.ExpectedDeferredStatement => "expected a call, an assignment or a discard",
@@ -2326,6 +2353,87 @@ test "parseParameter: parses an underscore as a discarded parameter" {
     try std.testing.expectEqualStrings("_", parameter.name);
     try std.testing.expectEqualStrings("i32", parameter.type.kind.identifier.name);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 6 }, parameter.location);
+}
+
+test "parseAnyParameter: parses a parameter of type any" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn count(values: any, _: any) -> usize: return 0");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const parameters = module.declarations[0].kind.function_definition.signature.parameters;
+    try std.testing.expectEqual(.any, parameters[0].kind);
+    try std.testing.expectEqualStrings("values", parameters[0].name);
+    try std.testing.expectEqual(.any, parameters[1].kind);
+    try std.testing.expectEqualStrings("_", parameters[1].name);
+}
+
+test "parseOperand: rejects any as the type of a variable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    var value: any = 1");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedAny, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 16 }, parser.failure.?.location.?);
+}
+
+test "parseOperand: rejects any as the type of a field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("struct Point:\n    x: any");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedAny, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 8 }, parser.failure.?.location.?);
+}
+
+test "parseOperand: rejects any as a return type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn make() -> any: return 1");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedAny, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, parser.failure.?.location.?);
+}
+
+test "parseOperand: rejects any as the element of a slice type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn take(values: []any): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedAny, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
+}
+
+test "parseOperand: rejects any as the target of a pointer type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn take(value: *any): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedAny, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 17 }, parser.failure.?.location.?);
+}
+
+test "parseOperand: rejects any as the type of a comptime parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn take(comptime value: any): noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedAny, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, parser.failure.?.location.?);
 }
 
 test "parseParameter: parses a type parameter" {

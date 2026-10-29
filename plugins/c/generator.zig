@@ -1617,7 +1617,7 @@ pub const Generator = struct {
             if (isZeroSized(parameter_type)) continue;
             if (written) try writer.writeAll(", ");
             const named = !isDiscardedParameter(body, parameters, index);
-            if (named and chosen) try writer.writeAll("[[maybe_unused]] ");
+            if (named and (chosen or parameter.measured)) try writer.writeAll("[[maybe_unused]] ");
             try self.generateType(writer, parameter_type);
             if (named) try writer.print(" {s}", .{parameter.name});
             written = true;
@@ -1882,6 +1882,7 @@ pub const Generator = struct {
         };
         const local_type = findLocalType(statement.*);
         try self.recordType(allocator, reached, local_type);
+        if (isMeasuredLocal(statement.*)) try writer.writeAll("[[maybe_unused]] ");
         try self.generateLocalType(writer, local_type, statement.kind == .constant_declaration);
         try writer.print(" {s}", .{name});
         if (value.kind != .undefined) {
@@ -3499,6 +3500,14 @@ pub const Generator = struct {
             .index => |indexing| try self.generateIndex(allocator, reached, writer, indexing),
             .slice => try self.generateSlice(allocator, reached, writer, expression, .expression),
             .field_access => |access| {
+                const container = followPointer(access.value.type.?);
+                if (container == .array) {
+                    try writer.writeAll("((void)");
+                    try self.generateOperand(allocator, reached, writer, access.value);
+                    try writer.writeAll(", ");
+                    try self.generateKnownInteger(writer, .usize, container.array.length);
+                    return writer.writeByte(')');
+                }
                 try self.recordPointerTarget(allocator, reached, access.value.type.?);
                 try self.generateBase(allocator, reached, writer, access.value);
                 const separator = if (access.value.type.? == .pointer) "->" else ".";
@@ -5661,6 +5670,14 @@ fn findLocalType(statement: ast.Statement) types.Type {
         .variable_declaration => |variable| ast.extractDeclaredType(variable.type, variable.value),
         .noop, .@"return", .discard, .call, .tuple_declaration, .assignment, .@"if", .@"while", .@"for" => unreachable,
         .match, .@"defer", .@"break", .@"continue" => unreachable,
+    };
+}
+
+fn isMeasuredLocal(statement: ast.Statement) bool {
+    return switch (statement.kind) {
+        .constant_declaration => |constant| constant.measured,
+        .variable_declaration => |variable| variable.measured,
+        else => false,
     };
 }
 
@@ -11291,6 +11308,34 @@ test "generateUnrolled: writes the block of a loop over a tuple once for each el
     );
 }
 
+test "generateFunction: writes an instance for each type of the argument to an any parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count(values: any) -> usize: return values.length\nfn first(values: any) -> u8: return values[0]\nfn main():\n    var array: [2]u8 = {1, 2}\n    array[0] = first(array)\n    _ = count(\"ab\")\n    _ = count(array)\n    _ = count(&array)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_array_2_u8 mn_array_2_u8;\ntypedef struct mn_slice_u8 mn_slice_u8;\n\nuint8_t mn_main_first_1(mn_array_2_u8 values);\nsize_t mn_main_count_1(mn_slice_u8 values);\nsize_t mn_main_count_2([[maybe_unused]] mn_array_2_u8 values);\nsize_t mn_main_count_3([[maybe_unused]] struct mn_array_2_u8 * values);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_array_2_u8_defined\n#define mn_array_2_u8_defined\ntypedef struct mn_array_2_u8 {\n    uint8_t items[2];\n} mn_array_2_u8;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    mn_array_2_u8 array = (mn_array_2_u8){ .items = { 1u, 2u } };\n    array.items[0u] = mn_main_first_1(array);\n    mn_main_count_1((mn_slice_u8){ .items = (uint8_t *)\"ab\", .length = 2 });\n    mn_main_count_2(array);\n    mn_main_count_3(&array);\n}\n\nuint8_t mn_main_first_1(mn_array_2_u8 values) {\n    return values.items[0u];\n}\n\nsize_t mn_main_count_1(mn_slice_u8 values) {\n    return values.length;\n}\n\nsize_t mn_main_count_2([[maybe_unused]] mn_array_2_u8 values) {\n    return 2u;\n}\n\nsize_t mn_main_count_3([[maybe_unused]] struct mn_array_2_u8 * values) {\n    return 2u;\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateFunction: compares slices through mn::memory::equal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -11301,7 +11346,7 @@ test "generateFunction: compares slices through mn::memory::equal" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn same(buffer: []const u8, length: usize) -> bool: return memory::equal(u8, buffer[0..length], \"yes\\n\")\nfn arrays(one: [3]i32, two: [3]i32) -> bool: return memory::equal(i32, &one, &two)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn same(buffer: []const u8, length: usize) -> bool: return memory::equal(buffer[0..length], \"yes\\n\")\nfn arrays(one: [3]u8, two: [3]u8) -> bool: return memory::equal(&one, &two)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11311,11 +11356,11 @@ test "generateFunction: compares slices through mn::memory::equal" {
 
     try std.testing.expectEqual(6, files.len);
     try std.testing.expectEqualStrings(
-        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_slice_u8 mn_slice_u8;\ntypedef struct mn_array_3_i32 mn_array_3_i32;\n\nbool mn_main_same(mn_slice_u8 buffer, size_t length);\nbool mn_main_arrays(mn_array_3_i32 one, mn_array_3_i32 two);\n",
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_slice_u8 mn_slice_u8;\ntypedef struct mn_array_3_u8 mn_array_3_u8;\n\nbool mn_main_same(mn_slice_u8 buffer, size_t length);\nbool mn_main_arrays(mn_array_3_u8 one, mn_array_3_u8 two);\n",
         files[0].contents,
     );
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n#include \"mn/memory.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\n#ifndef mn_array_3_i32_defined\n#define mn_array_3_i32_defined\ntypedef struct mn_array_3_i32 {\n    int32_t items[3];\n} mn_array_3_i32;\n#endif\n\nbool mn_main_same(mn_slice_u8 buffer, size_t length) {\n    return mn_mn_memory_equal_1((mn_slice_u8){ .items = buffer.items + 0u, .length = length - 0u }, (mn_slice_u8){ .items = (uint8_t *)\"yes\\n\", .length = 4 });\n}\n\nbool mn_main_arrays(mn_array_3_i32 one, mn_array_3_i32 two) {\n    return mn_mn_memory_equal_2((mn_slice_i32){ .items = (int32_t *)(&one)->items, .length = 3 }, (mn_slice_i32){ .items = (int32_t *)(&two)->items, .length = 3 });\n}\n",
+        "#include \"main.h\"\n#include \"mn/memory.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_array_3_u8_defined\n#define mn_array_3_u8_defined\ntypedef struct mn_array_3_u8 {\n    uint8_t items[3];\n} mn_array_3_u8;\n#endif\n\nbool mn_main_same(mn_slice_u8 buffer, size_t length) {\n    return mn_mn_memory_equal((mn_slice_u8){ .items = buffer.items + 0u, .length = length - 0u }, (mn_slice_u8){ .items = (uint8_t *)\"yes\\n\", .length = 4 });\n}\n\nbool mn_main_arrays(mn_array_3_u8 one, mn_array_3_u8 two) {\n    return mn_mn_memory_equal((mn_slice_u8){ .items = (uint8_t *)(&one)->items, .length = 3 }, (mn_slice_u8){ .items = (uint8_t *)(&two)->items, .length = 3 });\n}\n",
         files[1].contents,
     );
     try std.testing.expectEqualStrings(
@@ -11327,11 +11372,11 @@ test "generateFunction: compares slices through mn::memory::equal" {
         files[3].contents,
     );
     try std.testing.expectEqualStrings(
-        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\ntypedef struct mn_slice_u8 mn_slice_u8;\ntypedef struct mn_slice_i32 mn_slice_i32;\n\nbool mn_mn_memory_equal_1(mn_slice_u8 one, mn_slice_u8 two);\nbool mn_mn_memory_equal_2(mn_slice_i32 one, mn_slice_i32 two);\n",
+        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\ntypedef struct mn_slice_u8 mn_slice_u8;\n\nbool mn_mn_memory_equal(mn_slice_u8 one, mn_slice_u8 two);\n",
         files[4].contents,
     );
     try std.testing.expectEqualStrings(
-        "#include \"memory.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nbool mn_mn_memory_equal_1(mn_slice_u8 one, mn_slice_u8 two) {\n    if ((one.length != two.length)) {\n        return false;\n    }\n    const size_t mn_end_1 = one.length;\n    for (size_t mn_index_1 = 0; mn_index_1 < mn_end_1; mn_index_1 += 1) {\n        const size_t index = mn_index_1;\n        if ((one.items[index] != two.items[index])) {\n            return false;\n        }\n    }\n    return true;\n}\n\nbool mn_mn_memory_equal_2(mn_slice_i32 one, mn_slice_i32 two) {\n    if ((one.length != two.length)) {\n        return false;\n    }\n    const size_t mn_end_1 = one.length;\n    for (size_t mn_index_1 = 0; mn_index_1 < mn_end_1; mn_index_1 += 1) {\n        const size_t index = mn_index_1;\n        if ((one.items[index] != two.items[index])) {\n            return false;\n        }\n    }\n    return true;\n}\n",
+        "#include \"memory.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nbool mn_mn_memory_equal(mn_slice_u8 one, mn_slice_u8 two) {\n    if ((one.length != two.length)) {\n        return false;\n    }\n    const size_t mn_end_1 = one.length;\n    for (size_t mn_index_1 = 0; mn_index_1 < mn_end_1; mn_index_1 += 1) {\n        const size_t index = mn_index_1;\n        if ((one.items[index] != two.items[index])) {\n            return false;\n        }\n    }\n    return true;\n}\n",
         files[5].contents,
     );
 }
@@ -12817,6 +12862,34 @@ test "generateExpression: writes field accesses" {
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\nint32_t mn_main_read(mn_main_Line line) {\n    return line.start.x;\n}\n\nint32_t mn_main_first() {\n    return make().start.x;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateExpression: writes the length of an array as a constant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> [5]u8: return {1, 2, 3, 4, 5}\nfn sizes(values: [4]i32, pointer: *[3]u8) -> usize:\n    var buffer: [16]u8 = undefined\n    var other: [buffer.length]u16 = undefined\n    other[0] = 1\n    buffer[0] = 2\n    const fixed: [2]u8 = {1, 2}\n    return values.length + pointer.length + buffer.length + other.length + fixed.length + make().length\nfn measure(values: [4]i32) -> usize:\n    var copy: [values.length]i32 = values\n    copy[0] = 1\n    return copy.length" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_array_5_u8 mn_array_5_u8;\ntypedef struct mn_array_4_i32 mn_array_4_i32;\ntypedef struct mn_array_3_u8 mn_array_3_u8;\n\nmn_array_5_u8 mn_main_make();\nsize_t mn_main_sizes([[maybe_unused]] mn_array_4_i32 values, [[maybe_unused]] struct mn_array_3_u8 * pointer);\nsize_t mn_main_measure([[maybe_unused]] mn_array_4_i32 values);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_array_5_u8_defined\n#define mn_array_5_u8_defined\ntypedef struct mn_array_5_u8 {\n    uint8_t items[5];\n} mn_array_5_u8;\n#endif\n\n#ifndef mn_array_4_i32_defined\n#define mn_array_4_i32_defined\ntypedef struct mn_array_4_i32 {\n    int32_t items[4];\n} mn_array_4_i32;\n#endif\n\n#ifndef mn_array_16_u8_defined\n#define mn_array_16_u8_defined\ntypedef struct mn_array_16_u8 {\n    uint8_t items[16];\n} mn_array_16_u8;\n#endif\n\n#ifndef mn_array_16_u16_defined\n#define mn_array_16_u16_defined\ntypedef struct mn_array_16_u16 {\n    uint16_t items[16];\n} mn_array_16_u16;\n#endif\n\n#ifndef mn_array_2_u8_defined\n#define mn_array_2_u8_defined\ntypedef struct mn_array_2_u8 {\n    uint8_t items[2];\n} mn_array_2_u8;\n#endif\n\nmn_array_5_u8 mn_main_make() {\n    return (mn_array_5_u8){ .items = { 1u, 2u, 3u, 4u, 5u } };\n}\n\nsize_t mn_main_sizes([[maybe_unused]] mn_array_4_i32 values, [[maybe_unused]] struct mn_array_3_u8 * pointer) {\n    [[maybe_unused]] mn_array_16_u8 buffer;\n    [[maybe_unused]] mn_array_16_u16 other;\n    other.items[0u] = 1u;\n    buffer.items[0u] = 2u;\n    [[maybe_unused]] const mn_array_2_u8 fixed = (mn_array_2_u8){ .items = { 1u, 2u } };\n    return (((((4u + 3u) + 16u) + 16u) + 2u) + ((void)mn_main_make(), 5u));\n}\n\nsize_t mn_main_measure([[maybe_unused]] mn_array_4_i32 values) {\n    [[maybe_unused]] mn_array_4_i32 copy = values;\n    copy.items[0u] = 1;\n    return 4u;\n}\n",
         files[1].contents,
     );
 }
@@ -16990,4 +17063,32 @@ test "containsType: keeps arrays of pointers that differ in mutability apart" {
         "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_array_2_pointer_i32 mn_array_2_pointer_i32;\ntypedef struct mn_array_2_pointer_const_i32 mn_array_2_pointer_const_i32;\n\nvoid mn_main_take(mn_array_2_pointer_i32, mn_array_2_pointer_const_i32);\n",
         files[0].contents,
     );
+}
+
+test "integration: checks a run-time condition that calls a function with a type argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "cards.mn", .data = "struct Card:\n    question: []const u8\n    answer:   []const u8\n\nconst cards: [_]Card = {\n    { question = \"Question 1\", answer = \"Answer 1\" },\n    { question = \"Question 2\", answer = \"Answer 2\" },\n}\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io::stdout\nimport mn::io::stdin\nimport mn::memory\n\nimport cards::cards\n\n\nfn main():\n    var input_buffer: [4096]u8 = undefined\n    var byte_count: usize = 0\n    var card_index: usize = 0\n\n    while card_index < cards.length:\n        stdout::println(cards[card_index].question, {})\n        byte_count = stdin::read(&input_buffer)\n        if byte_count == 0: break\n\n        stdout::println(cards[card_index].answer, {})\n        byte_count = stdin::read(&input_buffer)\n        if byte_count == 0: break\n\n        if memory::equal(input_buffer[..byte_count], \"y\\n\"):\n           card_index += 1\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqual(11, files.len);
+    var main_file: []const u8 = "";
+    for (files) |file| {
+        if (std.mem.eql(u8, file.path, "main.c")) main_file = file.contents;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, main_file, "while ((card_index < 2u)) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, main_file, "if (mn_mn_memory_equal((mn_slice_u8){ .items = input_buffer.items, .length = byte_count }, (mn_slice_u8){ .items = (uint8_t *)\"y\\n\", .length = 2 })) {") != null);
 }

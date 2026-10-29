@@ -231,7 +231,12 @@ pub const Evaluator = struct {
 
     fn evaluateFieldAccess(self: *Evaluator, expression: *const ast.Expression) EvaluateError!Value {
         const access = expression.kind.field_access;
-        if (types.followPointer(access.value.type.?) != .slice) return self.readPlace(expression.location, try self.findPlace(expression.*));
+        const container = types.followPointer(access.value.type.?);
+        if (container == .array) {
+            _ = try self.evaluateExpression(access.value);
+            return .{ .integer = container.array.length };
+        }
+        if (container != .slice) return self.readPlace(expression.location, try self.findPlace(expression.*));
         var slice_value = try self.evaluateExpression(access.value);
         if (slice_value == .pointer) slice_value = try self.readPlace(access.value.location, slice_value.pointer);
         const slice = slice_value.slice;
@@ -2119,6 +2124,66 @@ test "evaluateFieldAccess: reads the pointer and the length of a slice at compil
     try std.testing.expectEqual(Value{ .integer = 5 }, declarations[3].kind.constant_declaration.known.?.*);
 }
 
+test "evaluateFieldAccess: gives the length of arrays from their types without reading them" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const primes: [_]i32 = {2, 3, 5}\nconst COUNT = primes.length\nfn sizes() -> usize:\n    var buffer: [64]u8 = undefined\n    const pointer = &buffer\n    var other: [buffer.length]u16 = undefined\n    other[0] = 1\n    buffer[0] = 2\n    return buffer.length + pointer.length + other.length\nconst SIZES = sizes()\nfn twice(comptime count: usize) -> usize: return count * 2\nfn local() -> usize:\n    var buffer: [8]u8 = undefined\n    buffer[0] = 1\n    return twice(buffer.length)\nconst LOCAL = local()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 3 }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 192 }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 16 }, declarations[6].kind.constant_declaration.known.?.*);
+}
+
+test "evaluateFieldAccess: runs a call that gives an array before taking its length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn bump(count: *u8) -> [2]u8:\n    count.* += 1\n    return {0, 0}\nfn run() -> u8:\n    var count: u8 = 0\n    const length = bump(&count).length\n    return count + mn::convert(u8, length)\nconst RUN = run()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(Value{ .integer = 3 }, loader.modules.items[0].declarations[3].kind.constant_declaration.known.?.*);
+}
+
+test "evaluateCall: evaluates a call with any arguments at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count(values: any) -> usize: return values.length\nconst ARRAY: [4]u8 = {1, 2, 3, 4}\nconst TOTAL = count(\"abc\") + count(ARRAY)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(Value{ .integer = 7 }, loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.*);
+}
+
 test "evaluateBuiltin: converts and truncates numbers at compile time" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3330,7 +3395,7 @@ test "executeFor: compares slices with mn::memory::equal at compile time" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nconst BUFFER: [4]u8 = {'y', 'e', 's', '\\n'}\nconst ONE: [3]i32 = {1, 2, 3}\nconst TWO: [3]i32 = {1, 2, 3}\nconst THREE: [3]i32 = {1, 2, 4}\nconst LITERAL = memory::equal(u8, &BUFFER, \"yes\\n\")\nconst UNEQUAL = memory::equal(u8, \"yes\", \"yet\")\nconst SHORTER = memory::equal(u8, \"ye\", \"yes\")\nconst EMPTY = memory::equal(u8, \"\", \"\")\nconst ARRAYS = memory::equal(i32, &ONE, &TWO)\nconst DIFFERENT = memory::equal(i32, &ONE, &THREE)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nconst BUFFER: [4]u8 = {'y', 'e', 's', '\\n'}\nconst ONE: [3]u8 = {1, 2, 3}\nconst TWO: [3]u8 = {1, 2, 3}\nconst THREE: [3]u8 = {1, 2, 4}\nconst LITERAL = memory::equal(&BUFFER, \"yes\\n\")\nconst UNEQUAL = memory::equal(\"yes\", \"yet\")\nconst SHORTER = memory::equal(\"ye\", \"yes\")\nconst EMPTY = memory::equal(\"\", \"\")\nconst ARRAYS = memory::equal(&ONE, &TWO)\nconst DIFFERENT = memory::equal(&ONE, &THREE)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);

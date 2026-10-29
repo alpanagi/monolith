@@ -181,7 +181,7 @@ pub const NameResolver = struct {
                     try bindings.append(allocator, .{ .name = parameter.name, .target = .{ .type = .{ .variable = variable } } });
                 },
                 .compile_time => return self.fail(parameter.location, error.CompileTimeTypeclassParameter),
-                .implicit => {},
+                .implicit, .any => {},
             }
         }
         return bindings.items;
@@ -670,7 +670,7 @@ pub const NameResolver = struct {
                     parameter.constraint = try self.expectOneParameterTypeclass(&parameter.type);
                     parameter.kind = .implicit;
                 },
-                .compile_time, .implicit => {},
+                .compile_time, .implicit, .any => {},
             }
         }
     }
@@ -973,6 +973,9 @@ pub const NameResolver = struct {
         self.bindings = &.{};
         defer self.module_index = caller_module_index;
         defer self.bindings = caller_bindings;
+        for (signature.parameters) |parameter| {
+            if (parameter.kind == .any) return self.fail(parameter.type.location, error.AnyInExternalFunction);
+        }
         try self.resolveFunctionTypes(signature);
         for (signature.parameters) |parameter| {
             if (containsInternalStruct(ast.extractType(parameter.type))) {
@@ -1087,7 +1090,7 @@ pub const NameResolver = struct {
             const target: ast.Binding.Target = switch (parameter.kind) {
                 .type => .{ .type = argument.value.type },
                 .compile_time => .{ .constant = try addBoundConstant(allocator, module, template.module, name, parameter, argument) },
-                .implicit => {
+                .implicit, .any => {
                     var implicit = parameter;
                     implicit.kind = .run_time;
                     implicit.type.denoted = argument.value.type;
@@ -1170,6 +1173,7 @@ pub const NameResolver = struct {
             const tuple = parameter.constraint != null and ast.isTupleTypeclass(modules, parameter.constraint.?);
             if (parameter.kind == .type and (parameter.constraint == null or tuple)) try dependency.roots.append(allocator, parameter.name);
             if (parameter.kind == .implicit and tuple) try dependency.roots.append(allocator, parameter.name);
+            if (parameter.kind == .any) try dependency.roots.append(allocator, parameter.name);
         }
         for (copy.signature.parameters, 0..) |parameter, index| {
             const variable: types.Type = .{ .variable = .{ .scope = .function, .index = index } };
@@ -1194,6 +1198,10 @@ pub const NameResolver = struct {
                     if (ast.isTupleTypeclass(modules, typeclass)) continue;
                     try bindings.append(allocator, .{ .name = parameter.name, .target = .{ .type = variable } });
                     try constraints.append(allocator, .{ .typeclass = typeclass, .arguments = arguments });
+                },
+                .any => {
+                    dependency.removed = true;
+                    continue;
                 },
                 .implicit => {
                     if (ast.isTupleTypeclass(modules, parameter.constraint.?)) {
@@ -1598,6 +1606,10 @@ pub const NameResolver = struct {
             const discarded = ast.isDiscardedName(parameter.name);
             if (!discarded and findTypedName(signature.parameters, parameter.name) != index) {
                 return self.fail(parameter.location, error.DuplicateParameter);
+            }
+            if (parameter.kind == .any) {
+                parameter.type.denoted = .{ .variable = .{ .scope = .function, .index = index } };
+                continue;
             }
             try self.resolveTypedName(parameter.name, parameter.location, &parameter.type);
         }
@@ -2167,12 +2179,12 @@ pub const NameResolver = struct {
                 return;
             }
             if (array_type.length == null) {
-                try self.resolveNamesInExpression(.{ .locals = scope.locals }, array_type.element);
+                try self.resolveNamesInExpression(scope.restrictToTypes(), array_type.element);
                 _ = try self.expectRuntimeType(array_type.element);
                 return;
             }
         }
-        try self.resolveNamesInExpression(.{ .locals = scope.locals }, written_type);
+        try self.resolveNamesInExpression(scope.restrictToTypes(), written_type);
         _ = try self.expectRuntimeType(written_type);
     }
 
@@ -2459,7 +2471,7 @@ pub const NameResolver = struct {
         array_type: *ast.ArrayType,
         literal_length: ?u64,
     ) ResolveError!void {
-        try self.resolveNamesInExpression(.{ .locals = scope.locals }, array_type.element);
+        try self.resolveNamesInExpression(scope.restrictToTypes(), array_type.element);
         const element = try self.expectType(array_type.element);
         var known_length = literal_length;
         if (array_type.length) |length| known_length = try self.expectLength(scope, length);
@@ -2478,12 +2490,24 @@ pub const NameResolver = struct {
                 return length;
             } else |_| {}
         }
-        try self.resolveNamesInExpression(.{ .locals = scope.locals }, expression);
+        const type_scope = scope.restrictToTypes();
+        const length_scope = if (isMeasuredParameter(type_scope, expression.*)) type_scope.exposeMeasurable() else type_scope;
+        try self.resolveNamesInExpression(length_scope, expression);
         const type_checker = try self.prepareChecker();
         const modules = self.loader.modules.items;
-        if (!type_checker.isKnown(modules, expression.*)) return self.fail(expression.location, error.CannotEvaluate);
+        if (!isArrayLengthAccess(expression.*) and !type_checker.isKnown(modules, expression.*)) {
+            return self.fail(expression.location, error.CannotEvaluate);
+        }
         const usize_type: types.Type = .{ .number = .usize };
-        const value = type_checker.evaluateKnown(modules, self.module_index, expression, usize_type) catch |type_error| {
+        type_checker.checkKnown(modules, self.module_index, length_scope.parameters, expression, usize_type) catch |type_error| {
+            self.adoptCheckerFailure(type_checker);
+            return type_error;
+        };
+        if (expression.kind == .field_access) {
+            const container = types.followPointer(expression.kind.field_access.value.type.?);
+            if (container == .array) return self.fail(expression.location, error.CallInArrayLength);
+        }
+        const value = type_checker.evaluateChecked(self.module_index, expression) catch |type_error| {
             self.adoptCheckerFailure(type_checker);
             return type_error;
         };
@@ -2495,7 +2519,7 @@ pub const NameResolver = struct {
         scope: Scope,
         slice_type: *ast.SliceType,
     ) ResolveError!void {
-        try self.resolveNamesInExpression(.{ .locals = scope.locals }, slice_type.element);
+        try self.resolveNamesInExpression(scope.restrictToTypes(), slice_type.element);
         const element = try self.expectType(slice_type.element);
         const allocator = self.arena.allocator();
         const slice = try self.types.addSlice(allocator, element, slice_type.constant);
@@ -2515,7 +2539,7 @@ pub const NameResolver = struct {
         location: token.Location,
         pointer_type: *ast.PointerType,
     ) ResolveError!void {
-        try self.resolveNamesInExpression(.{ .locals = scope.locals }, pointer_type.target);
+        try self.resolveNamesInExpression(scope.restrictToTypes(), pointer_type.target);
         const target = try self.expectType(pointer_type.target);
         if (target == .function) {
             if (pointer_type.many) return self.fail(location, error.ManyFunctionPointer);
@@ -2535,7 +2559,7 @@ pub const NameResolver = struct {
         scope: Scope,
         optional_type: *ast.OptionalType,
     ) ResolveError!void {
-        try self.resolveNamesInExpression(.{ .locals = scope.locals }, optional_type.child);
+        try self.resolveNamesInExpression(scope.restrictToTypes(), optional_type.child);
         const child = try self.expectType(optional_type.child);
         const optional = try self.types.addOptional(self.arena.allocator(), child);
         optional_type.value = .{ .optional = optional };
@@ -2549,7 +2573,7 @@ pub const NameResolver = struct {
         const allocator = self.arena.allocator();
         const elements = try allocator.alloc(types.Type, tuple_type.elements.len);
         for (tuple_type.elements, elements) |*written, *element| {
-            try self.resolveNamesInExpression(.{ .locals = scope.locals }, written);
+            try self.resolveNamesInExpression(scope.restrictToTypes(), written);
             element.* = try self.expectType(written);
         }
         const tuple = try self.types.addTuple(allocator, elements);
@@ -2562,7 +2586,7 @@ pub const NameResolver = struct {
         function_type: *ast.FunctionType,
     ) ResolveError!void {
         const allocator = self.arena.allocator();
-        const type_scope: Scope = .{ .locals = scope.locals };
+        const type_scope = scope.restrictToTypes();
         const parameters = try allocator.alloc(types.Type, function_type.parameters.len);
         for (function_type.parameters, parameters) |*written, *parameter| {
             try self.resolveNamesInExpression(type_scope, written);
@@ -3264,6 +3288,8 @@ pub const NameError = error{
     ModuleNotFound,
     ConstantRefersToItself,
     StructContainsItself,
+    CallInArrayLength,
+    AnyInExternalFunction,
     ReservedImport,
     NotExternalField,
     InternalStructInExternalFunction,
@@ -3347,6 +3373,17 @@ const Scope = struct {
     parameters: []const ast.TypedName = &.{},
     parameter_uses: []ast.Use = &.{},
     locals: []Local = &.{},
+    measurable: []const ast.TypedName = &.{},
+    measurable_uses: []ast.Use = &.{},
+
+    fn restrictToTypes(self: Scope) Scope {
+        if (self.parameters.len == 0) return .{ .locals = self.locals, .measurable = self.measurable, .measurable_uses = self.measurable_uses };
+        return .{ .locals = self.locals, .measurable = self.parameters, .measurable_uses = self.parameter_uses };
+    }
+
+    fn exposeMeasurable(self: Scope) Scope {
+        return .{ .locals = self.locals, .parameters = self.measurable, .parameter_uses = self.measurable_uses };
+    }
 };
 
 const Local = struct {
@@ -3426,6 +3463,8 @@ fn describeError(name_error: NameError) []const u8 {
         error.ModuleNotFound => "module not found",
         error.ConstantRefersToItself => "constant refers to itself",
         error.StructContainsItself => "struct contains itself",
+        error.AnyInExternalFunction => "an external function cannot have an 'any' parameter",
+        error.CallInArrayLength => "the length of an array in a type cannot come from a call, since nothing runs there",
         error.ReservedImport => "an import cannot make a reserved name available, use 'as' to name it",
         error.NotExternalField => "an external struct's fields must be numbers, bool, pointers, optional pointers, function pointers, arrays of these or external structs",
         error.InternalStructInExternalFunction => "a struct in an external function's parameters or return type must be an external struct",
@@ -3505,6 +3544,39 @@ fn containsInternalStruct(value_type: types.Type) bool {
         .optional => |optional| optional.child == .pointer and containsInternalStruct(optional.child),
         .number, .boolean, .void, .type, .@"enum", .result, .tuple, .function, .variable, .application => false,
     };
+}
+
+fn isArrayLengthAccess(expression: ast.Expression) bool {
+    if (expression.kind != .field_access) return false;
+    const access = expression.kind.field_access;
+    if (!std.mem.eql(u8, access.field, "length")) return false;
+    return switch (access.value.kind) {
+        inline .identifier, .path_expression => |name| hasKnownType(name.resolution),
+        else => false,
+    };
+}
+
+fn hasKnownType(resolution: ?ast.Resolution) bool {
+    const resolved = resolution orelse return false;
+    return switch (resolved) {
+        .parameter, .constant => true,
+        .local => |statement| switch (statement.kind) {
+            .constant_declaration => |constant| constant.type != null or constant.value.type != null,
+            .variable_declaration => |variable| variable.type != null or variable.value.type != null,
+            else => false,
+        },
+        .function, .type, .element, .typeclass_function, .typeclass_method, .case, .builtin => false,
+    };
+}
+
+fn isMeasuredParameter(scope: Scope, expression: ast.Expression) bool {
+    if (expression.kind != .field_access) return false;
+    const access = expression.kind.field_access;
+    if (!std.mem.eql(u8, access.field, "length") or access.value.kind != .identifier) return false;
+    const name = access.value.kind.identifier.name;
+    if (findLocal(scope.locals, name) != null) return false;
+    const index = findTypedName(scope.measurable, name) orelse return false;
+    return types.followPointer(ast.extractType(scope.measurable[index].type)) == .array;
 }
 
 fn isVisibleName(scope: Scope, name: []const u8) bool {
@@ -8931,6 +9003,84 @@ test "resolveArrayType: accepts void elements" {
     try std.testing.expectEqual(types.Type.void, ast.extractType(parameters[0].type).array.element);
 }
 
+test "isMeasuredParameter: takes an array length from the length of an array parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn measure(values: [4]i32, pointer: *[3]u8) -> usize:\n    var copy: [values.length]i32 = values\n    var bytes: [pointer.length]u8 = pointer.*\n    copy[0] = 1\n    bytes[0] = 2\n    return copy.length + bytes.length" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(4, ast.extractType(body[0].kind.variable_declaration.type.?).array.length);
+    try std.testing.expectEqual(3, ast.extractType(body[1].kind.variable_declaration.type.?).array.length);
+}
+
+test "isMeasuredParameter: takes an array length from a parameter whose type depends on a type parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn measure(type T, values: T) -> usize:\n    var copy: [values.length]u8 = undefined\n    copy[0] = 1\n    return copy.length\nconst SIZE = measure([5]i32, {1, 2, 3, 4, 5})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(5, loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.integer);
+}
+
+test "isMeasuredParameter: rejects a parameter used otherwise in a type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(count: usize):\n    var values: [count]u8 = undefined\n    values[0] = 1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownName, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, analyzer.failure.?.location.?);
+}
+
+test "expectLength: rejects the length of an array that comes from a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> [3]u8: return {1, 2, 3}\nfn fill():\n    var values: [make().length]u8 = undefined\n    values[0] = 1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.CallInArrayLength, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 18 }, analyzer.failure.?.location.?);
+}
+
 test "resolveArrayType: rejects a length to infer without an array literal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -11586,6 +11736,25 @@ test "resolveEnum: accepts an enum that points to itself" {
 
     const enumeration = ast.extractType(loader.modules.items[0].declarations[1].kind.function_definition.signature.parameters[0].type).@"enum";
     try std.testing.expectEqual(enumeration, enumeration.cases[1].type.?.pointer.target.@"enum");
+}
+
+test "resolveExternalSignature: rejects an any parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(value: any)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.AnyInExternalFunction, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, analyzer.failure.?.location.?);
 }
 
 test "resolveExternalSignature: rejects a struct that is not external through a slice and a pointer" {

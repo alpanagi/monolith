@@ -1,4 +1,4 @@
-fn equal(type T, one: []const T, two: []const T) -> bool:
+fn equal(one: []const u8, two: []const u8) -> bool:
     if one.length != two.length: return false
     for index in 0..one.length:
         if one[index] != two[index]: return false

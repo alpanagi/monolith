@@ -120,6 +120,7 @@ pub const ConstantDeclaration = struct {
     known: ?*Value = null,
     evaluating: bool = false,
     bound: bool = false,
+    measured: bool = false,
 };
 
 pub const TupleDeclaration = struct {
@@ -209,6 +210,7 @@ pub const VariableDeclaration = struct {
     type: ?Expression = null,
     value: Expression,
     deferred_use: ?Use = null,
+    measured: bool = false,
 };
 
 pub const Use = struct {
@@ -575,6 +577,7 @@ pub const TypedName = struct {
     kind: ParameterKind = .run_time,
     requirement: ?Expression = null,
     constraint: ?Resolution.Typeclass = null,
+    measured: bool = false,
 };
 
 pub const ParameterKind = enum {
@@ -582,6 +585,7 @@ pub const ParameterKind = enum {
     type,
     compile_time,
     implicit,
+    any,
 };
 
 pub const Field = struct {

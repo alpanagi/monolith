@@ -22,7 +22,7 @@
 - Identifiers are case-sensitive. By convention only types and type constructors start with a capital letter.
 - The single character `_` is reserved and cannot be used as an identifier by the user.
 - The following identifier names are reserved and cannot be used as identifiers by the user:
-    `and`, `as`, `break`, `case`, `catch`, `comptime`, `const`, `continue`, `defer`, `else`, `enum`, `errdefer`, `error`, `external`, `false`, `fn`, `for`, `if`, `import`, `in`, `instance`, `many`, `match`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `true`, `try`, `typeclass`, `undefined`, `var`, `void`, `while`
+    `and`, `any`, `as`, `break`, `case`, `catch`, `comptime`, `const`, `continue`, `defer`, `else`, `enum`, `errdefer`, `error`, `external`, `false`, `fn`, `for`, `if`, `import`, `in`, `instance`, `many`, `match`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `true`, `try`, `typeclass`, `undefined`, `var`, `void`, `while`
 - A reserved name can be the name of a function, struct, enum or error set, and a name after `::`, e.g. `fn match(pattern: []const u8) -> bool` called as `parser::match(pattern)`. Elsewhere it is reached through a path.
 
 ## Built-In Types
@@ -56,6 +56,7 @@
 - Nested arrays read left to right, e.g. `[3][4]f32` is 3 arrays of 4 floats.
 - Arrays are values. Assigning or passing an array copies all its elements.
 - Arrays support indexing, starting at 0.
+- `array.length` gives an array's length as a `usize`, known at compile time, e.g. `primes.length` is 3 for `const primes: [_]i32 = {2, 3, 5}`. It can be read but not assigned.
 
 ### Slice Types
 
@@ -272,7 +273,7 @@
 
 - `==` and `!=` work on numbers, `bool`, types, pointers, arrays whose elements support them, optionals whose values support them, and enums and error sets whose values support them. Arrays are equal when all their elements are equal. Optionals are equal when both are `null` or both hold equal values. An optional can be compared with `null`.
 - Two types are equal when they are the same type, e.g. `T == i32`.
-- Slices cannot be compared with `==` and `!=`, since a slice points to its elements. Their elements are compared with `mn::memory::equal` (see the standard library).
+- Slices cannot be compared with `==` and `!=`, since a slice points to its elements. Their bytes are compared with `mn::memory::equal` (see the standard library).
 - Two enum values, or two errors, are equal when they are the same case and their values are equal. An error can be compared with a value of an error set combined from its set, e.g. `failure == ParseError::missing_end`.
 - `<`, `<=`, `>` and `>=` work on numbers and multiple value pointers.
 - A comparison gives a `bool`.
@@ -485,8 +486,9 @@
 - `type` is the type of types. Types are values known at compile time, e.g. `const Number = i32`. A value whose type contains `type` exists only at compile time.
 - Top-level constants are evaluated at compile time.
 - A parameter written `type T` takes a type, e.g. `fn List(type T) -> type`. A parameter marked `comptime` takes a value known at compile time, e.g. `comptime format: []const u8`. Their arguments are evaluated at compile time.
-- A function gets its own instance for each different set of arguments to its `type` and `comptime` parameters.
-- A function with `type` or `comptime` parameters is checked for everything that does not depend on them, even if it is never called.
+- A parameter whose type is `any` takes a value of any type, e.g. `fn equal(one: any, two: any) -> bool`. `any` can only be the type of a parameter.
+- A function gets its own instance for each different set of arguments to its `type` and `comptime` parameters, and for each different set of types of the arguments to its `any` parameters.
+- A function with `type`, `comptime` or `any` parameters is checked for everything that does not depend on them, even if it is never called.
 - `struct:` followed by an indented block, written like a struct's, is a struct without a name, e.g. `return struct:` followed by `items: []T`.
 - A call evaluated at compile time gives the same result for the same arguments, e.g. `List(i32)` is the same type everywhere.
 - Any function can be evaluated at compile time, unless it reaches an external function.

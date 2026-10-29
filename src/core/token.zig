@@ -34,6 +34,7 @@ pub const TokenKind = union(enum) {
     keyword_enum,
     keyword_match,
     keyword_case,
+    keyword_any,
     keyword_try,
     keyword_catch,
     keyword_error,

@@ -174,6 +174,33 @@ pub const TypeChecker = struct {
         defer self.module_index = caller_module_index;
         defer self.compile_time = caller_compile_time;
         try self.checkExpression(&.{}, expression, expected);
+        if (!self.evaluator.isKnown(expression.*)) return self.fail(expression.location, error.CannotEvaluate);
+        return self.evaluateValue(expression);
+    }
+
+    pub fn checkKnown(
+        self: *TypeChecker,
+        modules: []ast.Module,
+        module_index: usize,
+        parameters: []const ast.TypedName,
+        expression: *ast.Expression,
+        expected: types.Type,
+    ) TypeError!void {
+        self.program.modules = modules;
+        const caller_module_index = self.module_index;
+        const caller_compile_time = self.compile_time;
+        self.module_index = module_index;
+        self.compile_time = true;
+        defer self.module_index = caller_module_index;
+        defer self.compile_time = caller_compile_time;
+        try self.checkExpression(parameters, expression, expected);
+    }
+
+    pub fn evaluateChecked(self: *TypeChecker, module_index: usize, expression: *const ast.Expression) TypeError!Value {
+        const caller_module_index = self.module_index;
+        self.module_index = module_index;
+        defer self.module_index = caller_module_index;
+        if (!self.evaluator.isKnown(expression.*)) return self.fail(expression.location, error.CannotEvaluate);
         return self.evaluateValue(expression);
     }
 
@@ -1701,8 +1728,14 @@ pub const TypeChecker = struct {
         if (!self.evaluator.isKnown(argument.*)) return self.fail(argument.location, error.CannotEvaluate);
         const value_type = (try self.evaluateValue(argument)).type;
         argument.denoted = value_type;
-        self.type_dependencies += 1;
+        self.countTypeDependency(argument.*);
         return value_type;
+    }
+
+    fn countTypeDependency(self: *TypeChecker, argument: ast.Expression) void {
+        const function = self.current_function orelse return;
+        const declaration = ast.findDeclaration(self.program.modules[function.module], function.declaration);
+        if (mentionsBinding(declaration.kind.function_definition.bindings, argument)) self.type_dependencies += 1;
     }
 
     fn checkCaseCall(
@@ -1778,6 +1811,12 @@ pub const TypeChecker = struct {
                     try arguments.append(allocator, argument.*);
                     continue;
                 },
+                .any => {
+                    const argument_type = try self.inferType(parameters, &argument.value);
+                    try bounds.append(allocator, .{ .type = .type, .value = .{ .type = argument_type } });
+                    try arguments.append(allocator, argument.*);
+                    continue;
+                },
                 .implicit => {
                     const argument_type = try self.inferType(parameters, &argument.value);
                     try self.expectInstance(argument.location, parameter.constraint.?, argument_type);
@@ -1796,7 +1835,7 @@ pub const TypeChecker = struct {
             const value = try self.evaluateValue(&argument.value);
             if (parameter.constraint) |constraint| try self.expectInstance(argument.location, constraint, value.type);
             try bounds.append(allocator, .{ .type = parameter_type, .value = value });
-            if (types.isCompileTimeOnly(parameter_type)) self.type_dependencies += 1;
+            if (types.isCompileTimeOnly(parameter_type)) self.countTypeDependency(argument.value);
         }
         const instance = try self.findInstance(expression.location, template, bounds.items);
         switch (call.callee) {
@@ -1877,7 +1916,8 @@ pub const TypeChecker = struct {
         const struct_type = switch (followPointer(value_type)) {
             .@"struct" => |struct_type| struct_type,
             .slice => |slice| return self.checkSliceField(expression, slice),
-            .number, .boolean, .void, .type, .@"enum", .array, .pointer, .optional, .result, .tuple, .function, .variable, .application => {
+            .array => |array| return self.checkArrayField(parameters, expression, array),
+            .number, .boolean, .void, .type, .@"enum", .pointer, .optional, .result, .tuple, .function, .variable, .application => {
                 return self.fail(access.field_location, error.NoFields);
             },
         };
@@ -1902,6 +1942,23 @@ pub const TypeChecker = struct {
             return self.fail(access.field_location, error.UnknownField);
         expression.type = field_type;
         return field_type;
+    }
+
+    fn checkArrayField(
+        self: *TypeChecker,
+        parameters: []const ast.TypedName,
+        expression: *ast.Expression,
+        array: *const types.Array,
+    ) TypeError!types.Type {
+        const access = expression.kind.field_access;
+        if (!std.mem.eql(u8, access.field, "length")) return self.fail(access.field_location, error.UnknownField);
+        const length_type: types.Type = .{ .number = .usize };
+        expression.type = length_type;
+        if (containsCall(access.value.*)) return length_type;
+        markMeasured(parameters, access.value.*);
+        const text = try std.fmt.allocPrint(self.arena.allocator(), "{d}", .{array.length});
+        expression.kind = .{ .integer_literal = .{ .text = text, .suffix = "usize" } };
+        return length_type;
     }
 
     fn inferType(
@@ -3498,6 +3555,99 @@ fn isOrdered(value_type: types.Type) bool {
             return false;
         },
     };
+}
+
+fn mentionsBinding(bindings: []const ast.Binding, expression: ast.Expression) bool {
+    return switch (expression.kind) {
+        .identifier => |identifier| isBoundName(bindings, identifier.name, identifier.resolution),
+        .path_expression => |path_expression| isBoundName(bindings, path_expression.path[0], path_expression.resolution),
+        .call => |call| isBoundCallee(bindings, call.callee) or for (call.arguments) |argument| {
+            if (mentionsBinding(bindings, argument.value)) break true;
+        } else false,
+        .array_type => |array_type| mentionsBinding(bindings, array_type.element.*) or
+            (if (array_type.length) |length| mentionsBinding(bindings, length.*) else false),
+        .slice_type => |slice_type| mentionsBinding(bindings, slice_type.element.*),
+        .pointer_type => |pointer_type| mentionsBinding(bindings, pointer_type.target.*),
+        .optional_type => |optional_type| mentionsBinding(bindings, optional_type.child.*),
+        .tuple_type => |tuple_type| for (tuple_type.elements) |element| {
+            if (mentionsBinding(bindings, element)) break true;
+        } else false,
+        .function_type => |function_type| mentionsBinding(bindings, function_type.return_type.*) or for (function_type.parameters) |parameter| {
+            if (mentionsBinding(bindings, parameter)) break true;
+        } else false,
+        .binary => |binary| mentionsBinding(bindings, binary.left.*) or mentionsBinding(bindings, binary.right.*),
+        .index => |indexing| mentionsBinding(bindings, indexing.value.*) or mentionsBinding(bindings, indexing.index.*),
+        .field_access => |access| mentionsBinding(bindings, access.value.*),
+        else => false,
+    };
+}
+
+fn isBoundCallee(bindings: []const ast.Binding, callee: ast.Name) bool {
+    return switch (callee) {
+        .identifier => |identifier| isBoundName(bindings, identifier.name, identifier.resolution),
+        .path_expression => |path_expression| isBoundName(bindings, path_expression.path[0], path_expression.resolution),
+        .member => false,
+    };
+}
+
+fn isBoundName(bindings: []const ast.Binding, name: []const u8, resolution: ?ast.Resolution) bool {
+    const resolved = resolution orelse return false;
+    if (resolved == .local or resolved == .parameter or resolved == .element) return false;
+    for (bindings) |binding| {
+        if (std.mem.eql(u8, binding.name, name)) return true;
+    }
+    return false;
+}
+
+fn containsCall(expression: ast.Expression) bool {
+    return switch (expression.kind) {
+        .call, .method_call, .@"try" => true,
+        .field_access => |access| containsCall(access.value.*),
+        .index => |indexing| containsCall(indexing.value.*) or containsCall(indexing.index.*),
+        .dereference, .unwrap, .address_of, .negation => |operand| containsCall(operand.*),
+        .unary => |unary| containsCall(unary.operand.*),
+        .binary => |binary| containsCall(binary.left.*) or containsCall(binary.right.*),
+        .slice => |slice| containsCall(slice.value.*) or
+            (if (slice.start) |start| containsCall(start.*) else false) or
+            (if (slice.end) |end| containsCall(end.*) else false),
+        .composite_literal => |literal| for (literal.elements) |element| {
+            if (containsCall(element.value)) break true;
+        } else false,
+        .range => |range| containsCall(range.start) or (if (range.end) |end| containsCall(end) else false),
+        .integer_literal,
+        .float_literal,
+        .boolean_literal,
+        .string_literal,
+        .undefined,
+        .null,
+        .identifier,
+        .path_expression,
+        .member,
+        .array_type,
+        .slice_type,
+        .pointer_type,
+        .optional_type,
+        .tuple_type,
+        .function_type,
+        .struct_type,
+        => false,
+    };
+}
+
+fn markMeasured(parameters: []const ast.TypedName, base: ast.Expression) void {
+    if (base.kind != .identifier) return;
+    const resolution = base.kind.identifier.resolution orelse return;
+    if (resolution == .parameter) {
+        if (resolution.parameter < parameters.len) @constCast(&parameters[resolution.parameter]).measured = true;
+        return;
+    }
+    if (resolution != .local) return;
+    const statement = @constCast(resolution.local);
+    switch (statement.kind) {
+        .constant_declaration => |*constant| constant.measured = true,
+        .variable_declaration => |*variable| variable.measured = true,
+        else => {},
+    }
 }
 
 fn isErrorPattern(error_set: *const types.Enum, pattern: ast.Expression) bool {
@@ -8247,6 +8397,52 @@ test "chooseBlock: checks only the block that a type comparison chooses" {
     try std.testing.expectEqual(Value{ .integer = 2 }, declarations[2].kind.constant_declaration.known.?.*);
 }
 
+test "countTypeDependency: keeps a condition that passes a type argument to a function a run-time condition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nfn check(buffer: []const u8, count: usize) -> bool:\n    if memory::equal(buffer, \"y\"): return true\n    if count == mn::size(u8): return true\n    return false" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[2].kind.function_definition.body;
+    try std.testing.expect(body[0].kind.@"if".known == null);
+    try std.testing.expect(body[1].kind.@"if".known == null);
+}
+
+test "countTypeDependency: chooses a block by a condition that passes a type parameter of the function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn pick(type T) -> i32:\n    if mn::size(T) == 4: return 1\n    else: return false\nfn main(): _ = pick(i32)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    var chosen = false;
+    for (loader.modules.items[0].declarations[3..]) |declaration| {
+        if (declaration.kind != .function_definition) continue;
+        const body = declaration.kind.function_definition.body;
+        if (body.len > 0 and body[0].kind == .@"if" and body[0].kind.@"if".known == true) chosen = true;
+    }
+    try std.testing.expect(chosen);
+}
+
 test "chooseBlock: rejects a condition on a type that is not known at compile time" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -12428,6 +12624,70 @@ test "checkFunctionCall: accepts a call that gives a type in a function that giv
     try std.testing.expectEqual(types.Type{ .number = .i32 }, ast.extractType(parameters[0].type));
 }
 
+test "instantiateCall: creates an instance for each type of the argument to an any parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count(values: any) -> usize: return values.length\nfn main():\n    const array: [2]u8 = {1, 2}\n    _ = count(\"ab\")\n    _ = count(\"abc\")\n    _ = count(array)\n    _ = count(&array)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const instances = analyzer.type_checker.instances.items;
+    try std.testing.expectEqual(3, instances.len);
+    try std.testing.expect(instances[0].arguments[0].value.type == .slice);
+    try std.testing.expectEqual(2, instances[1].arguments[0].value.type.array.length);
+    try std.testing.expect(instances[2].arguments[0].value.type == .pointer);
+}
+
+test "instantiateCall: checks the use of an any parameter in each instance and traces the call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count(values: any) -> usize: return values.length\nfn main(): _ = count(5i32)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NoFields, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 47 }, analyzer.failure.?.location.?);
+    const trace = try analyzer.collectCallTrace(arena.allocator(), analyzer.failure.?);
+    try std.testing.expectEqual(1, trace.len);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 16 }, trace[0].location);
+}
+
+test "check: checks what does not depend on an any parameter in a function that is never called" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn unused(value: any) -> i32:\n    _ = value\n    return true" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 12 }, analyzer.failure.?.location.?);
+}
+
 test "instantiateCall: creates an instance for each type given to a parameter of a typeclass type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -13752,6 +14012,68 @@ test "checkSliceField: rejects a field a slice does not have" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 48 }, analyzer.failure.?.location.?);
 }
 
+test "checkArrayField: gives the length of an array as a usize known at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const primes: [_]i32 = {2, 3, 5}\nconst COUNT = primes.length\nfn read() -> usize:\n    const values: [4]u8 = {1, 2, 3, 4}\n    var copy: [values.length]u8 = values\n    copy[0] = 1\n    return copy.length" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    const count = declarations[1].kind.constant_declaration.value;
+    try std.testing.expectEqual(types.Type{ .number = .usize }, count.type.?);
+    try std.testing.expectEqualStrings("3", count.kind.integer_literal.text);
+    const copy = declarations[2].kind.function_definition.body[1].kind.variable_declaration;
+    try std.testing.expectEqual(4, ast.extractType(copy.type.?).array.length);
+}
+
+test "checkArrayField: rejects assigning the length of an array" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn set():\n    var buffer: [4]u8 = undefined\n    buffer[0] = 1\n    buffer.length = 2" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NotWritable, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 5 }, analyzer.failure.?.location.?);
+}
+
+test "checkArrayField: rejects a field an array does not have" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn size(values: [4]u8) -> usize: return values.size" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownField, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 48 }, analyzer.failure.?.location.?);
+}
+
 test "checkDereference: rejects dereferencing a pointer to void" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -14605,7 +14927,7 @@ test "checkBinary: compares the elements of slices through mn::memory::equal" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn same(one: []const u8, two: []u8, length: usize) -> bool: return memory::equal(u8, two[0..length], \"yes\\n\") and memory::equal(u8, one, two)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn same(one: []const u8, two: []u8, length: usize) -> bool: return memory::equal(two[0..length], \"yes\\n\") and memory::equal(one, two)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14615,7 +14937,7 @@ test "checkBinary: compares the elements of slices through mn::memory::equal" {
     try std.testing.expectEqual(types.Type.boolean, value.type.?);
 }
 
-test "checkBinary: rejects mn::memory::equal on elements that cannot be compared for equality" {
+test "checkFunctionCall: rejects a slice of elements other than bytes passed to mn::memory::equal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -14625,14 +14947,14 @@ test "checkBinary: rejects mn::memory::equal on elements that cannot be compared
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nstruct Card:\n    value: i32\nfn same(one: []const Card, two: []const Card) -> bool: return memory::equal(Card, one, two)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn same(one: []const i32, two: []const i32) -> bool: return memory::equal(one, two)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
-    try std.testing.expectError(error.NotEquatable, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 4, .column = 23 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("memory", analyzer.failure.?.module.?[1]);
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 75 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("main", analyzer.failure.?.module.?[0]);
 }
 
 test "checkBinary: compares optionals of numbers for equality" {
