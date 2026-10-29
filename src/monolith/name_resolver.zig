@@ -16,6 +16,8 @@ const Value = core.Value;
 
 const isLanguageModule = @import("loader.zig").isLanguageModule;
 
+const keywords = @import("name.zig").keywords;
+
 pub const NameResolver = struct {
     arena: *std.heap.ArenaAllocator,
     io: std.Io,
@@ -96,7 +98,8 @@ pub const NameResolver = struct {
                     .instance_declaration => unreachable,
                 });
             }
-            if (isReservedName(module.path, name)) return self.fail(location, error.ReservedName);
+            if (isReservedDeclarationName(module.path, declaration.kind, name)) return self.fail(location, error.ReservedName);
+            if (declaration.kind == .import and isKeywordName(name)) return self.fail(location, error.ReservedImport);
             if (declaration.kind != .import and try self.hasMember(module.path, name)) {
                 return self.fail(location, error.NamedLikeModule);
             }
@@ -602,7 +605,7 @@ pub const NameResolver = struct {
             self.module_index = typeclass.module;
             self.typeclass = typeclass;
         } else if (signature.receiver) |*receiver| {
-            if (isReservedName(module.path, signature.name)) {
+            if (!isStandardLibrary(module.path) and hasReservedPrefix(signature.name)) {
                 return self.fail(declaration.location, error.ReservedName);
             }
             try self.resolveNamesInExpression(.{}, receiver);
@@ -1923,9 +1926,12 @@ pub const NameResolver = struct {
         self.dropped_names = names.items;
         condition.kind = .{ .boolean_literal = chosen };
         conditional.known = chosen;
+        const module = self.loader.modules.items[self.module_index];
         if (chosen) {
+            conditional.dropped_ends = ast.isEndingBlock(module, conditional.else_body orelse &.{});
             conditional.else_body = null;
         } else {
+            conditional.dropped_ends = ast.isEndingBlock(module, conditional.body);
             conditional.body = &.{};
         }
     }
@@ -2764,7 +2770,7 @@ pub const NameResolver = struct {
         }
         if (std.mem.eql(u8, name, "Self")) return self.fail(location, error.UnknownName);
         const module = self.loader.modules.items[self.module_index];
-        if (findDeclaration(module, name)) |index| {
+        if (findBareDeclaration(module, name)) |index| {
             return self.resolveDeclaration(self.module_index, index);
         }
         if (types.findBuiltInType(name)) |built_in_type| return .{ .type = built_in_type };
@@ -2826,7 +2832,7 @@ pub const NameResolver = struct {
         if (findTypedName(scope.parameters, last) != null) return null;
         if (std.mem.eql(u8, last, "Self")) return try self.resolveName(location, last);
         const module = self.loader.modules.items[self.module_index];
-        const index = findDeclaration(module, last) orelse {
+        const index = findBareDeclaration(module, last) orelse {
             const built_in_type = types.findBuiltInType(last) orelse return null;
             return .{ .type = built_in_type };
         };
@@ -2847,12 +2853,16 @@ pub const NameResolver = struct {
         location: token.Location,
         name: []const u8,
     ) ResolveError!Namespace {
+        if (std.mem.eql(u8, name, ast.module_root)) {
+            const module = self.loader.modules.items[self.module_index];
+            return .{ .path = module.path, .module = self.module_index, .directory = false };
+        }
         if (findLocal(scope.locals, name) != null) return self.fail(location, error.NoMembers);
         if (findTypedName(scope.parameters, name) != null) {
             return self.fail(location, error.NoMembers);
         }
         const module = self.loader.modules.items[self.module_index];
-        if (findDeclaration(module, name)) |index| {
+        if (findBareDeclaration(module, name)) |index| {
             return self.expectNamespace(location, self.module_index, index);
         }
         if (isBuiltInTypeName(name)) return self.fail(location, error.NoMembers);
@@ -3254,6 +3264,7 @@ pub const NameError = error{
     ModuleNotFound,
     ConstantRefersToItself,
     StructContainsItself,
+    ReservedImport,
     NotExternalField,
     InternalStructInExternalFunction,
     ManyVoidPointer,
@@ -3415,6 +3426,7 @@ fn describeError(name_error: NameError) []const u8 {
         error.ModuleNotFound => "module not found",
         error.ConstantRefersToItself => "constant refers to itself",
         error.StructContainsItself => "struct contains itself",
+        error.ReservedImport => "an import cannot make a reserved name available, use 'as' to name it",
         error.NotExternalField => "an external struct's fields must be numbers, bool, pointers, optional pointers, function pointers, arrays of these or external structs",
         error.InternalStructInExternalFunction => "a struct in an external function's parameters or return type must be an external struct",
         error.ManyVoidPointer => "a pointer to void cannot point to multiple values",
@@ -3545,6 +3557,24 @@ fn isReservedName(module_path: ast.Path, name: []const u8) bool {
     return !isStandardLibrary(module_path) and hasReservedPrefix(name);
 }
 
+fn isReservedDeclarationName(module_path: ast.Path, kind: ast.DeclarationKind, name: []const u8) bool {
+    return switch (kind) {
+        .function_definition, .function_declaration, .struct_definition, .enum_definition => {
+            return !isStandardLibrary(module_path) and hasReservedPrefix(name);
+        },
+        .constant_declaration, .typeclass_definition, .instance_declaration, .import => isReservedName(module_path, name),
+    };
+}
+
+fn findBareDeclaration(module: ast.Module, name: []const u8) ?usize {
+    if (std.mem.eql(u8, name, "void")) return null;
+    return findDeclaration(module, name);
+}
+
+fn isKeywordName(name: []const u8) bool {
+    return keywords.has(name);
+}
+
 fn isStandardLibrary(path: ast.Path) bool {
     return std.mem.eql(u8, path[0], "mn");
 }
@@ -3661,7 +3691,8 @@ fn isDependentStatement(dependency: Dependency, statement: ast.Statement) bool {
         .tuple_declaration => |declaration| isDependentExpression(names, declaration.value, false),
         .assignment => |assignment| isDependentExpression(names, assignment.target, false) or
             isDependentExpression(names, assignment.value, false),
-        .@"if" => |conditional| isDependentExpression(names, conditional.condition, false),
+        .@"if" => |conditional| isDependentExpression(names, conditional.condition, false) or
+            (conditional.names.len == 0 and mentionsAny(names.values, conditional.condition)),
         .@"while" => |loop| isDependentExpression(names, loop.condition, false),
         .@"for" => |loop| switch (loop.sequence) {
             .value => |value| isDependentExpression(names, value, false),
@@ -3938,10 +3969,20 @@ fn containsTarget(body: []const ast.Statement, target: *const ast.Statement) boo
 fn findBuiltin(path: ast.Path, name: []const u8) ?ast.Builtin {
     if (!isLanguageModule(path[0])) return null;
     const builtin = std.meta.stringToEnum(ast.Builtin, name) orelse return null;
-    const reflection = builtin == .length or builtin == .join;
-    if (path.len == 1 and !reflection) return builtin;
-    if (path.len == 2 and std.mem.eql(u8, path[1], "reflection") and reflection) return builtin;
+    const namespace = findBuiltinNamespace(builtin) orelse {
+        if (path.len == 1) return builtin;
+        return null;
+    };
+    if (path.len == 2 and std.mem.eql(u8, path[1], namespace)) return builtin;
     return null;
+}
+
+fn findBuiltinNamespace(builtin: ast.Builtin) ?[]const u8 {
+    return switch (builtin) {
+        .length, .join => "reflection",
+        .@"error" => "comptime",
+        .size, .alignment, .convert, .truncate, .cast, .@"align" => null,
+    };
 }
 
 fn findCase(receiver: types.Type, name: []const u8) ?ast.Resolution.Case {
@@ -4023,7 +4064,7 @@ fn addBoundConstant(
     known.* = argument.value;
     const name = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ instance_name, parameter.name });
     const value: ast.Expression = .{ .kind = .undefined, .type = argument.type, .location = parameter.location };
-    const constant: ast.ConstantDeclaration = .{ .name = name, .value = value, .resolved = true, .known = known };
+    const constant: ast.ConstantDeclaration = .{ .name = name, .value = value, .resolved = true, .known = known, .bound = true };
     const index = module.declarations.len + module.instances.items.len;
     const declaration = try allocator.create(ast.Declaration);
     declaration.* = .{ .kind = .{ .constant_declaration = constant }, .location = parameter.location };
@@ -4390,7 +4431,7 @@ test "resolveModule: allows reserved names in the standard library" {
     try std.testing.expectEqual(0, function.declaration);
 }
 
-test "resolveModule: rejects void as a name" {
+test "resolveModule: rejects void as the name of a constant" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -4400,7 +4441,7 @@ test "resolveModule: rejects void as a name" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn void(): noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const void: i32 = 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4409,7 +4450,7 @@ test "resolveModule: rejects void as a name" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, name_resolver.failure.?.location.?);
 }
 
-test "resolveModule: rejects Self as a name" {
+test "resolveModule: rejects Self as the name of a constant" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -4419,7 +4460,7 @@ test "resolveModule: rejects Self as a name" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Self:\n    count: i32" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Self: i32 = 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10400,6 +10441,128 @@ test "findPathOwner: prefers a declaration over a built-in type" {
     const body = loader.modules.items[0].declarations[2].kind.function_definition.body;
     const callee = body[0].kind.discard.kind.call.callee.path_expression;
     try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 1 } }, callee.resolution.?);
+}
+
+test "resolveFirstNamespace: resolves a path that starts with the separator to a declaration of the module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn match(pattern: []const u8) -> bool: return pattern.length > 0\nstruct Point:\n    x: i32\nfn make() -> ::Point: return ::Point{x = 1}\nfn main():\n    _ = ::match(\"x\")\n    _ = make()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[3].kind.function_definition.body;
+    const callee = body[0].kind.discard.kind.call.callee.path_expression;
+    try std.testing.expectEqual(ast.Resolution.Function{ .module = 0, .declaration = 0 }, callee.resolution.?.function);
+}
+
+test "resolveMember: reaches a function with a reserved name in another module through a path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "parser.mn", .data = "fn match(pattern: []const u8) -> bool: return pattern.length > 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import parser\nfn main():\n    _ = parser::match(\"x\")" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
+    const callee = body[0].kind.discard.kind.call.callee.path_expression;
+    try std.testing.expect(callee.resolution.? == .function);
+}
+
+test "resolveModule: rejects an import that makes a reserved name available" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::comptime" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ReservedImport, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, analyzer.failure.?.location.?);
+}
+
+test "resolveModule: rejects an import of a function with a reserved name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "parser.mn", .data = "fn match(pattern: []const u8) -> bool: return pattern.length > 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import parser::match" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ReservedImport, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, analyzer.failure.?.location.?);
+}
+
+test "resolveModule: accepts an import of a reserved name under another name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::comptime as compile\nfn check(comptime flag: bool):\n    if flag: compile::error(\"bad\")\nfn main(): check(false)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqualStrings("compile", loader.modules.items[0].declarations[0].kind.import.name);
+}
+
+test "findBareDeclaration: reaches declarations named void and Self only through a path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct void:\n    count: i32\n    fn read(self: Self) -> i32: return self.count\nfn Self() -> ::void: return ::void{count = 2}\nfn nothing() -> void: return\nfn main():\n    _ = ::Self().read()\n    nothing()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(types.Type.void, ast.extractType(declarations[3].kind.function_definition.signature.return_type));
+    try std.testing.expect(ast.extractType(declarations[2].kind.function_definition.signature.return_type) == .@"struct");
 }
 
 test "resolveFirstNamespace: rejects members of a parameter" {

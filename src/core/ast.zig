@@ -4,6 +4,8 @@ const types = @import("types.zig");
 
 const Value = @import("value.zig").Value;
 
+pub const module_root = "";
+
 pub const Program = struct {
     modules: []Module,
     types: *types.Registry,
@@ -117,6 +119,7 @@ pub const ConstantDeclaration = struct {
     resolved: bool = false,
     known: ?*Value = null,
     evaluating: bool = false,
+    bound: bool = false,
 };
 
 pub const TupleDeclaration = struct {
@@ -231,6 +234,7 @@ pub const If = struct {
     body: []Statement,
     else_body: ?[]Statement = null,
     known: ?bool = null,
+    dropped_ends: bool = false,
 };
 
 pub const While = struct {
@@ -446,6 +450,7 @@ pub const Builtin = enum {
     @"align",
     length,
     join,
+    @"error",
 };
 
 pub const Binary = struct {
@@ -831,6 +836,51 @@ pub fn extractBlocks(statement: Statement) [2][]const Statement {
         .@"continue",
         => .{ &.{}, &.{} },
     };
+}
+
+pub fn isEndingBlock(module: Module, statements: []const Statement) bool {
+    for (statements) |statement| {
+        if (isEndingStatement(module, statement)) return true;
+    }
+    return false;
+}
+
+fn isEndingStatement(module: Module, statement: Statement) bool {
+    return switch (statement.kind) {
+        .@"return", .@"break", .@"continue" => true,
+        .call => |expression| isComptimeErrorCall(module, expression),
+        .@"if" => |conditional| {
+            const else_body = conditional.else_body orelse return false;
+            return isEndingBlock(module, conditional.body) and isEndingBlock(module, else_body);
+        },
+        .match => |matching| {
+            for (matching.branches) |branch| {
+                if (!isEndingBlock(module, branch.body)) return false;
+            }
+            return true;
+        },
+        .noop, .discard, .constant_declaration, .tuple_declaration, .variable_declaration, .assignment, .@"while", .@"for", .@"defer" => false,
+    };
+}
+
+pub fn isComptimeErrorCall(module: Module, expression: Expression) bool {
+    if (expression.kind != .call) return false;
+    const path = switch (expression.kind.call.callee) {
+        .identifier, .member => return false,
+        .path_expression => |path_expression| path_expression,
+    };
+    if (path.resolution) |resolution| return resolution == .builtin and resolution.builtin == .@"error";
+    const names = path.path;
+    if (!std.mem.eql(u8, names[names.len - 1], "error")) return false;
+    if (names.len == 3) return std.mem.eql(u8, names[0], "mn") and std.mem.eql(u8, names[1], "comptime");
+    if (names.len != 2) return false;
+    for (module.declarations) |declaration| {
+        if (declaration.kind != .import) continue;
+        const import = declaration.kind.import;
+        if (!std.mem.eql(u8, import.name, names[0]) or import.path.len != 2) continue;
+        if (std.mem.eql(u8, import.path[0], "mn") and std.mem.eql(u8, import.path[1], "comptime")) return true;
+    }
+    return false;
 }
 
 pub fn isUnrolled(loop: For) bool {

@@ -23,6 +23,7 @@
 - The single character `_` is reserved and cannot be used as an identifier by the user.
 - The following identifier names are reserved and cannot be used as identifiers by the user:
     `and`, `as`, `break`, `case`, `catch`, `comptime`, `const`, `continue`, `defer`, `else`, `enum`, `errdefer`, `error`, `external`, `false`, `fn`, `for`, `if`, `import`, `in`, `instance`, `many`, `match`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `true`, `try`, `typeclass`, `undefined`, `var`, `void`, `while`
+- A reserved name can be the name of a function, struct, enum or error set, and a name after `::`, e.g. `fn match(pattern: []const u8) -> bool` called as `parser::match(pattern)`. Elsewhere it is reached through a path.
 
 ## Built-In Types
 
@@ -79,7 +80,7 @@
 - Tuple types can span multiple lines. A comma after the last element type is allowed.
 - Tuples support indexing with an index known at compile time, starting at 0.
 - Indexing a tuple type with an index known at compile time gives the type of that element, e.g. `T[0]`.
-- Every tuple type has an instance of `mn`'s typeclass `mn::Tuple`, which the compiler provides. A program cannot declare an instance of `mn::Tuple`. A parameter that requires it takes any tuple, e.g. `fn print(format: comptime []const u8, values: mn::Tuple)`, and code that depends on the tuple's elements is checked in each instance of the function.
+- Every tuple type has an instance of `mn`'s typeclass `mn::Tuple`, which the compiler provides. A program cannot declare an instance of `mn::Tuple`. A parameter that requires it takes any tuple, e.g. `fn print(comptime format: []const u8, values: mn::Tuple)`, and code that depends on the tuple's elements is checked in each instance of the function.
 
 ### Function Types
 
@@ -271,6 +272,7 @@
 
 - `==` and `!=` work on numbers, `bool`, types, pointers, arrays whose elements support them, optionals whose values support them, and enums and error sets whose values support them. Arrays are equal when all their elements are equal. Optionals are equal when both are `null` or both hold equal values. An optional can be compared with `null`.
 - Two types are equal when they are the same type, e.g. `T == i32`.
+- Slices cannot be compared with `==` and `!=`, since a slice points to its elements. Their elements are compared with `mn::memory::equal` (see the standard library).
 - Two enum values, or two errors, are equal when they are the same case and their values are equal. An error can be compared with a value of an error set combined from its set, e.g. `failure == ParseError::missing_end`.
 - `<`, `<=`, `>` and `>=` work on numbers and multiple value pointers.
 - A comparison gives a `bool`.
@@ -327,7 +329,7 @@
 - A block is a sequence of statements, one per line, indented deeper than the line that opens it. A block of one statement can follow the `:` on the same line, e.g. `fn one() -> u8: return 1`.
 - A block cannot be empty. `noop` is a statement that does nothing, e.g. `while running(): noop`.
 - A name declared in a block can be used from its declaration to the end of the block.
-- A statement that can never run is a compile-time error, e.g. one after a `return`.
+- A statement that can never run is a compile-time error, e.g. one after a `return`. Conditions are not evaluated at compile time for this, e.g. `return 2` after `if T == i32: return 1` can run.
 
 ### Calls
 
@@ -364,7 +366,7 @@
 - `if condition:` runs its block when the condition is true. The condition is a `bool`.
 - `else:` runs its block when the condition is false. It is on the line after the `if` block, at the same indentation as `if`.
 - `else if condition:` checks another condition when the previous ones are false, e.g. `if a:` followed by `else if b:` and `else:`.
-- A condition that depends on a type is evaluated at compile time, and only the block it chooses is checked and compiled, e.g. `if T == i32:` in a function with a `type T` parameter.
+- A condition that depends on a `type` or `comptime` parameter is evaluated at compile time, and only the block it chooses is checked and compiled, e.g. `if T == i32:` in a function with a `type T` parameter or `if format[0] == '{':` in a function with a `comptime format: []const u8` parameter.
 - `if optional as name:` runs its block when the optional is not `null`, with `name` holding its value, e.g. `if found as card:`. `*name` holds a pointer to the value instead of a copy. The name can be used only in the block.
 
 ### While
@@ -443,9 +445,12 @@
 - The program starts at the function `main` in `main.mn`.
 - `mn` is the module that comes with the language. It holds the built-in functions, which the compiler provides, and the standard library. A program's own `mn.mn` or `mn` directory is a compile-time error.
 - The built-in functions are `mn::size(T)` and `mn::alignment(T)`, which give a type's size and alignment in bytes as a `usize`, and `mn::convert(T, value)` and `mn::truncate(T, value)` (see Number Conversions), and `mn::cast(T, pointer)` and `mn::align(pointer, alignment)` (see Pointer Casts).
+- `mn::comptime::error(message)` stops compilation with the message wherever the code containing it is checked, e.g. in the block a condition chooses at compile time. Like `return`, it ends its block, so a function returning a value needs no `return` after it. The message is a `[]const u8` known at compile time. The error shows the location of the call and each call that led to it.
 - `mn::reflection` holds the built-in functions that inspect and build types. `mn::reflection::length(T)` gives a tuple type's number of elements as a `usize`. `mn::reflection::join(A, B)` gives the tuple type with the elements of `A` followed by those of `B`, e.g. `mn::reflection::join([Card], [usize])` is `[Card, usize]`.
 - `import path` makes the last name of the path available in the module. The path names a directory, a module or a declaration in a module, e.g. `import mn::io::stdout` allows `stdout::write("hi")`.
 - `import path as name` makes it available as `name` instead, e.g. `import mn::io::stdout as out`.
+- An import that would make a reserved name available is a compile-time error, e.g. `import mn::comptime`.
+- A path that starts with `::` names a top-level declaration of the current module, e.g. `::match(pattern)`.
 - `import` is written at the top level of a module. The name it makes available cannot be the same as another import or top-level declaration of the module.
 - Other modules can use every top-level declaration of a module.
 - A module can be next to a directory with the same name, e.g. `shapes.mn` and `shapes/`. A declaration in the module with the same name as a module or directory in the directory is a compile-time error, e.g. `circle` in `shapes.mn` and `shapes/circle.mn`.

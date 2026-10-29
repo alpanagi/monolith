@@ -182,7 +182,8 @@ pub fn isLanguageModule(name: []const u8) bool {
 
 pub fn isLanguageNamespace(path: ast.Path) bool {
     if (!isLanguageModule(path[0])) return false;
-    return path.len == 1 or (path.len == 2 and std.mem.eql(u8, path[1], "reflection"));
+    if (path.len == 1) return true;
+    return path.len == 2 and (std.mem.eql(u8, path[1], "reflection") or std.mem.eql(u8, path[1], "comptime"));
 }
 
 fn buildSourceFileName(

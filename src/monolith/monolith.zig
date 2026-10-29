@@ -1,4 +1,5 @@
 pub const Analyzer = @import("analyzer.zig").Analyzer;
+pub const CallNote = @import("analyzer.zig").CallNote;
 pub const Loader = @import("loader.zig").Loader;
 pub const NameResolver = @import("name_resolver.zig").NameResolver;
 pub const TypeChecker = @import("type_checker.zig").TypeChecker;

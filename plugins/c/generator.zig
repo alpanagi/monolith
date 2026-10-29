@@ -3564,6 +3564,7 @@ pub const Generator = struct {
         builtin: ast.Builtin,
     ) WriteError!void {
         if (builtin == .@"align") return self.generateAlign(allocator, reached, writer, call);
+        if (builtin == .@"error") unreachable;
         const target = ast.extractType(call.arguments[0].value);
         switch (builtin) {
             .size => try self.generateKnownInteger(writer, .usize, types.findLayout(target).size),
@@ -3578,7 +3579,7 @@ pub const Generator = struct {
                 try self.generateOperand(allocator, reached, writer, &call.arguments[1].value);
                 try writer.writeByte(')');
             },
-            .@"align" => unreachable,
+            .@"align", .@"error" => unreachable,
         }
     }
 
@@ -6612,6 +6613,37 @@ test "checkNames: rejects external function names defined in the target" {
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn int()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+
+    try std.testing.expectError(error.NameDefinedInTarget, generator.generateFiles(arena.allocator()));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, generator.failure.?.location.?);
+    try std.testing.expectEqualStrings("name is already defined in the target", generator.failure.?.message);
+}
+
+test "checkNames: rejects an external function named with a reserved word that is a C keyword" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn if()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);

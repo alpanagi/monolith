@@ -45,6 +45,17 @@ pub const Evaluator = struct {
         return self.expectCaught(expression.location, try self.evaluateExpression(expression));
     }
 
+    pub fn readText(self: *Evaluator, allocator: std.mem.Allocator, location: token.Location, value: Value) EvaluateError![]const u8 {
+        const slice = value.slice;
+        const elements = self.locate(slice.array).aggregate[slice.start..][0..slice.length];
+        const bytes = try allocator.alloc(u8, slice.length);
+        for (elements, bytes) |element, *byte| {
+            if (element != .integer) return self.fail(location, error.ReadUndefined);
+            byte.* = @intCast(element.integer);
+        }
+        return bytes;
+    }
+
     pub fn evaluateConstant(self: *Evaluator, constant: ast.Resolution.Constant) EvaluateError!*Value {
         const declaration = ast.findDeclaration(self.program.modules[constant.module], constant.declaration);
         const constant_declaration = &declaration.kind.constant_declaration;
@@ -482,6 +493,7 @@ pub const Evaluator = struct {
 
     fn evaluateBuiltin(self: *Evaluator, location: token.Location, call: ast.Call, builtin: ast.Builtin) EvaluateError!Value {
         if (builtin == .@"align") return self.fail(location, error.CannotEvaluate);
+        if (builtin == .@"error") unreachable;
         const target = (try self.evaluateExpression(&call.arguments[0].value)).type;
         switch (builtin) {
             .size => return .{ .integer = types.findLayout(target).size },
@@ -499,7 +511,7 @@ pub const Evaluator = struct {
                 return self.convertNumber(location, builtin, value, target.number);
             },
             .cast => return self.castPointer(location, target.pointer, &call.arguments[1].value),
-            .@"align" => unreachable,
+            .@"align", .@"error" => unreachable,
         }
     }
 

@@ -41,6 +41,14 @@ pub const keywords = std.StaticStringMap(token.TokenKind).initComptime(.{
     .{ "_", .underscore },
 });
 
+pub fn findKeywordName(kind: token.TokenKind) ?[]const u8 {
+    if (kind == .underscore) return null;
+    for (keywords.keys(), keywords.values()) |name, keyword| {
+        if (std.meta.activeTag(keyword) == std.meta.activeTag(kind)) return name;
+    }
+    return null;
+}
+
 pub fn isName(word: []const u8) bool {
     if (word.len == 0 or !isWordStart(word[0])) return false;
     for (word[1..]) |byte| {

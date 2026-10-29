@@ -6,6 +6,8 @@ const types = core.types;
 
 const Failure = core.Failure;
 
+const findKeywordName = @import("name.zig").findKeywordName;
+
 const comparison_operators: []const OperatorToken = &.{
     .{ .equals_equals, .equal },
     .{ .exclamation_mark_equals, .not_equal },
@@ -146,7 +148,7 @@ pub const Parser = struct {
     ) ParseError!?ast.FunctionSignature {
         var position = offset.*;
         _ = self.match(&position, .keyword_fn) orelse return null;
-        const name = try self.expect(&position, .identifier, error.ExpectedIdentifier);
+        const name = try self.expectName(&position);
         _ = try self.expect(&position, .left_parenthesis, error.ExpectedLeftParenthesis);
         const parameters = try self.parseParameters(allocator, &position);
         _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
@@ -155,7 +157,7 @@ pub const Parser = struct {
         offset.* = position;
         return .{
             .receiver = receiver,
-            .name = name.kind.identifier,
+            .name = name,
             .parameters = parameters,
             .return_type = return_type,
         };
@@ -829,15 +831,16 @@ pub const Parser = struct {
         var position = offset.*;
         const external = self.match(&position, .keyword_external) != null;
         _ = self.match(&position, .keyword_struct) orelse return null;
-        const name = try self.expect(&position, .identifier, error.ExpectedIdentifier);
+        const name_location = self.tokens[position].location;
+        const name = try self.expectName(&position);
         var fields: []ast.Field = &.{};
         if (self.match(&position, .colon) != null) {
-            const receiver = buildIdentifierExpression(name);
+            const receiver = try buildReceiverExpression(allocator, name, name_location);
             fields = try self.parseMembers(allocator, &position, receiver, 0, &self.methods);
         }
 
         offset.* = position;
-        return .{ .name = name.kind.identifier, .external = external, .fields = fields };
+        return .{ .name = name, .external = external, .fields = fields };
     }
 
     fn parseEnumDefinition(
@@ -852,10 +855,11 @@ pub const Parser = struct {
             else => return null,
         };
         position += 1;
-        const name = try self.expect(&position, .identifier, error.ExpectedIdentifier);
+        const name_location = self.tokens[position].location;
+        const name = try self.expectName(&position);
         var cases: std.ArrayList(ast.EnumCase) = .empty;
         if (self.match(&position, .colon) != null) {
-            const receiver = buildIdentifierExpression(name);
+            const receiver = try buildReceiverExpression(allocator, name, name_location);
             const depth = try self.expectBlock(position, 0);
             while (try self.matchBlockLine(&position, depth, 0)) {
                 const location = self.tokens[position].location;
@@ -875,7 +879,7 @@ pub const Parser = struct {
         }
 
         offset.* = position;
-        return .{ .name = name.kind.identifier, .kind = kind, .cases = cases.items };
+        return .{ .name = name, .kind = kind, .cases = cases.items };
     }
 
     fn parseCase(
@@ -1669,8 +1673,9 @@ pub const Parser = struct {
         offset: *usize,
     ) ParseError!?ast.Expression {
         var position = offset.*;
-        const first = self.match(&position, .identifier) orelse return null;
-        const callee = try self.parseName(allocator, &position, first);
+        const first = self.tokens[position];
+        const path = (try self.parsePathStart(allocator, &position)) orelse return null;
+        const callee = buildName(path);
         if (self.match(&position, .left_parenthesis) == null) return null;
         const arguments = try self.parseArguments(allocator, &position);
         _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
@@ -1688,22 +1693,33 @@ pub const Parser = struct {
         offset: *usize,
     ) ParseError!?ast.Expression {
         var position = offset.*;
-        const first = self.match(&position, .identifier) orelse return null;
-        const path = try self.parsePath(allocator, &position, first);
+        const first = self.tokens[position];
+        const path = (try self.parsePathStart(allocator, &position)) orelse return null;
 
         offset.* = position;
         return buildNameExpression(path, first.location);
     }
 
-    fn parseName(
+    fn parsePathStart(
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
-        first: token.Token,
-    ) ParseError!ast.Name {
-        const path = try self.parsePath(allocator, offset, first);
-        if (path.len == 1) return .{ .identifier = .{ .name = first.kind.identifier } };
-        return .{ .path_expression = .{ .path = path } };
+    ) ParseError!?ast.Path {
+        if (self.tokens[offset.*].kind == .identifier) {
+            const first = self.tokens[offset.*];
+            offset.* += 1;
+            return try self.parsePath(allocator, offset, first);
+        }
+        if (self.tokens[offset.*].kind != .double_colon) return null;
+        var position = offset.*;
+        var path: std.ArrayList([]const u8) = .empty;
+        try path.append(allocator, ast.module_root);
+        while (self.match(&position, .double_colon) != null) {
+            try path.append(allocator, try self.expectName(&position));
+        }
+
+        offset.* = position;
+        return path.items;
     }
 
     fn parsePath(
@@ -1716,12 +1732,19 @@ pub const Parser = struct {
         var path: std.ArrayList([]const u8) = .empty;
         try path.append(allocator, first.kind.identifier);
         while (self.match(&position, .double_colon) != null) {
-            const name = try self.expect(&position, .identifier, error.ExpectedIdentifier);
-            try path.append(allocator, name.kind.identifier);
+            try path.append(allocator, try self.expectName(&position));
         }
 
         offset.* = position;
         return path.items;
+    }
+
+    fn expectName(self: *Parser, offset: *usize) ParseError![]const u8 {
+        const current = self.tokens[offset.*];
+        offset.* += 1;
+        if (current.kind == .identifier) return current.kind.identifier;
+        const name = findKeywordName(current.kind) orelse return self.fail(offset.* - 1, error.ExpectedIdentifier);
+        return name;
     }
 
     fn parseNegation(
@@ -2030,14 +2053,22 @@ fn isLiteralType(expression: ast.Expression) bool {
     };
 }
 
-fn buildIdentifierExpression(name: token.Token) ast.Expression {
-    const identifier: ast.Identifier = .{ .name = name.kind.identifier };
-    return .{ .kind = .{ .identifier = identifier }, .location = name.location };
+fn buildReceiverExpression(allocator: std.mem.Allocator, name: []const u8, location: token.Location) std.mem.Allocator.Error!ast.Expression {
+    if (!std.mem.eql(u8, name, "void") and !std.mem.eql(u8, name, "Self")) {
+        return .{ .kind = .{ .identifier = .{ .name = name } }, .location = location };
+    }
+    const path = try allocator.dupe([]const u8, &.{ ast.module_root, name });
+    return .{ .kind = .{ .path_expression = .{ .path = path } }, .location = location };
 }
 
 fn isCallOrTriedCall(expression: ast.Expression) bool {
     const call = if (expression.kind == .@"try") expression.kind.@"try".* else expression;
     return call.kind == .call or call.kind == .method_call;
+}
+
+fn buildName(path: ast.Path) ast.Name {
+    if (path.len == 1) return .{ .identifier = .{ .name = path[0] } };
+    return .{ .path_expression = .{ .path = path } };
 }
 
 fn buildNameExpression(path: ast.Path, location: token.Location) ast.Expression {
@@ -2219,6 +2250,28 @@ test "parseFunctionDefinition: parses an inline body" {
     try std.testing.expectEqual(1, module.declarations[0].kind.function_definition.body.len);
     try std.testing.expect(module.declarations[0].kind.function_definition.body[0].kind == .noop);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, module.declarations[0].kind.function_definition.body[0].location);
+}
+
+test "parseFunctionSignature: accepts a reserved word as the name of a function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn match(pattern: []const u8) -> bool: return true");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    try std.testing.expectEqualStrings("match", module.declarations[0].kind.function_definition.signature.name);
+}
+
+test "parseFunctionSignature: rejects a reserved word as the name of a parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn find(match: []const u8) -> bool: return true");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 9 }, parser.failure.?.location.?);
 }
 
 test "parseFunctionSignature: rejects missing parenthesis" {
@@ -3458,6 +3511,17 @@ test "parseAssignment: rejects a call as the target of a compound assignment" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, parser.failure.?.location.?);
 }
 
+test "parseStatement: rejects a reserved word as the name of a local" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    const match = 1");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 11 }, parser.failure.?.location.?);
+}
+
 test "parseCallStatement: parses a call as a statement" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3675,6 +3739,41 @@ test "parseStructDefinition: parses fields in an indented block" {
     try std.testing.expectEqualStrings("i32", fields[0].type.kind.identifier.name);
     try std.testing.expectEqualStrings("y", fields[1].name);
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, fields[1].location);
+}
+
+test "parseStructDefinition: accepts a reserved word as the name of a struct and of an enum and an error set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("struct match:\n    value: i32\nenum case:\n    first\nerror for:\n    second");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    try std.testing.expectEqualStrings("match", module.declarations[0].kind.struct_definition.name);
+    try std.testing.expectEqualStrings("case", module.declarations[1].kind.enum_definition.name);
+    try std.testing.expectEqualStrings("for", module.declarations[2].kind.enum_definition.name);
+}
+
+test "parseStructDefinition: rejects a reserved word as the name of a field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("struct Point:\n    match: i32");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedField, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, parser.failure.?.location.?);
+}
+
+test "parseEnumDefinition: rejects a reserved word as the name of a case" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("enum Token:\n    match");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedCase, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, parser.failure.?.location.?);
 }
 
 test "parseStructDefinition: parses a struct without fields" {
@@ -5467,6 +5566,35 @@ test "parseNameExpression: parses a path used as a value" {
     try std.testing.expectEqualStrings("value", path_expression.path[1]);
 }
 
+test "parsePathStart: parses a path that starts with the separator as a path from the module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): ::match(::Point::new())");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const call = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call;
+    const path = call.callee.path_expression.path;
+    try std.testing.expectEqual(2, path.len);
+    try std.testing.expectEqualStrings(ast.module_root, path[0]);
+    try std.testing.expectEqualStrings("match", path[1]);
+    const inner = call.arguments[0].value.kind.call.callee.path_expression.path;
+    try std.testing.expectEqual(3, inner.len);
+    try std.testing.expectEqualStrings("Point", inner[1]);
+}
+
+test "parsePathStart: rejects a separator without a name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): ::(1)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, parser.failure.?.location.?);
+}
+
 test "parsePath: rejects a separator without a name after it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5476,6 +5604,19 @@ test "parsePath: rejects a separator without a name after it" {
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, parser.failure.?.location.?);
+}
+
+test "expectName: accepts reserved words after the separator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): mn::comptime::error(\"stop\")");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const path = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call.callee.path_expression.path;
+    try std.testing.expectEqualStrings("comptime", path[1]);
+    try std.testing.expectEqualStrings("error", path[2]);
 }
 
 test "parseNegation: wraps a number literal in a negation" {

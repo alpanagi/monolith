@@ -5,4 +5,5 @@ pub const Failure = struct {
     module: ?ast.Path = null,
     location: ?token.Location = null,
     message: []const u8,
+    function: ?ast.Resolution.Function = null,
 };
