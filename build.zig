@@ -40,9 +40,9 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     b.installDirectory(.{
-        .source_dir = b.path("std"),
+        .source_dir = b.path("mn"),
         .install_dir = .bin,
-        .install_subdir = "std",
+        .install_subdir = "mn",
     });
 
     b.installDirectory(.{

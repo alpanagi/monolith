@@ -14,6 +14,13 @@ pub const Value = union(enum) {
     slice: Value.Slice,
     function: ast.Resolution.Function,
     type: types.Type,
+    enumeration: Value.Enumeration,
+    failure: Value.Enumeration,
+
+    pub const Enumeration = struct {
+        case: *const types.Case,
+        value: ?*Value = null,
+    };
 
     pub const Pointer = struct {
         root: *Value,

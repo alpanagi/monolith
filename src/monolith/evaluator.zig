@@ -23,6 +23,7 @@ pub const Evaluator = struct {
     preparer: ?Preparer = null,
     cache: std.ArrayList(Cached) = .empty,
     calls: std.ArrayList(Active) = .empty,
+    returned_error: ?Value.Enumeration = null,
     failure: ?Failure = null,
 
     pub fn init(arena: *std.heap.ArenaAllocator, program: ast.Program) Evaluator {
@@ -41,7 +42,7 @@ pub const Evaluator = struct {
         const caller_frame = self.frame;
         self.frame = null;
         defer self.frame = caller_frame;
-        return self.evaluateExpression(expression);
+        return self.expectCaught(expression.location, try self.evaluateExpression(expression));
     }
 
     pub fn evaluateConstant(self: *Evaluator, constant: ast.Resolution.Constant) EvaluateError!*Value {
@@ -60,7 +61,7 @@ pub const Evaluator = struct {
         defer self.frame = caller_frame;
         const declared = ast.extractDeclaredType(constant_declaration.type, value.*);
         const cell = try self.arena.allocator().create(Value);
-        cell.* = try self.copy(try self.evaluateConverted(value.*, declared));
+        cell.* = try self.copy(try self.expectCaught(value.location, try self.evaluateConverted(value.*, declared)));
         constant_declaration.known = cell;
         return cell;
     }
@@ -73,7 +74,8 @@ pub const Evaluator = struct {
         const caller_frame = self.frame;
         self.frame = null;
         defer self.frame = caller_frame;
-        const value = try self.copy(try self.evaluateConverted(field.default.?.*, field.type));
+        const default = field.default.?.*;
+        const value = try self.copy(try self.expectCaught(default.location, try self.evaluateConverted(default, field.type)));
         field.default_value.?.* = value;
         return value;
     }
@@ -108,8 +110,23 @@ pub const Evaluator = struct {
                 }
                 return true;
             },
+            .enumeration => |enumeration| {
+                if (two != .enumeration or two.enumeration.case.tag != enumeration.case.tag) return false;
+                const inner = enumeration.value orelse return true;
+                return self.isSameKey(inner.*, two.enumeration.value.?.*);
+            },
+            .failure => |failure| {
+                if (two != .failure or two.failure.case.tag != failure.case.tag) return false;
+                const inner = failure.value orelse return true;
+                return self.isSameKey(inner.*, two.failure.value.?.*);
+            },
             .integer, .boolean, .void, .undefined, .pointer, .many, .function, .type => isEqual(one, two),
         };
+    }
+
+    fn expectCaught(self: *Evaluator, location: token.Location, value: Value) EvaluateError!Value {
+        if (value == .failure) return self.fail(location, error.UncaughtError);
+        return value;
     }
 
     fn isKnownWith(self: *const Evaluator, expression: ast.Expression, calls: bool) bool {
@@ -117,6 +134,7 @@ pub const Evaluator = struct {
             .integer_literal, .float_literal, .boolean_literal, .string_literal, .null => true,
             inline .identifier, .path_expression, .member => |name| self.isKnownResolution(name.resolution, calls),
             .negation, .unwrap, .dereference, .address_of => |operand| self.isKnownWith(operand.*, calls),
+            .@"try" => false,
             .unary => |unary| self.isKnownWith(unary.operand.*, calls),
             .binary => |binary| self.isKnownWith(binary.left.*, calls) and self.isKnownWith(binary.right.*, calls),
             .composite_literal => |literal| self.areKnown(literal.elements, calls),
@@ -145,7 +163,7 @@ pub const Evaluator = struct {
     fn isKnownResolution(self: *const Evaluator, resolution: ?ast.Resolution, calls: bool) bool {
         const resolved = resolution orelse return false;
         return switch (resolved) {
-            .constant, .function, .type => true,
+            .constant, .function, .type, .case, .builtin => true,
             .local => |statement| {
                 if (statement.kind != .constant_declaration) return false;
                 return self.isKnownWith(statement.kind.constant_declaration.value, calls);
@@ -178,8 +196,9 @@ pub const Evaluator = struct {
             .index, .field_access, .dereference => self.readPlace(location, try self.findPlace(expression)),
             .slice => |slice| self.evaluateSlice(expression, slice),
             .unwrap => |operand| self.evaluateUnwrap(expression, operand.*),
+            .@"try" => |operand| self.evaluateTry(operand.*),
             .address_of => |operand| self.evaluateAddress(operand.*),
-            .call => |call| self.evaluateCall(location, call),
+            .call => |call| self.evaluateCallExpression(location, call),
             .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type => .{
                 .type = ast.extractType(expression),
             },
@@ -203,6 +222,10 @@ pub const Evaluator = struct {
     }
 
     fn convert(self: *Evaluator, value: Value, value_type: types.Type, expected: types.Type) EvaluateError!Value {
+        if (expected == .result and value_type != .result) {
+            if (types.isResultError(value_type, expected.result.*)) return .{ .failure = value.enumeration };
+            return self.convert(value, value_type, expected.result.value);
+        }
         if (countOptionals(value_type) >= countOptionals(expected)) return convertDirectly(value, value_type, expected);
         const cell = try self.arena.allocator().create(Value);
         cell.* = try self.copy(convertDirectly(value, value_type, expected.optional.child));
@@ -219,8 +242,9 @@ pub const Evaluator = struct {
             .constant => |constant| (try self.evaluateConstant(constant)).*,
             .function => |function| Value{ .function = function },
             .type => |value_type| Value{ .type = value_type },
+            .case => |case| Value{ .enumeration = .{ .case = &case.enumeration.cases[case.index] } },
             .parameter, .local, .element => (try self.findCell(location, resolution)).*,
-            .typeclass_function, .typeclass_method => return self.fail(location, error.CannotEvaluate),
+            .typeclass_function, .typeclass_method, .builtin => return self.fail(location, error.CannotEvaluate),
         };
         if (value == .undefined) return self.fail(location, error.ReadUndefined);
         return value;
@@ -236,7 +260,7 @@ pub const Evaluator = struct {
                 .element => |element| {
                     if (frame.elements.get(element)) |cell| return cell;
                 },
-                .constant, .function, .type, .typeclass_function, .typeclass_method => unreachable,
+                .constant, .function, .type, .typeclass_function, .typeclass_method, .case, .builtin => unreachable,
             }
         }
         if (resolution == .local and resolution.local.kind == .constant_declaration) {
@@ -262,7 +286,7 @@ pub const Evaluator = struct {
                         .root_type = value_type,
                         .path = &.{},
                     },
-                    .function, .type, .typeclass_function, .typeclass_method => self.fail(location, error.CannotEvaluate),
+                    .function, .type, .typeclass_function, .typeclass_method, .case, .builtin => self.fail(location, error.CannotEvaluate),
                 };
             },
             .field_access => |access| {
@@ -297,6 +321,7 @@ pub const Evaluator = struct {
             .function_type,
             .struct_type,
             .unwrap,
+            .@"try",
             => {
                 const cell = try self.arena.allocator().create(Value);
                 cell.* = try self.evaluateExpression(expression);
@@ -331,7 +356,7 @@ pub const Evaluator = struct {
                 if (element < 0 or element >= length) return self.fail(location, error.IndexOutOfRange);
                 return self.extendPlace(many.array, @intCast(element));
             },
-            .number, .boolean, .void, .type, .@"struct", .optional, .function, .variable, .application => unreachable,
+            .number, .boolean, .@"enum", .void, .type, .@"struct", .optional, .result, .function, .variable, .application => unreachable,
         }
     }
 
@@ -370,7 +395,7 @@ pub const Evaluator = struct {
         return switch (try self.evaluateExpression(operand)) {
             .integer => |value| self.expectInRange(expression.location, number, -value),
             .float => |value| .{ .float = -value },
-            .boolean, .void, .undefined, .optional, .aggregate, .pointer, .many, .slice, .function, .type => unreachable,
+            .boolean, .void, .undefined, .optional, .aggregate, .pointer, .many, .slice, .function, .type, .enumeration, .failure => unreachable,
         };
     }
 
@@ -391,8 +416,69 @@ pub const Evaluator = struct {
         }
     }
 
+    fn evaluateCallExpression(self: *Evaluator, location: token.Location, call: ast.Call) EvaluateError!Value {
+        const resolution = ast.extractResolution(call.callee);
+        if (resolution == .builtin) return self.evaluateBuiltin(location, call, resolution.builtin);
+        if (resolution != .case) return self.evaluateCall(location, call);
+        const case = &resolution.case.enumeration.cases[resolution.case.index];
+        const cell = try self.arena.allocator().create(Value);
+        cell.* = try self.copy(try self.evaluateConverted(call.arguments[0].value, case.type.?));
+        return .{ .enumeration = .{ .case = case, .value = cell } };
+    }
+
+    fn evaluateBuiltin(self: *Evaluator, location: token.Location, call: ast.Call, builtin: ast.Builtin) EvaluateError!Value {
+        const target = (try self.evaluateExpression(call.arguments[0].value)).type;
+        switch (builtin) {
+            .size => return .{ .integer = types.findLayout(target).size },
+            .alignment => return .{ .integer = types.findLayout(target).alignment },
+            .convert, .truncate => {
+                const argument = call.arguments[1].value;
+                const value = try self.evaluateExpression(argument);
+                if (value == .undefined) return self.fail(argument.location, error.ReadUndefined);
+                return self.convertNumber(location, builtin, value, target.number);
+            },
+        }
+    }
+
+    fn convertNumber(
+        self: *Evaluator,
+        location: token.Location,
+        builtin: ast.Builtin,
+        value: Value,
+        target: types.NumberType,
+    ) EvaluateError!Value {
+        const float_target = isFloatType(target);
+        switch (value) {
+            .integer => |integer| {
+                if (float_target) return .{ .float = roundFloat(target, @floatFromInt(integer)) };
+                if (builtin == .truncate) return .{ .integer = truncateInteger(target, integer) };
+                if (integer < findMinimum(target) or integer > findMaximum(target)) {
+                    return self.fail(location, error.ConversionOutOfRange);
+                }
+                return value;
+            },
+            .float => |float| {
+                if (float_target) return .{ .float = roundFloat(target, float) };
+                if (std.math.isNan(float) or std.math.isInf(float)) return self.fail(location, error.ConversionOutOfRange);
+                const truncated = @trunc(float);
+                const minimum: f128 = @floatFromInt(findMinimum(target));
+                const maximum: f128 = @floatFromInt(findMaximum(target));
+                if (truncated < minimum or truncated > maximum) return self.fail(location, error.ConversionOutOfRange);
+                return .{ .integer = @intFromFloat(truncated) };
+            },
+            else => unreachable,
+        }
+    }
+
     fn evaluateBinary(self: *Evaluator, expression: ast.Expression, binary: ast.Binary) EvaluateError!Value {
         switch (binary.operator) {
+            .combine => {
+                const left = try self.evaluateExpression(binary.left.*);
+                const right = try self.evaluateExpression(binary.right.*);
+                if (!isErrorSet(left) or !isErrorSet(right)) return self.fail(expression.location, error.NotErrorSet);
+                const allocator = self.arena.allocator();
+                return .{ .type = .{ .@"enum" = try self.program.types.addCombined(allocator, left.type.@"enum", right.type.@"enum") } };
+            },
             .@"and" => {
                 const left = try self.evaluateExpression(binary.left.*);
                 if (!left.boolean) return left;
@@ -403,11 +489,23 @@ pub const Evaluator = struct {
                 if (left.boolean) return left;
                 return self.evaluateExpression(binary.right.*);
             },
+            .result => {
+                const left = try self.evaluateExpression(binary.left.*);
+                const right = try self.evaluateExpression(binary.right.*);
+                if (!isErrorSet(left)) return self.fail(binary.left.location, error.ExpectedErrorSet);
+                const allocator = self.arena.allocator();
+                return .{ .type = .{ .result = try self.program.types.addResult(allocator, left.type.@"enum", right.type) } };
+            },
             .@"orelse" => {
                 const left = try self.evaluateExpression(binary.left.*);
                 const inner = left.optional orelse return self.evaluateExpression(binary.right.*);
                 if (expression.type.? == .optional) return left;
                 return inner.*;
+            },
+            .@"catch" => {
+                const left = try self.evaluateExpression(binary.left.*);
+                if (left == .failure) return self.evaluateConverted(binary.right.*, expression.type.?);
+                return left;
             },
             .equal, .not_equal => {
                 const left = try self.evaluateExpression(binary.left.*);
@@ -494,7 +592,10 @@ pub const Evaluator = struct {
             .bitwise_or => left | right,
             .shift_left => shiftLeft(number, left, right),
             .shift_right => shiftRight(number, left, right),
+            .combine,
+            .result,
             .@"orelse",
+            .@"catch",
             .equal,
             .not_equal,
             .less_than,
@@ -541,7 +642,7 @@ pub const Evaluator = struct {
                 }
                 return .{ .aggregate = elements };
             },
-            .number, .boolean, .void, .type, .slice, .pointer, .optional, .function, .variable, .application => unreachable,
+            .number, .boolean, .@"enum", .void, .type, .slice, .pointer, .optional, .result, .function, .variable, .application => unreachable,
         }
     }
 
@@ -563,7 +664,7 @@ pub const Evaluator = struct {
                 if (value.many.index > available) return self.fail(location, error.SliceOutOfRange);
                 break :base .{ value.many.array, @intCast(value.many.index), available - @as(usize, @intCast(value.many.index)) };
             },
-            .number, .boolean, .void, .type, .@"struct", .optional, .tuple, .function, .variable, .application => unreachable,
+            .number, .boolean, .@"enum", .void, .type, .@"struct", .optional, .result, .tuple, .function, .variable, .application => unreachable,
         };
         const start = try self.evaluateBound(slice.start, 0);
         const end = try self.evaluateBound(slice.end, length);
@@ -585,6 +686,13 @@ pub const Evaluator = struct {
         return inner.*;
     }
 
+    fn evaluateTry(self: *Evaluator, operand: ast.Expression) EvaluateError!Value {
+        const value = try self.evaluateExpression(operand);
+        if (value != .failure) return value;
+        self.returned_error = value.failure;
+        return error.ErrorReturned;
+    }
+
     fn evaluateAddress(self: *Evaluator, operand: ast.Expression) EvaluateError!Value {
         switch (operand.kind) {
             inline .identifier, .path_expression, .member => |name| {
@@ -600,13 +708,13 @@ pub const Evaluator = struct {
         const function = switch (resolution) {
             .function => |function| function,
             .parameter, .local, .constant, .element => (try self.readResolution(location, resolution)).function,
-            .type, .typeclass_function, .typeclass_method => return self.fail(location, error.CannotEvaluate),
+            .type, .typeclass_function, .typeclass_method, .case, .builtin => return self.fail(location, error.CannotEvaluate),
         };
         const declaration = ast.findDeclaration(self.program.modules[function.module], function.declaration);
         const definition = switch (declaration.kind) {
             .function_definition => |*definition| definition,
             .function_declaration => return self.fail(location, error.ExternalCall),
-            .constant_declaration, .struct_definition, .typeclass_definition, .instance_declaration, .import => unreachable,
+            .constant_declaration, .struct_definition, .enum_definition, .typeclass_definition, .instance_declaration, .import => unreachable,
         };
         const signature = definition.signature;
         const allocator = self.arena.allocator();
@@ -642,7 +750,8 @@ pub const Evaluator = struct {
         const caller_module_index = self.module_index;
         self.module_index = if (definition.default_of) |typeclass| typeclass.module else function.module;
         defer self.module_index = caller_module_index;
-        const result: Value = switch (try self.executeBlock(definition.body)) {
+        const flow = try (self.executeBlock(definition.body) catch |execute_error| self.recoverReturnedError(execute_error));
+        const result: Value = switch (flow) {
             .returned => |value| value,
             .next => .void,
             .broke, .continued => unreachable,
@@ -650,6 +759,13 @@ pub const Evaluator = struct {
         if (cached) try self.recordOrigin(function, result, self.calls.items[self.calls.items.len - 1].created.items);
         if (cached) try self.cache.append(self.arena.allocator(), .{ .function = function, .arguments = parameters, .result = result });
         return result;
+    }
+
+    fn recoverReturnedError(self: *Evaluator, execute_error: EvaluateError) EvaluateError!Flow {
+        if (execute_error != error.ErrorReturned) return execute_error;
+        const failure = self.returned_error.?;
+        self.returned_error = null;
+        return .{ .returned = .{ .failure = failure } };
     }
 
     fn recordOrigin(
@@ -689,11 +805,42 @@ pub const Evaluator = struct {
     }
 
     fn executeBlock(self: *Evaluator, statements: []const ast.Statement) EvaluateError!Flow {
+        if (containsDefer(statements)) return self.executeDeferringBlock(statements);
         for (statements) |*statement| {
             const flow = try self.executeStatement(statement);
             if (flow != .next) return flow;
         }
         return .next;
+    }
+
+    fn executeDeferringBlock(self: *Evaluator, statements: []const ast.Statement) EvaluateError!Flow {
+        var deferred: std.ArrayList(ast.Defer) = .empty;
+        var flow: Flow = .next;
+        for (statements) |*statement| {
+            if (statement.kind == .@"defer") {
+                try deferred.append(self.arena.allocator(), statement.kind.@"defer");
+                continue;
+            }
+            flow = self.executeStatement(statement) catch |execute_error| {
+                if (execute_error == error.ErrorReturned) try self.executeDeferred(deferred.items, true);
+                return execute_error;
+            };
+            if (flow != .next) break;
+        }
+        if (deferred.items.len == 0) return flow;
+        if (flow == .returned) flow = .{ .returned = try self.copy(flow.returned) };
+        const failed = flow == .returned and flow.returned == .failure;
+        try self.executeDeferred(deferred.items, failed);
+        return flow;
+    }
+
+    fn executeDeferred(self: *Evaluator, deferred: []const ast.Defer, failed: bool) EvaluateError!void {
+        var index = deferred.len;
+        while (index > 0) {
+            index -= 1;
+            if (deferred[index].on_error and !failed) continue;
+            _ = try self.executeStatement(deferred[index].statement);
+        }
     }
 
     fn executeStatement(self: *Evaluator, statement: *const ast.Statement) EvaluateError!Flow {
@@ -729,6 +876,8 @@ pub const Evaluator = struct {
             },
             .@"while" => return self.executeWhile(statement),
             .@"for" => return self.executeFor(statement),
+            .match => return self.executeMatch(statement),
+            .@"defer" => unreachable,
             .@"break" => |jump| return .{ .broke = jump.loop.? },
             .@"continue" => |jump| return .{ .continued = jump.loop.? },
         }
@@ -763,6 +912,26 @@ pub const Evaluator = struct {
                 try self.readPlace(location, element_place);
             try self.declareElement(.{ .statement = statement, .position = position }, value);
         }
+    }
+
+    fn executeMatch(self: *Evaluator, statement: *const ast.Statement) EvaluateError!Flow {
+        const matching = statement.kind.match;
+        const value = matching.value;
+        const place = try self.findPlace(value);
+        const enumeration = (try self.readPlace(value.location, place)).enumeration;
+        for (matching.branches, matching.names, 0..) |branch, name, position| {
+            if (!isChosenBranch(value.type.?.@"enum", branch, enumeration.case.tag)) continue;
+            if (!ast.isDiscardedName(name.name)) {
+                const payload = enumeration.value.?;
+                const bound = if (name.pointer)
+                    Value{ .pointer = .{ .root = payload, .root_type = name.type.?.pointer.target, .path = &.{} } }
+                else
+                    payload.*;
+                try self.declareElement(.{ .statement = statement, .position = position }, bound);
+            }
+            return self.executeBlock(branch.body);
+        }
+        unreachable;
     }
 
     fn executeAssignment(self: *Evaluator, assignment: ast.Assignment) EvaluateError!void {
@@ -846,7 +1015,7 @@ pub const Evaluator = struct {
                         const target = try self.expectPointer(value.location, try self.evaluateExpression(value));
                         break :sequence .{ target, 0, @intCast(pointer.target.array.length) };
                     },
-                    .number, .boolean, .void, .type, .@"struct", .optional, .tuple, .function, .variable, .application => unreachable,
+                    .number, .boolean, .void, .type, .@"struct", .@"enum", .optional, .result, .tuple, .function, .variable, .application => unreachable,
                 };
                 for (0..length) |offset| {
                     try self.step(statement.location);
@@ -920,7 +1089,7 @@ pub const Evaluator = struct {
                 for (struct_type.fields, fields) |field, *field_value| field_value.* = try self.makeUndefined(field.type);
                 return .{ .aggregate = fields };
             },
-            .number, .boolean, .void, .type, .slice, .pointer, .optional, .function, .variable, .application => return .undefined,
+            .number, .boolean, .@"enum", .void, .type, .slice, .pointer, .optional, .result, .function, .variable, .application => return .undefined,
         }
     }
 
@@ -936,6 +1105,12 @@ pub const Evaluator = struct {
                 const cell = try self.arena.allocator().create(Value);
                 cell.* = try self.copy(inner.*);
                 return .{ .optional = cell };
+            },
+            inline .enumeration, .failure => |enumeration, tag| {
+                const inner = enumeration.value orelse return value;
+                const cell = try self.arena.allocator().create(Value);
+                cell.* = try self.copy(inner.*);
+                return @unionInit(Value, @tagName(tag), .{ .case = enumeration.case, .value = cell });
             },
             .integer, .float, .boolean, .void, .undefined, .pointer, .many, .slice, .function, .type => return value,
         }
@@ -995,6 +1170,11 @@ pub const EvaluationError = error{
     ReversedRange,
     ExternalCall,
     StepLimit,
+    NotErrorSet,
+    ExpectedErrorSet,
+    ConversionOutOfRange,
+    ErrorReturned,
+    UncaughtError,
     CallDepth,
     DependencyLoop,
 };
@@ -1040,10 +1220,23 @@ fn describeError(evaluation_error: EvaluationError) []const u8 {
         error.ReadUndefined => "undefined is read",
         error.ReversedRange => "range starts after its end",
         error.ExternalCall => "external functions cannot run at compile time",
+        error.NotErrorSet => "only error sets can be combined",
+        error.ExpectedErrorSet => "expected an error set before '!'",
+        error.ConversionOutOfRange => "value does not fit the type",
+        error.ErrorReturned => "error returned",
+        error.UncaughtError => "error is not caught",
         error.StepLimit => "evaluation takes more than 1000000 steps",
         error.CallDepth => "compile-time calls are nested more than 512 deep",
         error.DependencyLoop => "value depends on itself at compile time",
     };
+}
+
+fn isVisited(visited: ?*const Visited, identity: usize) bool {
+    var current = visited;
+    while (current) |node| : (current = node.parent) {
+        if (node.identity == identity) return true;
+    }
+    return false;
 }
 
 fn hasWritableReference(value_type: types.Type, visited: ?*const Visited) bool {
@@ -1052,6 +1245,7 @@ fn hasWritableReference(value_type: types.Type, visited: ?*const Visited) bool {
         .slice => |slice| !slice.constant or hasWritableReference(slice.element, visited),
         .array => |array| hasWritableReference(array.element, visited),
         .optional => |optional| hasWritableReference(optional.child, visited),
+        .result => |result| hasWritableReference(result.value, visited),
         .tuple => |tuple| {
             for (tuple.elements) |element| {
                 if (hasWritableReference(element, visited)) return true;
@@ -1059,13 +1253,20 @@ fn hasWritableReference(value_type: types.Type, visited: ?*const Visited) bool {
             return false;
         },
         .@"struct" => |struct_type| {
-            var current = visited;
-            while (current) |node| : (current = node.parent) {
-                if (node.fields.ptr == struct_type.fields.ptr) return false;
-            }
-            const node: Visited = .{ .fields = struct_type.fields, .parent = visited };
+            const identity = @intFromPtr(struct_type.fields.ptr);
+            if (isVisited(visited, identity)) return false;
+            const node: Visited = .{ .identity = identity, .parent = visited };
             for (struct_type.fields) |field| {
                 if (hasWritableReference(field.type, &node)) return true;
+            }
+            return false;
+        },
+        .@"enum" => |enumeration| {
+            const identity = @intFromPtr(enumeration);
+            if (isVisited(visited, identity)) return false;
+            const node: Visited = .{ .identity = identity, .parent = visited };
+            for (enumeration.cases) |case| {
+                if (hasWritableReference(case.type orelse continue, &node)) return true;
             }
             return false;
         },
@@ -1074,7 +1275,7 @@ fn hasWritableReference(value_type: types.Type, visited: ?*const Visited) bool {
 }
 
 const Visited = struct {
-    fields: []const types.Field,
+    identity: usize,
     parent: ?*const Visited,
 };
 
@@ -1089,6 +1290,46 @@ fn convertDirectly(value: Value, value_type: types.Type, expected: types.Type) V
     if (expected != .slice or value_type != .pointer) return value;
     const array = value_type.pointer.target.array;
     return .{ .slice = .{ .array = value.pointer, .start = 0, .length = @intCast(array.length) } };
+}
+
+fn isFloatType(number: types.NumberType) bool {
+    return number == .f16 or number == .f32 or number == .f64 or number == .f128;
+}
+
+fn truncateInteger(number: types.NumberType, value: i129) i129 {
+    const bits: u129 = @bitCast(value);
+    return switch (number) {
+        .u8 => @as(u8, @truncate(bits)),
+        .u16 => @as(u16, @truncate(bits)),
+        .u32 => @as(u32, @truncate(bits)),
+        .u64, .usize => @as(u64, @truncate(bits)),
+        .u128 => @as(u128, @truncate(bits)),
+        .i8 => @as(i8, @bitCast(@as(u8, @truncate(bits)))),
+        .i16 => @as(i16, @bitCast(@as(u16, @truncate(bits)))),
+        .i32 => @as(i32, @bitCast(@as(u32, @truncate(bits)))),
+        .i64, .isize => @as(i64, @bitCast(@as(u64, @truncate(bits)))),
+        .i128 => @as(i128, @bitCast(@as(u128, @truncate(bits)))),
+        .f16, .f32, .f64, .f128 => unreachable,
+    };
+}
+
+fn containsDefer(statements: []const ast.Statement) bool {
+    for (statements) |statement| {
+        if (statement.kind == .@"defer") return true;
+    }
+    return false;
+}
+
+fn isErrorSet(value: Value) bool {
+    return value.type == .@"enum" and value.type.@"enum".kind == .error_set;
+}
+
+fn isChosenBranch(enumeration: *const types.Enum, branch: ast.Branch, tag: usize) bool {
+    if (branch.cases.len == 0) return true;
+    for (branch.cases) |case| {
+        if (enumeration.cases[case.index.?].tag == tag) return true;
+    }
+    return false;
 }
 
 fn findFieldPosition(struct_type: types.Struct, name: []const u8) usize {
@@ -1132,7 +1373,8 @@ fn findNumber(value_type: types.Type) types.NumberType {
     return switch (value_type) {
         .number => |number| number,
         .optional => |optional| findNumber(optional.child),
-        .boolean, .void, .type, .@"struct", .array, .slice, .pointer, .tuple, .function, .variable, .application => unreachable,
+        .result => |result| findNumber(result.value),
+        .boolean, .void, .type, .@"struct", .@"enum", .array, .slice, .pointer, .tuple, .function, .variable, .application => unreachable,
     };
 }
 
@@ -1176,7 +1418,10 @@ fn computeFloat(operator: ast.BinaryOperator, number: types.NumberType, left: f1
         .bitwise_and,
         .bitwise_exclusive_or,
         .bitwise_or,
+        .combine,
+        .result,
         .@"orelse",
+        .@"catch",
         .equal,
         .not_equal,
         .less_than,
@@ -1198,7 +1443,7 @@ fn compare(operator: ast.BinaryOperator, left: Value, right: Value) bool {
             break :order std.math.order(value, right.float);
         },
         .many => |many| std.math.order(many.index, right.many.index),
-        .boolean, .void, .undefined, .optional, .aggregate, .pointer, .slice, .function, .type => unreachable,
+        .boolean, .void, .undefined, .optional, .aggregate, .pointer, .slice, .function, .type, .enumeration, .failure => unreachable,
     };
     return switch (operator) {
         .less_than => order == .lt,
@@ -1215,7 +1460,10 @@ fn compare(operator: ast.BinaryOperator, left: Value, right: Value) bool {
         .bitwise_and,
         .bitwise_exclusive_or,
         .bitwise_or,
+        .combine,
+        .result,
         .@"orelse",
+        .@"catch",
         .equal,
         .not_equal,
         .@"and",
@@ -1252,6 +1500,16 @@ fn isEqual(one: Value, two: Value) bool {
         },
         .function => |function| two == .function and std.meta.eql(function, two.function),
         .type => |value_type| two == .type and std.meta.eql(value_type, two.type),
+        .enumeration => |enumeration| {
+            if (two != .enumeration or two.enumeration.case.tag != enumeration.case.tag) return false;
+            const inner = enumeration.value orelse return true;
+            return isEqual(inner.*, two.enumeration.value.?.*);
+        },
+        .failure => |failure| {
+            if (two != .failure or two.failure.case.tag != failure.case.tag) return false;
+            const inner = failure.value orelse return true;
+            return isEqual(inner.*, two.failure.value.?.*);
+        },
     };
 }
 
@@ -1377,6 +1635,25 @@ test "Evaluator.evaluateConstant: rejects a constant that depends on itself thro
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, analyzer.failure.?.location.?);
 }
 
+test "Evaluator.evaluateConstant: rejects an error that is not caught" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing_end\n    bad_digit: u8\nerror FileError:\n    missing_file\nfn digit(text: u8) -> ParseError!u8:\n    if text < 48: return ParseError::bad_digit(text)\n    return text - 48\nconst VALUE = digit(20)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UncaughtError, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 9, .column = 15 }, analyzer.failure.?.location.?);
+}
+
 test "Evaluator.evaluateDefault: evaluates a field default with a call" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1476,6 +1753,152 @@ test "evaluateUnary: inverts the bits of an unsigned integer" {
 
     const value = loader.modules.items[0].declarations[0].kind.constant_declaration.value;
     try std.testing.expectEqual(Value{ .integer = 250 }, try analyzer.type_checker.evaluator.evaluate(value));
+}
+
+test "evaluateBuiltin: converts and truncates numbers at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nconst COUNT: u16 = 300\nconst LARGE: i32 = 300\nconst SMALL: u8 = 200\nconst FRACTION: f64 = -2.7\nconst HUGE: f32 = 100000.0\nconst WIDE = mn::convert(i64, COUNT)\nconst FLOAT = mn::convert(f32, LARGE)\nconst WHOLE = mn::convert(i32, FRACTION)\nconst LOW = mn::truncate(u8, LARGE)\nconst NEGATIVE = mn::truncate(i8, SMALL)\nconst INFINITE = mn::convert(f16, HUGE)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 300 }, declarations[6].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .float = 300 }, declarations[7].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = -2 }, declarations[8].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 44 }, declarations[9].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = -56 }, declarations[10].kind.constant_declaration.known.?.*);
+    try std.testing.expect(std.math.isInf(declarations[11].kind.constant_declaration.known.?.float));
+}
+
+test "evaluateBuiltin: rejects a float that the integer type cannot hold" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nconst LARGE: f32 = 300.0\nconst SMALL = mn::convert(u8, LARGE)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ConversionOutOfRange, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 15 }, analyzer.failure.?.location.?);
+}
+
+test "evaluateBinary: orders the cases of a combined error set by the declarations of its sets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Alpha:\n    first\nerror Beta:\n    second\n    third\nfn convert(value: Beta || Alpha) -> Alpha || Beta: return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const signature = loader.modules.items[0].declarations[2].kind.function_definition.signature;
+    const combined = ast.extractType(signature.parameters[0].type).@"enum";
+    try std.testing.expectEqual(combined, ast.extractType(signature.return_type).@"enum");
+    try std.testing.expectEqualStrings("first", combined.cases[0].name);
+    try std.testing.expectEqualStrings("second", combined.cases[1].name);
+    try std.testing.expectEqualStrings("third", combined.cases[2].name);
+    try std.testing.expectEqualStrings("Alpha_or_Beta", combined.name);
+}
+
+test "evaluateBinary: rejects combining types that are not error sets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32 || bool): _ = value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NotErrorSet, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, analyzer.failure.?.location.?);
+}
+test "evaluateBinary: rejects combining enums" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Alpha:\n    first\nenum Beta:\n    second\nfn take(value: Alpha || Beta): _ = value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NotErrorSet, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 16 }, analyzer.failure.?.location.?);
+}
+
+test "evaluateBinary: rejects a result of a type that is not an error set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn f() -> i32!u8: return 1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ExpectedErrorSet, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 11 }, analyzer.failure.?.location.?);
+}
+
+test "evaluateBinary: evaluates the fallback of catch only for an error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing_end\n    bad_digit: u8\nerror FileError:\n    missing_file\nfn digit(text: u8) -> ParseError!u8:\n    if text < 48: return ParseError::bad_digit(text)\n    return text - 48\nfn broken(zero: u8) -> u8: return 1 / zero\nconst VALUE = digit(50) catch broken(0)\nconst FALLBACK = digit(20) catch 7" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 7 }, declarations[5].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateBinary: compares arrays element by element" {
@@ -1742,6 +2165,27 @@ test "evaluateUnwrap: rejects unwrapping null" {
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 19 }, analyzer.type_checker.evaluator.failure.?.location.?);
 }
 
+test "evaluateTry: returns the error of a result from the function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing_end\n    bad_digit: u8\nerror FileError:\n    missing_file\nfn digit(text: u8) -> ParseError!u8:\n    if text < 48: return ParseError::bad_digit(text)\n    return text - 48\nfn total(one: u8, two: u8) -> ParseError || FileError!u8: return try digit(one) + try digit(two)\nconst GOOD = total(49, 50) catch 0\nconst BAD = total(49, 20) catch 99" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 3 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 99 }, declarations[5].kind.constant_declaration.known.?.*);
+}
+
 test "evaluateCall: runs a function at compile time" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1924,6 +2368,69 @@ test "recordOrigin: gives the origin only to the struct that a call returns" {
     try std.testing.expectEqual(null, inner.origin.?.function);
 }
 
+test "executeDeferringBlock: runs deferred statements in reverse order after the returned value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn run(total: *i32) -> i32:\n    defer total.* = total.* * 10 + 1\n    defer total.* = total.* * 10 + 2\n    total.* = 3\n    return total.*\nfn check() -> [2]i32:\n    var total: i32 = 0\n    const returned = run(&total)\n    return {returned, total}\nconst ORDER = check()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const elements = loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.aggregate;
+    try std.testing.expectEqual(Value{ .integer = 3 }, elements[0]);
+    try std.testing.expectEqual(Value{ .integer = 321 }, elements[1]);
+}
+
+test "executeDeferringBlock: runs errdefer only when the function returns an error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure:\n    bad\nfn inner(fail: bool) -> Failure!i32:\n    if fail: return Failure::bad\n    return 1\nfn step(total: *i32, fail: bool, tried: bool) -> Failure!i32:\n    errdefer total.* += 100\n    defer total.* += 1\n    if tried: return try inner(fail) + 1\n    if fail: return Failure::bad\n    return 0\nfn tally(fail: bool, tried: bool) -> i32:\n    var total: i32 = 0\n    const value = step(&total, fail, tried) catch 7\n    return total * 10 + value\nconst SUCCESS = tally(false, false)\nconst FAILURE = tally(true, false)\nconst TRIED = tally(true, true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 10 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 1017 }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 1017 }, declarations[6].kind.constant_declaration.known.?.*);
+}
+
+test "executeDeferringBlock: runs the deferred statements of a loop body on break and continue" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count() -> i32:\n    var total: i32 = 0\n    var index: i32 = 0\n    while index < 5:\n        defer total += 1\n        index += 1\n        if index == 2: continue\n        if index == 4: break\n    return total * 10 + index\nconst COUNT = count()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .integer = 44 }, known);
+}
+
 test "executeTupleDeclaration: takes a tuple apart" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1944,6 +2451,90 @@ test "executeTupleDeclaration: takes a tuple apart" {
     try std.testing.expectEqual(2, elements.len);
     try std.testing.expectEqual(Value{ .boolean = true }, elements[0]);
     try std.testing.expectEqual(Value{ .integer = 1 }, elements[1]);
+}
+
+test "executeMatch: runs the branch of the case and binds its value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    flag: bool\n    end\nfn score(token: Token) -> i64:\n    match token:\n        number(digits): return digits\n        flag(on):\n            if on: return 1\n            return 2\n        end: return 3\nconst NUMBER = score(Token::number(40))\nconst FLAG = score(Token::flag(false))\nconst END = score(Token::end)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 40 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 3 }, declarations[4].kind.constant_declaration.known.?.*);
+}
+
+test "executeMatch: writes through a pointer to the value of a case" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    flag: bool\n    end\nfn bump(value: Token) -> Token:\n    var token = value\n    match token:\n        number(*digits): digits.* += 1\n        else: noop\n    return token\nconst BUMPED = bump(Token::number(1))" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.*;
+    try std.testing.expectEqual(Value{ .integer = 2 }, known.enumeration.value.?.*);
+}
+
+test "executeMatch: runs the else branch and a branch that names a case through its error set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing_end\n    bad_digit: u8\nerror FileError:\n    missing_end\nfn code(failure: ParseError || FileError) -> u8:\n    match failure:\n        FileError::missing_end: return 2\n        else: return 1\nconst PARSE = code(ParseError::missing_end)\nconst FILE = code(FileError::missing_end)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[4].kind.constant_declaration.known.?.*);
+}
+
+test "executeMatch: runs a match in an instance of a function with a type parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    flag: bool\n    end\nfn pick(type T, token: Token, one: T, two: T) -> T:\n    match token:\n        number(digits):\n            if digits > 0: return one\n            return two\n        else: return two\nconst PICKED = pick(i32, Token::number(1), 3, 4)\nconst OTHER = pick(bool, Token::end, true, false)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 3 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .boolean = false }, declarations[3].kind.constant_declaration.known.?.*);
 }
 
 test "executeWhile: runs a loop with compound assignments" {

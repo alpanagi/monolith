@@ -28,6 +28,7 @@ const two_character_symbols = std.StaticStringMap(token.TokenKind).initComptime(
     .{ "%=", .percent_equals },
     .{ "&=", .ampersand_equals },
     .{ "|=", .pipe_equals },
+    .{ "||", .pipe_pipe },
     .{ "^=", .caret_equals },
 });
 
@@ -963,6 +964,23 @@ test "lexWord: recognizes the for and in keywords" {
     try std.testing.expectEqualStrings("inside", lexer.tokens.items[3].kind.identifier);
 }
 
+test "lexWord: recognizes the keywords of enums, matches and errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("enum match try catch || | error defer errdefer");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_enum);
+    try std.testing.expect(lexer.tokens.items[2].kind == .keyword_match);
+    try std.testing.expect(lexer.tokens.items[3].kind == .keyword_try);
+    try std.testing.expect(lexer.tokens.items[4].kind == .keyword_catch);
+    try std.testing.expect(lexer.tokens.items[5].kind == .pipe_pipe);
+    try std.testing.expect(lexer.tokens.items[6].kind == .pipe);
+    try std.testing.expect(lexer.tokens.items[7].kind == .keyword_error);
+    try std.testing.expect(lexer.tokens.items[8].kind == .keyword_defer);
+    try std.testing.expect(lexer.tokens.items[9].kind == .keyword_errdefer);
+}
+
 test "lexWord: recognizes the typeclass and instance keywords" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1588,12 +1606,12 @@ test "lexSymbols: lexes adjacent symbols" {
 test "lexSymbols: lexes two colons as one symbol" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("std::stdout:");
+    var lexer = Lexer.init("mn::stdout:");
     try lexer.lex(&arena);
 
     try std.testing.expectEqual(6, lexer.tokens.items.len);
     try std.testing.expect(lexer.tokens.items[2].kind == .double_colon);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 4 }, lexer.tokens.items[2].location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 3 }, lexer.tokens.items[2].location);
     try std.testing.expectEqualStrings("stdout", lexer.tokens.items[3].kind.identifier);
     try std.testing.expect(lexer.tokens.items[4].kind == .colon);
 }

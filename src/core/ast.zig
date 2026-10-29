@@ -25,6 +25,7 @@ pub const DeclarationKind = union(enum) {
     function_definition: FunctionDefinition,
     constant_declaration: ConstantDeclaration,
     struct_definition: StructDefinition,
+    enum_definition: EnumDefinition,
     typeclass_definition: TypeclassDefinition,
     instance_declaration: InstanceDeclaration,
     import: Import,
@@ -103,6 +104,8 @@ pub const StatementKind = union(enum) {
     @"if": If,
     @"while": While,
     @"for": For,
+    match: Match,
+    @"defer": Defer,
     @"break": Jump,
     @"continue": Jump,
 };
@@ -132,6 +135,19 @@ pub const StructDefinition = struct {
     name: []const u8,
     fields: []Field,
     value: ?types.Type = null,
+};
+
+pub const EnumDefinition = struct {
+    name: []const u8,
+    kind: types.EnumKind = .enumeration,
+    cases: []EnumCase,
+    value: ?types.Type = null,
+};
+
+pub const EnumCase = struct {
+    name: []const u8,
+    type: ?Expression,
+    location: token.Location,
 };
 
 pub const TypeclassDefinition = struct {
@@ -231,6 +247,29 @@ pub const For = struct {
     else_body: ?[]Statement = null,
 };
 
+pub const Defer = struct {
+    statement: *Statement,
+    on_error: bool = false,
+};
+
+pub const Match = struct {
+    value: Expression,
+    branches: []Branch,
+    names: []ElementName,
+};
+
+pub const Branch = struct {
+    cases: []BranchCase,
+    named: bool = false,
+    body: []Statement,
+    location: token.Location,
+};
+
+pub const BranchCase = struct {
+    name: Expression,
+    index: ?usize = null,
+};
+
 pub const Sequence = union(enum) {
     value: Expression,
     range: Range,
@@ -282,6 +321,7 @@ pub const ExpressionKind = union(enum) {
     field_access: FieldAccess,
     dereference: *Expression,
     unwrap: *Expression,
+    @"try": *Expression,
     struct_type: *StructType,
 };
 
@@ -332,6 +372,8 @@ pub const Resolution = union(enum) {
     element: Resolution.Element,
     typeclass_function: Resolution.TypeclassFunction,
     typeclass_method: Resolution.TypeclassFunction,
+    case: Resolution.Case,
+    builtin: Builtin,
 
     pub const Function = struct {
         module: usize,
@@ -353,10 +395,22 @@ pub const Resolution = union(enum) {
         position: usize,
     };
 
+    pub const Case = struct {
+        enumeration: *const types.Enum,
+        index: usize,
+    };
+
     pub const TypeclassFunction = struct {
         typeclass: Resolution.Typeclass,
         function: usize,
     };
+};
+
+pub const Builtin = enum {
+    size,
+    alignment,
+    convert,
+    truncate,
 };
 
 pub const Binary = struct {
@@ -377,7 +431,10 @@ pub const BinaryOperator = enum {
     bitwise_and,
     bitwise_exclusive_or,
     bitwise_or,
+    combine,
+    result,
     @"orelse",
+    @"catch",
     equal,
     not_equal,
     less_than,
@@ -495,6 +552,24 @@ pub const Field = struct {
     location: token.Location,
 };
 
+pub const Blocks = struct {
+    statement: Statement,
+    position: usize = 0,
+
+    pub fn next(self: *Blocks) ?[]const Statement {
+        const position = self.position;
+        self.position += 1;
+        if (self.statement.kind == .match) {
+            const branches = self.statement.kind.match.branches;
+            if (position >= branches.len) return null;
+            return branches[position].body;
+        }
+        const blocks = extractBlocks(self.statement);
+        if (position >= blocks.len) return null;
+        return blocks[position];
+    }
+};
+
 pub fn extractType(expression: Expression) types.Type {
     if (expression.denoted) |denoted| return denoted;
     return switch (expression.kind) {
@@ -531,6 +606,7 @@ pub fn extractFunctionSignature(declaration: Declaration) FunctionSignature {
         .function_declaration => |function_declaration| function_declaration,
         .constant_declaration,
         .struct_definition,
+        .enum_definition,
         .typeclass_definition,
         .instance_declaration,
         .import,
@@ -652,8 +728,11 @@ fn satisfiesRequirements(
 }
 
 pub fn findOwnMethod(modules: []const Module, receiver: types.Type, name: []const u8) ?Resolution.Function {
-    if (receiver != .@"struct") return null;
-    const owner = receiver.@"struct".module;
+    const owner = switch (receiver) {
+        .@"struct" => |struct_type| struct_type.module,
+        .@"enum" => |enumeration| if (types.isDeclaredEnum(enumeration)) enumeration.module else return null,
+        else => return null,
+    };
     const index = findOwnFunction(modules[owner], receiver, name) orelse return null;
     return .{ .module = owner, .declaration = index };
 }
@@ -666,6 +745,7 @@ fn findOwnFunction(module: Module, receiver: types.Type, name: []const u8) ?usiz
             .function_declaration,
             .constant_declaration,
             .struct_definition,
+            .enum_definition,
             .typeclass_definition,
             .instance_declaration,
             .import,
@@ -691,10 +771,16 @@ pub fn extractBlocks(statement: Statement) [2][]const Statement {
         .tuple_declaration,
         .variable_declaration,
         .assignment,
+        .match,
+        .@"defer",
         .@"break",
         .@"continue",
         => .{ &.{}, &.{} },
     };
+}
+
+pub fn iterateBlocks(statement: Statement) Blocks {
+    return .{ .statement = statement };
 }
 
 pub fn extractLabel(statement: Statement) ?[]const u8 {
@@ -710,6 +796,8 @@ pub fn extractLabel(statement: Statement) ?[]const u8 {
         .variable_declaration,
         .assignment,
         .@"if",
+        .match,
+        .@"defer",
         .@"break",
         .@"continue",
         => null,
@@ -722,7 +810,7 @@ pub fn extractElementType(sequence: Sequence) types.Type {
         .value => |value| switch (types.followPointer(value.type.?)) {
             .array => |array| array.element,
             .slice => |slice| slice.element,
-            .number, .boolean, .void, .type, .@"struct", .pointer, .optional, .tuple, .function, .variable, .application => {
+            .number, .boolean, .void, .type, .@"struct", .@"enum", .pointer, .optional, .result, .tuple, .function, .variable, .application => {
                 unreachable;
             },
         },
@@ -733,6 +821,7 @@ pub fn extractElementNames(statement: Statement) []ElementName {
     return switch (statement.kind) {
         .@"for" => |loop| loop.names,
         .tuple_declaration => |declaration| declaration.names,
+        .match => |matching| matching.names,
         .noop,
         .@"return",
         .discard,
@@ -742,6 +831,7 @@ pub fn extractElementNames(statement: Statement) []ElementName {
         .assignment,
         .@"if",
         .@"while",
+        .@"defer",
         .@"break",
         .@"continue",
         => unreachable,
@@ -790,7 +880,7 @@ pub fn findConstantRoot(expression: Expression) ?Resolution.Constant {
     return switch (expression.kind) {
         inline .identifier, .path_expression => |name| switch (name.resolution.?) {
             .constant => |constant| constant,
-            .parameter, .function, .type, .local, .element, .typeclass_function, .typeclass_method => null,
+            .parameter, .function, .type, .local, .element, .typeclass_function, .typeclass_method, .case, .builtin => null,
         },
         .field_access => |access| {
             if (access.value.type.? == .pointer) return null;
@@ -804,7 +894,7 @@ pub fn findConstantRoot(expression: Expression) ?Resolution.Constant {
 pub fn findElementConstantRoot(value: Expression) ?Resolution.Constant {
     return switch (value.type.?) {
         .array, .tuple => findConstantRoot(value),
-        .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .optional, .function, .variable, .application => null,
+        .number, .boolean, .void, .type, .@"struct", .@"enum", .slice, .pointer, .optional, .result, .function, .variable, .application => null,
     };
 }
 
@@ -905,6 +995,7 @@ pub fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std
         } },
         .dereference => |operand| .{ .dereference = try cloneExpressionPointer(allocator, operand) },
         .unwrap => |operand| .{ .unwrap = try cloneExpressionPointer(allocator, operand) },
+        .@"try" => |operand| .{ .@"try" = try cloneExpressionPointer(allocator, operand) },
         .struct_type => |struct_type| kind: {
             const cloned = try allocator.create(StructType);
             cloned.* = .{ .fields = struct_type.fields, .functions = struct_type.functions };
@@ -1012,10 +1103,37 @@ fn cloneStatement(allocator: std.mem.Allocator, statement: Statement) std.mem.Al
             .body = try cloneStatements(allocator, loop.body),
             .else_body = try cloneOptionalStatements(allocator, loop.else_body),
         } },
+        .match => |matching| .{ .match = .{
+            .value = try cloneExpression(allocator, matching.value),
+            .branches = try cloneBranches(allocator, matching.branches),
+            .names = try allocator.dupe(ElementName, matching.names),
+        } },
+        .@"defer" => |deferred| deferred: {
+            const inner = try allocator.create(Statement);
+            inner.* = try cloneStatement(allocator, deferred.statement.*);
+            break :deferred .{ .@"defer" = .{ .statement = inner, .on_error = deferred.on_error } };
+        },
         .@"break" => |jump| .{ .@"break" = .{ .label = jump.label } },
         .@"continue" => |jump| .{ .@"continue" = .{ .label = jump.label } },
     };
     return .{ .kind = kind, .location = statement.location };
+}
+
+fn cloneBranches(allocator: std.mem.Allocator, branches: []const Branch) std.mem.Allocator.Error![]Branch {
+    const cloned = try allocator.alloc(Branch, branches.len);
+    for (branches, cloned) |branch, *copy| {
+        const cases = try allocator.alloc(BranchCase, branch.cases.len);
+        for (branch.cases, cases) |case, *case_copy| {
+            case_copy.* = .{ .name = try cloneExpression(allocator, case.name) };
+        }
+        copy.* = .{
+            .cases = cases,
+            .named = branch.named,
+            .body = try cloneStatements(allocator, branch.body),
+            .location = branch.location,
+        };
+    }
+    return cloned;
 }
 
 fn cloneOptionalExpression(allocator: std.mem.Allocator, expression: ?Expression) std.mem.Allocator.Error!?Expression {
@@ -1087,6 +1205,29 @@ test "extractBlocks: finds an empty else block for an if without one" {
     const blocks = extractBlocks(conditional);
     try std.testing.expectEqual(@as([]const Statement, &body), blocks[0]);
     try std.testing.expectEqual(0, blocks[1].len);
+}
+
+test "iterateBlocks: walks the body of every branch of a match" {
+    const location: token.Location = .{ .row = 1, .column = 1 };
+    var one = [_]Statement{.{ .kind = .noop, .location = location }};
+    var two = [_]Statement{.{ .kind = .noop, .location = location }};
+    var branches = [_]Branch{
+        .{ .cases = &.{}, .body = &one, .location = location },
+        .{ .cases = &.{}, .body = &two, .location = location },
+    };
+    const matching: Statement = .{
+        .kind = .{ .match = .{
+            .value = .{ .kind = .{ .identifier = .{ .name = "value" } }, .location = location },
+            .branches = &branches,
+            .names = &.{},
+        } },
+        .location = location,
+    };
+
+    var blocks = iterateBlocks(matching);
+    try std.testing.expectEqual(@as([]const Statement, &one), blocks.next().?);
+    try std.testing.expectEqual(@as([]const Statement, &two), blocks.next().?);
+    try std.testing.expectEqual(null, blocks.next());
 }
 
 test "extractElementType: finds the element of the array a pointer points to" {

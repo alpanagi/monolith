@@ -19,7 +19,9 @@ pub const Generator = struct {
     steps: []const Step = &.{},
     loops: []const *const ast.Statement = &.{},
     tuple_declarations: []const *const ast.Statement = &.{},
+    matches: []const *const ast.Statement = &.{},
     innermost_loop: ?*const ast.Statement = null,
+    frames: std.ArrayList(Frame) = .empty,
     parameters: []const ast.TypedName = &.{},
     return_type: types.Type = .void,
     sequenced: bool = false,
@@ -183,7 +185,7 @@ pub const Generator = struct {
                 const signature = switch (declaration.kind) {
                     .function_definition => |function| function.signature,
                     .function_declaration => |function_declaration| function_declaration,
-                    .constant_declaration, .struct_definition => continue,
+                    .constant_declaration, .struct_definition, .enum_definition => continue,
                     .typeclass_definition, .instance_declaration, .import => continue,
                 };
                 const name = self.names[module_index][index].?;
@@ -203,9 +205,17 @@ pub const Generator = struct {
 
         const type_registry = self.program.types;
         for (type_registry.entries.items) |value_type| {
-            const struct_type = findStruct(value_type) orelse continue;
-            self.module_index = struct_type.module;
-            for (struct_type.fields) |field| try self.checkName(field.name, field.location);
+            switch (value_type) {
+                .@"struct" => |struct_type| {
+                    self.module_index = struct_type.module;
+                    for (struct_type.fields) |field| try self.checkName(field.name, field.location);
+                },
+                .@"enum" => |enumeration| {
+                    self.module_index = enumeration.module;
+                    for (enumeration.cases) |case| try self.checkName(case.name, case.location);
+                },
+                else => {},
+            }
         }
     }
 
@@ -377,10 +387,19 @@ pub const Generator = struct {
                         try collectPrototypeTags(allocator, &tags, field.type, false);
                     }
                 },
+                .@"enum" => |enumeration| {
+                    for (enumeration.cases) |case| {
+                        try collectPrototypeTags(allocator, &tags, case.type orelse continue, false);
+                    }
+                },
                 .array => |array| try collectPrototypeTags(allocator, &tags, array.element, false),
                 .slice => |slice| try collectPrototypeTags(allocator, &tags, slice.element, false),
                 .optional => |optional| {
                     try collectPrototypeTags(allocator, &tags, optional.child, false);
+                },
+                .result => |result| {
+                    try collectPrototypeTags(allocator, &tags, .{ .@"enum" = result.error_set }, false);
+                    try collectPrototypeTags(allocator, &tags, result.value, false);
                 },
                 .tuple => |tuple| {
                     for (tuple.elements) |element| {
@@ -409,9 +428,14 @@ pub const Generator = struct {
     ) std.mem.Allocator.Error![]const usize {
         var contained: std.ArrayList(usize) = .empty;
         for (try self.collectDefinitions(allocator, module_index)) |value_type| {
-            const struct_type = findStruct(value_type) orelse continue;
-            for (struct_type.fields) |field| {
-                try collectContainedModulesOf(allocator, &contained, field.type);
+            switch (value_type) {
+                .@"struct" => |struct_type| {
+                    for (struct_type.fields) |field| try collectContainedModulesOf(allocator, &contained, field.type);
+                },
+                .@"enum" => |enumeration| {
+                    for (enumeration.cases) |case| try collectContainedModulesOf(allocator, &contained, case.type orelse continue);
+                },
+                else => {},
             }
         }
         if (std.mem.findScalar(usize, contained.items, module_index)) |index| {
@@ -428,8 +452,12 @@ pub const Generator = struct {
         var ordered: std.ArrayList(types.Type) = .empty;
         const type_registry = self.program.types;
         for (type_registry.entries.items) |value_type| {
-            const struct_type = findStruct(value_type) orelse continue;
-            if (struct_type.module != module_index or types.isCompileTimeOnly(value_type)) continue;
+            const module = switch (value_type) {
+                .@"struct" => |struct_type| struct_type.module,
+                .@"enum" => |enumeration| enumeration.module,
+                else => continue,
+            };
+            if (module != module_index or types.isCompileTimeOnly(value_type)) continue;
             try orderDefinition(allocator, &ordered, module_index, value_type);
         }
         return ordered.items;
@@ -442,9 +470,11 @@ pub const Generator = struct {
     ) WriteError!void {
         switch (value_type) {
             .@"struct" => try self.generateStruct(writer, value_type),
+            .@"enum" => try self.generateEnumDefinition(writer, value_type),
             .array => try self.generateArrayDefinition(writer, value_type),
             .slice => try self.generateSliceDefinition(writer, value_type),
             .optional => try self.generateOptionalDefinition(writer, value_type),
+            .result => try self.generateResultDefinition(writer, value_type),
             .tuple => try self.generateTupleDefinition(writer, value_type),
             .number, .boolean, .void, .type, .pointer, .function, .variable, .application => {
                 unreachable;
@@ -471,6 +501,205 @@ pub const Generator = struct {
         try writer.writeAll(";\n");
     }
 
+    fn generateEnumDefinition(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        value_type: types.Type,
+    ) WriteError!void {
+        const enumeration = value_type.@"enum";
+        const declared = types.isDeclaredEnum(enumeration);
+        if (!declared) {
+            try writer.writeAll("#ifndef ");
+            try self.generateType(writer, value_type);
+            try writer.writeAll("_defined\n#define ");
+            try self.generateType(writer, value_type);
+            try writer.writeAll("_defined\n");
+        }
+        try writer.writeAll("typedef struct ");
+        try self.generateType(writer, value_type);
+        try writer.writeAll(" {\n    uint32_t tag;\n");
+        if (hasPayload(enumeration)) {
+            try writer.writeAll("    union {\n");
+            for (enumeration.cases) |case| {
+                const payload = case.type orelse continue;
+                if (isZeroSized(payload)) continue;
+                try writer.writeAll("        ");
+                try self.generateType(writer, payload);
+                try writer.writeByte(' ');
+                try self.generateCaseMember(writer, enumeration, case);
+                try writer.writeAll(";\n");
+            }
+            try writer.writeAll("    } value;\n");
+        }
+        try writer.writeAll("} ");
+        try self.generateType(writer, value_type);
+        try writer.writeAll(";\n");
+        if (!declared) try writer.writeAll("#endif\n");
+    }
+
+    fn generateCaseMember(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        enumeration: *const types.Enum,
+        case: types.Case,
+    ) WriteError!void {
+        if (!types.isDeclaredEnum(enumeration)) {
+            try self.generateTypeName(writer, .{ .@"enum" = case.declaring });
+            try writer.writeByte('_');
+        }
+        try writer.writeAll(case.name);
+    }
+
+    fn generateEnumEquality(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        value_type: types.Type,
+    ) WriteError!void {
+        const enumeration = value_type.@"enum";
+        try writer.writeAll("#ifndef ");
+        try self.generateType(writer, value_type);
+        try writer.writeAll("_equal_defined\n#define ");
+        try self.generateType(writer, value_type);
+        try writer.writeAll("_equal_defined\nstatic inline bool ");
+        try self.generateType(writer, value_type);
+        try writer.writeAll("_equal(");
+        try self.generateType(writer, value_type);
+        try writer.writeAll(" one, ");
+        try self.generateType(writer, value_type);
+        try writer.writeAll(" two) {\n    if (one.tag != two.tag) return false;\n    switch (one.tag) {\n");
+        for (enumeration.cases) |case| {
+            const payload = case.type orelse continue;
+            if (isZeroSized(payload)) continue;
+            try writer.print("    case {d}: return ", .{case.tag});
+            if (hasEqualityHelper(payload)) {
+                try self.generateType(writer, payload);
+                try writer.writeAll("_equal(one.value.");
+                try self.generateCaseMember(writer, enumeration, case);
+                try writer.writeAll(", two.value.");
+                try self.generateCaseMember(writer, enumeration, case);
+                try writer.writeAll(");\n");
+            } else {
+                try writer.writeAll("one.value.");
+                try self.generateCaseMember(writer, enumeration, case);
+                try writer.writeAll(" == two.value.");
+                try self.generateCaseMember(writer, enumeration, case);
+                try writer.writeAll(";\n");
+            }
+        }
+        try writer.writeAll("    default: return true;\n    }\n}\n#endif\n");
+    }
+
+    fn generateEnumConversion(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        conversion: Conversion,
+    ) WriteError!void {
+        const source = conversion.source.@"enum";
+        const target = conversion.target.@"enum";
+        try writer.writeAll("#ifndef ");
+        try self.generateConversionName(writer, conversion);
+        try writer.writeAll("_defined\n#define ");
+        try self.generateConversionName(writer, conversion);
+        try writer.writeAll("_defined\nstatic inline ");
+        try self.generateType(writer, conversion.target);
+        try writer.writeByte(' ');
+        try self.generateConversionName(writer, conversion);
+        try writer.writeByte('(');
+        try self.generateType(writer, conversion.source);
+        try writer.writeAll(" value) {\n    ");
+        try self.generateType(writer, conversion.target);
+        try writer.writeAll(" result;\n    result.tag = value.tag;\n");
+        if (hasPayload(source)) {
+            try writer.writeAll("    switch (value.tag) {\n");
+            for (source.cases) |case| {
+                const payload = case.type orelse continue;
+                if (isZeroSized(payload)) continue;
+                try writer.print("    case {d}: result.value.", .{case.tag});
+                try self.generateCaseMember(writer, target, case);
+                try writer.writeAll(" = value.value.");
+                try self.generateCaseMember(writer, source, case);
+                try writer.writeAll("; break;\n");
+            }
+            try writer.writeAll("    default: break;\n    }\n");
+        }
+        try writer.writeAll("    return result;\n}\n#endif\n");
+    }
+
+    fn generateResultConversion(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        conversion: Conversion,
+    ) WriteError!void {
+        const source = conversion.source.result;
+        const target = conversion.target.result;
+        try writer.writeAll("#ifndef ");
+        try self.generateConversionName(writer, conversion);
+        try writer.writeAll("_defined\n#define ");
+        try self.generateConversionName(writer, conversion);
+        try writer.writeAll("_defined\nstatic inline ");
+        try self.generateType(writer, conversion.target);
+        try writer.writeByte(' ');
+        try self.generateConversionName(writer, conversion);
+        try writer.writeByte('(');
+        try self.generateType(writer, conversion.source);
+        try writer.writeAll(" value) {\n    ");
+        try self.generateType(writer, conversion.target);
+        try writer.writeAll(" result;\n    result.error = ");
+        if (source.error_set == target.error_set) {
+            try writer.writeAll("value.error;\n");
+        } else {
+            const error_conversion: Conversion = .{
+                .source = .{ .@"enum" = source.error_set },
+                .target = .{ .@"enum" = target.error_set },
+            };
+            try self.generateConversionName(writer, error_conversion);
+            try writer.writeAll("(value.error);\n");
+        }
+        if (!isZeroSized(target.value)) try writer.writeAll("    result.value = value.value;\n");
+        try writer.writeAll("    return result;\n}\n#endif\n");
+    }
+
+    fn generateConversionName(self: *Generator, writer: *std.Io.Writer, conversion: Conversion) WriteError!void {
+        try self.generateType(writer, conversion.target);
+        try writer.writeAll("_from_");
+        try self.generateTypeName(writer, conversion.source);
+    }
+
+    fn generateCaseValue(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        case: ast.Resolution.Case,
+        payload: ?*const ast.Expression,
+    ) WriteError!void {
+        const value_type: types.Type = .{ .@"enum" = case.enumeration };
+        const resolved = case.enumeration.cases[case.index];
+        try self.recordType(allocator, reached, value_type);
+        const argument = payload orelse {
+            try self.generateCompoundStart(writer, value_type, .expression);
+            return writer.print(".tag = {d} }}", .{resolved.tag});
+        };
+        if (isZeroSized(resolved.type.?)) {
+            const effects = hasEffects(argument.*);
+            if (effects) {
+                try writer.writeByte('(');
+                try self.generateEffects(allocator, reached, writer, argument.*);
+                try writer.writeAll(", ");
+            }
+            try self.generateCompoundStart(writer, value_type, .expression);
+            try writer.print(".tag = {d} }}", .{resolved.tag});
+            if (effects) try writer.writeByte(')');
+            return;
+        }
+        try self.generateCompoundStart(writer, value_type, .expression);
+        try writer.print(".tag = {d}, .value.", .{resolved.tag});
+        try self.generateCaseMember(writer, case.enumeration, resolved);
+        try writer.writeAll(" = ");
+        try self.generateConvertedOperand(allocator, reached, writer, argument, resolved.type.?);
+        try writer.writeAll(" }");
+    }
+
     fn generateForwardDeclarations(
         self: *Generator,
         allocator: std.mem.Allocator,
@@ -490,7 +719,7 @@ pub const Generator = struct {
             const signature = switch (declaration.kind) {
                 .function_definition => |function| function.signature,
                 .function_declaration => |function_declaration| function_declaration,
-                .constant_declaration, .struct_definition => continue,
+                .constant_declaration, .struct_definition, .enum_definition => continue,
                 .typeclass_definition, .instance_declaration, .import => continue,
             };
             for (signature.parameters) |parameter| {
@@ -524,7 +753,13 @@ pub const Generator = struct {
                 const contained = forward.contained;
                 if (std.mem.findScalar(usize, contained, struct_type.module) != null) return;
             },
-            .array, .slice, .tuple => {
+            .@"enum" => |enumeration| {
+                if (types.isDeclaredEnum(enumeration)) {
+                    if (enumeration.module == self.module_index) return;
+                    if (std.mem.findScalar(usize, forward.contained, enumeration.module) != null) return;
+                } else if (containsType(forward.definitions, value_type)) return;
+            },
+            .array, .slice, .tuple, .result => {
                 if (containsType(forward.definitions, value_type)) return;
             },
             .optional => |optional| {
@@ -599,7 +834,7 @@ pub const Generator = struct {
             if (isCompileTimeFunction(declaration)) continue;
             const function = switch (declaration.kind) {
                 .function_definition => |function| function,
-                .function_declaration, .constant_declaration, .struct_definition => continue,
+                .function_declaration, .constant_declaration, .struct_definition, .enum_definition => continue,
                 .typeclass_definition, .instance_declaration, .import => continue,
             };
             for (function.signature.parameters) |parameter| {
@@ -626,13 +861,22 @@ pub const Generator = struct {
         }
         for (reached.equalities.items) |value_type| {
             try writer.writeByte('\n');
-            if (value_type == .array) {
-                try self.generateArrayEquality(writer, value_type);
+            switch (value_type) {
+                .array => try self.generateArrayEquality(writer, value_type),
+                .@"enum" => try self.generateEnumEquality(writer, value_type),
+                else => try self.generateOptionalEquality(writer, value_type),
+            }
+        }
+        for (reached.conversions.items) |conversion| {
+            try writer.writeByte('\n');
+            if (conversion.source == .result) {
+                try self.generateResultConversion(writer, conversion);
             } else {
-                try self.generateOptionalEquality(writer, value_type);
+                try self.generateEnumConversion(writer, conversion);
             }
         }
         try self.generateZeroSizedObject(writer, module);
+        try self.generateErrorReportDeclaration(writer, module);
         try self.generateStatics(writer);
         if (constants.written().len > 0) try writer.writeByte('\n');
         try writer.writeAll(constants.written());
@@ -696,6 +940,31 @@ pub const Generator = struct {
             try writer.writeAll(" value;\n");
         }
         try writer.writeAll("    bool present;\n} ");
+        try self.generateType(writer, value_type);
+        try writer.writeAll(";\n#endif\n");
+    }
+
+    fn generateResultDefinition(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        value_type: types.Type,
+    ) WriteError!void {
+        const result = value_type.result;
+        try writer.writeAll("#ifndef ");
+        try self.generateType(writer, value_type);
+        try writer.writeAll("_defined\n#define ");
+        try self.generateType(writer, value_type);
+        try writer.writeAll("_defined\ntypedef struct ");
+        try self.generateType(writer, value_type);
+        try writer.writeAll(" {\n    ");
+        try self.generateType(writer, .{ .@"enum" = result.error_set });
+        try writer.writeAll(" error;\n");
+        if (!isZeroSized(result.value)) {
+            try writer.writeAll("    ");
+            try self.generateType(writer, result.value);
+            try writer.writeAll(" value;\n");
+        }
+        try writer.writeAll("} ");
         try self.generateType(writer, value_type);
         try writer.writeAll(";\n#endif\n");
     }
@@ -795,6 +1064,17 @@ pub const Generator = struct {
         }
     }
 
+    fn generateErrorReportDeclaration(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        module: ast.Module,
+    ) WriteError!void {
+        for (module.declarations) |declaration| {
+            if (!self.isEntryPoint(declaration.kind) or !isResultMain(declaration.kind)) continue;
+            return writer.writeAll("\nvoid mn_runtime_error_report(char const *name);\n");
+        }
+    }
+
     fn generateConstantDefinition(
         self: *Generator,
         allocator: std.mem.Allocator,
@@ -857,6 +1137,21 @@ pub const Generator = struct {
                     try writer.writeAll(", ");
                 }
                 try writer.writeAll(".present = true }");
+            },
+            .result => |result| {
+                try self.generateCompoundStart(writer, value_type, form);
+                if (value == .failure) {
+                    const error_type: types.Type = .{ .@"enum" = result.error_set };
+                    try writer.writeAll(".error = ");
+                    try self.generateKnownValue(allocator, reached, writer, .{ .enumeration = value.failure }, error_type, .initializer);
+                    return writer.writeAll(" }");
+                }
+                try writer.writeAll(".error.tag = 0");
+                if (!isZeroSized(result.value)) {
+                    try writer.writeAll(", .value = ");
+                    try self.generateKnownValue(allocator, reached, writer, value, result.value, .initializer);
+                }
+                try writer.writeAll(" }");
             },
             .array => |array| {
                 try self.generateCompoundStart(writer, value_type, form);
@@ -922,6 +1217,18 @@ pub const Generator = struct {
                     try writer.writeByte(')');
                 },
                 else => unreachable,
+            },
+            .@"enum" => |enumeration| {
+                const known = value.enumeration;
+                try self.generateCompoundStart(writer, value_type, form);
+                try writer.print(".tag = {d}", .{known.case.tag});
+                const payload = known.case.type orelse return writer.writeAll(" }");
+                if (isZeroSized(payload)) return writer.writeAll(" }");
+                try writer.writeAll(", .value = { .");
+                try self.generateCaseMember(writer, enumeration, known.case.*);
+                try writer.writeAll(" = ");
+                try self.generateKnownValue(allocator, reached, writer, known.value.?.*, payload, .initializer);
+                try writer.writeAll(" } }");
             },
             .void, .type, .function, .variable, .application => unreachable,
         }
@@ -1011,7 +1318,7 @@ pub const Generator = struct {
                     try writer.print(".{s}", .{struct_type.fields[position].name});
                     current = struct_type.fields[position].type;
                 },
-                .number, .boolean, .void, .type, .slice, .pointer, .optional, .function, .variable, .application => unreachable,
+                .number, .boolean, .void, .type, .@"enum", .slice, .pointer, .optional, .result, .function, .variable, .application => unreachable,
             }
         }
     }
@@ -1062,7 +1369,7 @@ pub const Generator = struct {
                     try self.runtime_functions.append(allocator, name);
                 }
             },
-            .function_definition, .constant_declaration, .struct_definition => {},
+            .function_definition, .constant_declaration, .struct_definition, .enum_definition => {},
             .typeclass_definition, .instance_declaration, .import => {},
         }
     }
@@ -1081,7 +1388,8 @@ pub const Generator = struct {
             return reached.slices.append(allocator, value_type);
         }
         switch (value_type) {
-            .array, .optional, .tuple => {},
+            .array, .optional, .result, .tuple => {},
+            .@"enum" => |enumeration| if (types.isDeclaredEnum(enumeration)) return,
             .function => |function| {
                 for (function.parameters) |parameter| try self.recordType(allocator, reached, parameter);
                 return self.recordType(allocator, reached, function.return_type);
@@ -1098,8 +1406,15 @@ pub const Generator = struct {
         switch (value_type) {
             .array => |array| try self.recordType(allocator, reached, array.element),
             .optional => |optional| try self.recordType(allocator, reached, optional.child),
+            .result => |result| {
+                try self.recordType(allocator, reached, .{ .@"enum" = result.error_set });
+                try self.recordType(allocator, reached, result.value);
+            },
             .tuple => |tuple| {
                 for (tuple.elements) |element| try self.recordType(allocator, reached, element);
+            },
+            .@"enum" => |enumeration| {
+                for (enumeration.cases) |case| try self.recordType(allocator, reached, case.type orelse continue);
             },
             .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .function, .variable, .application => {
                 unreachable;
@@ -1139,14 +1454,83 @@ pub const Generator = struct {
         self.local_names = try buildLocalNames(allocator, function);
         self.steps = try self.collectSteps(allocator, function);
         self.loops = try collectLoops(allocator, function.body);
-        self.tuple_declarations = try collectTupleDeclarations(allocator, function.body);
+        self.tuple_declarations = try collectKind(allocator, function.body, .tuple_declaration);
+        self.matches = try collectKind(allocator, function.body, .match);
         self.parameters = function.signature.parameters;
         self.return_type = ast.extractType(function.signature.return_type);
-        self.in_main = self.isEntryPoint(.{ .function_definition = function });
-        try self.generateSignature(writer, .{ .function_definition = function }, index);
+        const kind: ast.DeclarationKind = .{ .function_definition = function };
+        self.in_main = self.isEntryPoint(kind) and !isResultMain(kind);
+        try self.generateSignature(writer, kind, index);
         try writer.writeByte(' ');
-        try self.generateBlock(allocator, reached, writer, function.body, null);
+        if (needsFinalReturn(self.return_type, function.body)) {
+            try writer.writeAll("{\n");
+            self.depth += 1;
+            try self.generateStatements(allocator, reached, writer, function.body, null);
+            try self.generateSuccessReturn(allocator, reached, writer);
+            self.depth -= 1;
+            try writer.writeByte('}');
+        } else {
+            try self.generateBlock(allocator, reached, writer, function.body, null);
+        }
         try writer.writeByte('\n');
+        if (self.isEntryPoint(kind) and isResultMain(kind)) try self.generateEntryPoint(allocator, writer, index);
+    }
+
+    fn generateDeferredReturn(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        returned: *const ast.Expression,
+    ) WriteError!void {
+        const name = "mn_returned";
+        try self.recordType(allocator, reached, self.return_type);
+        try self.generateIndentation(writer);
+        try self.generateLocalType(writer, self.return_type, true);
+        try writer.print(" {s} = ", .{name});
+        try self.generateFullValue(allocator, reached, writer, returned, self.return_type);
+        try writer.writeAll(";\n");
+        const errors: Errors = if (self.return_type != .result)
+            .none
+        else if (returned.type.? == .result)
+            .{ .dynamic = name }
+        else if (types.isResultError(returned.type.?, self.return_type.result.*))
+            .all
+        else
+            .none;
+        try self.generateUnwound(allocator, reached, writer, null, errors);
+        try self.generateIndentation(writer);
+        try writer.print("return {s};\n", .{name});
+    }
+
+    fn generateSuccessReturn(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+    ) WriteError!void {
+        try self.recordType(allocator, reached, self.return_type);
+        try self.generateIndentation(writer);
+        try writer.writeAll("return ");
+        try self.generateCompoundStart(writer, self.return_type, .expression);
+        try writer.writeAll(".error.tag = 0 };\n");
+    }
+
+    fn generateEntryPoint(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        index: usize,
+    ) WriteError!void {
+        const name = "mn_runtime_error_report";
+        if (!containsName(self.runtime_functions.items, name)) try self.runtime_functions.append(allocator, name);
+        try writer.writeAll("\nint main() {\n    ");
+        try self.generateType(writer, self.return_type);
+        try writer.print(" result = {s}();\n    if (result.error.tag == 0) return 0;\n    switch (result.error.tag) {{\n", .{self.names[self.module_index][index].?});
+        for (self.return_type.result.error_set.cases) |case| {
+            try writer.print("    case {d}: {s}(\"{s}\"); break;\n", .{ case.tag, name, case.name });
+        }
+        try writer.writeAll("    }\n    return 1;\n}\n");
     }
 
     fn collectSteps(
@@ -1158,30 +1542,41 @@ pub const Generator = struct {
         try collectStatements(allocator, &statements, function.body);
         var steps: std.ArrayList(Step) = .empty;
         for (statements.items) |statement| {
-            if (statement.kind == .assignment) {
-                const assignment = statement.kind.assignment;
-                const written = self.hasTarget(assignment.target);
-                const compound = assignment.operator != null and assignment.target.kind != .identifier;
-                const address: ?types.Type = if (written and compound) address: {
-                    const pointer = try self.program.types.addPointer(allocator, .{
-                        .target = assignment.target.type.?,
-                        .many = false,
-                        .constant = false,
-                    });
-                    break :address .{ .pointer = pointer };
-                } else null;
-                try collectTargetSteps(allocator, &steps, statement, written, address);
-            }
-            if (statement.kind == .@"for") {
-                for (try collectParts(allocator, &statement.kind.@"for")) |part| {
-                    if (!self.isStoredPart(statement, part) and !hasEffects(part.expression.*)) continue;
-                    try collectScopeSteps(allocator, &steps, statement, part.expression);
-                }
-            }
-            const expression = findStatementExpression(statement) orelse continue;
-            try collectScopeSteps(allocator, &steps, statement, expression);
+            const start = steps.items.len;
+            try self.collectStatementSteps(allocator, &steps, statement);
+            try liftSteps(allocator, steps.items[start..]);
         }
         return steps.items;
+    }
+
+    fn collectStatementSteps(
+        self: *const Generator,
+        allocator: std.mem.Allocator,
+        steps: *std.ArrayList(Step),
+        statement: *const ast.Statement,
+    ) std.mem.Allocator.Error!void {
+        if (statement.kind == .assignment) {
+            const assignment = statement.kind.assignment;
+            const written = self.hasTarget(assignment.target);
+            const compound = assignment.operator != null and assignment.target.kind != .identifier;
+            const address: ?types.Type = if (written and compound) address: {
+                const pointer = try self.program.types.addPointer(allocator, .{
+                    .target = assignment.target.type.?,
+                    .many = false,
+                    .constant = false,
+                });
+                break :address .{ .pointer = pointer };
+            } else null;
+            try collectTargetSteps(allocator, steps, statement, written, address);
+        }
+        if (statement.kind == .@"for") {
+            for (try collectParts(allocator, &statement.kind.@"for")) |part| {
+                if (!self.isStoredPart(statement, part) and !hasEffects(part.expression.*)) continue;
+                try collectScopeSteps(allocator, steps, statement, part.expression);
+            }
+        }
+        const expression = findStatementExpression(statement) orelse return;
+        try collectScopeSteps(allocator, steps, statement, expression);
     }
 
     fn generateSignature(
@@ -1190,11 +1585,11 @@ pub const Generator = struct {
         kind: ast.DeclarationKind,
         index: usize,
     ) WriteError!void {
-        if (self.isEntryPoint(kind)) return writer.writeAll("int main()");
+        if (self.isEntryPoint(kind) and !isResultMain(kind)) return writer.writeAll("int main()");
         const signature = switch (kind) {
             .function_definition => |function| function.signature,
             .function_declaration => |function_declaration| function_declaration,
-            .constant_declaration, .struct_definition => unreachable,
+            .constant_declaration, .struct_definition, .enum_definition => unreachable,
             .typeclass_definition, .instance_declaration, .import => unreachable,
         };
         try self.generateType(writer, ast.extractType(signature.return_type));
@@ -1241,7 +1636,7 @@ pub const Generator = struct {
         try writer.writeAll("{\n");
         self.depth += 1;
         if (named) try self.generateElementDeclarations(allocator, reached, writer, loop.?);
-        for (block) |*statement| try self.generateStatement(allocator, reached, writer, statement);
+        try self.generateStatements(allocator, reached, writer, block, loop);
         if (loop) |statement| {
             if (containsGoto(block, statement, .@"continue", statement)) {
                 try self.generateIndentation(writer);
@@ -1253,6 +1648,100 @@ pub const Generator = struct {
         try writer.writeByte('}');
     }
 
+    fn generateStatements(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        block: []const ast.Statement,
+        loop: ?*const ast.Statement,
+    ) WriteError!void {
+        try self.frames.append(allocator, .{ .loop = loop });
+        const frame = self.frames.items.len - 1;
+        for (block) |*statement| {
+            if (statement.kind == .@"defer") {
+                try self.frames.items[frame].deferred.append(allocator, statement.kind.@"defer");
+                continue;
+            }
+            try self.generateStatement(allocator, reached, writer, statement);
+        }
+        if (!endsWithJump(block)) try self.generateFrameDeferred(allocator, reached, writer, frame, .none);
+        _ = self.frames.pop();
+    }
+
+    fn generateFrameDeferred(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        frame: usize,
+        errors: Errors,
+    ) WriteError!void {
+        const deferred = self.frames.items[frame].deferred.items;
+        var index = deferred.len;
+        while (index > 0) {
+            index -= 1;
+            const statement = deferred[index].statement;
+            if (deferred[index].on_error) {
+                switch (errors) {
+                    .none => continue,
+                    .all => {},
+                    .dynamic => |name| {
+                        try self.generateIndentation(writer);
+                        try writer.print("if ({s}.error.tag != 0) {{\n", .{name});
+                        self.depth += 1;
+                        try self.generateDeferredStatement(allocator, reached, writer, statement);
+                        self.depth -= 1;
+                        try self.generateIndentation(writer);
+                        try writer.writeAll("}\n");
+                        continue;
+                    },
+                }
+            }
+            try self.generateDeferredStatement(allocator, reached, writer, statement);
+        }
+    }
+
+    fn generateDeferredStatement(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+    ) WriteError!void {
+        if (!self.hasTemporaries(statement)) return self.generateStatement(allocator, reached, writer, statement);
+        try self.generateIndentation(writer);
+        try writer.writeAll("{\n");
+        self.depth += 1;
+        try self.generateStatement(allocator, reached, writer, statement);
+        self.depth -= 1;
+        try self.generateIndentation(writer);
+        try writer.writeAll("}\n");
+    }
+
+    fn generateUnwound(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        loop: ?*const ast.Statement,
+        errors: Errors,
+    ) WriteError!void {
+        var frame = self.frames.items.len;
+        while (frame > 0) {
+            frame -= 1;
+            try self.generateFrameDeferred(allocator, reached, writer, frame, errors);
+            if (loop != null and self.frames.items[frame].loop == loop) return;
+        }
+    }
+
+    fn hasDeferred(self: *const Generator) bool {
+        for (self.frames.items) |frame| {
+            if (frame.deferred.items.len > 0) return true;
+        }
+        return false;
+    }
+
     fn generateStatement(
         self: *Generator,
         allocator: std.mem.Allocator,
@@ -1262,10 +1751,13 @@ pub const Generator = struct {
     ) WriteError!void {
         if (!self.hasOutput(statement)) return;
         try self.generateTemporaries(writer, statement);
+        if (statement.kind != .@"while") try self.generateLiftedSteps(allocator, reached, writer, statement);
         switch (statement.kind) {
             .noop => unreachable,
             .@"return" => {
                 const returned = findStatementExpression(statement) orelse {
+                    try self.generateUnwound(allocator, reached, writer, null, .none);
+                    if (self.return_type == .result) return self.generateSuccessReturn(allocator, reached, writer);
                     try self.generateIndentation(writer);
                     return writer.writeAll(if (self.in_main) "return 0;\n" else "return;\n");
                 };
@@ -1275,15 +1767,18 @@ pub const Generator = struct {
                         try self.generateStatementEffects(allocator, reached, writer, returned);
                         try writer.writeAll(";\n");
                     }
+                    try self.generateUnwound(allocator, reached, writer, null, .none);
                     try self.generateIndentation(writer);
                     return writer.writeAll("return;\n");
                 }
+                if (self.hasDeferred()) return self.generateDeferredReturn(allocator, reached, writer, returned);
                 try self.generateIndentation(writer);
                 try writer.writeAll("return ");
                 try self.generateFullValue(allocator, reached, writer, returned, self.return_type);
                 try writer.writeAll(";\n");
             },
             .discard, .call => |*expression| {
+                if (self.isLiftedRoot(expression)) return;
                 try self.generateExpressionStatement(allocator, reached, writer, expression);
             },
             .constant_declaration, .variable_declaration => {
@@ -1298,8 +1793,10 @@ pub const Generator = struct {
             },
             .@"while" => try self.generateWhile(allocator, reached, writer, statement),
             .@"for" => try self.generateFor(allocator, reached, writer, statement),
-            .@"break" => |jump| try self.generateJump(writer, jump.loop.?, .@"break"),
-            .@"continue" => |jump| try self.generateJump(writer, jump.loop.?, .@"continue"),
+            .match => try self.generateMatch(allocator, reached, writer, statement),
+            .@"break" => |jump| try self.generateJump(allocator, reached, writer, jump.loop.?, .@"break"),
+            .@"continue" => |jump| try self.generateJump(allocator, reached, writer, jump.loop.?, .@"continue"),
+            .@"defer" => unreachable,
         }
     }
 
@@ -1333,7 +1830,8 @@ pub const Generator = struct {
                 return hasEffects(assignment.target) or hasEffects(assignment.value);
             },
             .discard => |expression| expression.kind != .identifier,
-            .@"return", .call, .@"if", .@"while", .@"for", .@"break", .@"continue" => true,
+            .@"defer" => |deferred| self.hasOutput(deferred.statement),
+            .@"return", .call, .@"if", .@"while", .@"for", .match, .@"break", .@"continue" => true,
         };
     }
 
@@ -1438,6 +1936,125 @@ pub const Generator = struct {
             }
             try writer.writeAll(";\n");
         }
+    }
+
+    fn generateMatch(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+    ) WriteError!void {
+        const matching = &statement.kind.match;
+        const value = &matching.value;
+        const value_type = value.type.?;
+        try self.recordType(allocator, reached, value_type);
+        const stored = !isPlainName(value.*) and self.readsElements(statement);
+        const addressed = self.addressesElements(statement);
+        if (stored) {
+            try self.generateIndentation(writer);
+            if (addressed) {
+                try self.generateTaggedType(writer, value_type);
+                const writable = hasWritablePointerName(matching.names);
+                try writer.writeAll(if (writable) " * const " else " const * const ");
+                try self.generateMatchValueName(writer, statement);
+                try writer.writeAll(" = ");
+                try self.generateAddress(allocator, reached, writer, value);
+            } else {
+                try self.generateLocalType(writer, value_type, true);
+                try writer.writeByte(' ');
+                try self.generateMatchValueName(writer, statement);
+                try writer.writeAll(" = ");
+                try self.generateFullValue(allocator, reached, writer, value, value_type);
+            }
+            try writer.writeAll(";\n");
+        }
+        try self.generateIndentation(writer);
+        try writer.writeAll("switch (");
+        if (stored) {
+            try self.generateMatchValueName(writer, statement);
+            try writer.writeAll(if (addressed) "->tag" else ".tag");
+        } else {
+            try self.generateFullExpression(allocator, reached, writer, value);
+            try writer.writeAll(".tag");
+        }
+        try writer.writeAll(") {\n");
+        const enclosing_loop = self.innermost_loop;
+        self.innermost_loop = null;
+        for (0..matching.branches.len) |position| {
+            try self.generateBranch(allocator, reached, writer, statement, position, stored, addressed);
+        }
+        self.innermost_loop = enclosing_loop;
+        try self.generateIndentation(writer);
+        try writer.writeAll("}\n");
+    }
+
+    fn generateBranch(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+        position: usize,
+        stored: bool,
+        addressed: bool,
+    ) WriteError!void {
+        const matching = &statement.kind.match;
+        const branch = matching.branches[position];
+        const enumeration = matching.value.type.?.@"enum";
+        const last = position + 1 == matching.branches.len;
+        const element: ast.Resolution.Element = .{ .statement = statement, .position = position };
+        const local_name = self.findLocalName(.{ .element = element });
+        const empty = local_name == null and for (branch.body) |*inner| {
+            if (self.hasOutput(inner)) break false;
+        } else true;
+        if (last) {
+            try self.generateIndentation(writer);
+            try writer.writeAll("default: ");
+        } else {
+            for (branch.cases, 0..) |case, index| {
+                if (index > 0) try writer.writeByte('\n');
+                try self.generateIndentation(writer);
+                try writer.print("case {d}:", .{enumeration.cases[case.index.?].tag});
+            }
+            try writer.writeByte(' ');
+        }
+        if (empty) return writer.writeAll("break;\n");
+        try writer.writeAll("{\n");
+        self.depth += 1;
+        if (local_name) |declared_name| {
+            const name = matching.names[position];
+            try self.generateElementName(allocator, reached, writer, name, declared_name);
+            if (!isZeroSizedPointer(name)) {
+                if (name.pointer) try writer.writeByte('&');
+                if (stored) {
+                    try self.generateMatchValueName(writer, statement);
+                    try writer.writeAll(if (addressed) "->value." else ".value.");
+                } else {
+                    try self.generateExpression(allocator, reached, writer, matching.value);
+                    try writer.writeAll(".value.");
+                }
+                try self.generateCaseMember(writer, enumeration, enumeration.cases[branch.cases[0].index.?]);
+            }
+            try writer.writeAll(";\n");
+        }
+        try self.generateStatements(allocator, reached, writer, branch.body, null);
+        if (!last and !endsWithJump(branch.body)) {
+            try self.generateIndentation(writer);
+            try writer.writeAll("break;\n");
+        }
+        self.depth -= 1;
+        try self.generateIndentation(writer);
+        try writer.writeAll("}\n");
+    }
+
+    fn generateMatchValueName(
+        self: *Generator,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+    ) WriteError!void {
+        const number = std.mem.findScalar(*const ast.Statement, self.matches, statement).? + 1;
+        try writer.print("mn_match_value_{d}", .{number});
     }
 
     fn readsElements(self: *const Generator, statement: *const ast.Statement) bool {
@@ -1611,7 +2228,7 @@ pub const Generator = struct {
         const else_body = conditional.else_body orelse return;
         try writer.writeAll(" else ");
         const chained = else_body.len == 1 and else_body[0].kind == .@"if";
-        if (chained and !self.hasTemporaries(&else_body[0])) {
+        if (chained and !self.hasTemporaries(&else_body[0]) and !self.isLiftedStatement(&else_body[0])) {
             return self.generateIf(allocator, reached, writer, &else_body[0].kind.@"if");
         }
         try self.generateBlock(allocator, reached, writer, else_body, null);
@@ -1626,11 +2243,33 @@ pub const Generator = struct {
     ) WriteError!void {
         const loop = &statement.kind.@"while";
         try self.generateIndentation(writer);
+        if (self.isLiftedStatement(statement)) {
+            try writer.writeAll("while (true) {\n");
+            self.depth += 1;
+            try self.generateLiftedSteps(allocator, reached, writer, statement);
+            try self.generateIndentation(writer);
+            try writer.writeAll("if (!");
+            try self.generateFullExpression(allocator, reached, writer, &loop.condition);
+            try writer.writeAll(") break;\n");
+            try self.generateIndentation(writer);
+            try self.generateLoopBody(allocator, reached, writer, statement);
+            self.depth -= 1;
+            try self.generateIndentation(writer);
+            try writer.writeAll("}\n");
+            return self.generateLoopEnd(allocator, reached, writer, statement);
+        }
         try writer.writeAll("while (");
         try self.generateFullExpression(allocator, reached, writer, &loop.condition);
         try writer.writeAll(") ");
         try self.generateLoopBody(allocator, reached, writer, statement);
         try self.generateLoopEnd(allocator, reached, writer, statement);
+    }
+
+    fn isLiftedStatement(self: *const Generator, statement: *const ast.Statement) bool {
+        for (self.steps) |step| {
+            if (step.statement == statement and step.lifted) return true;
+        }
+        return false;
     }
 
     fn generateFor(
@@ -1760,7 +2399,7 @@ pub const Generator = struct {
                     try self.generatePartValue(allocator, reached, writer, statement, part);
                     try writer.writeAll(".length");
                 },
-                .number, .boolean, .void, .type, .@"struct", .pointer, .optional, .tuple, .function, .variable, .application => {
+                .number, .boolean, .void, .type, .@"struct", .@"enum", .pointer, .optional, .result, .tuple, .function, .variable, .application => {
                     unreachable;
                 },
             },
@@ -1857,7 +2496,7 @@ pub const Generator = struct {
         statement: *const ast.Statement,
     ) WriteError!void {
         const body, const else_body = ast.extractBlocks(statement.*);
-        for (else_body) |*else_statement| try self.generateStatement(allocator, reached, writer, else_statement);
+        try self.generateStatements(allocator, reached, writer, else_body, null);
         if (isEmptyLoop(statement.*) or !containsGoto(body, statement, .@"break", statement)) return;
         try self.generateIndentation(writer);
         try writer.print("mn_break_{d}:;\n", .{self.findLoopNumber(statement)});
@@ -1865,10 +2504,13 @@ pub const Generator = struct {
 
     fn generateJump(
         self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
         writer: *std.Io.Writer,
         loop: *const ast.Statement,
         tag: std.meta.Tag(ast.StatementKind),
     ) WriteError!void {
+        try self.generateUnwound(allocator, reached, writer, loop, .none);
         try self.generateIndentation(writer);
         const name = @tagName(tag);
         if (!isGoto(loop, tag, self.innermost_loop)) return writer.print("{s};\n", .{name});
@@ -1921,8 +2563,284 @@ pub const Generator = struct {
         expected: types.Type,
     ) WriteError!void {
         if (isOptionalWrap(expression.type.?, expected)) return self.generateWrapped(allocator, reached, writer, expression, expected, false);
-        if (!isArrayToSlice(expression.type.?, expected)) return self.generateExpression(allocator, reached, writer, expression.*);
+        if (isResultWrap(expression.type.?, expected)) return self.generateResultWrapped(allocator, reached, writer, expression, expected);
+        if (isConversionCall(expression.type.?, expected)) return self.generateEnumConverted(allocator, reached, writer, expression, expected);
+        if (!isArrayToSlice(expression.type.?, expected)) return self.generateOperand(allocator, reached, writer, expression);
         try self.generateSliceOf(allocator, reached, writer, expression, null, null, expected, .expression);
+    }
+
+    fn generateResultWrapped(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        expression: *const ast.Expression,
+        expected: types.Type,
+    ) WriteError!void {
+        const result = expected.result;
+        try self.recordType(allocator, reached, expected);
+        if (types.isResultError(expression.type.?, result.*)) {
+            try self.generateCompoundStart(writer, expected, .expression);
+            try writer.writeAll(".error = ");
+            try self.generateConverted(allocator, reached, writer, expression, .{ .@"enum" = result.error_set });
+            return writer.writeAll(" }");
+        }
+        if (!isZeroSized(result.value)) {
+            try self.generateCompoundStart(writer, expected, .expression);
+            try writer.writeAll(".error.tag = 0, .value = ");
+            try self.generateConverted(allocator, reached, writer, expression, result.value);
+            return writer.writeAll(" }");
+        }
+        const effects = hasEffects(expression.*);
+        if (effects) {
+            try writer.writeAll("((void)(");
+            try self.generateStatementEffects(allocator, reached, writer, expression);
+            try writer.writeAll("), ");
+        }
+        try self.generateCompoundStart(writer, expected, .expression);
+        try writer.writeAll(".error.tag = 0 }");
+        if (effects) try writer.writeByte(')');
+    }
+
+    fn generateLiftedSteps(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+    ) WriteError!void {
+        for (self.steps) |*step| {
+            if (step.statement != statement or !step.lifted or step.lazy) continue;
+            try self.generateLiftedStep(allocator, reached, writer, step);
+        }
+    }
+
+    fn generateLiftedScope(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        scope: *const ast.Expression,
+    ) WriteError!void {
+        for (self.steps) |*step| {
+            if (step.scope != scope or !step.lifted) continue;
+            try self.generateLiftedStep(allocator, reached, writer, step);
+        }
+    }
+
+    fn generateLiftedStep(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        step: *const Step,
+    ) WriteError!void {
+        const expression = step.expression;
+        if (step.address == null and expression.kind == .@"try") return self.generateLiftedTry(allocator, reached, writer, step);
+        if (step.address == null and self.isLiftedShortCircuit(expression)) {
+            return self.generateLiftedShortCircuit(allocator, reached, writer, step);
+        }
+        if (step.temporary == null and !isUnit(expression.*)) return;
+        try self.generateIndentation(writer);
+        if (step.temporary) |number| try writer.print("mn_temporary_{d} = ", .{number});
+        if (step.address != null) {
+            try writer.writeByte('&');
+        } else if (self.findAddressTemporary(expression)) |number| {
+            return writer.print("(*mn_temporary_{d});\n", .{number});
+        }
+        try self.generateExpression(allocator, reached, writer, expression.*);
+        try writer.writeAll(";\n");
+    }
+
+    fn generateLiftedTry(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        step: *const Step,
+    ) WriteError!void {
+        const operand = step.expression.kind.@"try";
+        const result_type = operand.type.?;
+        try self.recordType(allocator, reached, result_type);
+        try self.recordType(allocator, reached, self.return_type);
+        const deferred = self.hasDeferred();
+        try self.generateIndentation(writer);
+        try writer.writeAll("if (");
+        try self.generateOperand(allocator, reached, writer, operand);
+        try writer.writeAll(".error.tag != 0) ");
+        if (deferred) {
+            try writer.writeAll("{\n");
+            self.depth += 1;
+            try self.generateUnwound(allocator, reached, writer, null, .all);
+            try self.generateIndentation(writer);
+        }
+        try writer.writeAll("return ");
+        try self.generateCompoundStart(writer, self.return_type, .expression);
+        try writer.writeAll(".error = ");
+        const source: types.Type = .{ .@"enum" = result_type.result.error_set };
+        const target: types.Type = .{ .@"enum" = self.return_type.result.error_set };
+        if (source.@"enum" == target.@"enum") {
+            try self.generateOperand(allocator, reached, writer, operand);
+            try writer.writeAll(".error");
+        } else {
+            try self.recordConversion(allocator, reached, .{ .source = source, .target = target });
+            try self.generateConversionName(writer, .{ .source = source, .target = target });
+            try writer.writeByte('(');
+            try self.generateOperand(allocator, reached, writer, operand);
+            try writer.writeAll(".error)");
+        }
+        try writer.writeAll(" };\n");
+        if (deferred) {
+            self.depth -= 1;
+            try self.generateIndentation(writer);
+            try writer.writeAll("}\n");
+        }
+        const number = step.temporary orelse return;
+        try self.generateIndentation(writer);
+        try writer.print("mn_temporary_{d} = ", .{number});
+        try self.generateOperand(allocator, reached, writer, operand);
+        try writer.writeAll(".value;\n");
+    }
+
+    fn generateLiftedShortCircuit(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        step: *const Step,
+    ) WriteError!void {
+        const binary = step.expression.kind.binary;
+        const value_type = step.expression.type.?;
+        const left_type = binary.left.type.?;
+        try self.generateIndentation(writer);
+        try writer.writeAll("if (");
+        switch (binary.operator) {
+            .@"and", .@"or" => {
+                if (binary.operator == .@"or") try writer.writeByte('!');
+                try writer.writeByte('(');
+                try self.generateOperand(allocator, reached, writer, binary.left);
+                try writer.writeByte(')');
+            },
+            .@"orelse" => {
+                try writer.writeAll("!(");
+                try self.generateOperand(allocator, reached, writer, binary.left);
+                try writer.writeAll(if (isPointerOptional(left_type)) " != NULL)" else ".present)");
+            },
+            .@"catch" => {
+                try self.generateOperand(allocator, reached, writer, binary.left);
+                try writer.writeAll(".error.tag != 0");
+            },
+            else => unreachable,
+        }
+        try writer.writeAll(") {\n");
+        self.depth += 1;
+        try self.generateLiftedScope(allocator, reached, writer, binary.right);
+        try self.generateIndentation(writer);
+        if (step.temporary) |number| {
+            try writer.print("mn_temporary_{d} = ", .{number});
+            try self.generateFullValue(allocator, reached, writer, binary.right, value_type);
+        } else {
+            try writer.writeAll("(void)(");
+            try self.generateStatementEffects(allocator, reached, writer, binary.right);
+            try writer.writeByte(')');
+        }
+        try writer.writeAll(";\n");
+        self.depth -= 1;
+        try self.generateIndentation(writer);
+        try writer.writeByte('}');
+        const number = step.temporary orelse return writer.writeByte('\n');
+        try writer.writeAll(" else {\n");
+        self.depth += 1;
+        try self.generateIndentation(writer);
+        try writer.print("mn_temporary_{d} = ", .{number});
+        try self.generateOperand(allocator, reached, writer, binary.left);
+        const unwrapped = switch (binary.operator) {
+            .@"orelse" => !isPointerOptional(left_type) and !std.meta.eql(value_type, left_type),
+            .@"catch" => true,
+            else => false,
+        };
+        if (unwrapped) try writer.writeAll(".value");
+        try writer.writeAll(";\n");
+        self.depth -= 1;
+        try self.generateIndentation(writer);
+        try writer.writeAll("}\n");
+    }
+
+    fn isLiftedShortCircuit(self: *const Generator, expression: *const ast.Expression) bool {
+        if (expression.kind != .binary or !isShortCircuit(expression.kind.binary.operator)) return false;
+        const right = expression.kind.binary.right;
+        for (self.steps) |step| {
+            if (step.scope == right and step.lifted) return true;
+        }
+        return false;
+    }
+
+    fn isLiftedRoot(self: *const Generator, expression: *const ast.Expression) bool {
+        for (self.steps) |step| {
+            if (step.expression == expression and step.lifted) return true;
+        }
+        return false;
+    }
+
+    fn generateCatch(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        expression: ast.Expression,
+    ) WriteError!void {
+        const binary = expression.kind.binary;
+        try writer.writeByte('(');
+        try self.generateOperand(allocator, reached, writer, binary.left);
+        try writer.writeAll(".error.tag == 0 ? ");
+        if (isZeroSized(expression.type.?)) {
+            try writer.writeAll("(void)0 : ");
+            if (hasEffects(binary.right.*)) {
+                try writer.writeAll("(void)(");
+                try self.generateStatementEffects(allocator, reached, writer, binary.right);
+                return writer.writeAll("))");
+            }
+            return writer.writeAll("(void)0)");
+        }
+        try self.generateOperand(allocator, reached, writer, binary.left);
+        try writer.writeAll(".value : ");
+        try self.generateFullValue(allocator, reached, writer, binary.right, expression.type.?);
+        try writer.writeByte(')');
+    }
+
+    fn generateEnumConverted(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        expression: *const ast.Expression,
+        expected: types.Type,
+    ) WriteError!void {
+        const conversion: Conversion = .{ .source = expression.type.?, .target = expected };
+        try self.recordConversion(allocator, reached, conversion);
+        try self.generateConversionName(writer, conversion);
+        try writer.writeByte('(');
+        try self.generateOperand(allocator, reached, writer, expression);
+        try writer.writeByte(')');
+    }
+
+    fn recordConversion(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        conversion: Conversion,
+    ) WriteError!void {
+        try self.recordType(allocator, reached, conversion.target);
+        try self.recordType(allocator, reached, conversion.source);
+        if (conversion.source == .result) {
+            const source: types.Type = .{ .@"enum" = conversion.source.result.error_set };
+            const target: types.Type = .{ .@"enum" = conversion.target.result.error_set };
+            if (source.@"enum" != target.@"enum") try self.recordConversion(allocator, reached, .{ .source = source, .target = target });
+        }
+        const recorded = for (reached.conversions.items) |earlier| {
+            if (std.meta.eql(earlier, conversion)) break true;
+        } else false;
+        if (!recorded) try reached.conversions.append(allocator, conversion);
     }
 
     fn generateWrapped(
@@ -1992,7 +2910,7 @@ pub const Generator = struct {
     ) WriteError!void {
         var written = false;
         for (self.steps) |step| {
-            if (step.scope != scope) continue;
+            if (step.scope != scope or step.lifted) continue;
             if (written) try writer.writeAll(", ");
             if (step.temporary) |number| try writer.print("mn_temporary_{d} = ", .{number});
             if (step.address == null) {
@@ -2011,7 +2929,7 @@ pub const Generator = struct {
 
     fn hasSteps(self: *const Generator, scope: *const ast.Expression) bool {
         for (self.steps) |step| {
-            if (step.scope == scope) return true;
+            if (step.scope == scope and !step.lifted) return true;
         }
         return false;
     }
@@ -2032,6 +2950,7 @@ pub const Generator = struct {
     ) WriteError!void {
         for (self.steps) |step| {
             if (step.expression != expression or step.address != null) continue;
+            if (step.lifted and step.temporary == null) continue;
             return writer.print("mn_temporary_{d}", .{step.temporary.?});
         }
         if (self.findAddressTemporary(expression)) |number| {
@@ -2049,6 +2968,8 @@ pub const Generator = struct {
         expected: types.Type,
     ) WriteError!void {
         if (isOptionalWrap(expression.type.?, expected)) return self.generateWrapped(allocator, reached, writer, expression, expected, true);
+        if (isResultWrap(expression.type.?, expected)) return self.generateResultWrapped(allocator, reached, writer, expression, expected);
+        if (isConversionCall(expression.type.?, expected)) return self.generateEnumConverted(allocator, reached, writer, expression, expected);
         if (!isArrayToSlice(expression.type.?, expected)) return self.generateOperand(allocator, reached, writer, expression);
         try self.generateSliceOf(allocator, reached, writer, expression, null, null, expected, .expression);
     }
@@ -2121,18 +3042,22 @@ pub const Generator = struct {
                 .constant => |constant| try self.generateConstant(allocator, reached, writer, constant),
                 .local, .element => try writer.writeAll(self.findLocalName(identifier.resolution.?).?),
                 .function => |function| try self.generateFunctionName(allocator, reached, writer, function),
-                .type, .typeclass_function, .typeclass_method => unreachable,
+                .case => |case| try self.generateCaseValue(allocator, reached, writer, case, null),
+                .type, .typeclass_function, .typeclass_method, .builtin => unreachable,
             },
             inline .path_expression, .member => |name| switch (name.resolution.?) {
                 .constant => |constant| try self.generateConstant(allocator, reached, writer, constant),
                 .function => |function| try self.generateFunctionName(allocator, reached, writer, function),
-                .parameter, .type, .local, .element, .typeclass_function, .typeclass_method => unreachable,
+                .case => |case| try self.generateCaseValue(allocator, reached, writer, case, null),
+                .parameter, .type, .local, .element, .typeclass_function, .typeclass_method, .builtin => unreachable,
             },
             .call => |call| {
                 const hoists = try self.generateHoistedEffects(allocator, reached, writer, call.arguments);
                 switch (ast.extractResolution(call.callee)) {
                     .function => |function| try self.generateFunctionCall(allocator, reached, writer, call, function),
                     .parameter, .local, .constant, .element => try self.generateValueCall(allocator, reached, writer, call),
+                    .case => |case| try self.generateCaseValue(allocator, reached, writer, case, &call.arguments[0].value),
+                    .builtin => |builtin| try self.generateBuiltinCall(allocator, reached, writer, call, builtin),
                     .type, .typeclass_function, .typeclass_method => unreachable,
                 }
                 if (hoists) try writer.writeByte(')');
@@ -2149,10 +3074,14 @@ pub const Generator = struct {
             },
             .binary => |binary| {
                 const equality = binary.operator == .equal or binary.operator == .not_equal;
-                if (equality and !ast.isNullComparison(binary)) try collectEqualities(allocator, &reached.equalities, binary.left.type.?);
+                if (equality and !ast.isNullComparison(binary)) {
+                    try collectEqualities(allocator, &reached.equalities, binary.left.type.?);
+                    try collectEqualities(allocator, &reached.equalities, binary.right.type.?);
+                }
                 try self.recordPointerTarget(allocator, reached, binary.left.type.?);
                 try self.recordPointerTarget(allocator, reached, binary.right.type.?);
                 if (binary.operator == .@"orelse") return self.generateOrElse(allocator, reached, writer, expression);
+                if (binary.operator == .@"catch") return self.generateCatch(allocator, reached, writer, expression);
                 const operation: Operation = .{
                     .operator = binary.operator,
                     .left = binary.left,
@@ -2193,8 +3122,38 @@ pub const Generator = struct {
                 try self.generateBase(allocator, reached, writer, operand);
                 try writer.writeAll(".value");
             },
+            .@"try" => |operand| {
+                for (self.steps) |step| {
+                    if (step.expression.kind != .@"try" or step.expression.kind.@"try" != operand) continue;
+                    const number = step.temporary orelse break;
+                    return writer.print("mn_temporary_{d}", .{number});
+                }
+                try writer.writeAll("(void)0");
+            },
             .method_call, .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type, .struct_type => {
                 unreachable;
+            },
+        }
+    }
+
+    fn generateBuiltinCall(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        call: ast.Call,
+        builtin: ast.Builtin,
+    ) WriteError!void {
+        const target = ast.extractType(call.arguments[0].value);
+        switch (builtin) {
+            .size => try self.generateKnownInteger(writer, .usize, types.findLayout(target).size),
+            .alignment => try self.generateKnownInteger(writer, .usize, types.findLayout(target).alignment),
+            .convert, .truncate => {
+                try writer.writeAll("((");
+                try self.generateType(writer, target);
+                try writer.writeByte(')');
+                try self.generateOperand(allocator, reached, writer, &call.arguments[1].value);
+                try writer.writeByte(')');
             },
         }
     }
@@ -2233,6 +3192,7 @@ pub const Generator = struct {
             .subtract => {
                 if (operation.right.type.? == .pointer) return self.generatePointerDifference(allocator, reached, writer, operation);
             },
+            .combine, .result, .@"catch" => unreachable,
             .multiply,
             .divide,
             .add,
@@ -2373,11 +3333,15 @@ pub const Generator = struct {
     ) WriteError!void {
         const equal = operation.operator == .equal;
         if (!equal) try writer.writeAll("(!");
-        try self.generateType(writer, operation.left.type.?);
+        var operand_type = operation.left.type.?;
+        if (isConversionCall(operand_type, operation.right.type.?) and types.isEnumPart(operand_type.@"enum", operation.right.type.?.@"enum")) {
+            operand_type = operation.right.type.?;
+        }
+        try self.generateType(writer, operand_type);
         try writer.writeAll("_equal(");
-        try self.generateOperand(allocator, reached, writer, operation.left);
+        try self.generateConvertedOperand(allocator, reached, writer, operation.left, operand_type);
         try writer.writeAll(", ");
-        try self.generateOperand(allocator, reached, writer, operation.right);
+        try self.generateConvertedOperand(allocator, reached, writer, operation.right, operand_type);
         try writer.writeByte(')');
         if (!equal) try writer.writeByte(')');
     }
@@ -2497,7 +3461,7 @@ pub const Generator = struct {
             .tuple => return writer.print("._{d}", .{indexing.position.?}),
             .array, .slice => try writer.writeAll(".items"),
             .pointer => |pointer| if (!pointer.many) try writer.writeAll("->items"),
-            .number, .boolean, .void, .type, .@"struct", .optional, .function, .variable, .application => {
+            .number, .boolean, .void, .type, .@"struct", .@"enum", .optional, .result, .function, .variable, .application => {
                 unreachable;
             },
         }
@@ -2553,7 +3517,7 @@ pub const Generator = struct {
         const read_only = switch (value.type.?) {
             .array => isStoredAsConstant(value.*),
             .pointer => |pointer| pointer.constant,
-            .number, .boolean, .void, .type, .@"struct", .slice, .optional, .tuple, .function, .variable, .application => false,
+            .number, .boolean, .void, .type, .@"struct", .@"enum", .slice, .optional, .result, .tuple, .function, .variable, .application => false,
         };
         if (read_only) {
             try writer.writeByte('(');
@@ -2564,7 +3528,7 @@ pub const Generator = struct {
         switch (value.type.?) {
             .array, .slice => try writer.writeAll(".items"),
             .pointer => |pointer| if (!pointer.many) try writer.writeAll("->items"),
-            .number, .boolean, .void, .type, .@"struct", .optional, .tuple, .function, .variable, .application => {
+            .number, .boolean, .void, .type, .@"struct", .@"enum", .optional, .result, .tuple, .function, .variable, .application => {
                 unreachable;
             },
         }
@@ -2607,7 +3571,7 @@ pub const Generator = struct {
                 try self.generateBase(allocator, reached, writer, value);
                 try writer.writeAll(".length");
             },
-            .number, .boolean, .void, .type, .@"struct", .pointer, .optional, .tuple, .function, .variable, .application => {
+            .number, .boolean, .void, .type, .@"struct", .@"enum", .pointer, .optional, .result, .tuple, .function, .variable, .application => {
                 unreachable;
             },
         }
@@ -2729,7 +3693,7 @@ pub const Generator = struct {
                 const constant_declaration = declaration.kind.constant_declaration;
                 break :callee_type ast.extractDeclaredType(constant_declaration.type, constant_declaration.value);
             },
-            .function, .type, .typeclass_function, .typeclass_method => unreachable,
+            .function, .type, .typeclass_function, .typeclass_method, .case, .builtin => unreachable,
         };
         try writer.writeByte('(');
         var written = false;
@@ -2870,6 +3834,7 @@ pub const Generator = struct {
             .field_access,
             .dereference,
             .unwrap,
+            .@"try",
             => unreachable,
         }
     }
@@ -2909,6 +3874,10 @@ pub const Generator = struct {
                 }
                 return writer.writeAll(struct_type.name);
             },
+            .@"enum" => {
+                try writer.writeAll("mn_");
+                return self.generateTypeName(writer, value_type);
+            },
             .array => |array| {
                 try writer.print("mn_array_{d}_", .{array.length});
                 return self.generateTypeName(writer, array.element);
@@ -2927,6 +3896,10 @@ pub const Generator = struct {
                 if (isPointerOptional(value_type)) return self.generateType(writer, optional.child);
                 try writer.writeAll("mn_optional_");
                 return self.generateTypeName(writer, optional.child);
+            },
+            .result => {
+                try writer.writeAll("mn_");
+                return self.generateTypeName(writer, value_type);
             },
             .tuple => {
                 try writer.writeAll("mn_");
@@ -2958,8 +3931,8 @@ pub const Generator = struct {
         writer: *std.Io.Writer,
         value_type: types.Type,
     ) WriteError!void {
-        const tagged = value_type == .@"struct" or value_type == .array or value_type == .slice or
-            value_type == .tuple or (value_type == .optional and !isPointerOptional(value_type));
+        const tagged = value_type == .@"struct" or value_type == .@"enum" or value_type == .array or value_type == .slice or
+            value_type == .tuple or value_type == .result or (value_type == .optional and !isPointerOptional(value_type));
         if (tagged and !isZeroSized(value_type)) try writer.writeAll("struct ");
         try self.generateType(writer, value_type);
     }
@@ -2978,6 +3951,15 @@ pub const Generator = struct {
                 }
                 try writer.writeAll(struct_type.name);
             },
+            .@"enum" => |enumeration| {
+                for (enumeration.parts, 0..) |part, index| {
+                    if (index > 0) try writer.writeAll("_or_");
+                    for (self.program.modules[part.module].path) |path_part| {
+                        try writer.print("{s}_", .{path_part});
+                    }
+                    try writer.writeAll(part.name);
+                }
+            },
             .array => |array| {
                 try writer.print("array_{d}_", .{array.length});
                 try self.generateTypeName(writer, array.element);
@@ -2993,6 +3975,12 @@ pub const Generator = struct {
             .optional => |optional| {
                 try writer.writeAll("optional_");
                 try self.generateTypeName(writer, optional.child);
+            },
+            .result => |result| {
+                try writer.writeAll("result_");
+                try self.generateTypeName(writer, .{ .@"enum" = result.error_set });
+                try writer.writeByte('_');
+                try self.generateTypeName(writer, result.value);
             },
             .tuple => |tuple| {
                 try writer.print("tuple_{d}", .{tuple.elements.len});
@@ -3057,6 +4045,7 @@ pub const Generator = struct {
             },
             .field_access => |access| return self.generateEffects(allocator, reached, writer, access.value.*),
             .dereference, .unwrap => |operand| return self.generateEffects(allocator, reached, writer, operand.*),
+            .@"try" => return self.generateExpression(allocator, reached, writer, expression),
             .integer_literal,
             .float_literal,
             .boolean_literal,
@@ -3099,7 +4088,7 @@ pub const Generator = struct {
         const declaration = self.program.modules[module_index].declarations[index];
         const constant = switch (declaration.kind) {
             .constant_declaration => |constant| constant,
-            .function_declaration, .function_definition, .struct_definition => return false,
+            .function_declaration, .function_definition, .struct_definition, .enum_definition => return false,
             .typeclass_definition, .instance_declaration, .import => return false,
         };
         if (ast.isAlias(constant) or constant.value.type == null) return false;
@@ -3149,6 +4138,12 @@ const Reached = struct {
     slices: std.ArrayList(types.Type) = .empty,
     definitions: std.ArrayList(types.Type) = .empty,
     equalities: std.ArrayList(types.Type) = .empty,
+    conversions: std.ArrayList(Conversion) = .empty,
+};
+
+const Conversion = struct {
+    source: types.Type,
+    target: types.Type,
 };
 
 const Form = enum {
@@ -3178,12 +4173,25 @@ const Operation = struct {
     right: *const ast.Expression,
 };
 
+const Frame = struct {
+    deferred: std.ArrayList(ast.Defer) = .empty,
+    loop: ?*const ast.Statement = null,
+};
+
+const Errors = union(enum) {
+    none,
+    all,
+    dynamic: []const u8,
+};
+
 const Step = struct {
     expression: *const ast.Expression,
     scope: *const ast.Expression,
     statement: *const ast.Statement,
     temporary: ?usize,
     address: ?types.Type = null,
+    lifted: bool = false,
+    lazy: bool = false,
 };
 
 const Static = struct {
@@ -3230,7 +4238,7 @@ fn buildCName(
         .function_definition => |function| {
             if (function.check_only) return null;
             const signature = function.signature;
-            if (module_index == 0 and ast.isMain(signature)) return signature.name;
+            if (module_index == 0 and ast.isMain(signature) and !isResultMain(declaration.kind)) return signature.name;
             if (signature.typeclass) |typeclass| {
                 var parts: std.ArrayList([]const u8) = .empty;
                 for (function.instance_arguments) |argument| {
@@ -3257,7 +4265,7 @@ fn buildCName(
         .constant_declaration => |constant| {
             return try buildQualifiedName(allocator, module.path, constant.name);
         },
-        .struct_definition, .typeclass_definition, .instance_declaration, .import => return null,
+        .struct_definition, .enum_definition, .typeclass_definition, .instance_declaration, .import => return null,
     }
 }
 
@@ -3287,6 +4295,18 @@ fn buildTypeName(
             const path = try std.mem.join(allocator, "_", program.modules[struct_type.module].path);
             return std.mem.concat(allocator, u8, &.{ path, "_", struct_type.name });
         },
+        .@"enum" => |enumeration| {
+            var names: std.ArrayList([]const u8) = .empty;
+            for (enumeration.parts) |part| {
+                if (part.module == module_index) {
+                    try names.append(allocator, part.name);
+                } else {
+                    const path = try std.mem.join(allocator, "_", program.modules[part.module].path);
+                    try names.append(allocator, try std.mem.concat(allocator, u8, &.{ path, "_", part.name }));
+                }
+            }
+            return std.mem.join(allocator, "_or_", names.items);
+        },
         .number => |number| @tagName(number),
         .boolean => "bool",
         .array => |array| {
@@ -3304,6 +4324,11 @@ fn buildTypeName(
         .optional => |optional| {
             const child = try buildTypeName(allocator, program, module_index, optional.child);
             return std.mem.concat(allocator, u8, &.{ "optional_", child });
+        },
+        .result => |result| {
+            const error_set = try buildTypeName(allocator, program, module_index, .{ .@"enum" = result.error_set });
+            const value = try buildTypeName(allocator, program, module_index, result.value);
+            return std.mem.concat(allocator, u8, &.{ "result_", error_set, "_", value });
         },
         .tuple => |tuple| {
             var name: std.ArrayList(u8) = .empty;
@@ -3364,10 +4389,20 @@ fn collectContainedModulesOf(
             if (std.mem.findScalar(usize, contained.items, struct_type.module) != null) return;
             try contained.append(allocator, struct_type.module);
         },
+        .@"enum" => |enumeration| {
+            for (enumeration.parts) |part| {
+                if (std.mem.findScalar(usize, contained.items, part.module) != null) continue;
+                try contained.append(allocator, part.module);
+            }
+        },
         .array => |array| try collectContainedModulesOf(allocator, contained, array.element),
         .optional => |optional| {
             if (isPointerOptional(value_type)) return;
             try collectContainedModulesOf(allocator, contained, optional.child);
+        },
+        .result => |result| {
+            try collectContainedModulesOf(allocator, contained, .{ .@"enum" = result.error_set });
+            try collectContainedModulesOf(allocator, contained, result.value);
         },
         .tuple => |tuple| {
             for (tuple.elements) |element| {
@@ -3400,7 +4435,14 @@ fn collectPrototypeTags(
             if (!in_prototype) return collectPrototypeTags(allocator, tags, optional.child, false);
             if (!containsType(tags.items, value_type)) try tags.append(allocator, value_type);
         },
-        .@"struct", .array, .slice, .tuple => {
+        .result => |result| {
+            if (!in_prototype) {
+                try collectPrototypeTags(allocator, tags, .{ .@"enum" = result.error_set }, false);
+                return collectPrototypeTags(allocator, tags, result.value, false);
+            }
+            if (!containsType(tags.items, value_type)) try tags.append(allocator, value_type);
+        },
+        .@"struct", .@"enum", .array, .slice, .tuple => {
             if (!in_prototype or containsType(tags.items, value_type)) return;
             try tags.append(allocator, value_type);
         },
@@ -3436,6 +4478,7 @@ fn hasEffects(expression: ast.Expression) bool {
         },
         .field_access => |access| return hasEffects(access.value.*),
         .dereference, .unwrap => |operand| return hasEffects(operand.*),
+        .@"try" => return true,
         .integer_literal,
         .float_literal,
         .boolean_literal,
@@ -3459,14 +4502,14 @@ fn hasEffects(expression: ast.Expression) bool {
 
 fn isUnit(expression: ast.Expression) bool {
     return switch (expression.kind) {
-        .call => true,
+        .call, .@"try" => true,
         .binary => |binary| isShortCircuit(binary.operator) and hasEffects(binary.right.*),
         else => false,
     };
 }
 
 fn isShortCircuit(operator: ast.BinaryOperator) bool {
-    return operator == .@"and" or operator == .@"or" or operator == .@"orelse";
+    return operator == .@"and" or operator == .@"or" or operator == .@"orelse" or operator == .@"catch";
 }
 
 fn isComparison(operator: ast.BinaryOperator) bool {
@@ -3488,7 +4531,10 @@ fn isComparison(operator: ast.BinaryOperator) bool {
         .bitwise_and,
         .bitwise_exclusive_or,
         .bitwise_or,
+        .combine,
+        .result,
         .@"orelse",
+        .@"catch",
         .@"and",
         .@"or",
         => false,
@@ -3511,7 +4557,7 @@ fn operatorSymbol(operator: ast.BinaryOperator) []const u8 {
         .less_than_or_equal => "<=",
         .greater_than => ">",
         .greater_than_or_equal => ">=",
-        .shift_left, .shift_right, .@"and", .@"or", .@"orelse" => unreachable,
+        .shift_left, .shift_right, .@"and", .@"or", .@"orelse", .@"catch", .combine, .result => unreachable,
     };
 }
 
@@ -3538,10 +4584,16 @@ fn collectEqualities(
 ) std.mem.Allocator.Error!void {
     if (!hasEqualityHelper(value_type)) return;
     if (containsType(equalities.items, value_type)) return;
+    if (value_type == .@"enum") {
+        for (value_type.@"enum".cases) |case| {
+            try collectEqualities(allocator, equalities, case.type orelse continue);
+        }
+        return equalities.append(allocator, value_type);
+    }
     const child = switch (value_type) {
         .array => |array| array.element,
         .optional => |optional| optional.child,
-        .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .tuple, .function, .variable, .application => {
+        .number, .boolean, .void, .type, .@"struct", .@"enum", .slice, .pointer, .result, .tuple, .function, .variable, .application => {
             unreachable;
         },
     };
@@ -3553,8 +4605,22 @@ fn hasEqualityHelper(value_type: types.Type) bool {
     return switch (value_type) {
         .array => !isZeroSized(value_type),
         .optional => !isPointerOptional(value_type),
-        .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .tuple, .function, .variable, .application => false,
+        .@"enum" => true,
+        .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .result, .tuple, .function, .variable, .application => false,
     };
+}
+
+fn hasPayload(enumeration: *const types.Enum) bool {
+    for (enumeration.cases) |case| {
+        const payload = case.type orelse continue;
+        if (!isZeroSized(payload)) return true;
+    }
+    return false;
+}
+
+fn isConversionCall(value_type: types.Type, expected: types.Type) bool {
+    if (value_type == .result and expected == .result) return value_type.result != expected.result;
+    return value_type == .@"enum" and expected == .@"enum" and value_type.@"enum" != expected.@"enum";
 }
 
 fn collectTargetSteps(
@@ -3602,7 +4668,8 @@ fn findStatementExpression(statement: *const ast.Statement) ?*const ast.Expressi
         .assignment => |*assignment| &assignment.value,
         .@"if" => |*conditional| &conditional.condition,
         .@"while" => |*loop| &loop.condition,
-        .@"for", .@"break", .@"continue" => null,
+        .match => |*matching| &matching.value,
+        .@"for", .@"defer", .@"break", .@"continue" => null,
     };
 }
 
@@ -3668,11 +4735,40 @@ fn collectScopeSteps(
     statement: *const ast.Statement,
     scope: *const ast.Expression,
 ) std.mem.Allocator.Error!void {
-    if (try needsSequence(allocator, scope)) {
+    const tried = try containsTry(allocator, scope);
+    if (tried or try needsSequence(allocator, scope)) {
         const consumed = isUnit(scope.*) or !isZeroSized(scope.type.?);
         try collectUnitSteps(allocator, steps, statement, scope, scope, consumed, false);
     }
+    if (tried and (scope.kind == .@"try" or (scope.kind == .binary and isShortCircuit(scope.kind.binary.operator)))) {
+        const stored = !isZeroSized(scope.type.?) and statement.kind != .discard;
+        try steps.append(allocator, .{
+            .expression = scope,
+            .scope = scope,
+            .statement = statement,
+            .temporary = if (stored) countTemporaries(steps.items) + 1 else null,
+        });
+    }
     try collectInnerScopeSteps(allocator, steps, statement, scope);
+}
+
+fn liftSteps(allocator: std.mem.Allocator, steps: []Step) std.mem.Allocator.Error!void {
+    const tried = for (steps) |step| {
+        if (step.expression.kind == .@"try") break true;
+    } else false;
+    if (!tried) return;
+    for (steps) |*step| step.lifted = !step.lazy or try containsTry(allocator, step.scope);
+}
+
+fn containsTry(allocator: std.mem.Allocator, expression: *const ast.Expression) std.mem.Allocator.Error!bool {
+    if (expression.kind == .@"try") return true;
+    if (expression.kind == .binary and isShortCircuit(expression.kind.binary.operator)) {
+        if (try containsTry(allocator, expression.kind.binary.right)) return true;
+    }
+    for (try collectScopeChildren(allocator, expression)) |child| {
+        if (try containsTry(allocator, child)) return true;
+    }
+    return false;
 }
 
 fn needsSequence(
@@ -3704,7 +4800,9 @@ fn repeatsUnit(
 }
 
 fn repeatsOptional(expression: ast.Expression) bool {
-    if (expression.kind != .binary or expression.kind.binary.operator != .@"orelse") return false;
+    if (expression.kind != .binary) return false;
+    const operator = expression.kind.binary.operator;
+    if (operator != .@"orelse" and operator != .@"catch") return false;
     return !isPlainName(expression.kind.binary.left.*);
 }
 
@@ -3769,7 +4867,7 @@ fn isMemoryRead(expression: ast.Expression) bool {
         .identifier => |identifier| switch (identifier.resolution.?) {
             .local => |statement| statement.kind == .variable_declaration,
             .parameter, .constant, .function, .type, .element => false,
-            .typeclass_function, .typeclass_method => unreachable,
+            .typeclass_function, .typeclass_method, .case, .builtin => unreachable,
         },
         .field_access => |access| access.value.type.? == .pointer or isMemoryRead(access.value.*),
         .index => |indexing| !isStorage(indexing.value.type.?) or isMemoryRead(indexing.value.*),
@@ -3823,7 +4921,12 @@ fn collectInnerScopeSteps(
     expression: *const ast.Expression,
 ) std.mem.Allocator.Error!void {
     if (expression.kind == .binary and isShortCircuit(expression.kind.binary.operator)) {
-        try collectScopeSteps(allocator, steps, statement, expression.kind.binary.right);
+        const right = expression.kind.binary.right;
+        const start = steps.items.len;
+        try collectScopeSteps(allocator, steps, statement, right);
+        for (steps.items[start..]) |*step| {
+            if (step.scope == right) step.lazy = true;
+        }
     }
     for (try collectScopeChildren(allocator, expression)) |child| {
         try collectInnerScopeSteps(allocator, steps, statement, child);
@@ -3858,7 +4961,7 @@ fn collectScopeChildren(
             if (slice.end) |end| try children.append(allocator, end);
         },
         .field_access => |access| try children.append(allocator, access.value),
-        .dereference, .unwrap => |operand| try children.append(allocator, operand),
+        .dereference, .unwrap, .@"try" => |operand| try children.append(allocator, operand),
         .integer_literal,
         .float_literal,
         .boolean_literal,
@@ -3893,7 +4996,7 @@ fn countTemporaries(steps: []const Step) usize {
 fn extractBody(kind: ast.DeclarationKind) []const ast.Statement {
     return switch (kind) {
         .function_definition => |function| function.body,
-        .function_declaration, .constant_declaration, .struct_definition => &.{},
+        .function_declaration, .constant_declaration, .struct_definition, .enum_definition => &.{},
         .typeclass_definition, .instance_declaration, .import => &.{},
     };
 }
@@ -3914,7 +5017,7 @@ fn buildLocalNames(
     var statements: std.ArrayList(*const ast.Statement) = .empty;
     try collectStatements(allocator, &statements, body);
     for (statements.items) |statement| {
-        if (statement.kind == .@"for" or statement.kind == .tuple_declaration) {
+        if (declaresNames(statement.*)) {
             for (ast.extractElementNames(statement.*)) |name| try written.append(allocator, name.name);
         }
         const local = extractLocal(statement.*) orelse continue;
@@ -3923,10 +5026,14 @@ fn buildLocalNames(
 
     var local_names: std.ArrayList(LocalName) = .empty;
     for (statements.items) |statement| {
-        if (statement.kind == .@"for" or statement.kind == .tuple_declaration) {
+        if (declaresNames(statement.*)) {
             for (ast.extractElementNames(statement.*), 0..) |name, position| {
                 const element: ast.Resolution.Element = .{ .statement = statement, .position = position };
-                const scope = if (statement.kind == .@"for") statement.kind.@"for".body else body;
+                const scope = switch (statement.kind) {
+                    .@"for" => |loop| loop.body,
+                    .match => |matching| matching.branches[position].body,
+                    else => body,
+                };
                 if (!isElementDeclared(scope, element)) continue;
                 try local_names.append(allocator, .{
                     .resolution = .{ .element = element },
@@ -3943,6 +5050,10 @@ fn buildLocalNames(
         });
     }
     return local_names.items;
+}
+
+fn declaresNames(statement: ast.Statement) bool {
+    return statement.kind == .@"for" or statement.kind == .tuple_declaration or statement.kind == .match;
 }
 
 fn reserveName(
@@ -3968,21 +5079,24 @@ fn collectStatements(
 ) std.mem.Allocator.Error!void {
     for (body) |*statement| {
         try statements.append(allocator, statement);
-        for (ast.extractBlocks(statement.*)) |block| try collectStatements(allocator, statements, block);
+        if (statement.kind == .@"defer") try statements.append(allocator, statement.kind.@"defer".statement);
+        var blocks = ast.iterateBlocks(statement.*);
+        while (blocks.next()) |block| try collectStatements(allocator, statements, block);
     }
 }
 
-fn collectTupleDeclarations(
+fn collectKind(
     allocator: std.mem.Allocator,
     body: []const ast.Statement,
+    kind: std.meta.Tag(ast.StatementKind),
 ) std.mem.Allocator.Error![]const *const ast.Statement {
     var statements: std.ArrayList(*const ast.Statement) = .empty;
     try collectStatements(allocator, &statements, body);
-    var declarations: std.ArrayList(*const ast.Statement) = .empty;
+    var collected: std.ArrayList(*const ast.Statement) = .empty;
     for (statements.items) |statement| {
-        if (statement.kind == .tuple_declaration) try declarations.append(allocator, statement);
+        if (statement.kind == kind) try collected.append(allocator, statement);
     }
-    return declarations.items;
+    return collected.items;
 }
 
 fn collectLoops(
@@ -4002,7 +5116,7 @@ fn containsGoto(
     body: []const ast.Statement,
     loop: *const ast.Statement,
     tag: std.meta.Tag(ast.StatementKind),
-    innermost_loop: *const ast.Statement,
+    innermost_loop: ?*const ast.Statement,
 ) bool {
     for (body) |*statement| {
         switch (statement.kind) {
@@ -4020,11 +5134,24 @@ fn containsGoto(
                 if (!isEmptyLoop(statement.*) and containsGoto(inner_body, loop, tag, statement)) return true;
                 if (containsGoto(else_body, loop, tag, innermost_loop)) return true;
             },
+            .match => |matching| {
+                for (matching.branches) |branch| {
+                    if (containsGoto(branch.body, loop, tag, null)) return true;
+                }
+            },
             .noop, .@"return", .discard, .call, .constant_declaration, .tuple_declaration => {},
-            .variable_declaration, .assignment => {},
+            .variable_declaration, .assignment, .@"defer" => {},
         }
     }
     return false;
+}
+
+fn endsWithJump(body: []const ast.Statement) bool {
+    if (body.len == 0) return false;
+    return switch (body[body.len - 1].kind) {
+        .@"return", .@"break", .@"continue" => true,
+        else => false,
+    };
 }
 
 fn isGoto(
@@ -4041,7 +5168,7 @@ fn extractLocal(statement: ast.Statement) ?Local {
         .constant_declaration => |constant| .{ .name = constant.name, .value = constant.value },
         .variable_declaration => |variable| .{ .name = variable.name, .value = variable.value },
         .noop, .@"return", .discard, .call, .tuple_declaration, .assignment, .@"if", .@"while", .@"for" => null,
-        .@"break", .@"continue" => null,
+        .match, .@"defer", .@"break", .@"continue" => null,
     };
 }
 
@@ -4050,7 +5177,7 @@ fn findLocalType(statement: ast.Statement) types.Type {
         .constant_declaration => |constant| ast.extractDeclaredType(constant.type, constant.value),
         .variable_declaration => |variable| ast.extractDeclaredType(variable.type, variable.value),
         .noop, .@"return", .discard, .call, .tuple_declaration, .assignment, .@"if", .@"while", .@"for" => unreachable,
-        .@"break", .@"continue" => unreachable,
+        .match, .@"defer", .@"break", .@"continue" => unreachable,
     };
 }
 
@@ -4104,10 +5231,15 @@ fn isDiscarded(body: []const ast.Statement, resolution: ast.Resolution) bool {
             .@"break",
             .@"continue",
             => continue,
-            .@"if", .@"while", .@"for" => {
-                for (ast.extractBlocks(statement)) |block| {
+            .@"if", .@"while", .@"for", .match => {
+                var blocks = ast.iterateBlocks(statement);
+                while (blocks.next()) |block| {
                     if (isDiscarded(block, resolution)) return true;
                 }
+                continue;
+            },
+            .@"defer" => |deferred| {
+                if (isDiscarded(deferred.statement[0..1], resolution)) return true;
                 continue;
             },
         };
@@ -4122,8 +5254,8 @@ fn isStoredAsConstant(expression: ast.Expression) bool {
         .identifier => |identifier| switch (identifier.resolution.?) {
             .local => |statement| statement.kind == .constant_declaration,
             .constant, .element => true,
-            .parameter, .function, .type => false,
-            .typeclass_function, .typeclass_method => unreachable,
+            .parameter, .function, .type, .case => false,
+            .typeclass_function, .typeclass_method, .builtin => unreachable,
         },
         .path_expression => true,
         .field_access => |access| {
@@ -4135,7 +5267,7 @@ fn isStoredAsConstant(expression: ast.Expression) bool {
             .array, .tuple => isStoredAsConstant(indexing.value.*),
             .pointer => |pointer| pointer.constant,
             .slice => false,
-            .number, .boolean, .void, .type, .@"struct", .optional, .function, .variable, .application => {
+            .number, .boolean, .void, .type, .@"struct", .@"enum", .optional, .result, .function, .variable, .application => {
                 unreachable;
             },
         },
@@ -4153,7 +5285,7 @@ fn findTargetRoot(target: ast.Expression) ?*const ast.Statement {
         },
         .index => |indexing| switch (indexing.value.type.?) {
             .array, .tuple => findTargetRoot(indexing.value.*),
-            .number, .boolean, .void, .type, .@"struct", .slice, .pointer, .optional, .function, .variable, .application => {
+            .number, .boolean, .void, .type, .@"struct", .@"enum", .slice, .pointer, .optional, .result, .function, .variable, .application => {
                 return null;
             },
         },
@@ -4205,6 +5337,10 @@ fn findAddressedContainer(statement: *const ast.Statement) ?*const ast.Expressio
             if (!ast.hasPointerName(loop.names) or loop.sequence != .value) return null;
             return &loop.sequence.value;
         },
+        .match => |*matching| {
+            if (!ast.hasPointerName(matching.names)) return null;
+            return &matching.value;
+        },
         .noop,
         .@"return",
         .discard,
@@ -4214,6 +5350,7 @@ fn findAddressedContainer(statement: *const ast.Statement) ?*const ast.Expressio
         .assignment,
         .@"if",
         .@"while",
+        .@"defer",
         .@"break",
         .@"continue",
         => null,
@@ -4270,6 +5407,7 @@ fn containsPlace(value: Value) bool {
             }
             return false;
         },
+        .enumeration, .failure => |enumeration| if (enumeration.value) |inner| containsPlace(inner.*) else false,
         .integer, .float, .boolean, .void, .undefined, .function, .type => false,
     };
 }
@@ -4290,6 +5428,19 @@ fn collectAddressedConstantsOf(
     for (try collectScopeChildren(allocator, expression)) |child| {
         try collectAddressedConstantsOf(allocator, addressed, child);
     }
+}
+
+fn isResultWrap(value_type: types.Type, expected: types.Type) bool {
+    return expected == .result and value_type != .result;
+}
+
+fn isResultMain(kind: ast.DeclarationKind) bool {
+    return kind == .function_definition and ast.extractType(kind.function_definition.signature.return_type) == .result;
+}
+
+fn needsFinalReturn(return_type: types.Type, body: []const ast.Statement) bool {
+    if (return_type != .result or !isZeroSized(return_type.result.value)) return false;
+    return !endsWithJump(body);
 }
 
 fn isOptionalWrap(value_type: types.Type, expected: types.Type) bool {
@@ -4323,7 +5474,7 @@ fn isPointerOptional(value_type: types.Type) bool {
 fn findStruct(value_type: types.Type) ?types.Struct {
     return switch (value_type) {
         .@"struct" => |struct_type| struct_type,
-        .number, .boolean, .void, .type, .array, .slice, .pointer, .optional, .tuple, .function, .variable, .application => {
+        .number, .boolean, .void, .type, .@"enum", .array, .slice, .pointer, .optional, .result, .tuple, .function, .variable, .application => {
             return null;
         },
     };
@@ -4345,9 +5496,19 @@ fn orderDefinition(
         },
         .array => |array| try orderDefinition(allocator, ordered, module_index, array.element),
         .slice => {},
+        .@"enum" => |enumeration| {
+            if (types.isDeclaredEnum(enumeration) and enumeration.module != module_index) return;
+            for (enumeration.cases) |case| {
+                try orderDefinition(allocator, ordered, module_index, case.type orelse continue);
+            }
+        },
         .optional => |optional| {
             if (isPointerOptional(value_type)) return;
             try orderDefinition(allocator, ordered, module_index, optional.child);
+        },
+        .result => |result| {
+            try orderDefinition(allocator, ordered, module_index, .{ .@"enum" = result.error_set });
+            try orderDefinition(allocator, ordered, module_index, result.value);
         },
         .tuple => |tuple| {
             for (tuple.elements) |element| {
@@ -4498,11 +5659,13 @@ fn isSameCType(one: types.Type, two: types.Type) bool {
         .pointer => |pointer| two == .pointer and pointer.many == two.pointer.many and
             pointer.constant == two.pointer.constant and isSameCType(pointer.target, two.pointer.target),
         .optional => |optional| two == .optional and isSameCType(optional.child, two.optional.child),
+        .result => |result| two == .result and result.error_set == two.result.error_set and
+            isSameCType(result.value, two.result.value),
         .tuple => |tuple| two == .tuple and isSameCTypes(tuple.elements, two.tuple.elements),
         .function => |function| two == .function and
             isSameCType(function.return_type, two.function.return_type) and
             isSameCTypes(function.parameters, two.function.parameters),
-        .number, .boolean, .void, .type, .@"struct", .variable, .application => {
+        .number, .boolean, .void, .type, .@"struct", .@"enum", .variable, .application => {
             return std.meta.eql(one, two);
         },
     };
@@ -4527,8 +5690,8 @@ test "Generator.generate: writes the modules and the runtime files they use" {
     defer plugin_directory.cleanup();
     var output_directory = std.testing.tmpDir(.{});
     defer output_directory.cleanup();
-    try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []const u8)\nconst write = mn_runtime_stdout_write" });
+    try compiler_directory.dir.createDirPath(std.testing.io, "mn");
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []const u8)\nconst write = mn_runtime_stdout_write" });
     try plugin_directory.dir.createDirPath(std.testing.io, "runtime");
     try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/monolith.h", .data = "header" });
     try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/stdout.c", .data = "stdout" });
@@ -4537,7 +5700,7 @@ test "Generator.generate: writes the modules and the runtime files they use" {
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
     const compiler_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &compiler_directory.sub_path });
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import std\nfn show(): std::stdout::write(\"hi\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn show(): mn::stdout::write(\"hi\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4595,13 +5758,13 @@ test "Generator.generate: builds an executable when the main module defines main
     defer compiler_directory.cleanup();
     var output_directory = std.testing.tmpDir(.{});
     defer output_directory.cleanup();
-    try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []const u8)\nconst write = mn_runtime_stdout_write" });
+    try compiler_directory.dir.createDirPath(std.testing.io, "mn");
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []const u8)\nconst write = mn_runtime_stdout_write" });
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
     const compiler_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &compiler_directory.sub_path });
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "hello.mn", .data = "import std\nfn main(): std::stdout::write(\"hi\\n\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "hello.mn", .data = "import mn\nfn main(): mn::stdout::write(\"hi\\n\")" });
     try loader.loadMainModule(&arena, std.testing.io, "hello");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4734,8 +5897,8 @@ test "generateFiles: writes the standard library at its module path" {
     defer program_directory.cleanup();
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
-    try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []const u8)\nconst write = mn_runtime_stdout_write" });
+    try compiler_directory.dir.createDirPath(std.testing.io, "mn");
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []const u8)\nconst write = mn_runtime_stdout_write" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -4745,7 +5908,7 @@ test "generateFiles: writes the standard library at its module path" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import std\nfn main(): std::stdout::write(\"hi\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn main(): mn::stdout::write(\"hi\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4757,10 +5920,10 @@ test "generateFiles: writes the standard library at its module path" {
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n#include \"std/stdout.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    mn_runtime_stdout_write((mn_slice_u8){ .items = (uint8_t *)\"hi\", .length = 2 });\n}\n",
+        "#include \"main.h\"\n#include \"mn/stdout.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    mn_runtime_stdout_write((mn_slice_u8){ .items = (uint8_t *)\"hi\", .length = 2 });\n}\n",
         files[1].contents,
     );
-    try std.testing.expectEqualStrings("std/stdout.h", files[2].path);
+    try std.testing.expectEqualStrings("mn/stdout.h", files[2].path);
     try std.testing.expectEqualStrings(
         "#pragma once\n\n#include \"../runtime/monolith.h\"\n\ntypedef struct mn_slice_u8 mn_slice_u8;\n\nvoid mn_runtime_stdout_write(mn_slice_u8 text);\n",
         files[2].contents,
@@ -4777,8 +5940,8 @@ test "generateFiles: calls a standard library function that takes the empty tupl
     defer program_directory.cleanup();
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
-    try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []const u8)\n\nconst write = mn_runtime_stdout_write\n\nfn println(text: []const u8, _: []):\n    write(text)\n    write(\"\\n\")\n" });
+    try compiler_directory.dir.createDirPath(std.testing.io, "mn");
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []const u8)\n\nconst write = mn_runtime_stdout_write\n\nfn println(text: []const u8, _: []):\n    write(text)\n    write(\"\\n\")\n" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -4788,7 +5951,7 @@ test "generateFiles: calls a standard library function that takes the empty tupl
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import std\nfn main(): std::stdout::println(\"hi\", {})" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn main(): mn::stdout::println(\"hi\", {})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4800,15 +5963,15 @@ test "generateFiles: calls a standard library function that takes the empty tupl
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n#include \"std/stdout.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    mn_std_stdout_println((mn_slice_u8){ .items = (uint8_t *)\"hi\", .length = 2 });\n}\n",
+        "#include \"main.h\"\n#include \"mn/stdout.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    mn_mn_stdout_println((mn_slice_u8){ .items = (uint8_t *)\"hi\", .length = 2 });\n}\n",
         files[1].contents,
     );
     try std.testing.expectEqualStrings(
-        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\ntypedef struct mn_slice_u8 mn_slice_u8;\n\nvoid mn_runtime_stdout_write(mn_slice_u8 text);\n\nvoid mn_std_stdout_println(mn_slice_u8 text);\n",
+        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\ntypedef struct mn_slice_u8 mn_slice_u8;\n\nvoid mn_runtime_stdout_write(mn_slice_u8 text);\n\nvoid mn_mn_stdout_println(mn_slice_u8 text);\n",
         files[2].contents,
     );
     try std.testing.expectEqualStrings(
-        "#include \"stdout.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nvoid mn_std_stdout_println(mn_slice_u8 text) {\n    mn_runtime_stdout_write(text);\n    mn_runtime_stdout_write((mn_slice_u8){ .items = (uint8_t *)\"\\n\", .length = 1 });\n}\n",
+        "#include \"stdout.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nvoid mn_mn_stdout_println(mn_slice_u8 text) {\n    mn_runtime_stdout_write(text);\n    mn_runtime_stdout_write((mn_slice_u8){ .items = (uint8_t *)\"\\n\", .length = 1 });\n}\n",
         files[3].contents,
     );
 }
@@ -5443,6 +6606,40 @@ test "generateStruct: leaves out fields of zero-sized types" {
     try std.testing.expectEqualStrings(
         "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_Tagged {\n    int32_t value;\n} mn_main_Tagged;\n\nvoid mn_main_show(mn_main_Tagged);\n",
         files[0].contents,
+    );
+}
+
+test "generateEnumDefinition: writes an enum and error sets with their cases, equality and conversion to a combined set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing_end\n    bad_digit: u8\nerror FileError:\n    missing_file\n    missing_end\nenum Token:\n    number: i64\n    end\n    fn is_end(self: Self) -> bool: return self == Token::end\nfn widen(failure: FileError) -> ParseError || FileError: return failure\nfn is_missing(failure: ParseError || FileError) -> bool: return failure == ParseError::missing_end\nfn digit(value: u8) -> ParseError: return ParseError::bad_digit(value)\nfn number() -> Token: return Token::number(4)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_ParseError {\n    uint32_t tag;\n    union {\n        uint8_t bad_digit;\n    } value;\n} mn_main_ParseError;\n\ntypedef struct mn_main_FileError {\n    uint32_t tag;\n} mn_main_FileError;\n\ntypedef struct mn_main_Token {\n    uint32_t tag;\n    union {\n        int64_t number;\n    } value;\n} mn_main_Token;\n\ntypedef struct mn_main_ParseError_or_main_FileError mn_main_ParseError_or_main_FileError;\n\nbool mn_main_Token_is_end(mn_main_Token self);\nmn_main_ParseError_or_main_FileError mn_main_widen(mn_main_FileError failure);\nbool mn_main_is_missing(mn_main_ParseError_or_main_FileError failure);\nmn_main_ParseError mn_main_digit(uint8_t value);\nmn_main_Token mn_main_number();\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_main_ParseError_or_main_FileError_defined\n#define mn_main_ParseError_or_main_FileError_defined\ntypedef struct mn_main_ParseError_or_main_FileError {\n    uint32_t tag;\n    union {\n        uint8_t main_ParseError_bad_digit;\n    } value;\n} mn_main_ParseError_or_main_FileError;\n#endif\n\n#ifndef mn_main_Token_equal_defined\n#define mn_main_Token_equal_defined\nstatic inline bool mn_main_Token_equal(mn_main_Token one, mn_main_Token two) {\n    if (one.tag != two.tag) return false;\n    switch (one.tag) {\n    case 0: return one.value.number == two.value.number;\n    default: return true;\n    }\n}\n#endif\n\n#ifndef mn_main_ParseError_or_main_FileError_equal_defined\n#define mn_main_ParseError_or_main_FileError_equal_defined\nstatic inline bool mn_main_ParseError_or_main_FileError_equal(mn_main_ParseError_or_main_FileError one, mn_main_ParseError_or_main_FileError two) {\n    if (one.tag != two.tag) return false;\n    switch (one.tag) {\n    case 2: return one.value.main_ParseError_bad_digit == two.value.main_ParseError_bad_digit;\n    default: return true;\n    }\n}\n#endif\n\n#ifndef mn_main_ParseError_equal_defined\n#define mn_main_ParseError_equal_defined\nstatic inline bool mn_main_ParseError_equal(mn_main_ParseError one, mn_main_ParseError two) {\n    if (one.tag != two.tag) return false;\n    switch (one.tag) {\n    case 2: return one.value.bad_digit == two.value.bad_digit;\n    default: return true;\n    }\n}\n#endif\n\n#ifndef mn_main_ParseError_or_main_FileError_from_main_FileError_defined\n#define mn_main_ParseError_or_main_FileError_from_main_FileError_defined\nstatic inline mn_main_ParseError_or_main_FileError mn_main_ParseError_or_main_FileError_from_main_FileError(mn_main_FileError value) {\n    mn_main_ParseError_or_main_FileError result;\n    result.tag = value.tag;\n    return result;\n}\n#endif\n\n#ifndef mn_main_ParseError_or_main_FileError_from_main_ParseError_defined\n#define mn_main_ParseError_or_main_FileError_from_main_ParseError_defined\nstatic inline mn_main_ParseError_or_main_FileError mn_main_ParseError_or_main_FileError_from_main_ParseError(mn_main_ParseError value) {\n    mn_main_ParseError_or_main_FileError result;\n    result.tag = value.tag;\n    switch (value.tag) {\n    case 2: result.value.main_ParseError_bad_digit = value.value.bad_digit; break;\n    default: break;\n    }\n    return result;\n}\n#endif\n\nbool mn_main_Token_is_end(mn_main_Token self) {\n    return mn_main_Token_equal(self, (mn_main_Token){ .tag = 1 });\n}\n\nmn_main_ParseError_or_main_FileError mn_main_widen(mn_main_FileError failure) {\n    return mn_main_ParseError_or_main_FileError_from_main_FileError(failure);\n}\n\nbool mn_main_is_missing(mn_main_ParseError_or_main_FileError failure) {\n    return mn_main_ParseError_or_main_FileError_equal(failure, mn_main_ParseError_or_main_FileError_from_main_ParseError((mn_main_ParseError){ .tag = 1 }));\n}\n\nmn_main_ParseError mn_main_digit(uint8_t value) {\n    return (mn_main_ParseError){ .tag = 2, .value.bad_digit = value };\n}\n\nmn_main_Token mn_main_number() {\n    return (mn_main_Token){ .tag = 0, .value.number = 4 };\n}\n",
+        files[1].contents,
     );
 }
 
@@ -6288,8 +7485,8 @@ test "recordCalledFunction: records the runtime functions that a field access ca
     defer program_directory.cleanup();
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
-    try compiler_directory.dir.createDirPath(std.testing.io, "std");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "std/clock.mn", .data = "struct Time:\n    seconds: i64\nexternal fn mn_runtime_clock_now() -> Time\nconst now = mn_runtime_clock_now" });
+    try compiler_directory.dir.createDirPath(std.testing.io, "mn");
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/clock.mn", .data = "struct Time:\n    seconds: i64\nexternal fn mn_runtime_clock_now() -> Time\nconst now = mn_runtime_clock_now" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -6299,7 +7496,7 @@ test "recordCalledFunction: records the runtime functions that a field access ca
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import std\nfn seconds() -> i64: return std::clock::now().seconds" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn seconds() -> i64: return mn::clock::now().seconds" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7100,6 +8297,40 @@ test "generateBlock: writes statements on separate lines" {
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\nvoid mn_main_stop() {\n    return;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateStatements: runs deferred statements at every way out of their block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure:\n    bad\nfn close(): noop\nfn note(value: i32): _ = value\nfn inner(fail: bool) -> Failure!i32:\n    if fail: return Failure::bad\n    return 1\nfn step(fail: bool) -> Failure!i32:\n    errdefer note(1)\n    defer close()\n    const value = try inner(fail)\n    return value + 1\nfn count() -> i32:\n    var total: i32 = 0\n    while total < 5:\n        defer note(total)\n        total += 1\n        if total == 2: continue\n        if total == 4: break\n    return total\nfn plain():\n    defer close()\n    note(2)\nfn pass(fail: bool) -> Failure!i32:\n    errdefer note(3)\n    return inner(fail)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_Failure {\n    uint32_t tag;\n} mn_main_Failure;\n\ntypedef struct mn_result_main_Failure_i32 mn_result_main_Failure_i32;\n\nvoid mn_main_close();\nvoid mn_main_note(int32_t);\nmn_result_main_Failure_i32 mn_main_inner(bool fail);\nmn_result_main_Failure_i32 mn_main_step(bool fail);\nint32_t mn_main_count();\nvoid mn_main_plain();\nmn_result_main_Failure_i32 mn_main_pass(bool fail);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_result_main_Failure_i32_defined\n#define mn_result_main_Failure_i32_defined\ntypedef struct mn_result_main_Failure_i32 {\n    mn_main_Failure error;\n    int32_t value;\n} mn_result_main_Failure_i32;\n#endif\n\nvoid mn_main_close() {}\n\nvoid mn_main_note(int32_t) {}\n\nmn_result_main_Failure_i32 mn_main_inner(bool fail) {\n    if (fail) {\n        return (mn_result_main_Failure_i32){ .error = (mn_main_Failure){ .tag = 1 } };\n    }\n    return (mn_result_main_Failure_i32){ .error.tag = 0, .value = 1 };\n}\n\nmn_result_main_Failure_i32 mn_main_step(bool fail) {\n    mn_result_main_Failure_i32 mn_temporary_1;\n    int32_t mn_temporary_2;\n    mn_temporary_1 = mn_main_inner(fail);\n    if (mn_temporary_1.error.tag != 0) {\n        mn_main_close();\n        mn_main_note(1);\n        return (mn_result_main_Failure_i32){ .error = mn_temporary_1.error };\n    }\n    mn_temporary_2 = mn_temporary_1.value;\n    const int32_t value = mn_temporary_2;\n    const mn_result_main_Failure_i32 mn_returned = (mn_result_main_Failure_i32){ .error.tag = 0, .value = (value + 1) };\n    mn_main_close();\n    return mn_returned;\n}\n\nint32_t mn_main_count() {\n    int32_t total = 0;\n    while ((total < 5)) {\n        total = (total + 1);\n        if ((total == 2)) {\n            mn_main_note(total);\n            continue;\n        }\n        if ((total == 4)) {\n            mn_main_note(total);\n            break;\n        }\n        mn_main_note(total);\n    }\n    return total;\n}\n\nvoid mn_main_plain() {\n    mn_main_note(2);\n    mn_main_close();\n}\n\nmn_result_main_Failure_i32 mn_main_pass(bool fail) {\n    const mn_result_main_Failure_i32 mn_returned = mn_main_inner(fail);\n    if (mn_returned.error.tag != 0) {\n        mn_main_note(3);\n    }\n    return mn_returned;\n}\n",
         files[1].contents,
     );
 }
@@ -8119,6 +9350,143 @@ test "generateTupleDeclaration: stores a constant whose element a pointer name p
         "#include \"main.h\"\n\n#ifndef mn_tuple_2_i32_bool_defined\n#define mn_tuple_2_i32_bool_defined\ntypedef struct mn_tuple_2_i32_bool {\n    int32_t _0;\n    bool _1;\n} mn_tuple_2_i32_bool;\n#endif\n\nchar mn_zero_sized;\n\nconst mn_tuple_2_i32_bool mn_main_pair = { ._0 = 1, ._1 = true };\n\nint main() {\n    int32_t const * const number = &mn_main_pair._0;\n    keep(number);\n}\n",
         files[1].contents,
     );
+}
+
+test "generateMatch: writes a switch on the tag that binds the values of the cases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    flag: bool\n    end\n    other\nerror ParseError:\n    missing_end\n    bad_digit: u8\nerror FileError:\n    missing_end\nfn total(token: Token) -> i64:\n    match token:\n        number(digits): return digits\n        flag, end: return 1\n        else: return 0\nfn bump(token: *Token):\n    match token.*:\n        number(*digits): digits.* += 1\n        flag(_): noop\n        end, other: noop\nfn sum(tokens: []const Token) -> i64:\n    var result: i64 = 0\n    for token in tokens:\n        match token:\n            end: break\n            other: continue\n            number(digits): result += digits\n            flag: noop\n    return result\nfn first(tokens: []const Token) -> i64:\n    match tokens[0]:\n        number(digits): return digits\n        else: return 0\nfn code(failure: ParseError || FileError) -> u8:\n    match failure:\n        ParseError::missing_end: return 1\n        FileError::missing_end: return 2\n        bad_digit(digit): return digit" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_Token {\n    uint32_t tag;\n    union {\n        int64_t number;\n        bool flag;\n    } value;\n} mn_main_Token;\n\ntypedef struct mn_main_ParseError {\n    uint32_t tag;\n    union {\n        uint8_t bad_digit;\n    } value;\n} mn_main_ParseError;\n\ntypedef struct mn_main_FileError {\n    uint32_t tag;\n} mn_main_FileError;\n\ntypedef struct mn_slice_main_Token mn_slice_main_Token;\ntypedef struct mn_main_ParseError_or_main_FileError mn_main_ParseError_or_main_FileError;\n\nint64_t mn_main_total(mn_main_Token token);\nvoid mn_main_bump(struct mn_main_Token * token);\nint64_t mn_main_sum(mn_slice_main_Token tokens);\nint64_t mn_main_first(mn_slice_main_Token tokens);\nuint8_t mn_main_code(mn_main_ParseError_or_main_FileError failure);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_main_Token_defined\n#define mn_slice_main_Token_defined\ntypedef struct mn_slice_main_Token {\n    struct mn_main_Token *items;\n    size_t length;\n} mn_slice_main_Token;\n#endif\n\n#ifndef mn_main_ParseError_or_main_FileError_defined\n#define mn_main_ParseError_or_main_FileError_defined\ntypedef struct mn_main_ParseError_or_main_FileError {\n    uint32_t tag;\n    union {\n        uint8_t main_ParseError_bad_digit;\n    } value;\n} mn_main_ParseError_or_main_FileError;\n#endif\n\nint64_t mn_main_total(mn_main_Token token) {\n    switch (token.tag) {\n    case 0: {\n        const int64_t digits = token.value.number;\n        return digits;\n    }\n    case 1:\n    case 2: {\n        return 1;\n    }\n    default: {\n        return 0;\n    }\n    }\n}\n\nvoid mn_main_bump(struct mn_main_Token * token) {\n    struct mn_main_Token * const mn_match_value_1 = &(*token);\n    switch (mn_match_value_1->tag) {\n    case 0: {\n        int64_t * const digits = &mn_match_value_1->value.number;\n        int64_t * mn_temporary_1;\n        mn_temporary_1 = &(*digits), (*mn_temporary_1) = ((*mn_temporary_1) + 1);\n        break;\n    }\n    case 1: break;\n    default: break;\n    }\n}\n\nint64_t mn_main_sum(mn_slice_main_Token tokens) {\n    int64_t result = 0;\n    for (size_t mn_index_1 = 0; mn_index_1 < tokens.length; mn_index_1 += 1) {\n        const mn_main_Token token = tokens.items[mn_index_1];\n        switch (token.tag) {\n        case 2: {\n            goto mn_break_1;\n        }\n        case 3: {\n            goto mn_continue_1;\n        }\n        case 0: {\n            const int64_t digits = token.value.number;\n            result = (result + digits);\n            break;\n        }\n        default: break;\n        }\n        mn_continue_1:;\n    }\n    mn_break_1:;\n    return result;\n}\n\nint64_t mn_main_first(mn_slice_main_Token tokens) {\n    const mn_main_Token mn_match_value_1 = tokens.items[0u];\n    switch (mn_match_value_1.tag) {\n    case 0: {\n        const int64_t digits = mn_match_value_1.value.number;\n        return digits;\n    }\n    default: {\n        return 0;\n    }\n    }\n}\n\nuint8_t mn_main_code(mn_main_ParseError_or_main_FileError failure) {\n    switch (failure.tag) {\n    case 1: {\n        return 1u;\n    }\n    case 3: {\n        return 2u;\n    }\n    default: {\n        const uint8_t digit = failure.value.main_ParseError_bad_digit;\n        return digit;\n    }\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateBranch: points into a constant and a zero-sized value and leaves loops with goto" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    empty: [0]u8\n    end\nconst ORIGIN = Token::number(7)\nfn make() -> Token: return Token::end\nfn origin() -> i64:\n    match ORIGIN:\n        number(*digits): return digits.*\n        else: return 0\nfn kind() -> i64:\n    match make():\n        number: return 1\n        else: return 0\nfn take(bytes: *const [0]u8): _ = bytes\nfn hollow(token: Token):\n    match token:\n        empty(*bytes): take(bytes)\n        else: noop\nfn scan(tokens: []const Token) -> i64:\n    var count: i64 = 0\n    while count < 10:\n        for token in tokens:\n            match token:\n                end: break\n                else: match make():\n                    number(digits): count += digits\n                    else: continue\n    else: count = 1\n    return count" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_Token {\n    uint32_t tag;\n    union {\n        int64_t number;\n    } value;\n} mn_main_Token;\n\ntypedef struct mn_slice_main_Token mn_slice_main_Token;\n\nmn_main_Token mn_main_make();\nint64_t mn_main_origin();\nint64_t mn_main_kind();\nvoid mn_main_take(void const *);\nvoid mn_main_hollow(mn_main_Token token);\nint64_t mn_main_scan(mn_slice_main_Token tokens);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_main_Token_defined\n#define mn_slice_main_Token_defined\ntypedef struct mn_slice_main_Token {\n    struct mn_main_Token *items;\n    size_t length;\n} mn_slice_main_Token;\n#endif\n\nmn_main_Token mn_main_make() {\n    return (mn_main_Token){ .tag = 2 };\n}\n\nint64_t mn_main_origin() {\n    switch ((mn_main_Token){ .tag = 0, .value = { .number = 7 } }.tag) {\n    case 0: {\n        int64_t const * const digits = &(mn_main_Token){ .tag = 0, .value = { .number = 7 } }.value.number;\n        return (*digits);\n    }\n    default: {\n        return 0;\n    }\n    }\n}\n\nint64_t mn_main_kind() {\n    switch (mn_main_make().tag) {\n    case 0: {\n        return 1;\n    }\n    default: {\n        return 0;\n    }\n    }\n}\n\nvoid mn_main_take(void const *) {}\n\nvoid mn_main_hollow(mn_main_Token token) {\n    switch (token.tag) {\n    case 1: {\n        void const * const bytes = ((void const *)&mn_zero_sized);\n        mn_main_take(bytes);\n        break;\n    }\n    default: break;\n    }\n}\n\nint64_t mn_main_scan(mn_slice_main_Token tokens) {\n    int64_t count = 0;\n    while ((count < 10)) {\n        for (size_t mn_index_2 = 0; mn_index_2 < tokens.length; mn_index_2 += 1) {\n            const mn_main_Token token = tokens.items[mn_index_2];\n            switch (token.tag) {\n            case 2: {\n                goto mn_break_2;\n            }\n            default: {\n                const mn_main_Token mn_match_value_2 = mn_main_make();\n                switch (mn_match_value_2.tag) {\n                case 0: {\n                    const int64_t digits = mn_match_value_2.value.number;\n                    count = (count + digits);\n                    break;\n                }\n                default: {\n                    goto mn_continue_2;\n                }\n                }\n            }\n            }\n            mn_continue_2:;\n        }\n        mn_break_2:;\n    }\n    count = 1;\n    return count;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateTry: returns the error of a result from the function and converts it to the function's set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing_end\n    bad_digit: u8\nerror FileError:\n    missing_file\nfn digit(text: u8) -> ParseError!u8:\n    if text < 48: return ParseError::bad_digit(text)\n    return text - 48\nfn check(text: u8) -> ParseError!void:\n    if text == 0: return ParseError::missing_end\nfn total(one: u8, two: u8) -> ParseError || FileError!u8:\n    try check(one)\n    return try digit(one) + try digit(two)\nfn safe(text: u8) -> u8: return digit(text) catch 0\nfn widen(text: u8) -> ParseError || FileError!u8: return digit(text)\nfn ready(text: u8) -> ParseError!bool: return text > 0\nfn count(text: u8) -> ParseError!u8:\n    var result: u8 = 0\n    while try ready(text - result): result += 1\n    if text > 9 and try ready(text): return 1\n    else if try ready(text): return 2\n    return result\nfn fallback(text: u8) -> ParseError!u8: return digit(text) catch try digit(48)\nfn run() -> ParseError || FileError!void:\n    _ = try total(49, 50)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_ParseError {\n    uint32_t tag;\n    union {\n        uint8_t bad_digit;\n    } value;\n} mn_main_ParseError;\n\ntypedef struct mn_main_FileError {\n    uint32_t tag;\n} mn_main_FileError;\n\ntypedef struct mn_result_main_ParseError_u8 mn_result_main_ParseError_u8;\ntypedef struct mn_result_main_ParseError_void mn_result_main_ParseError_void;\ntypedef struct mn_result_main_ParseError_or_main_FileError_u8 mn_result_main_ParseError_or_main_FileError_u8;\ntypedef struct mn_result_main_ParseError_bool mn_result_main_ParseError_bool;\ntypedef struct mn_result_main_ParseError_or_main_FileError_void mn_result_main_ParseError_or_main_FileError_void;\n\nmn_result_main_ParseError_u8 mn_main_digit(uint8_t text);\nmn_result_main_ParseError_void mn_main_check(uint8_t text);\nmn_result_main_ParseError_or_main_FileError_u8 mn_main_total(uint8_t one, uint8_t two);\nuint8_t mn_main_safe(uint8_t text);\nmn_result_main_ParseError_or_main_FileError_u8 mn_main_widen(uint8_t text);\nmn_result_main_ParseError_bool mn_main_ready(uint8_t text);\nmn_result_main_ParseError_u8 mn_main_count(uint8_t text);\nmn_result_main_ParseError_u8 mn_main_fallback(uint8_t text);\nmn_result_main_ParseError_or_main_FileError_void mn_main_run();\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_result_main_ParseError_u8_defined\n#define mn_result_main_ParseError_u8_defined\ntypedef struct mn_result_main_ParseError_u8 {\n    mn_main_ParseError error;\n    uint8_t value;\n} mn_result_main_ParseError_u8;\n#endif\n\n#ifndef mn_result_main_ParseError_void_defined\n#define mn_result_main_ParseError_void_defined\ntypedef struct mn_result_main_ParseError_void {\n    mn_main_ParseError error;\n} mn_result_main_ParseError_void;\n#endif\n\n#ifndef mn_main_ParseError_or_main_FileError_defined\n#define mn_main_ParseError_or_main_FileError_defined\ntypedef struct mn_main_ParseError_or_main_FileError {\n    uint32_t tag;\n    union {\n        uint8_t main_ParseError_bad_digit;\n    } value;\n} mn_main_ParseError_or_main_FileError;\n#endif\n\n#ifndef mn_result_main_ParseError_or_main_FileError_u8_defined\n#define mn_result_main_ParseError_or_main_FileError_u8_defined\ntypedef struct mn_result_main_ParseError_or_main_FileError_u8 {\n    mn_main_ParseError_or_main_FileError error;\n    uint8_t value;\n} mn_result_main_ParseError_or_main_FileError_u8;\n#endif\n\n#ifndef mn_result_main_ParseError_bool_defined\n#define mn_result_main_ParseError_bool_defined\ntypedef struct mn_result_main_ParseError_bool {\n    mn_main_ParseError error;\n    bool value;\n} mn_result_main_ParseError_bool;\n#endif\n\n#ifndef mn_result_main_ParseError_or_main_FileError_void_defined\n#define mn_result_main_ParseError_or_main_FileError_void_defined\ntypedef struct mn_result_main_ParseError_or_main_FileError_void {\n    mn_main_ParseError_or_main_FileError error;\n} mn_result_main_ParseError_or_main_FileError_void;\n#endif\n\n#ifndef mn_main_ParseError_or_main_FileError_from_main_ParseError_defined\n#define mn_main_ParseError_or_main_FileError_from_main_ParseError_defined\nstatic inline mn_main_ParseError_or_main_FileError mn_main_ParseError_or_main_FileError_from_main_ParseError(mn_main_ParseError value) {\n    mn_main_ParseError_or_main_FileError result;\n    result.tag = value.tag;\n    switch (value.tag) {\n    case 2: result.value.main_ParseError_bad_digit = value.value.bad_digit; break;\n    default: break;\n    }\n    return result;\n}\n#endif\n\n#ifndef mn_result_main_ParseError_or_main_FileError_u8_from_result_main_ParseError_u8_defined\n#define mn_result_main_ParseError_or_main_FileError_u8_from_result_main_ParseError_u8_defined\nstatic inline mn_result_main_ParseError_or_main_FileError_u8 mn_result_main_ParseError_or_main_FileError_u8_from_result_main_ParseError_u8(mn_result_main_ParseError_u8 value) {\n    mn_result_main_ParseError_or_main_FileError_u8 result;\n    result.error = mn_main_ParseError_or_main_FileError_from_main_ParseError(value.error);\n    result.value = value.value;\n    return result;\n}\n#endif\n\nmn_result_main_ParseError_u8 mn_main_digit(uint8_t text) {\n    if ((text < 48u)) {\n        return (mn_result_main_ParseError_u8){ .error = (mn_main_ParseError){ .tag = 2, .value.bad_digit = text } };\n    }\n    return (mn_result_main_ParseError_u8){ .error.tag = 0, .value = ((uint8_t)(text - 48u)) };\n}\n\nmn_result_main_ParseError_void mn_main_check(uint8_t text) {\n    if ((text == 0u)) {\n        return (mn_result_main_ParseError_void){ .error = (mn_main_ParseError){ .tag = 1 } };\n    }\n    return (mn_result_main_ParseError_void){ .error.tag = 0 };\n}\n\nmn_result_main_ParseError_or_main_FileError_u8 mn_main_total(uint8_t one, uint8_t two) {\n    mn_result_main_ParseError_void mn_temporary_1;\n    mn_temporary_1 = mn_main_check(one);\n    if (mn_temporary_1.error.tag != 0) return (mn_result_main_ParseError_or_main_FileError_u8){ .error = mn_main_ParseError_or_main_FileError_from_main_ParseError(mn_temporary_1.error) };\n    mn_result_main_ParseError_u8 mn_temporary_2;\n    uint8_t mn_temporary_3;\n    mn_result_main_ParseError_u8 mn_temporary_4;\n    uint8_t mn_temporary_5;\n    mn_temporary_2 = mn_main_digit(one);\n    if (mn_temporary_2.error.tag != 0) return (mn_result_main_ParseError_or_main_FileError_u8){ .error = mn_main_ParseError_or_main_FileError_from_main_ParseError(mn_temporary_2.error) };\n    mn_temporary_3 = mn_temporary_2.value;\n    mn_temporary_4 = mn_main_digit(two);\n    if (mn_temporary_4.error.tag != 0) return (mn_result_main_ParseError_or_main_FileError_u8){ .error = mn_main_ParseError_or_main_FileError_from_main_ParseError(mn_temporary_4.error) };\n    mn_temporary_5 = mn_temporary_4.value;\n    return (mn_result_main_ParseError_or_main_FileError_u8){ .error.tag = 0, .value = ((uint8_t)(mn_temporary_3 + mn_temporary_5)) };\n}\n\nuint8_t mn_main_safe(uint8_t text) {\n    mn_result_main_ParseError_u8 mn_temporary_1;\n    return (mn_temporary_1 = mn_main_digit(text), (mn_temporary_1.error.tag == 0 ? mn_temporary_1.value : 0u));\n}\n\nmn_result_main_ParseError_or_main_FileError_u8 mn_main_widen(uint8_t text) {\n    return mn_result_main_ParseError_or_main_FileError_u8_from_result_main_ParseError_u8(mn_main_digit(text));\n}\n\nmn_result_main_ParseError_bool mn_main_ready(uint8_t text) {\n    return (mn_result_main_ParseError_bool){ .error.tag = 0, .value = (text > 0u) };\n}\n\nmn_result_main_ParseError_u8 mn_main_count(uint8_t text) {\n    uint8_t result = 0u;\n    mn_result_main_ParseError_bool mn_temporary_1;\n    bool mn_temporary_2;\n    while (true) {\n        mn_temporary_1 = mn_main_ready(((uint8_t)(text - result)));\n        if (mn_temporary_1.error.tag != 0) return (mn_result_main_ParseError_u8){ .error = mn_temporary_1.error };\n        mn_temporary_2 = mn_temporary_1.value;\n        if (!mn_temporary_2) break;\n        {\n            result = ((uint8_t)(result + 1u));\n        }\n    }\n    bool mn_temporary_3;\n    mn_result_main_ParseError_bool mn_temporary_4;\n    bool mn_temporary_5;\n    if (((text > 9u))) {\n        mn_temporary_4 = mn_main_ready(text);\n        if (mn_temporary_4.error.tag != 0) return (mn_result_main_ParseError_u8){ .error = mn_temporary_4.error };\n        mn_temporary_5 = mn_temporary_4.value;\n        mn_temporary_3 = mn_temporary_5;\n    } else {\n        mn_temporary_3 = (text > 9u);\n    }\n    if (mn_temporary_3) {\n        return (mn_result_main_ParseError_u8){ .error.tag = 0, .value = 1u };\n    } else {\n        mn_result_main_ParseError_bool mn_temporary_6;\n        bool mn_temporary_7;\n        mn_temporary_6 = mn_main_ready(text);\n        if (mn_temporary_6.error.tag != 0) return (mn_result_main_ParseError_u8){ .error = mn_temporary_6.error };\n        mn_temporary_7 = mn_temporary_6.value;\n        if (mn_temporary_7) {\n            return (mn_result_main_ParseError_u8){ .error.tag = 0, .value = 2u };\n        }\n    }\n    return (mn_result_main_ParseError_u8){ .error.tag = 0, .value = result };\n}\n\nmn_result_main_ParseError_u8 mn_main_fallback(uint8_t text) {\n    mn_result_main_ParseError_u8 mn_temporary_1;\n    uint8_t mn_temporary_2;\n    mn_result_main_ParseError_u8 mn_temporary_3;\n    uint8_t mn_temporary_4;\n    mn_temporary_1 = mn_main_digit(text);\n    if (mn_temporary_1.error.tag != 0) {\n        mn_temporary_3 = mn_main_digit(48u);\n        if (mn_temporary_3.error.tag != 0) return (mn_result_main_ParseError_u8){ .error = mn_temporary_3.error };\n        mn_temporary_4 = mn_temporary_3.value;\n        mn_temporary_2 = mn_temporary_4;\n    } else {\n        mn_temporary_2 = mn_temporary_1.value;\n    }\n    return (mn_result_main_ParseError_u8){ .error.tag = 0, .value = mn_temporary_2 };\n}\n\nmn_result_main_ParseError_or_main_FileError_void mn_main_run() {\n    mn_result_main_ParseError_or_main_FileError_u8 mn_temporary_1;\n    mn_temporary_1 = mn_main_total(49u, 50u);\n    if (mn_temporary_1.error.tag != 0) return (mn_result_main_ParseError_or_main_FileError_void){ .error = mn_temporary_1.error };\n    return (mn_result_main_ParseError_or_main_FileError_void){ .error.tag = 0 };\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateEntryPoint: reports the error that ends main and ends with a nonzero status" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing_end\n    bad_digit: u8\nfn main() -> ParseError!void: return ParseError::missing_end" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_ParseError {\n    uint32_t tag;\n    union {\n        uint8_t bad_digit;\n    } value;\n} mn_main_ParseError;\n\ntypedef struct mn_result_main_ParseError_void mn_result_main_ParseError_void;\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_result_main_ParseError_void_defined\n#define mn_result_main_ParseError_void_defined\ntypedef struct mn_result_main_ParseError_void {\n    mn_main_ParseError error;\n} mn_result_main_ParseError_void;\n#endif\n\nchar mn_zero_sized;\n\nvoid mn_runtime_error_report(char const *name);\n\nmn_result_main_ParseError_void mn_main_main() {\n    return (mn_result_main_ParseError_void){ .error = (mn_main_ParseError){ .tag = 1 } };\n}\n\nint main() {\n    mn_result_main_ParseError_void result = mn_main_main();\n    if (result.error.tag == 0) return 0;\n    switch (result.error.tag) {\n    case 1: mn_runtime_error_report(\"missing_end\"); break;\n    case 2: mn_runtime_error_report(\"bad_digit\"); break;\n    }\n    return 1;\n}\n",
+        files[1].contents,
+    );
+    try std.testing.expectEqualStrings("mn_runtime_error_report", generator.runtime_functions.items[0]);
 }
 
 test "generateAssignment: assigns a field" {
@@ -12780,6 +14148,40 @@ test "generateConstant: writes the value of a constant with operators at each us
     );
 }
 
+test "generateBuiltinCall: writes sizes and alignments as constants and conversions as casts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Pair:\n    small: u8\n    large: i32\nenum Token:\n    number: i64\n    end\nerror Failure:\n    bad: u8\nfn size() -> usize: return mn::size(Pair)\nfn alignment() -> usize: return mn::alignment(Pair)\nfn token() -> usize: return mn::size(Token)\nfn maybe() -> usize: return mn::size(?i32)\nfn text() -> usize: return mn::size([]const u8)\nfn result() -> usize: return mn::size(Failure!u16)\nfn whole(value: f64) -> i32: return mn::convert(i32, value)\nfn low(value: i32) -> u8: return mn::truncate(u8, value)\nfn wide(value: u8) -> u64: return value\nfn float(value: f32) -> f64: return value\nfn use(pair: Pair, token: Token, failure: Failure!u16) -> usize:\n    _ = pair\n    _ = token\n    _ = failure\n    return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_Token {\n    uint32_t tag;\n    union {\n        int64_t number;\n    } value;\n} mn_main_Token;\n\ntypedef struct mn_main_Failure {\n    uint32_t tag;\n    union {\n        uint8_t bad;\n    } value;\n} mn_main_Failure;\n\ntypedef struct mn_main_Pair {\n    uint8_t small;\n    int32_t large;\n} mn_main_Pair;\n\ntypedef struct mn_result_main_Failure_u16 mn_result_main_Failure_u16;\n\nsize_t mn_main_size();\nsize_t mn_main_alignment();\nsize_t mn_main_token();\nsize_t mn_main_maybe();\nsize_t mn_main_text();\nsize_t mn_main_result();\nint32_t mn_main_whole(double value);\nuint8_t mn_main_low(int32_t value);\nuint64_t mn_main_wide(uint8_t value);\ndouble mn_main_float(float value);\nsize_t mn_main_use(mn_main_Pair, mn_main_Token, mn_result_main_Failure_u16);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_result_main_Failure_u16_defined\n#define mn_result_main_Failure_u16_defined\ntypedef struct mn_result_main_Failure_u16 {\n    mn_main_Failure error;\n    uint16_t value;\n} mn_result_main_Failure_u16;\n#endif\n\nsize_t mn_main_size() {\n    return 8u;\n}\n\nsize_t mn_main_alignment() {\n    return 4u;\n}\n\nsize_t mn_main_token() {\n    return 16u;\n}\n\nsize_t mn_main_maybe() {\n    return 8u;\n}\n\nsize_t mn_main_text() {\n    return 16u;\n}\n\nsize_t mn_main_result() {\n    return 12u;\n}\n\nint32_t mn_main_whole(double value) {\n    return ((int32_t)value);\n}\n\nuint8_t mn_main_low(int32_t value) {\n    return ((uint8_t)value);\n}\n\nuint64_t mn_main_wide(uint8_t value) {\n    return value;\n}\n\ndouble mn_main_float(float value) {\n    return value;\n}\n\nsize_t mn_main_use(mn_main_Pair, mn_main_Token, mn_result_main_Failure_u16) {\n    return 0u;\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateFunctionCall: passes a pointer to an array as a slice" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -14523,8 +15925,8 @@ test "buildRelativePath: walks into directories" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const path = try buildRelativePath(arena.allocator(), "hello.c", "std/stdout.h");
-    try std.testing.expectEqualStrings("std/stdout.h", path);
+    const path = try buildRelativePath(arena.allocator(), "hello.c", "mn/stdout.h");
+    try std.testing.expectEqualStrings("mn/stdout.h", path);
 }
 
 test "buildRelativePath: walks out of directories" {
@@ -14532,7 +15934,7 @@ test "buildRelativePath: walks out of directories" {
     defer arena.deinit();
 
     const allocator = arena.allocator();
-    const path = try buildRelativePath(allocator, "std/stdout.h", "monolith.h");
+    const path = try buildRelativePath(allocator, "mn/stdout.h", "monolith.h");
     try std.testing.expectEqualStrings("../monolith.h", path);
     const runtime = try buildRelativePath(allocator, "utils/math/add.c", "runtime/monolith.h");
     try std.testing.expectEqualStrings("../../runtime/monolith.h", runtime);

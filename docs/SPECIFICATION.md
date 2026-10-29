@@ -22,7 +22,7 @@
 - Identifiers are case-sensitive. By convention only types and type constructors start with a capital letter.
 - The single character `_` is reserved and cannot be used as an identifier by the user.
 - The following identifier names are reserved and cannot be used as identifiers by the user:
-    `and`, `as`, `break`, `comptime`, `const`, `continue`, `else`, `external`, `false`, `fn`, `for`, `if`, `import`, `in`, `instance`, `many`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `true`, `typeclass`, `undefined`, `var`, `void`, `while`
+    `and`, `as`, `break`, `catch`, `comptime`, `const`, `continue`, `defer`, `else`, `enum`, `errdefer`, `error`, `external`, `false`, `fn`, `for`, `if`, `import`, `in`, `instance`, `many`, `match`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `true`, `try`, `typeclass`, `undefined`, `var`, `void`, `while`
 
 ## Built-In Types
 
@@ -100,6 +100,16 @@
 - A method can also be called on a pointer to the value, which is dereferenced automatically, one level only, e.g. `pointer.area()`. If the pointer's own type has a method with the same name, that method is called.
 - A method is found by the exact type of the value.
 - Two functions in a struct's block cannot have the same name, and they cannot have the name of a field.
+
+## Enums
+
+- An enum is a type whose value is one of several cases. It is declared with `enum`, its name, and its cases in an indented block, e.g. `enum Token:` followed by `number: i64`, `name: []const u8` and `end`.
+- A case can carry a value of the type written after `:`. A case without a type carries no value.
+- Case names must be unique within an enum.
+- `Enum::case` gives a case without a value, e.g. `Token::end`. `Enum::case(value)` gives a case with its value, e.g. `Token::number(42)`.
+- An enum has at least one case.
+- Enums are declared at the top level of a module. An enum's block can also declare functions, as a struct's can. A function cannot have the name of a case.
+- Enums are values. Assigning or passing an enum copies its case and its value.
 
 ## Literals
 
@@ -202,17 +212,18 @@
 
 - Operators bind in the following order, from strongest to weakest:
     1. Postfix: calls, indexing `a[i]`, slicing `a[i..j]`, field access `a.b`, dereference `a.*`, optional unwrap `a.?`
-    2. Prefix: `-`, `!`, `~`, `&`
+    2. Prefix: `-`, `!`, `~`, `&`, `try`
     3. `*`, `/`, `%`
     4. `+`, `-`
     5. `<<`, `>>`
     6. `&`
     7. `^`
-    8. `|`
-    9. `orelse`
-    10. `==`, `!=`, `<`, `<=`, `>`, `>=`
-    11. `and`
-    12. `or`
+    8. `|`, `||`
+    9. `!` between an error set and a type, e.g. `ParseError || FileError!Token` is `(ParseError || FileError)!Token`
+    10. `orelse`, `catch`
+    11. `==`, `!=`, `<`, `<=`, `>`, `>=`
+    12. `and`
+    13. `or`
 - Operators on the same level are left-associative. Operands and arguments are evaluated left to right. Comparisons cannot be chained, e.g. `a < b < c` is a compile-time error.
 - Parentheses group an expression.
 
@@ -220,6 +231,15 @@
 
 - Unless stated otherwise, both operands of a binary operator must have the same type. Numbers of different types are never mixed implicitly.
 - An unsuffixed literal takes its type from the surrounding code. As an operand, it takes the type the operator requires, e.g. `pointer + 1`, otherwise the type of the other operand, e.g. `count + 1`.
+
+### Number Conversions
+
+- A number converts implicitly to a type of the same kind that holds every value of its type, e.g. `u8` to `u32`, `u8` to `i16`, `i8` to `i64` and `f32` to `f64`. Operands of an operator are not converted.
+- `mn::convert(T, value)` converts a number to the number type `T`, keeping its value, e.g. `mn::convert(u8, count)`.
+- Converting an integer to an integer type that cannot hold its value is illegal behavior. When the value is known at compile time, it is a compile-time error.
+- `mn::truncate(T, value)` converts an integer to a smaller integer type `T`, keeping only its low bits, e.g. `mn::truncate(i8, -1i32)` is `-1` and `mn::truncate(u8, 300u32)` is `44`.
+- An integer converted to a float, and a float converted to a smaller float, round to the nearest representable value, ties to even. A float beyond the smaller type's largest finite value becomes an infinity.
+- A float converted to an integer rounds toward zero. A NaN, an infinity, or a value the integer type cannot hold is illegal behavior.
 
 ### Arithmetic Operators
 
@@ -232,8 +252,9 @@
 
 ### Comparison Operators
 
-- `==` and `!=` work on numbers, `bool`, types, pointers, arrays whose elements support them, and optionals whose values support them. Arrays are equal when all their elements are equal. Optionals are equal when both are `null` or both hold equal values. An optional can be compared with `null`.
+- `==` and `!=` work on numbers, `bool`, types, pointers, arrays whose elements support them, optionals whose values support them, and enums and error sets whose values support them. Arrays are equal when all their elements are equal. Optionals are equal when both are `null` or both hold equal values. An optional can be compared with `null`.
 - Two types are equal when they are the same type, e.g. `T == i32`.
+- Two enum values, or two errors, are equal when they are the same case and their values are equal. An error can be compared with a value of an error set combined from its set, e.g. `failure == ParseError::missing_end`.
 - `<`, `<=`, `>` and `>=` work on numbers and multiple value pointers.
 - A comparison gives a `bool`.
 
@@ -299,6 +320,7 @@
 
 - `_ = value` discards a value. The value must be a call or the name of a parameter, local constant or variable.
 - Discarding a call that returns `void`, or a name that is used elsewhere, is a compile-time error.
+- Discarding a result that can hold an error is a compile-time error, e.g. `_ = parse(text)`.
 
 ### Assignments
 
@@ -310,6 +332,15 @@
 
 - `return value` ends the function and gives its result. A function without a return type uses `return` without a value.
 - Every path through a function with a return type must end with a `return`. A path that never ends, such as an endless loop, needs none.
+
+### Defer
+
+- `defer` followed by a call, an assignment or a discard runs it when the enclosing block ends, e.g. `defer allocator.free(items)`.
+- It runs on every way out of the block: reaching its end, `return`, `break`, `continue`, and an error returned through `try`.
+- Deferred statements run in reverse order of their `defer`.
+- A deferred statement's expressions are evaluated when it runs, not when `defer` is reached. With `return value`, the value is evaluated before the deferred statements run.
+- `errdefer` works like `defer`, but runs only when the function returns an error after the `errdefer` was reached.
+- A deferred statement cannot use `try`.
 
 ### If
 
@@ -334,6 +365,15 @@
 - An unused name is a compile-time error.
 - `else:` runs its block when the sequence ends, but not when the loop is left with `break` or `return`. It is on the line after the `for` block, at the same indentation as `for`. Its block is not part of the loop, so `break` and `continue` in it act on an enclosing loop.
 
+### Match
+
+- `match value:` runs the branch for the value's case. Its branches are in an indented block, each with one or more cases and a block, e.g. `end: noop`.
+- A branch can name the value a case carries, e.g. `number(digits): total += digits`. `*digits` holds a pointer to it instead of a copy, as in a constant declaration (see Variables and Constants), and `_` leaves it without a name.
+- A branch with several cases separated by commas cannot name their values, e.g. `name, end: noop`.
+- A branch can name a case through its enum or error set, e.g. `ParseError::missing_end:`. This is needed when a combined error set has two cases with the same name.
+- The branches must cover every case of the enum exactly once. `else:` as the last branch covers the remaining cases.
+- `match` works on enums and error sets.
+
 ### Break and Continue
 
 - `break` leaves the innermost loop. `continue` ends the current run of its block: a `while` evaluates its condition again, and a `for` goes on with the next element.
@@ -352,15 +392,30 @@
 - Arguments are given in the order of the parameters.
 - `&name` gives a pointer to a function, e.g. to pass it as an argument. A pointer to a function is called like a function.
 - `external fn` declares a function defined outside the program, without a body, e.g. `external fn write(text: []const u8)`.
-- `main` has no parameters and no return type, and cannot be called, used as a value or be external.
+- `main` has no parameters and either no return type or a result without a value, e.g. `ParseError!void`. It cannot be called, used as a value or be external.
+- An error that ends `main` writes the case's name to the standard error stream and ends the program with a nonzero status.
+
+## Errors
+
+- An error set is declared with `error`, its name, and its cases in an indented block, e.g. `error ParseError:` followed by `unexpected: [usize, usize]` and `missing_end`. Its cases are written, compared and matched like an enum's, e.g. `ParseError::missing_end`.
+- An error set without cases has no block, e.g. `error Never`. A result with it cannot hold an error.
+- Error sets are declared at the top level of a module.
+- `One || Two` is an error set with the cases of both. Each case keeps the set that declares it, e.g. `ParseError::missing_end` is a case of `ParseError || FileError`. A value of an error set converts implicitly to an error set combined from it.
+- `E!T` is a result: either a value of type `T`, or an error of the set `E`, e.g. `ParseError!Token`. `E!void` is a result without a value.
+- A value of type `T` and a case of `E` convert implicitly to `E!T`, e.g. `return token` and `return ParseError::missing_end`.
+- A result converts implicitly to a result of the same value type whose error set contains its own, e.g. `ParseError!Token` to `(ParseError || FileError)!Token`.
+- `try result` gives the result's value, or returns its error from the function. The function's own result must be able to hold that error, e.g. through `ParseError || FileError`.
+- `result catch fallback` gives the result's value, or `fallback` if it holds an error. `fallback` is evaluated only when needed.
+- An error that is not caught during compile-time evaluation is a compile-time error.
 
 ## Modules
 
 - Each `.mn` file is a module. Its path is its location in the program's directory without the extension, with `::` between names, e.g. `shapes/circle.mn` is `shapes::circle`.
 - The program starts at the function `main` in `main.mn`.
-- `std` is the standard library. A program's own `std.mn` or `std` directory is a compile-time error.
-- `import path` makes the last name of the path available in the module. The path names a directory, a module or a declaration in a module, e.g. `import std::io::stdout` allows `stdout::write("hi")`.
-- `import path as name` makes it available as `name` instead, e.g. `import std::io::stdout as out`.
+- `mn` is the module that comes with the language. It holds the built-in functions, which the compiler provides, and the standard library. A program's own `mn.mn` or `mn` directory is a compile-time error.
+- The built-in functions are `mn::size(T)` and `mn::alignment(T)`, which give a type's size and alignment in bytes as a `usize`, and `mn::convert(T, value)` and `mn::truncate(T, value)` (see Number Conversions).
+- `import path` makes the last name of the path available in the module. The path names a directory, a module or a declaration in a module, e.g. `import mn::io::stdout` allows `stdout::write("hi")`.
+- `import path as name` makes it available as `name` instead, e.g. `import mn::io::stdout as out`.
 - `import` is written at the top level of a module. The name it makes available cannot be the same as another import or top-level declaration of the module.
 - Other modules can use every top-level declaration of a module.
 - A module can be next to a directory with the same name, e.g. `shapes.mn` and `shapes/`. A declaration in the module with the same name as a module or directory in the directory is a compile-time error, e.g. `circle` in `shapes.mn` and `shapes/circle.mn`.

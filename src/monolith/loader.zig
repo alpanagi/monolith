@@ -13,7 +13,6 @@ pub const Loader = struct {
     program_path: []const u8,
     compiler_path: []const u8,
     modules: std.ArrayList(ast.Module) = .empty,
-    program_has_std: ?bool = null,
     failure: ?Failure = null,
 
     pub fn init(program_path: []const u8, compiler_path: []const u8) Loader {
@@ -26,7 +25,14 @@ pub const Loader = struct {
         io: std.Io,
         name: []const u8,
     ) LoadError!void {
-        const path = try arena.allocator().dupe([]const u8, &.{name});
+        const allocator = arena.allocator();
+        const own_file = try std.fs.path.join(allocator, &.{ self.program_path, "mn.mn" });
+        const own_directory = try std.fs.path.join(allocator, &.{ self.program_path, "mn" });
+        if (try isFile(io, own_file) or try isDirectory(io, own_directory)) {
+            self.failure = .{ .message = "mn is the module that comes with the language, a program cannot have its own" };
+            return error.ReservedModuleName;
+        }
+        const path = try allocator.dupe([]const u8, &.{name});
         _ = try self.loadModule(arena, io, path);
     }
 
@@ -43,32 +49,12 @@ pub const Loader = struct {
         self: *Loader,
         arena: *std.heap.ArenaAllocator,
         io: std.Io,
-        module_index: usize,
-        location: token.Location,
         name: []const u8,
     ) LoadError!?Namespace {
-        if (std.mem.eql(u8, name, "monolith")) {
-            const message = "module name is reserved";
-            return self.fail(module_index, location, message, error.ReservedModuleName);
-        }
-
-        const allocator = arena.allocator();
-        if (std.mem.eql(u8, name, "std")) {
-            if (self.program_has_std == null) {
-                const program_path = self.program_path;
-                const own_file = try std.fs.path.join(allocator, &.{ program_path, "std.mn" });
-                const own_directory = try std.fs.path.join(allocator, &.{ program_path, "std" });
-                const has_file = try isFile(io, own_file);
-                self.program_has_std = has_file or try isDirectory(io, own_directory);
-            }
-            if (self.program_has_std.?) {
-                const message = "name is ambiguous";
-                return self.fail(module_index, location, message, error.AmbiguousName);
-            }
-        }
-
-        const path = try allocator.dupe([]const u8, &.{name});
-        return self.loadNamespace(arena, io, path);
+        const path = try arena.allocator().dupe([]const u8, &.{name});
+        const namespace = try self.loadNamespace(arena, io, path);
+        if (namespace == null and isLanguageModule(name)) return .{ .path = path, .module = null, .directory = false };
+        return namespace;
     }
 
     pub fn loadMember(
@@ -94,18 +80,6 @@ pub const Loader = struct {
         const file = try self.buildModuleFileName(allocator, member);
         if (try isFile(io, file)) return true;
         return isDirectory(io, try self.buildDirectoryName(allocator, member));
-    }
-
-    fn fail(
-        self: *Loader,
-        module_index: usize,
-        location: token.Location,
-        message: []const u8,
-        load_error: LoadError,
-    ) LoadError {
-        const module = self.modules.items[module_index].path;
-        self.failure = .{ .module = module, .location = location, .message = message };
-        return load_error;
     }
 
     fn loadNamespace(
@@ -136,7 +110,7 @@ pub const Loader = struct {
     }
 
     fn chooseRoot(self: *Loader, name: []const u8) []const u8 {
-        if (std.mem.eql(u8, name, "std")) return self.compiler_path;
+        if (isLanguageModule(name)) return self.compiler_path;
         return self.program_path;
     }
 
@@ -199,7 +173,11 @@ pub const LoadError = LexError ||
     ParseError ||
     std.Io.Dir.StatFileError ||
     std.Io.Dir.ReadFileAllocError ||
-    error{ ReservedModuleName, AmbiguousName };
+    error{ReservedModuleName};
+
+pub fn isLanguageModule(name: []const u8) bool {
+    return std.mem.eql(u8, name, "mn");
+}
 
 fn buildSourceFileName(
     allocator: std.mem.Allocator,
@@ -224,6 +202,52 @@ fn isDirectory(io: std.Io, path: []const u8) LoadError!bool {
     return stat.kind == .directory;
 }
 
+test "loadMainModule: rejects a program with its own mn module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    try program_directory.dir.writeFile(io, .{ .sub_path = "mn.mn", .data = "fn one(): noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(io, .{ .sub_path = "main.mn", .data = "" });
+
+    try std.testing.expectError(error.ReservedModuleName, loader.loadMainModule(&arena, io, "main"));
+}
+
+test "loadMainModule: rejects a program with its own mn directory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    try program_directory.dir.createDirPath(io, "mn");
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(io, .{ .sub_path = "main.mn", .data = "" });
+
+    try std.testing.expectError(error.ReservedModuleName, loader.loadMainModule(&arena, io, "main"));
+}
+
 test "loadRoot: loads a module at the top" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -244,15 +268,14 @@ test "loadRoot: loads a module at the top" {
     var loader = Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(io, .{ .sub_path = "main.mn", .data = "" });
     try loader.loadMainModule(&arena, io, "main");
-    const location: token.Location = .{ .row = 1, .column = 1 };
-    const namespace = (try loader.loadRoot(&arena, io, 0, location, "utils")).?;
+    const namespace = (try loader.loadRoot(&arena, io, "utils")).?;
 
     try std.testing.expectEqual(1, namespace.module.?);
     const expected = try std.fs.path.join(arena.allocator(), &.{ program_path, "utils.mn" });
     try std.testing.expectEqualStrings(expected, try loader.buildModuleFileName(arena.allocator(), loader.modules.items[1].path));
 }
 
-test "loadRoot: reads std from the compiler's directory" {
+test "loadRoot: reads mn from the compiler's directory" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const io = std.testing.io;
@@ -260,8 +283,8 @@ test "loadRoot: reads std from the compiler's directory" {
     defer program_directory.cleanup();
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
-    try compiler_directory.dir.createDirPath(io, "std");
-    try compiler_directory.dir.writeFile(io, .{ .sub_path = "std/stdout.mn", .data = "fn one(): noop" });
+    try compiler_directory.dir.createDirPath(io, "mn");
+    try compiler_directory.dir.writeFile(io, .{ .sub_path = "mn/stdout.mn", .data = "fn one(): noop" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -273,14 +296,39 @@ test "loadRoot: reads std from the compiler's directory" {
     var loader = Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(io, .{ .sub_path = "main.mn", .data = "" });
     try loader.loadMainModule(&arena, io, "main");
-    const location: token.Location = .{ .row = 1, .column = 1 };
-    const namespace = (try loader.loadRoot(&arena, io, 0, location, "std")).?;
+    const namespace = (try loader.loadRoot(&arena, io, "mn")).?;
 
     try std.testing.expectEqual(null, namespace.module);
     try std.testing.expect(namespace.directory);
     _ = try loader.loadMember(&arena, io, namespace, "stdout");
-    const expected = try std.fs.path.join(arena.allocator(), &.{ compiler_path, "std/stdout.mn" });
+    const expected = try std.fs.path.join(arena.allocator(), &.{ compiler_path, "mn/stdout.mn" });
     try std.testing.expectEqualStrings(expected, try loader.buildModuleFileName(arena.allocator(), loader.modules.items[1].path));
+}
+
+test "loadRoot: gives the language module even without its directory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    const compiler_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
+    );
+    var loader = Loader.init(program_path, compiler_path);
+    try program_directory.dir.writeFile(io, .{ .sub_path = "main.mn", .data = "" });
+    try loader.loadMainModule(&arena, io, "main");
+    const namespace = (try loader.loadRoot(&arena, io, "mn")).?;
+
+    try std.testing.expectEqual(null, namespace.module);
+    try std.testing.expect(!namespace.directory);
+    try std.testing.expectEqualStrings("mn", namespace.path[0]);
 }
 
 test "loadRoot: finds nothing for a name that is neither a file nor a directory" {
@@ -302,62 +350,7 @@ test "loadRoot: finds nothing for a name that is neither a file nor a directory"
     var loader = Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(io, .{ .sub_path = "main.mn", .data = "" });
     try loader.loadMainModule(&arena, io, "main");
-    const location: token.Location = .{ .row = 1, .column = 1 };
-    try std.testing.expectEqual(null, try loader.loadRoot(&arena, io, 0, location, "missing"));
-}
-
-test "loadRoot: rejects the reserved name monolith" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const io = std.testing.io;
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    var compiler_directory = std.testing.tmpDir(.{});
-    defer compiler_directory.cleanup();
-    try program_directory.dir.writeFile(io, .{ .sub_path = "monolith.mn", .data = "fn one(): noop" });
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    const compiler_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
-    );
-    var loader = Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(io, .{ .sub_path = "main.mn", .data = "" });
-    try loader.loadMainModule(&arena, io, "main");
-    const location: token.Location = .{ .row = 1, .column = 1 };
-    const result = loader.loadRoot(&arena, io, 0, location, "monolith");
-
-    try std.testing.expectError(error.ReservedModuleName, result);
-    try std.testing.expectEqual(location, loader.failure.?.location.?);
-}
-
-test "loadRoot: rejects std when the program has its own" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const io = std.testing.io;
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    var compiler_directory = std.testing.tmpDir(.{});
-    defer compiler_directory.cleanup();
-    try program_directory.dir.createDirPath(io, "std");
-    try compiler_directory.dir.createDirPath(io, "std");
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    const compiler_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
-    );
-    var loader = Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(io, .{ .sub_path = "main.mn", .data = "" });
-    try loader.loadMainModule(&arena, io, "main");
-    const location: token.Location = .{ .row = 1, .column = 1 };
-
-    try std.testing.expectError(error.AmbiguousName, loader.loadRoot(&arena, io, 0, location, "std"));
-    try std.testing.expectEqual(loader.modules.items[0].path, loader.failure.?.module.?);
+    try std.testing.expectEqual(null, try loader.loadRoot(&arena, io, "missing"));
 }
 
 test "loadMember: loads each module once" {
@@ -381,8 +374,7 @@ test "loadMember: loads each module once" {
     var loader = Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(io, .{ .sub_path = "main.mn", .data = "" });
     try loader.loadMainModule(&arena, io, "main");
-    const location: token.Location = .{ .row = 1, .column = 1 };
-    const utils = (try loader.loadRoot(&arena, io, 0, location, "utils")).?;
+    const utils = (try loader.loadRoot(&arena, io, "utils")).?;
     const first = (try loader.loadMember(&arena, io, utils, "math")).?;
     const second = (try loader.loadMember(&arena, io, utils, "math")).?;
 
@@ -434,9 +426,8 @@ test "loadModule: reports failures in the module they are in" {
     var loader = Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(io, .{ .sub_path = "main.mn", .data = "" });
     try loader.loadMainModule(&arena, io, "main");
-    const location: token.Location = .{ .row = 1, .column = 1 };
 
-    try std.testing.expectError(error.UnexpectedTab, loader.loadRoot(&arena, io, 0, location, "utils"));
+    try std.testing.expectError(error.UnexpectedTab, loader.loadRoot(&arena, io, "utils"));
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"utils"}), loader.failure.?.module.?);
     try std.testing.expectEqual(1, loader.modules.items.len);
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, loader.failure.?.location.?);
@@ -459,9 +450,8 @@ test "loadModule: describes a parse error in a module it reaches" {
     try program_directory.dir.writeFile(io, .{ .sub_path = "utils.mn", .data = "fn one()" });
     try program_directory.dir.writeFile(io, .{ .sub_path = "main.mn", .data = "" });
     try loader.loadMainModule(&arena, io, "main");
-    const location: token.Location = .{ .row = 1, .column = 1 };
 
-    try std.testing.expectError(error.ExpectedColon, loader.loadRoot(&arena, io, 0, location, "utils"));
+    try std.testing.expectError(error.ExpectedColon, loader.loadRoot(&arena, io, "utils"));
     try std.testing.expectEqualStrings("expected ':'", loader.failure.?.message);
 }
 

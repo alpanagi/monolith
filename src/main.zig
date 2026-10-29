@@ -29,7 +29,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     const module_name = arguments.module_name;
     const is_type_name = types.findBuiltInType(module_name) != null;
-    if (!isName(module_name) or is_type_name or std.mem.eql(u8, module_name, "std")) {
+    if (!isName(module_name) or is_type_name or std.mem.eql(u8, module_name, "mn")) {
         const failure: Failure = .{ .message = "file name must be a valid name" };
         return report(allocator, stderr, &loader, failure);
     }

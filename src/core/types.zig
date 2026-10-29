@@ -10,10 +10,12 @@ pub const Type = union(enum) {
     void,
     type,
     @"struct": Struct,
+    @"enum": *const Enum,
     array: *const Array,
     slice: *const Slice,
     pointer: *const Pointer,
     optional: *const Optional,
+    result: *const Result,
     tuple: *const Tuple,
     function: *const Function,
     variable: Variable,
@@ -44,6 +46,29 @@ pub const Struct = struct {
     name: []const u8,
     fields: []const Field,
     origin: ?*Origin = null,
+};
+
+pub const Enum = struct {
+    module: usize,
+    path: []const []const u8 = &.{},
+    position: usize = 0,
+    name: []const u8,
+    kind: EnumKind = .enumeration,
+    cases: []const Case = &.{},
+    parts: []const *const Enum = &.{},
+};
+
+pub const EnumKind = enum {
+    enumeration,
+    error_set,
+};
+
+pub const Case = struct {
+    name: []const u8,
+    type: ?Type,
+    declaring: *const Enum,
+    tag: usize,
+    location: token.Location,
 };
 
 pub const Origin = struct {
@@ -80,6 +105,12 @@ pub const Pointer = struct {
 
 pub const Optional = struct {
     child: Type,
+    variables: bool = false,
+};
+
+pub const Result = struct {
+    error_set: *const Enum,
+    value: Type,
     variables: bool = false,
 };
 
@@ -127,9 +158,12 @@ pub const Registry = struct {
     slices: std.ArrayList(*const Slice) = .empty,
     pointers: std.ArrayList(*const Pointer) = .empty,
     optionals: std.ArrayList(*const Optional) = .empty,
+    results: std.ArrayList(*const Result) = .empty,
     tuples: std.ArrayList(*const Tuple) = .empty,
     functions: std.ArrayList(*const Function) = .empty,
     applications: std.ArrayList(*const Application) = .empty,
+    combined: std.ArrayList(*const Enum) = .empty,
+    tags: usize = 1,
 
     pub fn add(
         self: *Registry,
@@ -199,6 +233,21 @@ pub const Registry = struct {
         return optional;
     }
 
+    pub fn addResult(
+        self: *Registry,
+        allocator: std.mem.Allocator,
+        error_set: *const Enum,
+        value: Type,
+    ) std.mem.Allocator.Error!*const Result {
+        for (self.results.items) |result| {
+            if (result.error_set == error_set and std.meta.eql(result.value, value)) return result;
+        }
+        const result = try allocator.create(Result);
+        result.* = .{ .error_set = error_set, .value = value, .variables = hasVariables(value) };
+        try self.results.append(allocator, result);
+        return result;
+    }
+
     pub fn addTuple(
         self: *Registry,
         allocator: std.mem.Allocator,
@@ -231,6 +280,45 @@ pub const Registry = struct {
         };
         try self.functions.append(allocator, function);
         return function;
+    }
+
+    pub fn addCombined(
+        self: *Registry,
+        allocator: std.mem.Allocator,
+        one: *const Enum,
+        two: *const Enum,
+    ) std.mem.Allocator.Error!*const Enum {
+        var parts: std.ArrayList(*const Enum) = .empty;
+        for ([_]*const Enum{ one, two }) |side| {
+            for (side.parts) |part| {
+                if (std.mem.findScalar(*const Enum, parts.items, part) == null) try parts.append(allocator, part);
+            }
+        }
+        if (parts.items.len == 1) return parts.items[0];
+        std.mem.sort(*const Enum, parts.items, {}, isDeclaredBefore);
+        for (self.combined.items) |combined| {
+            if (combined.parts.len != parts.items.len) continue;
+            const same = for (parts.items) |part| {
+                if (std.mem.findScalar(*const Enum, combined.parts, part) == null) break false;
+            } else true;
+            if (same) return combined;
+        }
+        var cases: std.ArrayList(Case) = .empty;
+        var names: std.ArrayList([]const u8) = .empty;
+        for (parts.items) |part| {
+            try cases.appendSlice(allocator, part.cases);
+            try names.append(allocator, part.name);
+        }
+        const combined = try allocator.create(Enum);
+        combined.* = .{
+            .module = parts.items[0].module,
+            .name = try std.mem.join(allocator, "_or_", names.items),
+            .kind = .error_set,
+            .cases = cases.items,
+            .parts = parts.items,
+        };
+        try self.combined.append(allocator, combined);
+        return combined;
     }
 
     pub fn addApplication(
@@ -273,11 +361,12 @@ pub fn containsVariable(value_type: Type, scope: Scope) bool {
             }
             return false;
         },
-        .number, .boolean, .void, .type, .@"struct" => false,
+        .number, .boolean, .void, .type, .@"struct", .@"enum" => false,
         .pointer => |pointer| containsVariable(pointer.target, scope),
         .slice => |slice| containsVariable(slice.element, scope),
         .array => |array| containsVariable(array.element, scope),
         .optional => |optional| containsVariable(optional.child, scope),
+        .result => |result| containsVariable(result.value, scope),
         .tuple => |tuple| {
             for (tuple.elements) |element| {
                 if (containsVariable(element, scope)) return true;
@@ -327,7 +416,7 @@ pub fn matchType(pattern: Type, concrete: Type, scope: Scope, assigned: []?Argum
             }
             return true;
         },
-        .number, .boolean, .void, .type, .@"struct" => return !exact or std.meta.eql(pattern, concrete),
+        .number, .boolean, .void, .type, .@"struct", .@"enum" => return !exact or std.meta.eql(pattern, concrete),
         .pointer => |pointer| {
             if (concrete != .pointer or concrete.pointer.many != pointer.many) return false;
             if (exact and concrete.pointer.constant != pointer.constant) return false;
@@ -345,6 +434,10 @@ pub fn matchType(pattern: Type, concrete: Type, scope: Scope, assigned: []?Argum
         .optional => |optional| {
             if (concrete != .optional) return false;
             return matchType(optional.child, concrete.optional.child, scope, assigned, exact);
+        },
+        .result => |result| {
+            if (concrete != .result or concrete.result.error_set != result.error_set) return false;
+            return matchType(result.value, concrete.result.value, scope, assigned, exact);
         },
         .tuple => |tuple| {
             if (concrete != .tuple or concrete.tuple.elements.len != tuple.elements.len) return false;
@@ -375,7 +468,7 @@ pub fn substitute(
             const argument = arguments[variable.index];
             return if (argument == .type) argument.type else value_type;
         },
-        .number, .boolean, .void, .type, .@"struct" => value_type,
+        .number, .boolean, .void, .type, .@"struct", .@"enum" => value_type,
         .application => |application| {
             var constructor = application.constructor;
             if (constructor == .variable and constructor.variable.scope == .typeclass and constructor.variable.index < arguments.len) {
@@ -406,6 +499,11 @@ pub fn substitute(
         .optional => |optional| .{ .optional = try registry.addOptional(
             allocator,
             try substitute(allocator, registry, optional.child, arguments),
+        ) },
+        .result => |result| .{ .result = try registry.addResult(
+            allocator,
+            result.error_set,
+            try substitute(allocator, registry, result.value, arguments),
         ) },
         .tuple => |tuple| {
             const elements = try allocator.alloc(Type, tuple.elements.len);
@@ -459,8 +557,29 @@ pub const Side = enum {
     two,
 };
 
+pub fn isDeclaredEnum(enumeration: *const Enum) bool {
+    return enumeration.parts.len == 1 and enumeration.parts[0] == enumeration;
+}
+
+pub fn isResultError(value_type: Type, result: Result) bool {
+    if (value_type != .@"enum" or value_type.@"enum".kind != .error_set) return false;
+    if (result.value != .@"enum") return true;
+    return !isEnumPart(value_type.@"enum", result.value.@"enum");
+}
+
+pub fn isEnumPart(enumeration: *const Enum, combined: *const Enum) bool {
+    for (enumeration.parts) |part| {
+        if (std.mem.findScalar(*const Enum, combined.parts, part) == null) return false;
+    }
+    return true;
+}
+
 pub fn containsStruct(value_type: Type, target: Struct) bool {
-    return containsStructWithin(value_type, target, null);
+    return containsByValue(value_type, .{ .@"struct" = target }, null);
+}
+
+pub fn containsEnum(value_type: Type, target: *const Enum) bool {
+    return containsByValue(value_type, .{ .@"enum" = target }, null);
 }
 
 fn containsTypeValue(value_type: Type, visited: ?*const Visited) bool {
@@ -471,6 +590,7 @@ fn containsTypeValue(value_type: Type, visited: ?*const Visited) bool {
         .slice => |slice| containsTypeValue(slice.element, visited),
         .pointer => |pointer| containsTypeValue(pointer.target, visited),
         .optional => |optional| containsTypeValue(optional.child, visited),
+        .result => |result| containsTypeValue(result.value, visited),
         .tuple => |tuple| {
             for (tuple.elements) |element| {
                 if (containsTypeValue(element, visited)) return true;
@@ -484,43 +604,81 @@ fn containsTypeValue(value_type: Type, visited: ?*const Visited) bool {
             return containsTypeValue(function.return_type, visited);
         },
         .@"struct" => |struct_type| {
-            var current = visited;
-            while (current) |node| : (current = node.parent) {
-                if (node.fields.ptr == struct_type.fields.ptr) return false;
-            }
-            const node: Visited = .{ .fields = struct_type.fields, .parent = visited };
+            const identity = @intFromPtr(struct_type.fields.ptr);
+            if (isVisited(visited, identity)) return false;
+            const node: Visited = .{ .identity = identity, .parent = visited };
             for (struct_type.fields) |field| {
                 if (containsTypeValue(field.type, &node)) return true;
+            }
+            return false;
+        },
+        .@"enum" => |enumeration| {
+            const identity = @intFromPtr(enumeration);
+            if (isVisited(visited, identity)) return false;
+            const node: Visited = .{ .identity = identity, .parent = visited };
+            for (enumeration.cases) |case| {
+                if (containsTypeValue(case.type orelse continue, &node)) return true;
             }
             return false;
         },
     };
 }
 
-fn containsStructWithin(value_type: Type, target: Struct, visited: ?*const Visited) bool {
+fn isVisited(visited: ?*const Visited, identity: usize) bool {
+    var current = visited;
+    while (current) |node| : (current = node.parent) {
+        if (node.identity == identity) return true;
+    }
+    return false;
+}
+
+fn containsByValue(value_type: Type, target: Type, visited: ?*const Visited) bool {
     return switch (value_type) {
         .number, .boolean, .void, .type, .variable, .application, .slice, .pointer, .function => false,
-        .array => |array| containsStructWithin(array.element, target, visited),
-        .optional => |optional| containsStructWithin(optional.child, target, visited),
+        .array => |array| containsByValue(array.element, target, visited),
+        .optional => |optional| containsByValue(optional.child, target, visited),
+        .result => |result| containsByValue(.{ .@"enum" = result.error_set }, target, visited) or
+            containsByValue(result.value, target, visited),
         .tuple => |tuple| {
             for (tuple.elements) |element| {
-                if (containsStructWithin(element, target, visited)) return true;
+                if (containsByValue(element, target, visited)) return true;
             }
             return false;
         },
         .@"struct" => |struct_type| {
-            if (std.meta.eql(struct_type, target)) return true;
-            var current = visited;
-            while (current) |node| : (current = node.parent) {
-                if (node.fields.ptr == struct_type.fields.ptr) return false;
-            }
-            const node: Visited = .{ .fields = struct_type.fields, .parent = visited };
+            if (target == .@"struct" and std.meta.eql(struct_type, target.@"struct")) return true;
+            const identity = @intFromPtr(struct_type.fields.ptr);
+            if (isVisited(visited, identity)) return false;
+            const node: Visited = .{ .identity = identity, .parent = visited };
             for (struct_type.fields) |field| {
-                if (containsStructWithin(field.type, target, &node)) return true;
+                if (containsByValue(field.type, target, &node)) return true;
+            }
+            return false;
+        },
+        .@"enum" => |enumeration| {
+            if (target == .@"enum" and target.@"enum" == enumeration) return true;
+            const identity = @intFromPtr(enumeration);
+            if (isVisited(visited, identity)) return false;
+            const node: Visited = .{ .identity = identity, .parent = visited };
+            for (enumeration.cases) |case| {
+                if (containsByValue(case.type orelse continue, target, &node)) return true;
             }
             return false;
         },
     };
+}
+
+fn isDeclaredBefore(_: void, one: *const Enum, two: *const Enum) bool {
+    const length = @min(one.path.len, two.path.len);
+    for (one.path[0..length], two.path[0..length]) |one_part, two_part| {
+        switch (std.mem.order(u8, one_part, two_part)) {
+            .lt => return true,
+            .gt => return false,
+            .eq => {},
+        }
+    }
+    if (one.path.len != two.path.len) return one.path.len < two.path.len;
+    return one.position < two.position;
 }
 
 fn matchConstructor(pattern: Constructor, concrete: Constructor, scope: Scope, assigned: []?Argument) bool {
@@ -560,7 +718,7 @@ fn unifyType(one: Unified, two: Unified, sides: Sides) bool {
             if (right.type == .application) return unifyType(right, left, sides);
             return std.meta.eql(left.type, right.type);
         },
-        .number, .boolean, .void, .type, .variable => return std.meta.eql(left.type, right.type),
+        .number, .boolean, .void, .type, .variable, .@"enum" => return std.meta.eql(left.type, right.type),
         .pointer => |pointer| {
             const other = right.type;
             if (other != .pointer or other.pointer.many != pointer.many or other.pointer.constant != pointer.constant) return false;
@@ -579,6 +737,10 @@ fn unifyType(one: Unified, two: Unified, sides: Sides) bool {
         .optional => |optional| {
             if (right.type != .optional) return false;
             return unifyParts(optional.child, left.side, right.type.optional.child, right.side, sides);
+        },
+        .result => |result| {
+            if (right.type != .result or right.type.result.error_set != result.error_set) return false;
+            return unifyParts(result.value, left.side, right.type.result.value, right.side, sides);
         },
         .tuple => |tuple| {
             const other = right.type;
@@ -625,7 +787,7 @@ fn occurs(variable: Unified, term: Unified, sides: Sides) bool {
     return switch (current.type) {
         .variable => |other| isInstanceVariable(current.type) and current.side == variable.side and
             other.index == variable.type.variable.index,
-        .number, .boolean, .void, .type, .@"struct" => false,
+        .number, .boolean, .void, .type, .@"struct", .@"enum" => false,
         .application => |application| {
             for (application.arguments) |argument| {
                 if (occurs(variable, .{ .type = argument, .side = current.side }, sides)) return true;
@@ -636,6 +798,7 @@ fn occurs(variable: Unified, term: Unified, sides: Sides) bool {
         .slice => |slice| occurs(variable, .{ .type = slice.element, .side = current.side }, sides),
         .array => |array| occurs(variable, .{ .type = array.element, .side = current.side }, sides),
         .optional => |optional| occurs(variable, .{ .type = optional.child, .side = current.side }, sides),
+        .result => |result| occurs(variable, .{ .type = result.value, .side = current.side }, sides),
         .tuple => |tuple| {
             for (tuple.elements) |element| {
                 if (occurs(variable, .{ .type = element, .side = current.side }, sides)) return true;
@@ -656,7 +819,7 @@ fn isInstanceVariable(value_type: Type) bool {
 }
 
 const Visited = struct {
-    fields: []const Field,
+    identity: usize,
     parent: ?*const Visited,
 };
 
@@ -668,6 +831,80 @@ pub fn followPointer(value_type: Type) Type {
     if (value_type != .pointer) return value_type;
     return value_type.pointer.target;
 }
+
+pub fn findLayout(value_type: Type) Layout {
+    if (isZeroSized(value_type)) return .{ .size = 0, .alignment = 1 };
+    return switch (value_type) {
+        .number => |number| {
+            const size: u64 = switch (number) {
+                .i8, .u8 => 1,
+                .i16, .u16, .f16 => 2,
+                .i32, .u32, .f32 => 4,
+                .i64, .u64, .isize, .usize, .f64 => 8,
+                .i128, .u128, .f128 => 16,
+            };
+            return .{ .size = size, .alignment = size };
+        },
+        .boolean => .{ .size = 1, .alignment = 1 },
+        .pointer => .{ .size = 8, .alignment = 8 },
+        .slice => .{ .size = 16, .alignment = 8 },
+        .array => |array| {
+            const element = findLayout(array.element);
+            return .{ .size = element.size * array.length, .alignment = element.alignment };
+        },
+        .optional => |optional| {
+            if (optional.child == .pointer) return findLayout(optional.child);
+            var layout: Layout = .{ .size = 0, .alignment = 1 };
+            layout.append(findLayout(optional.child));
+            layout.append(findLayout(.boolean));
+            return layout.finish();
+        },
+        .result => |result| {
+            var layout: Layout = .{ .size = 0, .alignment = 1 };
+            layout.append(findLayout(.{ .@"enum" = result.error_set }));
+            layout.append(findLayout(result.value));
+            return layout.finish();
+        },
+        .tuple => |tuple| {
+            var layout: Layout = .{ .size = 0, .alignment = 1 };
+            for (tuple.elements) |element| layout.append(findLayout(element));
+            return layout.finish();
+        },
+        .@"struct" => |struct_type| {
+            var layout: Layout = .{ .size = 0, .alignment = 1 };
+            for (struct_type.fields) |field| layout.append(findLayout(field.type));
+            return layout.finish();
+        },
+        .@"enum" => |enumeration| {
+            var payload: Layout = .{ .size = 0, .alignment = 1 };
+            for (enumeration.cases) |case| {
+                const member = findLayout(case.type orelse continue);
+                payload.size = @max(payload.size, member.size);
+                payload.alignment = @max(payload.alignment, member.alignment);
+            }
+            var layout: Layout = .{ .size = 0, .alignment = 1 };
+            layout.append(findLayout(.{ .number = .u32 }));
+            layout.append(payload.finish());
+            return layout.finish();
+        },
+        .void, .type, .function, .variable, .application => unreachable,
+    };
+}
+
+pub const Layout = struct {
+    size: u64,
+    alignment: u64,
+
+    fn append(self: *Layout, member: Layout) void {
+        if (member.size == 0) return;
+        self.size = std.mem.alignForward(u64, self.size, member.alignment) + member.size;
+        self.alignment = @max(self.alignment, member.alignment);
+    }
+
+    fn finish(self: Layout) Layout {
+        return .{ .size = std.mem.alignForward(u64, self.size, self.alignment), .alignment = self.alignment };
+    }
+};
 
 pub fn isZeroSized(value_type: Type) bool {
     switch (value_type) {
@@ -685,7 +922,7 @@ pub fn isZeroSized(value_type: Type) bool {
             return true;
         },
         .void => return true,
-        .number, .boolean, .type, .slice, .pointer, .optional, .function, .variable, .application => {
+        .number, .boolean, .type, .slice, .pointer, .optional, .result, .function, .variable, .application, .@"enum" => {
             return false;
         },
     }
@@ -695,11 +932,12 @@ fn hasVariables(value_type: Type) bool {
     return switch (value_type) {
         .variable => true,
         .application => |application| application.variables,
-        .number, .boolean, .void, .type, .@"struct" => false,
+        .number, .boolean, .void, .type, .@"struct", .@"enum" => false,
         .array => |array| array.variables,
         .slice => |slice| slice.variables,
         .pointer => |pointer| pointer.variables,
         .optional => |optional| optional.variables,
+        .result => |result| result.variables,
         .tuple => |tuple| tuple.variables,
         .function => |function| function.variables,
     };
