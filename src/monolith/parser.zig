@@ -734,13 +734,9 @@ pub const Parser = struct {
         var position = offset.*;
         const underscore = self.match(&position, .underscore) orelse return null;
         _ = try self.expect(&position, .equals, error.ExpectedEquals);
-        const start = position;
         const discarded = (try self.parseExpression(allocator, &position)) orelse {
-            return self.fail(start, error.ExpectedCallOrName);
+            return self.fail(position, error.ExpectedExpression);
         };
-        if (!isCallOrTriedCall(discarded) and discarded.kind != .identifier) {
-            return self.fail(start, error.ExpectedCallOrName);
-        }
 
         offset.* = position;
         return .{ .kind = .{ .discard = discarded }, .location = underscore.location };
@@ -1394,6 +1390,7 @@ pub const Parser = struct {
         var position = offset.*;
         const current = self.tokens[position];
         if (current.kind == .keyword_try) return self.parseTry(allocator, offset);
+        if (try self.parseJumpExpression(allocator, offset)) |jump| return jump;
         const operator = findUnaryOperator(current.kind);
         if (operator == null and current.kind != .ampersand) {
             return self.parsePostfix(allocator, offset);
@@ -1433,6 +1430,38 @@ pub const Parser = struct {
 
         offset.* = position;
         return .{ .kind = .{ .@"try" = operand }, .location = keyword.location };
+    }
+
+    fn parseJumpExpression(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.Expression {
+        var position = offset.*;
+        const keyword = self.tokens[position];
+        const parsed = if (keyword.kind == .keyword_return)
+            try self.parseReturnExpression(allocator, &position)
+        else
+            try self.parseJump(&position);
+        const jump = parsed orelse return null;
+        const statement = try allocator.create(ast.Statement);
+        statement.* = jump;
+
+        offset.* = position;
+        return .{ .kind = .{ .jump = statement }, .location = keyword.location };
+    }
+
+    fn parseReturnExpression(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.Statement {
+        var position = offset.*;
+        const keyword = self.match(&position, .keyword_return) orelse return null;
+        const value = try self.parseExpression(allocator, &position);
+
+        offset.* = position;
+        return .{ .kind = .{ .@"return" = value }, .location = keyword.location };
     }
 
     fn parsePostfix(
@@ -1989,7 +2018,6 @@ pub const ParseError = error{
     ExpectedStatement,
     ExpectedExpression,
     ExpectedNumber,
-    ExpectedCallOrName,
     ExpectedTarget,
     ExpectedRightBracket,
     ExpectedLeftBrace,
@@ -2134,7 +2162,6 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.ExpectedStatement => "expected a statement",
         error.ExpectedExpression => "expected an expression",
         error.ExpectedNumber => "expected a number after '-'",
-        error.ExpectedCallOrName => "expected a call or a name",
         error.ExpectedTarget => "expression cannot be assigned",
         error.ExpectedRightBracket => "expected ']'",
         error.ExpectedLeftBrace => "expected '{'",
@@ -3522,26 +3549,39 @@ test "parseDiscard: rejects a missing equals sign" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, parser.failure.?.location.?);
 }
 
-test "parseDiscard: rejects a discarded literal" {
+test "parseDiscard: parses a discarded operation" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): _ = 5");
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): _ = count + 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
 
-    try std.testing.expectError(error.ExpectedCallOrName, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
+    const discarded = module.declarations[0].kind.function_definition.body[0].kind.discard;
+    try std.testing.expectEqual(ast.BinaryOperator.add, discarded.kind.binary.operator);
 }
 
-test "parseDiscard: rejects a discarded field access" {
+test "parseDiscard: parses a discarded field access" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("fn main(): _ = make().x");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
 
-    try std.testing.expectError(error.ExpectedCallOrName, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
+    const discarded = module.declarations[0].kind.function_definition.body[0].kind.discard;
+    try std.testing.expectEqualStrings("x", discarded.kind.field_access.field);
+}
+
+test "parseDiscard: rejects a missing value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main(): _ =");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 15 }, parser.failure.?.location.?);
 }
 
 test "parseVariableDeclaration: parses a variable with a written type and undefined" {
@@ -4695,15 +4735,19 @@ test "parseComparison: parses a comparison in parentheses as an operand of a com
     try std.testing.expectEqual(ast.BinaryOperator.less_than, value.kind.binary.left.kind.binary.operator);
 }
 
-test "parseOrElse: rejects return as the fallback" {
+test "parseOrElse: takes a return as the fallback" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return a orelse return 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
 
-    try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 32 }, parser.failure.?.location.?);
+    const value = module.declarations[0].kind.function_definition.body[0].kind.@"return".?;
+    try std.testing.expectEqual(ast.BinaryOperator.@"orelse", value.kind.binary.operator);
+    const fallback = value.kind.binary.right.kind.jump;
+    try std.testing.expectEqualStrings("1", fallback.kind.@"return".?.kind.integer_literal.text);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 32 }, fallback.location);
 }
 
 test "parseOrElse: binds bitwise or tighter than orelse" {
@@ -5018,6 +5062,59 @@ test "parseTry: binds try to its operand before a binary operator" {
     try std.testing.expectEqual(ast.BinaryOperator.add, value.kind.binary.operator);
     try std.testing.expectEqualStrings("first", value.kind.binary.left.kind.@"try".kind.call.callee.identifier.name);
     try std.testing.expectEqualStrings("second", value.kind.binary.right.kind.@"try".kind.call.callee.identifier.name);
+}
+
+test "parseJumpExpression: gives a return the rest of the expression as its value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return a orelse return b orelse c");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const value = module.declarations[0].kind.function_definition.body[0].kind.@"return".?;
+    const returned = value.kind.binary.right.kind.jump.kind.@"return".?;
+    try std.testing.expectEqual(ast.BinaryOperator.@"orelse", returned.kind.binary.operator);
+    try std.testing.expectEqualStrings("b", returned.kind.binary.left.kind.identifier.name);
+}
+
+test "parseJumpExpression: parses a return without a value before a closing parenthesis" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn f(): g(a orelse return)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const call = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call;
+    const fallback = call.arguments[0].value.kind.binary.right.kind.jump;
+    try std.testing.expectEqual(null, fallback.kind.@"return");
+}
+
+test "parseJumpExpression: parses break and continue with a label" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn f():\n    const a = b orelse break @outer\n    const c = d orelse continue");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const broken = body[0].kind.constant_declaration.value.kind.binary.right.kind.jump;
+    try std.testing.expectEqualStrings("outer", broken.kind.@"break".label.?);
+    const continued = body[1].kind.constant_declaration.value.kind.binary.right.kind.jump;
+    try std.testing.expectEqual(null, continued.kind.@"continue".label);
+}
+
+test "parseJumpExpression: rejects a label without the at sign" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn f(): const a = b orelse break outer");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.LabelWithoutSigil, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 34 }, parser.failure.?.location.?);
 }
 
 test "parsePostfix: parses a chain of field accesses" {

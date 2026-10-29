@@ -338,7 +338,7 @@
 
 ### Discards
 
-- `_ = value` discards a value. The value must be a call or the name of a parameter, local constant or variable.
+- `_ = value` discards a value, e.g. `_ = read_input(&buffer) orelse break`.
 - Discarding a call that returns `void`, or a name that is used elsewhere, is a compile-time error.
 - Discarding a result that can hold an error is a compile-time error, e.g. `_ = parse(text)`.
 
@@ -411,6 +411,7 @@
 - A loop can have a label, written `@` and a name before `while` or `for`, e.g. `@outer while running:`. `break @outer` and `continue @outer` act on that loop instead of the innermost one.
 - A label cannot repeat the label of an enclosing loop. An unused label is a compile-time error.
 - `break` and `continue` outside a loop are a compile-time error.
+- `return`, `break` and `continue` are also expressions that never produce a value, so they can be used wherever a value is expected, e.g. `const input = read_input(&buffer) orelse break`. Code that can never run because of them is a compile-time error, e.g. `count + return 5`.
 
 ## Functions
 
@@ -448,6 +449,7 @@
 - The program starts at the function `main` in `main.mn`.
 - `mn` is the module that comes with the language. It holds the built-in functions, which the compiler provides, and the standard library. A program's own `mn.mn` or `mn` directory is a compile-time error.
 - The built-in functions are `mn::size(T)` and `mn::alignment(T)`, which give a type's size and alignment in bytes as a `usize`, and `mn::convert(T, value)` and `mn::truncate(T, value)` (see Number Conversions), and `mn::cast(T, pointer)` and `mn::align(pointer, alignment)` (see Pointer Casts).
+- `mn::math::add_wrapping(a, b)`, `mn::math::subtract_wrapping(a, b)` and `mn::math::multiply_wrapping(a, b)` take two integers of the same type and give a result of that type that wraps around on overflow instead of being illegal behavior, e.g. `math::add_wrapping(value, 1)` is 0 for a `u8` `value` of 255.
 - `mn::comptime::error(message)` stops compilation with the message wherever the code containing it is checked, e.g. in the block a condition chooses at compile time. Like `return`, it ends its block, so a function returning a value needs no `return` after it. The message is a `[]const u8` known at compile time. The error shows the location of the call and each call that led to it.
 - `mn::reflection` holds the built-in functions that inspect and build types. `mn::reflection::length(T)` gives a tuple type's number of elements as a `usize`. `mn::reflection::join(A, B)` gives the tuple type with the elements of `A` followed by those of `B`, e.g. `mn::reflection::join([Card], [usize])` is `[Card, usize]`.
 - `import path` makes the last name of the path available in the module. The path names a directory, a module or a declaration in a module, e.g. `import mn::io::stdout` allows `stdout::write("hi")`.

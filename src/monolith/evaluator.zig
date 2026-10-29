@@ -24,6 +24,7 @@ pub const Evaluator = struct {
     cache: std.ArrayList(Cached) = .empty,
     calls: std.ArrayList(Active) = .empty,
     returned_error: ?Value.Enumeration = null,
+    jumped: ?Flow = null,
     failure: ?Failure = null,
 
     pub fn init(arena: *std.heap.ArenaAllocator, program: ast.Program) Evaluator {
@@ -169,7 +170,7 @@ pub const Evaluator = struct {
             },
             .method_call => |call| calls and self.isKnownWith(call.receiver.*, calls) and self.areKnown(call.arguments, calls),
             .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type, .struct_type => true,
-            .undefined => false,
+            .undefined, .jump => false,
         };
     }
 
@@ -226,6 +227,7 @@ pub const Evaluator = struct {
             .call => |*call| self.evaluateCallExpression(location, call),
             .method_call => self.fail(location, error.CannotEvaluate),
             .struct_type => unreachable,
+            .jump => |statement| self.evaluateJump(location, statement),
         };
     }
 
@@ -393,6 +395,7 @@ pub const Evaluator = struct {
             .unwrap,
             .@"try",
             .range,
+            .jump,
             => {
                 const cell = try self.arena.allocator().create(Value);
                 cell.* = try self.evaluateExpression(&expression);
@@ -499,6 +502,7 @@ pub const Evaluator = struct {
     fn evaluateBuiltin(self: *Evaluator, location: token.Location, call: ast.Call, builtin: ast.Builtin) EvaluateError!Value {
         if (builtin == .@"align") return self.fail(location, error.CannotEvaluate);
         if (builtin == .@"error") unreachable;
+        if (ast.findWrappingOperator(builtin)) |operator| return self.evaluateWrapping(call, operator);
         const target = (try self.evaluateExpression(&call.arguments[0].value)).type;
         switch (builtin) {
             .size => return .{ .integer = types.findLayout(target).size },
@@ -516,8 +520,24 @@ pub const Evaluator = struct {
                 return self.convertNumber(location, builtin, value, target.number);
             },
             .cast => return self.castPointer(location, target.pointer, &call.arguments[1].value),
-            .@"align", .@"error" => unreachable,
+            .@"align", .@"error", .add_wrapping, .subtract_wrapping, .multiply_wrapping => unreachable,
         }
+    }
+
+    fn evaluateWrapping(self: *Evaluator, call: ast.Call, operator: ast.BinaryOperator) EvaluateError!Value {
+        var operands: [2]u129 = undefined;
+        for (call.arguments, &operands) |*argument, *operand| {
+            const value = try self.evaluateExpression(&argument.value);
+            if (value == .undefined) return self.fail(argument.value.location, error.ReadUndefined);
+            operand.* = @bitCast(value.integer);
+        }
+        const bits = switch (operator) {
+            .add => operands[0] +% operands[1],
+            .subtract => operands[0] -% operands[1],
+            .multiply => operands[0] *% operands[1],
+            else => unreachable,
+        };
+        return .{ .integer = truncateInteger(findNumber(call.arguments[0].value.type.?), @bitCast(bits)) };
     }
 
     fn castPointer(self: *Evaluator, location: token.Location, target: *const types.Pointer, argument: *const ast.Expression) EvaluateError!Value {
@@ -782,6 +802,17 @@ pub const Evaluator = struct {
         return error.ErrorReturned;
     }
 
+    fn evaluateJump(self: *Evaluator, location: token.Location, statement: *const ast.Statement) EvaluateError!Value {
+        if (self.frame == null) return self.fail(location, error.CannotEvaluate);
+        self.jumped = switch (statement.kind) {
+            .@"return" => try self.executeStatement(statement),
+            .@"break" => |jump| .{ .broke = jump.loop.? },
+            .@"continue" => |jump| .{ .continued = jump.loop.? },
+            else => unreachable,
+        };
+        return error.Jumped;
+    }
+
     fn evaluateAddress(self: *Evaluator, operand: ast.Expression) EvaluateError!Value {
         switch (operand.kind) {
             inline .identifier, .path_expression, .member => |name| {
@@ -944,7 +975,7 @@ pub const Evaluator = struct {
     fn executeBlock(self: *Evaluator, statements: []const ast.Statement) EvaluateError!Flow {
         if (containsDefer(statements)) return self.executeDeferringBlock(statements);
         for (statements) |*statement| {
-            const flow = try self.executeStatement(statement);
+            const flow = self.executeStatement(statement) catch |execute_error| return self.recoverJump(execute_error);
             if (flow != .next) return flow;
         }
         return .next;
@@ -958,7 +989,8 @@ pub const Evaluator = struct {
                 try deferred.append(self.arena.allocator(), statement.kind.@"defer");
                 continue;
             }
-            flow = self.executeStatement(statement) catch |execute_error| {
+            flow = self.executeStatement(statement) catch |execute_error| flow: {
+                if (execute_error == error.Jumped) break :flow try self.recoverJump(execute_error);
                 if (execute_error == error.ErrorReturned) try self.executeDeferred(deferred.items, true);
                 return execute_error;
             };
@@ -978,6 +1010,13 @@ pub const Evaluator = struct {
             if (deferred[index].on_error and !failed) continue;
             _ = try self.executeStatement(deferred[index].statement);
         }
+    }
+
+    fn recoverJump(self: *Evaluator, execute_error: EvaluateError) EvaluateError!Flow {
+        if (execute_error != error.Jumped) return execute_error;
+        const flow = self.jumped.?;
+        self.jumped = null;
+        return flow;
     }
 
     fn executeStatement(self: *Evaluator, statement: *const ast.Statement) EvaluateError!Flow {
@@ -1423,6 +1462,7 @@ pub const EvaluationError = error{
     ExpectedErrorSet,
     ConversionOutOfRange,
     ErrorReturned,
+    Jumped,
     UncaughtError,
     CallDepth,
     DependencyLoop,
@@ -1475,6 +1515,7 @@ fn describeError(evaluation_error: EvaluationError) []const u8 {
         error.ExpectedErrorSet => "expected an error set before '!'",
         error.ConversionOutOfRange => "value does not fit the type",
         error.ErrorReturned => "error returned",
+        error.Jumped => "returned, broke or continued",
         error.UncaughtError => "error is not caught",
         error.StepLimit => "evaluation takes more than 1000000 steps",
         error.CallDepth => "compile-time calls are nested more than 512 deep",
@@ -2212,6 +2253,39 @@ test "evaluateCall: strips one line ending with mn::text::strip at compile time"
     try std.testing.expectEqual(Value{ .integer = 2 }, declarations[11].kind.constant_declaration.known.?.*);
 }
 
+test "Xoshiro256: gives the reference numbers and stays inside a range at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::random\nimport mn::random::Generator\nfn mix(seed: u64) -> [4]u64:\n    var state = seed\n    return {random::splitmix64(&state), random::splitmix64(&state), random::splitmix64(&state), random::splitmix64(&state)}\nfn reference() -> [6]u64:\n    var generator = random::Xoshiro256{state = {1, 2, 3, 4}}\n    return {Generator::next(&generator), Generator::next(&generator), Generator::next(&generator), Generator::next(&generator), Generator::next(&generator), Generator::next(&generator)}\nfn seeded() -> [4]u64:\n    var generator = random::Xoshiro256::new(42)\n    return {generator.next(), generator.next(), generator.next(), generator.next()}\nfn repeats() -> bool:\n    var one = random::Xoshiro256::new(42)\n    var two = random::Xoshiro256::new(42)\n    for _ in 0..100:\n        if Generator::next(&one) != Generator::next(&two): return false\n    return true\nfn stays_inside() -> bool:\n    var generator = random::Xoshiro256::new(7)\n    var seen: [6]bool = {false, false, false, false, false, false}\n    for _ in 0..1000:\n        const value = generator.range(1..7)\n        if value < 1 or value >= 7: return false\n        seen[value - 1] = true\n        if Generator::range(&generator, 0..1) != 0: return false\n    for found in seen:\n        if !found: return false\n    return true\nconst MIX = mix(0)\nconst REFERENCE = reference()\nconst SEEDED = seeded()\nconst REPEATS = repeats()\nconst STAYS_INSIDE = stays_inside()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    const mixed = [_]i129{ 16294208416658607535, 7960286522194355700, 487617019471545679, 17909611376780542444 };
+    for (mixed, declarations[7].kind.constant_declaration.known.?.aggregate) |expected, value| {
+        try std.testing.expectEqual(Value{ .integer = expected }, value);
+    }
+    const reference = [_]i129{ 11520, 0, 1509978240, 1215971899390074240, 1216172134540287360, 607988272756665600 };
+    for (reference, declarations[8].kind.constant_declaration.known.?.aggregate) |expected, value| {
+        try std.testing.expectEqual(Value{ .integer = expected }, value);
+    }
+    const seeded = [_]i129{ 1546998764402558742, 6990951692964543102, 12544586762248559009, 17057574109182124193 };
+    for (seeded, declarations[9].kind.constant_declaration.known.?.aggregate) |expected, value| {
+        try std.testing.expectEqual(Value{ .integer = expected }, value);
+    }
+    try std.testing.expect(declarations[10].kind.constant_declaration.known.?.boolean);
+    try std.testing.expect(declarations[11].kind.constant_declaration.known.?.boolean);
+}
+
 test "evaluateBuiltin: converts and truncates numbers at compile time" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2312,6 +2386,29 @@ test "evaluateBuiltin: rejects aligning a pointer at compile time" {
 
     try std.testing.expectError(error.CannotEvaluate, analyzer.analyze());
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 21 }, analyzer.failure.?.location.?);
+}
+
+test "evaluateWrapping: wraps around at compile time for signed and unsigned integers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::math\nconst ADD_U8 = math::add_wrapping(255u8, 1)\nconst SUBTRACT_U8 = math::subtract_wrapping(0u8, 1)\nconst MULTIPLY_U8 = math::multiply_wrapping(255u8, 2)\nconst ADD_I8 = math::add_wrapping(127i8, 1)\nconst SUBTRACT_I8 = math::subtract_wrapping(-128i8, 1)\nconst MULTIPLY_I8 = math::multiply_wrapping(127i8, 2)\nconst NEGATE_I8 = math::multiply_wrapping(-128i8, -1)\nconst ADD_U64 = math::add_wrapping(18446744073709551615u64, 1)\nconst SUBTRACT_U64 = math::subtract_wrapping(0u64, 1)\nconst MULTIPLY_U64 = math::multiply_wrapping(18446744073709551615u64, 2)\nconst ADD_I64 = math::add_wrapping(9223372036854775807i64, 1)\nconst SUBTRACT_I64 = math::subtract_wrapping(-9223372036854775808i64, 1)\nconst MULTIPLY_I64 = math::multiply_wrapping(9223372036854775807i64, 2)\nconst NEGATE_I64 = math::multiply_wrapping(-9223372036854775808i64, -1)\nconst MULTIPLY_U16 = math::multiply_wrapping(65535u16, 65535)\nconst MULTIPLY_U128 = math::multiply_wrapping(340282366920938463463374607431768211455u128, 3)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    const expected = [_]i129{ 0, 255, 254, -128, 127, -2, -128, 0, 18446744073709551615, 18446744073709551614, -9223372036854775808, 9223372036854775807, -2, -9223372036854775808, 1, 340282366920938463463374607431768211453 };
+    for (expected, declarations[1..]) |value, declaration| {
+        try std.testing.expectEqual(Value{ .integer = value }, declaration.kind.constant_declaration.known.?.*);
+    }
 }
 
 test "evaluateBinary: orders the cases of a combined error set by the declarations of its sets" {
@@ -2699,6 +2796,32 @@ test "evaluateTry: returns the error of a result from the function" {
     const declarations = loader.modules.items[0].declarations;
     try std.testing.expectEqual(Value{ .integer = 3 }, declarations[4].kind.constant_declaration.known.?.*);
     try std.testing.expectEqual(Value{ .integer = 99 }, declarations[5].kind.constant_declaration.known.?.*);
+}
+
+test "evaluateJump: returns, breaks and continues from inside an expression at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure:\n    bad\nfn parse(text: u8) -> Failure!u8:\n    if text == 0: return Failure::bad\n    return text\nfn safe(text: u8) -> u8:\n    const digit = parse(text) catch return 9\n    return digit\nfn total(values: [4]?i32) -> i32:\n    var sum: i32 = 0\n    var index: usize = 0\n    while index < 4:\n        index += 1\n        const value = values[index - 1] orelse continue\n        sum += value\n    return sum\nfn first(values: [4]?i32) -> i32:\n    var index: usize = 0\n    @outer while true:\n        while index < 4:\n            const value = values[index] orelse break @outer\n            index += 1\n            if value > 2: return value\n    return -1\nfn guard(value: ?i32, log: *i32) -> i32:\n    defer log.* = log.* * 10 + 1\n    const found = value orelse return 0\n    defer log.* = log.* * 10 + 2\n    return found\nfn check() -> [7]i32:\n    var missing_log: i32 = 0\n    const missing = guard(null, &missing_log)\n    var present_log: i32 = 0\n    const present = guard(5, &present_log)\n    const one: [4]?i32 = {1, null, 3, null}\n    const two: [4]?i32 = {1, 2, 4, null}\n    const three: [4]?i32 = {1, null, 4, 0}\n    return {total(one), first(two), first(three), missing * 100 + missing_log, present * 100 + present_log, safe(0), safe(4)}\nconst RESULTS = check()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const elements = loader.modules.items[0].declarations[7].kind.constant_declaration.known.?.aggregate;
+    try std.testing.expectEqual(Value{ .integer = 4 }, elements[0]);
+    try std.testing.expectEqual(Value{ .integer = 4 }, elements[1]);
+    try std.testing.expectEqual(Value{ .integer = -1 }, elements[2]);
+    try std.testing.expectEqual(Value{ .integer = 1 }, elements[3]);
+    try std.testing.expectEqual(Value{ .integer = 521 }, elements[4]);
+    try std.testing.expectEqual(Value{ .integer = 9 }, elements[5]);
+    try std.testing.expectEqual(Value{ .integer = 4 }, elements[6]);
 }
 
 test "evaluateCall: evaluates an inline function at compile time like any function" {

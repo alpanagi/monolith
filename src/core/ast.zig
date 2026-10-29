@@ -361,6 +361,7 @@ pub const ExpressionKind = union(enum) {
     @"try": *Expression,
     range: *Range,
     struct_type: *StructType,
+    jump: *Statement,
 };
 
 pub const Call = struct {
@@ -455,6 +456,9 @@ pub const Builtin = enum {
     length,
     join,
     @"error",
+    add_wrapping,
+    subtract_wrapping,
+    multiply_wrapping,
 };
 
 pub const Binary = struct {
@@ -596,6 +600,16 @@ pub const Field = struct {
     default: ?Expression = null,
     default_value: ?Value = null,
     location: token.Location,
+};
+
+pub const Expressions = struct {
+    items: [2]*const Expression = undefined,
+    count: usize = 0,
+
+    fn append(self: *Expressions, expression: *const Expression) void {
+        self.items[self.count] = expression;
+        self.count += 1;
+    }
 };
 
 pub const Blocks = struct {
@@ -869,6 +883,114 @@ fn isEndingStatement(module: Module, statement: Statement) bool {
     };
 }
 
+pub fn extractExpressions(statement: *const Statement) Expressions {
+    var expressions: Expressions = .{};
+    switch (statement.kind) {
+        .@"return" => |*value| if (value.*) |*returned| expressions.append(returned),
+        .discard, .call => |*expression| expressions.append(expression),
+        .constant_declaration => |*constant| expressions.append(&constant.value),
+        .tuple_declaration => |*declaration| expressions.append(&declaration.value),
+        .variable_declaration => |*variable| expressions.append(&variable.value),
+        .assignment => |*assignment| {
+            expressions.append(&assignment.value);
+            expressions.append(&assignment.target);
+        },
+        .@"if" => |*conditional| expressions.append(&conditional.condition),
+        .@"while" => |*loop| expressions.append(&loop.condition),
+        .@"for" => |*loop| switch (loop.sequence) {
+            .value => |*value| expressions.append(value),
+            .range => |*range| {
+                expressions.append(&range.start);
+                if (range.end) |*end| expressions.append(end);
+            },
+        },
+        .match => |*matching| expressions.append(&matching.value),
+        .noop, .@"defer", .@"break", .@"continue" => {},
+    }
+    return expressions;
+}
+
+pub fn collectJumps(
+    allocator: std.mem.Allocator,
+    jumps: *std.ArrayList(*Statement),
+    expression: *const Expression,
+) std.mem.Allocator.Error!void {
+    switch (expression.kind) {
+        .integer_literal,
+        .float_literal,
+        .boolean_literal,
+        .string_literal,
+        .undefined,
+        .null,
+        .identifier,
+        .path_expression,
+        .array_type,
+        .slice_type,
+        .pointer_type,
+        .optional_type,
+        .tuple_type,
+        .function_type,
+        .struct_type,
+        => {},
+        .member => |member| try collectJumps(allocator, jumps, member.owner),
+        .call => |call| {
+            if (call.callee == .member) try collectJumps(allocator, jumps, call.callee.member.owner);
+            for (call.arguments) |*argument| try collectJumps(allocator, jumps, &argument.value);
+        },
+        .method_call => |call| {
+            try collectJumps(allocator, jumps, call.receiver);
+            for (call.arguments) |*argument| try collectJumps(allocator, jumps, &argument.value);
+        },
+        .composite_literal => |literal| {
+            for (literal.elements) |*element| try collectJumps(allocator, jumps, &element.value);
+        },
+        .binary => |binary| {
+            try collectJumps(allocator, jumps, binary.left);
+            try collectJumps(allocator, jumps, binary.right);
+        },
+        .unary => |unary| try collectJumps(allocator, jumps, unary.operand),
+        .negation, .address_of, .dereference, .unwrap, .@"try" => |operand| try collectJumps(allocator, jumps, operand),
+        .index => |indexing| {
+            try collectJumps(allocator, jumps, indexing.value);
+            try collectJumps(allocator, jumps, indexing.index);
+        },
+        .slice => |slice| {
+            try collectJumps(allocator, jumps, slice.value);
+            if (slice.start) |start| try collectJumps(allocator, jumps, start);
+            if (slice.end) |end| try collectJumps(allocator, jumps, end);
+        },
+        .field_access => |access| try collectJumps(allocator, jumps, access.value),
+        .range => |range| {
+            try collectJumps(allocator, jumps, &range.start);
+            if (range.end) |*end| try collectJumps(allocator, jumps, end);
+        },
+        .jump => |statement| {
+            try jumps.append(allocator, statement);
+            if (statement.kind == .@"return") {
+                if (statement.kind.@"return") |*value| try collectJumps(allocator, jumps, value);
+            }
+        },
+    }
+}
+
+pub fn collectStatementJumps(
+    allocator: std.mem.Allocator,
+    jumps: *std.ArrayList(*Statement),
+    statement: *const Statement,
+) std.mem.Allocator.Error!void {
+    const expressions = extractExpressions(statement);
+    for (expressions.items[0..expressions.count]) |expression| try collectJumps(allocator, jumps, expression);
+}
+
+pub fn findWrappingOperator(builtin: Builtin) ?BinaryOperator {
+    return switch (builtin) {
+        .add_wrapping => .add,
+        .subtract_wrapping => .subtract,
+        .multiply_wrapping => .multiply,
+        .size, .alignment, .convert, .truncate, .cast, .@"align", .length, .join, .@"error" => null,
+    };
+}
+
 pub fn isComptimeErrorCall(module: Module, expression: Expression) bool {
     if (expression.kind != .call) return false;
     const path = switch (expression.kind.call.callee) {
@@ -1118,6 +1240,7 @@ pub fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std
             cloned.* = .{ .fields = struct_type.fields, .functions = struct_type.functions };
             break :kind .{ .struct_type = cloned };
         },
+        .jump => |statement| .{ .jump = try cloneJump(allocator, statement) },
     };
     return .{ .kind = kind, .location = expression.location };
 }
@@ -1237,6 +1360,12 @@ fn cloneStatement(allocator: std.mem.Allocator, statement: Statement) std.mem.Al
         .@"continue" => |jump| .{ .@"continue" = .{ .label = jump.label } },
     };
     return .{ .kind = kind, .location = statement.location };
+}
+
+fn cloneJump(allocator: std.mem.Allocator, statement: *const Statement) std.mem.Allocator.Error!*Statement {
+    const cloned = try allocator.create(Statement);
+    cloned.* = try cloneStatement(allocator, statement.*);
+    return cloned;
 }
 
 fn cloneDefer(allocator: std.mem.Allocator, deferred: Defer) std.mem.Allocator.Error!Defer {

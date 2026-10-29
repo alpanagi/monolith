@@ -1692,6 +1692,7 @@ pub const NameResolver = struct {
             .slice,
             .@"try",
             .range,
+            .jump,
             => return self.fail(expression.location, error.TypeMismatch),
         }
     }
@@ -1837,6 +1838,7 @@ pub const NameResolver = struct {
             .parameter_uses = block.parameter_uses,
             .locals = block.locals.items,
         };
+        try self.resolveStatementJumps(block, statement);
         switch (statement.kind) {
             .noop => {},
             .@"return" => |*value| {
@@ -1916,12 +1918,7 @@ pub const NameResolver = struct {
                 }
                 try self.resolveBranches(block, statement);
             },
-            .@"break" => |*jump| {
-                jump.loop = try self.resolveJump(block, statement.location, jump.label, error.BreakOutsideLoop);
-            },
-            .@"continue" => |*jump| {
-                jump.loop = try self.resolveJump(block, statement.location, jump.label, error.ContinueOutsideLoop);
-            },
+            .@"break", .@"continue" => try self.resolveJump(block.loops.items, statement),
         }
         return null;
     }
@@ -2127,19 +2124,31 @@ pub const NameResolver = struct {
         return target;
     }
 
-    fn resolveJump(
-        self: *NameResolver,
-        block: Block,
-        location: token.Location,
-        label: ?[]const u8,
-        outside_error: NameError,
-    ) NameError!*const ast.Statement {
-        const loops = block.loops.items;
-        if (loops.len == 0) return self.fail(location, outside_error);
-        const name = label orelse return loops[loops.len - 1].statement;
-        const loop = findLoop(loops, name) orelse return self.fail(location, error.UnknownLabel);
+    fn resolveJump(self: *NameResolver, loops: []Loop, statement: *ast.Statement) NameError!void {
+        const jump = switch (statement.kind) {
+            .@"break", .@"continue" => |*jump| jump,
+            else => unreachable,
+        };
+        if (loops.len == 0) {
+            const outside_error: NameError = if (statement.kind == .@"break") error.BreakOutsideLoop else error.ContinueOutsideLoop;
+            return self.fail(statement.location, outside_error);
+        }
+        const name = jump.label orelse {
+            jump.loop = loops[loops.len - 1].statement;
+            return;
+        };
+        const loop = findLoop(loops, name) orelse return self.fail(statement.location, error.UnknownLabel);
         loop.label_used = true;
-        return loop.statement;
+        jump.loop = loop.statement;
+    }
+
+    fn resolveStatementJumps(self: *NameResolver, block: Block, statement: *const ast.Statement) ResolveError!void {
+        var jumps: std.ArrayList(*ast.Statement) = .empty;
+        try ast.collectStatementJumps(self.arena.allocator(), &jumps, statement);
+        for (jumps.items) |jump| {
+            if (jump.kind == .@"return") continue;
+            try self.resolveJump(block.loops.items, jump);
+        }
     }
 
     fn resolveLocalConstant(
@@ -2281,6 +2290,7 @@ pub const NameResolver = struct {
             .unwrap,
             .@"try",
             .range,
+            .jump,
             => unreachable,
         }
     }
@@ -2424,6 +2434,11 @@ pub const NameResolver = struct {
                 struct_type.module = self.module_index;
                 struct_type.bindings = self.bindings;
                 struct_type.prefix = self.owner_name;
+            },
+            .jump => |statement| {
+                if (statement.kind == .@"return") {
+                    if (statement.kind.@"return") |*value| try self.resolveNamesInExpression(scope, value);
+                }
             },
         }
     }
@@ -3075,6 +3090,7 @@ pub const NameResolver = struct {
             .range,
             .struct_type,
             .member,
+            .jump,
             => {
                 if (!constant.resolved) {
                     try self.resolveNamesInExpression(.{}, value);
@@ -3455,13 +3471,14 @@ const Dependency = struct {
     removed: bool = false,
 
     fn names(self: Dependency) Names {
-        return .{ .roots = self.roots.items, .values = self.values.items };
+        return .{ .roots = self.roots.items, .values = self.values.items, .returns = self.returns };
     }
 };
 
 const Names = struct {
     roots: []const []const u8 = &.{},
     values: []const []const u8 = &.{},
+    returns: bool = false,
 };
 
 const NamedInstance = struct {
@@ -3866,6 +3883,10 @@ fn isDependentExpression(names: Names, expression: ast.Expression, in_type: bool
             (if (slice.start) |start| isDependentExpression(names, start.*, in_type) else false) or
             (if (slice.end) |end| isDependentExpression(names, end.*, in_type) else false),
         .field_access => |access| isDependentExpression(names, access.value.*, in_type),
+        .jump => |statement| switch (statement.kind) {
+            .@"return" => |value| if (value) |returned| names.returns or isDependentExpression(names, returned, in_type) else false,
+            else => false,
+        },
         .struct_type => |struct_type| {
             for (struct_type.fields) |field| {
                 if (isDependentExpression(names, field.type, true)) return true;
@@ -4024,6 +4045,10 @@ fn collectExpressionNames(
         .struct_type => |struct_type| {
             for (struct_type.fields) |field| try collectExpressionNames(allocator, names, field.type);
         },
+        .jump => |statement| switch (statement.kind) {
+            .@"return" => |value| if (value) |returned| try collectExpressionNames(allocator, names, returned),
+            else => {},
+        },
     }
 }
 
@@ -4086,6 +4111,7 @@ fn findBuiltinNamespace(builtin: ast.Builtin) ?[]const u8 {
     return switch (builtin) {
         .length, .join => "reflection",
         .@"error" => "comptime",
+        .add_wrapping, .subtract_wrapping, .multiply_wrapping => "math",
         .size, .alignment, .convert, .truncate, .cast, .@"align" => null,
     };
 }
@@ -8037,6 +8063,47 @@ test "resolveJump: rejects a label that does not name an enclosing loop" {
 
     try std.testing.expectError(error.UnknownLabel, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 18 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveStatementJumps: resolves a labeled break in a fallback to its loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read() -> ?i32: return null\nfn main():\n    @outer while true:\n        while true:\n            const value = read() orelse break @outer\n            _ = value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
+    const inner = body[0].kind.@"while".body[0].kind.@"while";
+    const fallback = inner.body[0].kind.constant_declaration.value.kind.binary.right.kind.jump;
+    try std.testing.expectEqual(&body[0], fallback.kind.@"break".loop.?);
+}
+
+test "resolveStatementJumps: rejects a break in a fallback outside a loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read() -> ?i32: return null\nfn main():\n    const value = read() orelse break\n    _ = value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.BreakOutsideLoop, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 33 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveLocalConstant: rejects a reserved name" {

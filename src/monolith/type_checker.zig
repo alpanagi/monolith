@@ -413,6 +413,12 @@ pub const TypeChecker = struct {
             },
             .passed => .assigned,
         };
+        var jumps: std.ArrayList(*ast.Statement) = .empty;
+        try ast.collectStatementJumps(self.arena.allocator(), &jumps, statement);
+        for (jumps.items) |jump| {
+            if (jump.kind != .@"break") continue;
+            mergeExit(trace, jump.kind.@"break".loop.?, flow);
+        }
         switch (statement.kind) {
             .call => |expression| {
                 if (ast.isComptimeErrorCall(self.program.modules[self.module_index], expression)) return .ended;
@@ -422,9 +428,7 @@ pub const TypeChecker = struct {
             .variable_declaration, .assignment => return flow,
             .@"return", .@"continue" => return .ended,
             .@"break" => |jump| {
-                for (trace.exits.items) |*exit| {
-                    if (exit.loop == jump.loop.?) exit.flow = mergeFlows(exit.flow, flow);
-                }
+                mergeExit(trace, jump.loop.?, flow);
                 return .ended;
             },
             .@"if" => |conditional| {
@@ -533,26 +537,11 @@ pub const TypeChecker = struct {
     ) TypeError!void {
         const parameters = signature.parameters;
         const return_type = ast.extractType(signature.return_type);
+        try self.expectReachableStatement(statement);
         switch (statement.kind) {
             .noop => {},
-            .@"return" => |*value| {
-                if (value.*) |*expression| {
-                    if (return_type == .void) {
-                        return self.fail(expression.location, error.UnexpectedReturnValue);
-                    }
-                    try self.checkExpression(parameters, expression, return_type);
-                } else if (!returnsNoValue(return_type)) {
-                    return self.fail(statement.location, error.MissingReturnValue);
-                }
-            },
-            .discard => |*expression| {
-                if (expression.kind == .identifier) return;
-                const value_type = try self.checkStatementCall(parameters, expression);
-                if (value_type == .void) return self.fail(expression.location, error.DiscardedVoid);
-                if (canHoldError(value_type)) {
-                    return self.fail(expression.location, error.DiscardedError);
-                }
-            },
+            .@"return" => try self.checkReturn(parameters, statement, return_type),
+            .discard => |*expression| try self.checkDiscard(parameters, expression),
             .call => |*expression| {
                 if (try self.checkStatementCall(parameters, expression) != .void) {
                     return self.fail(expression.location, error.UnusedResult);
@@ -651,6 +640,108 @@ pub const TypeChecker = struct {
                 try self.checkStatement(signature, deferred.statement);
             },
             .@"break", .@"continue" => {},
+        }
+    }
+
+    fn checkDiscard(
+        self: *TypeChecker,
+        parameters: []const ast.TypedName,
+        expression: *ast.Expression,
+    ) TypeError!void {
+        if (expression.kind == .identifier) return;
+        const value_type = if (isCallOrTriedCall(expression.*))
+            try self.checkStatementCall(parameters, expression)
+        else
+            try self.inferType(parameters, expression);
+        if (value_type == .void) return self.fail(expression.location, error.DiscardedVoid);
+        if (canHoldError(value_type)) return self.fail(expression.location, error.DiscardedError);
+    }
+
+    fn expectReachableStatement(self: *TypeChecker, statement: *const ast.Statement) CheckError!void {
+        const expressions = ast.extractExpressions(statement);
+        for (expressions.items[0..expressions.count]) |expression| try self.expectReachable(expression);
+        for (expressions.items[0..expressions.count]) |expression| {
+            if (expression.kind != .jump) continue;
+            const location = switch (statement.kind) {
+                .@"if", .@"while", .@"for", .match => expression.location,
+                else => statement.location,
+            };
+            return self.fail(location, error.UnreachableCode);
+        }
+    }
+
+    fn expectReachable(self: *TypeChecker, expression: *const ast.Expression) CheckError!void {
+        const allocator = self.arena.allocator();
+        var parts: std.ArrayList(*const ast.Expression) = .empty;
+        var end = expression.location;
+        switch (expression.kind) {
+            .integer_literal,
+            .float_literal,
+            .boolean_literal,
+            .string_literal,
+            .undefined,
+            .null,
+            .identifier,
+            .path_expression,
+            .member,
+            .array_type,
+            .slice_type,
+            .pointer_type,
+            .optional_type,
+            .tuple_type,
+            .function_type,
+            .struct_type,
+            => return,
+            .call => |call| {
+                for (call.arguments) |*argument| try parts.append(allocator, &argument.value);
+            },
+            .method_call => |call| {
+                try parts.append(allocator, call.receiver);
+                for (call.arguments) |*argument| try parts.append(allocator, &argument.value);
+                end = call.name_location;
+            },
+            .composite_literal => |literal| {
+                for (literal.elements) |*element| try parts.append(allocator, &element.value);
+            },
+            .binary => |binary| {
+                try parts.append(allocator, binary.left);
+                end = binary.operator_location;
+                if (isShortCircuit(binary.operator)) {
+                    try self.expectReachable(binary.right);
+                } else {
+                    try parts.append(allocator, binary.right);
+                }
+            },
+            .unary => |unary| try parts.append(allocator, unary.operand),
+            .negation, .address_of, .dereference, .unwrap, .@"try" => |operand| try parts.append(allocator, operand),
+            .index => |indexing| {
+                try parts.append(allocator, indexing.value);
+                try parts.append(allocator, indexing.index);
+            },
+            .slice => |slice| {
+                try parts.append(allocator, slice.value);
+                if (slice.start) |start| try parts.append(allocator, start);
+                if (slice.end) |slice_end| try parts.append(allocator, slice_end);
+            },
+            .field_access => |access| {
+                try parts.append(allocator, access.value);
+                end = access.field_location;
+            },
+            .range => |range| {
+                try parts.append(allocator, &range.start);
+                if (range.end) |*range_end| try parts.append(allocator, range_end);
+            },
+            .jump => |statement| {
+                if (statement.kind == .@"return") {
+                    if (statement.kind.@"return") |*value| try parts.append(allocator, value);
+                }
+            },
+        }
+        for (parts.items, 0..) |part, index| {
+            try self.expectReachable(part);
+            if (part.kind != .jump) continue;
+            const location = if (index + 1 < parts.items.len) parts.items[index + 1].location else end;
+            return self.fail(location, error.UnreachableCode);
         }
     }
 
@@ -1184,6 +1275,7 @@ pub const TypeChecker = struct {
             .slice => try self.inferSliceType(parameters, expression),
             .field_access => try self.checkFieldAccess(parameters, expression),
             .index, .address_of, .dereference, .unwrap, .@"try", .range => try self.inferType(parameters, expression),
+            .jump => try self.checkJumpValue(parameters, expression, expected),
         };
         if (!isConvertible(value_type, expected)) return self.fail(expression.location, error.TypeMismatch);
         if (exact and isWidened(value_type, expected)) return self.fail(expression.location, error.TypeMismatch);
@@ -1234,6 +1326,7 @@ pub const TypeChecker = struct {
             .unwrap,
             .@"try",
             .range,
+            .jump,
             => {},
         }
     }
@@ -1673,7 +1766,7 @@ pub const TypeChecker = struct {
         const arguments = expression.kind.call.arguments;
         const count: usize = switch (builtin) {
             .size, .alignment, .length, .@"error" => 1,
-            .convert, .truncate, .cast, .@"align", .join => 2,
+            .convert, .truncate, .cast, .@"align", .join, .add_wrapping, .subtract_wrapping, .multiply_wrapping => 2,
         };
         if (arguments.len != count) return self.fail(expression.location, error.ArgumentCountMismatch);
         for (arguments) |argument| {
@@ -1681,6 +1774,7 @@ pub const TypeChecker = struct {
         }
         if (builtin == .@"align") return self.checkAlign(parameters, expression);
         if (builtin == .@"error") return self.fail(expression.location, error.ComptimeErrorAsValue);
+        if (ast.findWrappingOperator(builtin)) |operator| return self.checkWrapping(parameters, expression, operator);
         const type_argument = &arguments[0].value;
         const target = try self.checkTypeArgument(parameters, type_argument);
         switch (builtin) {
@@ -1727,8 +1821,27 @@ pub const TypeChecker = struct {
                 expression.type = target;
                 return target;
             },
-            .@"align", .@"error" => unreachable,
+            .@"align", .@"error", .add_wrapping, .subtract_wrapping, .multiply_wrapping => unreachable,
         }
+    }
+
+    fn checkWrapping(
+        self: *TypeChecker,
+        parameters: []const ast.TypedName,
+        expression: *ast.Expression,
+        operator: ast.BinaryOperator,
+    ) TypeError!types.Type {
+        const arguments = expression.kind.call.arguments;
+        const binary: ast.Binary = .{
+            .operator = operator,
+            .operator_location = expression.location,
+            .left = &arguments[0].value,
+            .right = &arguments[1].value,
+        };
+        const operand_type = try self.checkOperands(parameters, binary, null);
+        if (!isInteger(operand_type)) return self.fail(expression.location, error.NotInteger);
+        expression.type = operand_type;
+        return operand_type;
     }
 
     fn checkComptimeError(
@@ -2073,6 +2186,7 @@ pub const TypeChecker = struct {
             .unwrap => return self.checkUnwrap(parameters, expression),
             .@"try" => return self.checkTry(parameters, expression),
             .range => return self.checkRange(parameters, expression),
+            .jump => return self.checkJumpValue(parameters, expression, .void),
         }
     }
 
@@ -2669,6 +2783,48 @@ pub const TypeChecker = struct {
         return expression.type.?;
     }
 
+    fn checkJumpValue(
+        self: *TypeChecker,
+        parameters: []const ast.TypedName,
+        expression: *ast.Expression,
+        value_type: types.Type,
+    ) TypeError!types.Type {
+        try self.checkJump(parameters, expression);
+        expression.type = value_type;
+        return value_type;
+    }
+
+    fn checkJump(
+        self: *TypeChecker,
+        parameters: []const ast.TypedName,
+        expression: *ast.Expression,
+    ) TypeError!void {
+        if (self.deferring) return self.fail(expression.location, error.JumpInDefer);
+        const statement = expression.kind.jump;
+        switch (statement.kind) {
+            .@"return" => {
+                const return_type = self.return_type orelse return self.fail(statement.location, error.ReturnOutsideFunction);
+                try self.checkReturn(parameters, statement, return_type);
+            },
+            .@"break" => |jump| if (jump.loop == null) return self.fail(statement.location, error.BreakOutsideLoop),
+            .@"continue" => |jump| if (jump.loop == null) return self.fail(statement.location, error.ContinueOutsideLoop),
+            else => unreachable,
+        }
+    }
+
+    fn checkReturn(
+        self: *TypeChecker,
+        parameters: []const ast.TypedName,
+        statement: *ast.Statement,
+        return_type: types.Type,
+    ) TypeError!void {
+        if (statement.kind.@"return") |*value| {
+            if (return_type == .void) return self.fail(value.location, error.UnexpectedReturnValue);
+            return self.checkExpression(parameters, value, return_type);
+        }
+        if (!returnsNoValue(return_type)) return self.fail(statement.location, error.MissingReturnValue);
+    }
+
     fn computeValueType(
         self: *TypeChecker,
         parameters: []const ast.TypedName,
@@ -2826,6 +2982,7 @@ pub const TypeChecker = struct {
             .unwrap,
             .@"try",
             .range,
+            .jump,
             => unreachable,
         };
     }
@@ -2877,6 +3034,7 @@ pub const TypeChecker = struct {
             .unwrap,
             .@"try",
             .range,
+            .jump,
             => unreachable,
         }
     }
@@ -3064,6 +3222,11 @@ pub const CheckError = error{
     UnheldError,
     DiscardedError,
     TryInDefer,
+    JumpInDefer,
+    UnreachableCode,
+    ReturnOutsideFunction,
+    BreakOutsideLoop,
+    ContinueOutsideLoop,
     ErrdeferWithoutError,
     NoLayout,
     ExpectedNumber,
@@ -3089,7 +3252,7 @@ fn describeError(check_error: CheckError) []const u8 {
         error.MainIsExternal => "main cannot be external",
         error.ArgumentCountMismatch => "wrong number of arguments",
         error.UnusedResult => "call result is unused, discard it with _ =",
-        error.DiscardedVoid => "call returns no value to discard",
+        error.DiscardedVoid => "there is no value to discard",
         error.TypeVariable => "variable cannot hold a type",
         error.TypeParameter => "parameter cannot hold a type",
         error.CompileTimeValue => "value exists only at compile time",
@@ -3174,6 +3337,11 @@ fn describeError(check_error: CheckError) []const u8 {
         error.UnheldError => "the function's result cannot hold this error",
         error.DiscardedError => "a result that can hold an error cannot be discarded",
         error.TryInDefer => "a deferred statement cannot use try",
+        error.JumpInDefer => "a deferred statement cannot return, break or continue",
+        error.UnreachableCode => "code can never run because of an earlier return, break or continue",
+        error.ReturnOutsideFunction => "return outside a function body",
+        error.BreakOutsideLoop => "break outside a loop",
+        error.ContinueOutsideLoop => "continue outside a loop",
         error.ErrdeferWithoutError => "errdefer needs a function that can return an error",
         error.NoLayout => "type has no size at run time",
         error.ExpectedNumber => "expected a number",
@@ -3287,6 +3455,12 @@ const Use = union(enum) {
     read: token.Location,
     passed,
 };
+
+fn mergeExit(trace: *Trace, loop: *const ast.Statement, flow: Flow) void {
+    for (trace.exits.items) |*exit| {
+        if (exit.loop == loop) exit.flow = mergeFlows(exit.flow, flow);
+    }
+}
 
 fn mergeFlows(one: Flow, two: Flow) Flow {
     if (one == .ended) return two;
@@ -3474,7 +3648,7 @@ fn hasOwnType(expression: ast.Expression) bool {
         .integer_literal, .float_literal => |literal| literal.suffix != null,
         .negation => |operand| hasOwnType(operand.*),
         .composite_literal => |literal| literal.type != null,
-        .null, .undefined => false,
+        .null, .undefined, .jump => false,
         .unary => |unary| unary.operator == .not or hasOwnType(unary.operand.*),
         .binary => |binary| switch (binary.operator) {
             .shift_left, .shift_right, .@"orelse" => hasOwnType(binary.left.*),
@@ -3741,6 +3915,7 @@ fn appendExpressionCalls(
             try appendExpressionCalls(allocator, calls, range.start);
             if (range.end) |end| try appendExpressionCalls(allocator, calls, end);
         },
+        .jump => |statement| try appendBlockCalls(allocator, calls, statement[0..1]),
         .integer_literal,
         .float_literal,
         .boolean_literal,
@@ -3763,7 +3938,7 @@ fn appendExpressionCalls(
 
 fn containsCall(expression: ast.Expression) bool {
     return switch (expression.kind) {
-        .call, .method_call, .@"try" => true,
+        .call, .method_call, .@"try", .jump => true,
         .field_access => |access| containsCall(access.value.*),
         .index => |indexing| containsCall(indexing.value.*) or containsCall(indexing.index.*),
         .dereference, .unwrap, .address_of, .negation => |operand| containsCall(operand.*),
@@ -3820,6 +3995,15 @@ fn isErrorPattern(error_set: *const types.Enum, pattern: ast.Expression) bool {
         .path_expression => |path_expression| path_expression.resolution.? == .case,
         else => false,
     };
+}
+
+fn isCallOrTriedCall(expression: ast.Expression) bool {
+    const call = if (expression.kind == .@"try") expression.kind.@"try".* else expression;
+    return call.kind == .call or call.kind == .method_call;
+}
+
+fn isShortCircuit(operator: ast.BinaryOperator) bool {
+    return operator == .@"and" or operator == .@"or" or operator == .@"orelse" or operator == .@"catch";
 }
 
 fn isUnknownName(expression: ast.Expression) bool {
@@ -4014,6 +4198,7 @@ fn findUse(variable: *const ast.Statement, expression: ast.Expression) Use {
             return findUse(variable, binary.right.*);
         },
         .unary => |unary| return findUse(variable, unary.operand.*),
+        .jump => |statement| return findStatementUse(variable, statement.*),
         .integer_literal,
         .float_literal,
         .boolean_literal,
@@ -5756,6 +5941,111 @@ test "traceStatement: rejects a missing return after a match with a branch that 
 
     try std.testing.expectError(error.MissingReturn, analyzer.analyze());
     try std.testing.expectEqual(token.Location{ .row = 5, .column = 27 }, analyzer.failure.?.location.?);
+}
+
+test "traceStatement: rejects a missing return after a declaration whose fallback returns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(_: i32): noop\nfn pick(value: ?i32) -> i32:\n    const found = value orelse return 0\n    step(found)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.MissingReturn, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 25 }, type_checker.failure.?.location.?);
+}
+
+test "traceStatement: continues the path after a declaration whose fallback returns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?i32) -> i32:\n    const found = value orelse return 0\n    return found" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    try std.testing.expectEqual(null, type_checker.failure);
+}
+
+test "traceStatement: accepts a statement after an endless loop that a break in a fallback leaves" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(_: i32): noop\nfn read() -> ?i32: return null\nfn main():\n    while true:\n        const value = read() orelse break\n        step(value)\n    step(0)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    try std.testing.expectEqual(null, type_checker.failure);
+}
+
+test "traceStatement: counts a variable passed before a fallback break as assigned after the loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(buffer: *[4]u8) -> ?u8:\n    buffer[0] = 1\n    return null\nfn main():\n    var buffer: [4]u8 = undefined\n    while true:\n        const input = read(&buffer) orelse break\n        _ = input\n    _ = buffer[0]" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    try std.testing.expectEqual(null, type_checker.failure);
+}
+
+test "traceStatement: rejects a read of a variable that a fallback break leaves undefined" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(_: u8): noop\nfn read() -> ?u8: return null\nfn main():\n    var value: u8 = undefined\n    while true:\n        const input = read() orelse break\n        value = input\n    step(value + 1)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UndefinedRead, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 8, .column = 10 }, type_checker.failure.?.location.?);
 }
 
 test "checkDeferredUses: rejects a variable whose field is only assigned" {
@@ -8108,6 +8398,340 @@ test "checkStatement: rejects a local constant that holds a type known only at r
 
     try std.testing.expectError(error.CannotEvaluate, analyzer.analyze());
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 18 }, analyzer.failure.?.location.?);
+}
+
+test "checkStatement: accepts discarding any value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next() -> i32: return 1\nfn read(buffer: *[4]u8) -> ?u8:\n    buffer[0] = 1\n    return null\nfn run(count: i32, total: i32):\n    var buffer: [4]u8 = undefined\n    _ = count + 1\n    _ = total + next()\n    while true: _ = read(&buffer) orelse break" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    try std.testing.expectEqual(null, type_checker.failure);
+}
+
+test "checkStatement: rejects discarding a void value that is not a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn maybe() -> ?void: return null\nfn main():\n    _ = maybe() orelse return" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.DiscardedVoid, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 9 }, type_checker.failure.?.location.?);
+}
+
+test "expectReachableStatement: rejects a declaration whose value is a jump" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(_: i32): noop\nfn main():\n    const value: i32 = return\n    step(value)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableCode, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, type_checker.failure.?.location.?);
+}
+
+test "expectReachableStatement: rejects an assignment whose value is a jump" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(flag: bool) -> i32:\n    var result: i32 = 0\n    if flag: result = return 1\n    return result" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableCode, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 14 }, type_checker.failure.?.location.?);
+}
+
+test "expectReachableStatement: rejects a discard of a jump" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    _ = return" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableCode, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, type_checker.failure.?.location.?);
+}
+
+test "expectReachableStatement: rejects a return whose whole value is a jump" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick() -> i32:\n    return return 5" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableCode, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, type_checker.failure.?.location.?);
+}
+
+test "expectReachableStatement: rejects a loop at a condition that is a jump" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn main():\n    while true:\n        while break: step()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableCode, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 15 }, type_checker.failure.?.location.?);
+}
+
+test "expectReachableStatement: rejects an if at a condition that is a jump" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn check() -> bool:\n    if return true: step()\n    return false" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableCode, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 8 }, type_checker.failure.?.location.?);
+}
+
+test "expectReachableStatement: rejects a for loop at a sequence that is a jump" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    for _ in return: noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableCode, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 14 }, type_checker.failure.?.location.?);
+}
+
+test "expectReachableStatement: rejects a match at a value that is a jump" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick() -> i32:\n    match return 1:\n        else: return 2" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableCode, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 11 }, type_checker.failure.?.location.?);
+}
+
+test "expectReachable: rejects an operator after a return in its right operand" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn total(count: i32) -> i32: return count + return 5" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableCode, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 43 }, type_checker.failure.?.location.?);
+}
+
+test "expectReachable: rejects the arguments after a return in an argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn add(one: i32, two: i32) -> i32: return one + two\nfn next() -> i32: return 1\nfn total() -> i32: return add(return 1, next())" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableCode, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 41 }, type_checker.failure.?.location.?);
+}
+
+test "expectReachable: rejects the call after a return in its last argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn add(one: i32, two: i32) -> i32: return one + two\nfn total() -> i32: return add(1, return 2)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableCode, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 27 }, type_checker.failure.?.location.?);
+}
+
+test "expectReachable: rejects a short-circuit operator after a return in its left operand" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn check(ready: bool) -> bool: return (return true) and ready" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableCode, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 53 }, type_checker.failure.?.location.?);
+}
+
+test "expectReachable: rejects a return whose value returns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?i32) -> i32: return value orelse return return 1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.UnreachableCode, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 50 }, type_checker.failure.?.location.?);
+}
+
+test "expectReachable: accepts a jump on the right of a short-circuit operator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure:\n    bad\nfn parse(text: u8) -> Failure!u8:\n    if text == 0: return Failure::bad\n    return text\nfn check(ready: bool, value: ?i32, text: u8) -> bool:\n    const one = ready and return false\n    const two = ready or return true\n    const three = value orelse return false\n    const four = parse(text) catch return false\n    return one == two and three > 0 and four > 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(null, analyzer.failure);
 }
 
 test "checkConditionNames: gives the name of an if the value of the optional or a pointer to it" {
@@ -13699,6 +14323,86 @@ test "checkBuiltinCall: rejects a cast of a function pointer" {
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 39 }, analyzer.failure.?.location.?);
 }
 
+test "checkWrapping: gives a literal argument the type of the other operand" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::math\nfn step(value: u8) -> u8: return math::add_wrapping(value, 1)\nfn twice(value: i64) -> i64: return math::multiply_wrapping(2, value)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    const added = declarations[1].kind.function_definition.body[0].kind.@"return".?.kind.call;
+    try std.testing.expectEqual(types.Type{ .number = .u8 }, added.arguments[1].value.type.?);
+    const multiplied = declarations[2].kind.function_definition.body[0].kind.@"return".?.kind.call;
+    try std.testing.expectEqual(types.Type{ .number = .i64 }, multiplied.arguments[0].value.type.?);
+}
+
+test "checkWrapping: rejects operands of different types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn mix(small: u8, large: u16) -> u16: return mn::math::subtract_wrapping(small, large)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MismatchedOperands, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 46 }, analyzer.failure.?.location.?);
+}
+
+test "checkWrapping: rejects operands that are not integers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::math\nfn grow(value: f32) -> f32: return math::add_wrapping(value, value)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NotInteger, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 36 }, analyzer.failure.?.location.?);
+}
+
+test "checkWrapping: rejects a literal that the other operand's type cannot hold" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::math\nfn step(value: u8) -> u8: return math::add_wrapping(value, 256)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.LiteralOutOfRange, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 60 }, analyzer.failure.?.location.?);
+}
+
 test "checkAlign: gives the type of the multiple value pointer" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -18705,6 +19409,107 @@ test "checkTry: rejects a value that is not a result" {
 
     try std.testing.expectError(error.NotResult, analyzer.analyze());
     try std.testing.expectEqual(token.Location{ .row = 9, .column = 46 }, analyzer.failure.?.location.?);
+}
+
+test "checkJump: rejects a returned value that does not match the return type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?i32) -> i32: return value orelse return true" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.TypeMismatch, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 57 }, type_checker.failure.?.location.?);
+}
+
+test "checkJump: rejects a return without a value in a function that returns a value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?i32) -> i32: return value orelse return" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.MissingReturnValue, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 50 }, type_checker.failure.?.location.?);
+}
+
+test "checkJump: rejects a jump in a deferred statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(_: i32): noop\nfn run(value: ?i32):\n    defer step(value orelse return)\n    noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+
+    try std.testing.expectError(error.JumpInDefer, type_checker.check());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 29 }, type_checker.failure.?.location.?);
+}
+
+test "checkJump: rejects a return outside a function body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read() -> ?i32: return null\nconst VALUE: i32 = read() orelse return 1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ReturnOutsideFunction, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 34 }, analyzer.failure.?.location.?);
+}
+
+test "checkJump: rejects a break outside a function body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read() -> ?i32: return null\nconst VALUE: i32 = read() orelse break" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.BreakOutsideLoop, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 34 }, analyzer.failure.?.location.?);
 }
 
 test "computeValueType: rejects a case that carries a value without it" {

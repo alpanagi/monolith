@@ -1677,7 +1677,7 @@ pub const Generator = struct {
         if (named) try self.generateElementDeclarations(allocator, reached, writer, loop.?);
         try self.generateStatements(allocator, reached, writer, block, loop);
         if (loop) |statement| {
-            if (containsGoto(block, statement, .@"continue", statement)) {
+            if (try containsGoto(allocator, block, statement, .@"continue", statement)) {
                 try self.generateIndentation(writer);
                 try writer.print("mn_continue_{d}:;\n", .{self.findLoopNumber(statement)});
             }
@@ -1793,34 +1793,11 @@ pub const Generator = struct {
         if (statement.kind != .@"while") try self.generateLiftedSteps(allocator, reached, writer, statement);
         switch (statement.kind) {
             .noop => unreachable,
-            .@"return" => {
-                const returned = findStatementExpression(statement) orelse {
-                    try self.generateUnwound(allocator, reached, writer, null, .none);
-                    if (self.return_type == .result) return self.generateSuccessReturn(allocator, reached, writer);
-                    if (self.inline_exit != null) return self.generateInlineJump(writer);
-                    try self.generateIndentation(writer);
-                    return writer.writeAll(if (self.in_main) "return 0;\n" else "return;\n");
-                };
-                if (isZeroSized(returned.type.?) and isZeroSized(self.return_type)) {
-                    if (hasEffects(returned.*)) {
-                        try self.generateIndentation(writer);
-                        try self.generateStatementEffects(allocator, reached, writer, returned);
-                        try writer.writeAll(";\n");
-                    }
-                    try self.generateUnwound(allocator, reached, writer, null, .none);
-                    if (self.inline_exit != null) return self.generateInlineJump(writer);
-                    try self.generateIndentation(writer);
-                    return writer.writeAll("return;\n");
-                }
-                if (self.hasDeferred()) return self.generateDeferredReturn(allocator, reached, writer, returned);
-                try self.generateIndentation(writer);
-                try self.generateReturnStart(writer);
-                try self.generateFullValue(allocator, reached, writer, returned, self.return_type);
-                try self.generateReturnEnd(writer);
-            },
+            .@"return" => try self.generateReturn(allocator, reached, writer, statement),
             .discard, .call => |*expression| {
                 if (self.isLiftedRoot(expression)) return;
-                try self.generateExpressionStatement(allocator, reached, writer, expression);
+                if (isUnit(expression.*) and !isBuiltinCall(expression.*)) return self.generateExpressionStatement(allocator, reached, writer, expression);
+                try self.generateDiscard(allocator, reached, writer, expression);
             },
             .constant_declaration, .variable_declaration => {
                 try self.generateLocal(allocator, reached, writer, statement);
@@ -1840,6 +1817,38 @@ pub const Generator = struct {
             .@"continue" => |jump| try self.generateJump(allocator, reached, writer, jump.loop.?, .@"continue"),
             .@"defer" => unreachable,
         }
+    }
+
+    fn generateReturn(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+    ) WriteError!void {
+        const returned = findStatementExpression(statement) orelse {
+            try self.generateUnwound(allocator, reached, writer, null, .none);
+            if (self.return_type == .result) return self.generateSuccessReturn(allocator, reached, writer);
+            if (self.inline_exit != null) return self.generateInlineJump(writer);
+            try self.generateIndentation(writer);
+            return writer.writeAll(if (self.in_main) "return 0;\n" else "return;\n");
+        };
+        if (isZeroSized(returned.type.?) and isZeroSized(self.return_type)) {
+            if (hasEffects(returned.*)) {
+                try self.generateIndentation(writer);
+                try self.generateStatementEffects(allocator, reached, writer, returned);
+                try writer.writeAll(";\n");
+            }
+            try self.generateUnwound(allocator, reached, writer, null, .none);
+            if (self.inline_exit != null) return self.generateInlineJump(writer);
+            try self.generateIndentation(writer);
+            return writer.writeAll("return;\n");
+        }
+        if (self.hasDeferred()) return self.generateDeferredReturn(allocator, reached, writer, returned);
+        try self.generateIndentation(writer);
+        try self.generateReturnStart(writer);
+        try self.generateFullValue(allocator, reached, writer, returned, self.return_type);
+        try self.generateReturnEnd(writer);
     }
 
     fn generateTemporaries(
@@ -1900,6 +1909,25 @@ pub const Generator = struct {
         try self.generateIndentation(writer);
         try self.generateFullExpression(allocator, reached, writer, expression);
         try writer.writeAll(";\n");
+    }
+
+    fn generateDiscard(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        expression: *const ast.Expression,
+    ) WriteError!void {
+        if (isZeroSized(expression.type.?)) {
+            if (!hasEffects(expression.*)) return;
+            try self.generateIndentation(writer);
+            try self.generateStatementEffects(allocator, reached, writer, expression);
+            return writer.writeAll(";\n");
+        }
+        try self.generateIndentation(writer);
+        try writer.writeAll("(void)(");
+        try self.generateFullExpression(allocator, reached, writer, expression);
+        try writer.writeAll(");\n");
     }
 
     fn generateLocal(
@@ -2546,7 +2574,7 @@ pub const Generator = struct {
         if (self.isLiftedStatement(statement)) {
             try writer.writeAll("while (true) {\n");
             self.depth += 1;
-            try self.generateLiftedSteps(allocator, reached, writer, statement);
+            try self.generateLiftedCondition(allocator, reached, writer, statement);
             try self.generateIndentation(writer);
             try writer.writeAll("if (!");
             try self.generateFullExpression(allocator, reached, writer, &loop.condition);
@@ -2576,7 +2604,7 @@ pub const Generator = struct {
         try self.generateIndentation(writer);
         try writer.writeAll("while (true) {\n");
         self.depth += 1;
-        if (self.isLiftedStatement(statement)) try self.generateLiftedSteps(allocator, reached, writer, statement);
+        if (self.isLiftedStatement(statement)) try self.generateLiftedCondition(allocator, reached, writer, statement);
         try self.generateStoredValue(allocator, reached, writer, access);
         try self.generateIndentation(writer);
         try writer.writeAll("if (");
@@ -2588,6 +2616,19 @@ pub const Generator = struct {
         try self.generateIndentation(writer);
         try writer.writeAll("}\n");
         try self.generateLoopEnd(allocator, reached, writer, statement);
+    }
+
+    fn generateLiftedCondition(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+    ) WriteError!void {
+        const enclosing_loop = self.innermost_loop;
+        self.innermost_loop = statement;
+        defer self.innermost_loop = enclosing_loop;
+        try self.generateLiftedSteps(allocator, reached, writer, statement);
     }
 
     fn isLiftedStatement(self: *const Generator, statement: *const ast.Statement) bool {
@@ -2646,11 +2687,11 @@ pub const Generator = struct {
             try self.generateIndentation(writer);
             try writer.writeAll("}\n");
             _ = self.unrolled.pop();
-            if (containsGoto(expansion, statement, .@"continue", statement)) {
+            if (try containsGoto(allocator, expansion, statement, .@"continue", statement)) {
                 try self.generateIndentation(writer);
                 try writer.print("mn_continue_{d}_{d}:;\n", .{ number, position });
             }
-            if (containsGoto(expansion, statement, .@"break", statement)) broken = true;
+            if (try containsGoto(allocator, expansion, statement, .@"break", statement)) broken = true;
         }
         self.innermost_loop = enclosing_loop;
         try self.generateStatements(allocator, reached, writer, loop.else_body orelse &.{}, null);
@@ -2920,7 +2961,7 @@ pub const Generator = struct {
     ) WriteError!void {
         const body, const else_body = ast.extractBlocks(statement.*);
         try self.generateStatements(allocator, reached, writer, else_body, null);
-        if (isEmptyLoop(statement.*) or !containsGoto(body, statement, .@"break", statement)) return;
+        if (isEmptyLoop(statement.*) or !try containsGoto(allocator, body, statement, .@"break", statement)) return;
         try self.generateIndentation(writer);
         try writer.print("mn_break_{d}:;\n", .{self.findLoopNumber(statement)});
     }
@@ -3065,6 +3106,7 @@ pub const Generator = struct {
         step: *const Step,
     ) WriteError!void {
         const expression = step.expression;
+        if (step.address == null and expression.kind == .jump) return self.generateLiftedJump(allocator, reached, writer, expression.kind.jump);
         if (step.address == null and expression.kind == .@"try") return self.generateLiftedTry(allocator, reached, writer, step);
         if (step.address == null and isInlineCall(expression.*)) return self.generateInlinedCall(allocator, reached, writer, step);
         if (step.address == null and self.isLiftedShortCircuit(expression)) {
@@ -3080,6 +3122,21 @@ pub const Generator = struct {
         }
         try self.generateExpression(allocator, reached, writer, expression.*);
         try writer.writeAll(";\n");
+    }
+
+    fn generateLiftedJump(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        statement: *const ast.Statement,
+    ) WriteError!void {
+        switch (statement.kind) {
+            .@"return" => try self.generateReturn(allocator, reached, writer, statement),
+            .@"break" => |jump| try self.generateJump(allocator, reached, writer, jump.loop.?, .@"break"),
+            .@"continue" => |jump| try self.generateJump(allocator, reached, writer, jump.loop.?, .@"continue"),
+            else => unreachable,
+        }
     }
 
     fn generateInlinedCall(
@@ -3280,16 +3337,18 @@ pub const Generator = struct {
         try writer.writeAll(") {\n");
         self.depth += 1;
         try self.generateLiftedScope(allocator, reached, writer, binary.right);
-        try self.generateIndentation(writer);
-        if (step.temporary) |number| {
-            try writer.print("mn_temporary_{d} = ", .{number});
-            try self.generateFullValue(allocator, reached, writer, binary.right, value_type);
-        } else {
-            try writer.writeAll("(void)(");
-            try self.generateStatementEffects(allocator, reached, writer, binary.right);
-            try writer.writeByte(')');
+        if (binary.right.kind != .jump) {
+            try self.generateIndentation(writer);
+            if (step.temporary) |number| {
+                try writer.print("mn_temporary_{d} = ", .{number});
+                try self.generateFullValue(allocator, reached, writer, binary.right, value_type);
+            } else {
+                try writer.writeAll("(void)(");
+                try self.generateStatementEffects(allocator, reached, writer, binary.right);
+                try writer.writeByte(')');
+            }
+            try writer.writeAll(";\n");
         }
-        try writer.writeAll(";\n");
         self.depth -= 1;
         try self.generateIndentation(writer);
         try writer.writeByte('}');
@@ -3686,7 +3745,7 @@ pub const Generator = struct {
                 }
                 try writer.writeAll("(void)0");
             },
-            .method_call, .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type, .struct_type => {
+            .method_call, .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type, .struct_type, .jump => {
                 unreachable;
             },
         }
@@ -3725,6 +3784,7 @@ pub const Generator = struct {
     ) WriteError!void {
         if (builtin == .@"align") return self.generateAlign(allocator, reached, writer, call);
         if (builtin == .@"error") unreachable;
+        if (ast.findWrappingOperator(builtin)) |operator| return self.generateWrapping(allocator, reached, writer, call, operator);
         const target = ast.extractType(call.arguments[0].value);
         switch (builtin) {
             .size => try self.generateKnownInteger(writer, .usize, types.findLayout(target).size),
@@ -3739,8 +3799,37 @@ pub const Generator = struct {
                 try self.generateOperand(allocator, reached, writer, &call.arguments[1].value);
                 try writer.writeByte(')');
             },
-            .@"align", .@"error" => unreachable,
+            .@"align", .@"error", .add_wrapping, .subtract_wrapping, .multiply_wrapping => unreachable,
         }
+    }
+
+    fn generateWrapping(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        call: ast.Call,
+        operator: ast.BinaryOperator,
+    ) WriteError!void {
+        const value_type = call.arguments[0].value.type.?;
+        const unsigned_type: types.Type = .{ .number = findUnsignedNumber(value_type.number) };
+        try writer.writeByte('(');
+        if (!std.meta.eql(value_type, unsigned_type)) {
+            try writer.writeByte('(');
+            try self.generateType(writer, value_type);
+            try writer.writeByte(')');
+        }
+        try writer.writeByte('(');
+        try self.generateType(writer, unsigned_type);
+        try writer.writeAll(")(1u * (");
+        try self.generateType(writer, unsigned_type);
+        try writer.writeAll(")(");
+        try self.generateOperand(allocator, reached, writer, &call.arguments[0].value);
+        try writer.print(") {s} (", .{operatorSymbol(operator)});
+        try self.generateType(writer, unsigned_type);
+        try writer.writeAll(")(");
+        try self.generateOperand(allocator, reached, writer, &call.arguments[1].value);
+        try writer.writeAll(")))");
     }
 
     fn generateAlign(
@@ -4439,6 +4528,7 @@ pub const Generator = struct {
             .unwrap,
             .@"try",
             .range,
+            .jump,
             => unreachable,
         }
     }
@@ -4671,6 +4761,7 @@ pub const Generator = struct {
             .tuple_type,
             .function_type,
             .struct_type,
+            .jump,
             => unreachable,
         }
     }
@@ -5123,7 +5214,7 @@ fn hasEffects(expression: ast.Expression) bool {
         },
         .field_access => |access| return hasEffects(access.value.*),
         .dereference, .unwrap => |operand| return hasEffects(operand.*),
-        .@"try" => return true,
+        .@"try", .jump => return true,
         .range => |range| return hasEffects(range.start) or (if (range.end) |end| hasEffects(end) else false),
         .integer_literal,
         .float_literal,
@@ -5148,7 +5239,7 @@ fn hasEffects(expression: ast.Expression) bool {
 
 fn isUnit(expression: ast.Expression) bool {
     return switch (expression.kind) {
-        .call, .@"try" => true,
+        .call, .@"try", .jump => true,
         .binary => |binary| isShortCircuit(binary.operator) and hasEffects(binary.right.*),
         else => false,
     };
@@ -5204,6 +5295,18 @@ fn operatorSymbol(operator: ast.BinaryOperator) []const u8 {
         .greater_than => ">",
         .greater_than_or_equal => ">=",
         .shift_left, .shift_right, .@"and", .@"or", .@"orelse", .@"catch", .combine, .result => unreachable,
+    };
+}
+
+fn findUnsignedNumber(number: types.NumberType) types.NumberType {
+    return switch (number) {
+        .i8, .u8 => .u8,
+        .i16, .u16 => .u16,
+        .i32, .u32 => .u32,
+        .i64, .u64 => .u64,
+        .i128, .u128 => .u128,
+        .isize, .usize => .usize,
+        .f16, .f32, .f64, .f128 => unreachable,
     };
 }
 
@@ -5386,9 +5489,9 @@ fn collectScopeSteps(
         const consumed = isUnit(scope.*) or !isZeroSized(scope.type.?);
         try collectUnitSteps(allocator, steps, statement, scope, scope, consumed, false);
     }
-    const lifted_root = scope.kind == .@"try" or isInlineCall(scope.*) or (scope.kind == .binary and isShortCircuit(scope.kind.binary.operator));
+    const lifted_root = scope.kind == .@"try" or scope.kind == .jump or isInlineCall(scope.*) or (scope.kind == .binary and isShortCircuit(scope.kind.binary.operator));
     if (tried and lifted_root) {
-        const stored = !isZeroSized(scope.type.?) and statement.kind != .discard;
+        const stored = scope.kind != .jump and !isZeroSized(scope.type.?) and statement.kind != .discard;
         try steps.append(allocator, .{
             .expression = scope,
             .scope = scope,
@@ -5401,14 +5504,14 @@ fn collectScopeSteps(
 
 fn liftSteps(allocator: std.mem.Allocator, steps: []Step) std.mem.Allocator.Error!void {
     const tried = for (steps) |step| {
-        if (step.expression.kind == .@"try" or isInlineCall(step.expression.*)) break true;
+        if (isLift(step.expression.*)) break true;
     } else false;
     if (!tried) return;
     for (steps) |*step| step.lifted = !step.lazy or try containsLift(allocator, step.scope);
 }
 
 fn containsLift(allocator: std.mem.Allocator, expression: *const ast.Expression) std.mem.Allocator.Error!bool {
-    if (expression.kind == .@"try" or isInlineCall(expression.*)) return true;
+    if (isLift(expression.*)) return true;
     if (expression.kind == .binary and isShortCircuit(expression.kind.binary.operator)) {
         if (try containsLift(allocator, expression.kind.binary.right)) return true;
     }
@@ -5416,6 +5519,14 @@ fn containsLift(allocator: std.mem.Allocator, expression: *const ast.Expression)
         if (try containsLift(allocator, child)) return true;
     }
     return false;
+}
+
+fn isBuiltinCall(expression: ast.Expression) bool {
+    return expression.kind == .call and ast.extractResolution(expression.kind.call.callee) == .builtin;
+}
+
+fn isLift(expression: ast.Expression) bool {
+    return expression.kind == .@"try" or expression.kind == .jump or isInlineCall(expression);
 }
 
 fn isInlineCall(expression: ast.Expression) bool {
@@ -5617,6 +5728,9 @@ fn collectScopeChildren(
             try children.append(allocator, &range.start);
             if (range.end) |*end| try children.append(allocator, end);
         },
+        .jump => |statement| {
+            if (findStatementExpression(statement)) |value| try children.append(allocator, value);
+        },
         .integer_literal,
         .float_literal,
         .boolean_literal,
@@ -5777,35 +5891,41 @@ fn collectLoops(
 }
 
 fn containsGoto(
+    allocator: std.mem.Allocator,
     body: []const ast.Statement,
     loop: *const ast.Statement,
     tag: std.meta.Tag(ast.StatementKind),
     innermost_loop: ?*const ast.Statement,
-) bool {
+) std.mem.Allocator.Error!bool {
     for (body) |*statement| {
+        var jumps: std.ArrayList(*ast.Statement) = .empty;
+        try ast.collectStatementJumps(allocator, &jumps, statement);
+        const expression_loop = if (statement.kind == .@"while") statement else innermost_loop;
+        for (jumps.items) |jump| {
+            if (isGotoJump(jump, loop, tag, expression_loop)) return true;
+        }
         switch (statement.kind) {
-            .@"break", .@"continue" => |jump| {
-                if (std.meta.activeTag(statement.kind) != tag or jump.loop.? != loop) continue;
-                if (isGoto(loop, tag, innermost_loop)) return true;
+            .@"break", .@"continue" => {
+                if (isGotoJump(statement, loop, tag, innermost_loop)) return true;
             },
             .@"if" => |conditional| {
-                if (containsGoto(conditional.body, loop, tag, innermost_loop)) return true;
+                if (try containsGoto(allocator, conditional.body, loop, tag, innermost_loop)) return true;
                 const else_body = conditional.else_body orelse continue;
-                if (containsGoto(else_body, loop, tag, innermost_loop)) return true;
+                if (try containsGoto(allocator, else_body, loop, tag, innermost_loop)) return true;
             },
             .@"while", .@"for" => {
                 const inner_body, const else_body = ast.extractBlocks(statement.*);
                 if (statement.kind == .@"for") {
                     for (statement.kind.@"for".expansions) |expansion| {
-                        if (containsGoto(expansion, loop, tag, statement)) return true;
+                        if (try containsGoto(allocator, expansion, loop, tag, statement)) return true;
                     }
                 }
-                if (!isEmptyLoop(statement.*) and containsGoto(inner_body, loop, tag, statement)) return true;
-                if (containsGoto(else_body, loop, tag, innermost_loop)) return true;
+                if (!isEmptyLoop(statement.*) and try containsGoto(allocator, inner_body, loop, tag, statement)) return true;
+                if (try containsGoto(allocator, else_body, loop, tag, innermost_loop)) return true;
             },
             .match => |matching| {
                 for (matching.branches) |branch| {
-                    if (containsGoto(branch.body, loop, tag, null)) return true;
+                    if (try containsGoto(allocator, branch.body, loop, tag, null)) return true;
                 }
             },
             .noop, .@"return", .discard, .call, .constant_declaration, .tuple_declaration => {},
@@ -5813,6 +5933,20 @@ fn containsGoto(
         }
     }
     return false;
+}
+
+fn isGotoJump(
+    jump: *const ast.Statement,
+    loop: *const ast.Statement,
+    tag: std.meta.Tag(ast.StatementKind),
+    innermost_loop: ?*const ast.Statement,
+) bool {
+    const target = switch (jump.kind) {
+        .@"break", .@"continue" => |inner| inner.loop.?,
+        else => return false,
+    };
+    if (std.meta.activeTag(jump.kind) != tag or target != loop) return false;
+    return isGoto(loop, tag, innermost_loop);
 }
 
 fn endsWithJump(body: []const ast.Statement) bool {
@@ -9278,6 +9412,34 @@ test "hasTarget: assigns through slices and pointers whose root is not a local" 
     );
 }
 
+test "generateDiscard: casts a discarded value to void and keeps its effects" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next() -> i32: return 1\nfn read(buffer: *[4]u8) -> ?u8:\n    buffer[0] = 1\n    return null\nfn run(count: i32, total: i32) -> u8:\n    var buffer: [4]u8 = undefined\n    _ = count + 1\n    _ = total + next()\n    while true: _ = read(&buffer) orelse break\n    return buffer[0]" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_array_4_u8 mn_array_4_u8;\ntypedef struct mn_optional_u8 mn_optional_u8;\n\nint32_t mn_main_next();\nmn_optional_u8 mn_main_read(struct mn_array_4_u8 * buffer);\nuint8_t mn_main_run(int32_t count, int32_t total);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_optional_u8_defined\n#define mn_optional_u8_defined\ntypedef struct mn_optional_u8 {\n    uint8_t value;\n    bool present;\n} mn_optional_u8;\n#endif\n\n#ifndef mn_array_4_u8_defined\n#define mn_array_4_u8_defined\ntypedef struct mn_array_4_u8 {\n    uint8_t items[4];\n} mn_array_4_u8;\n#endif\n\nint32_t mn_main_next() {\n    return 1;\n}\n\nmn_optional_u8 mn_main_read(struct mn_array_4_u8 * buffer) {\n    buffer->items[0u] = 1u;\n    return (mn_optional_u8){ .present = false };\n}\n\nuint8_t mn_main_run(int32_t count, int32_t total) {\n    mn_array_4_u8 buffer;\n    (void)((count + 1));\n    (void)((total + mn_main_next()));\n    while (true) {\n        mn_optional_u8 mn_temporary_1;\n        mn_temporary_1 = mn_main_read(&buffer);\n        if (!(mn_temporary_1.present)) {\n            break;\n        }\n    }\n    return buffer.items[0u];\n}\n",
+        files[1].contents,
+    );
+}
+
 test "generateLocal: declares a local constant in C" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -11517,6 +11679,118 @@ test "generateFunction: writes an instance for each type of the argument to an a
     );
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_array_2_u8_defined\n#define mn_array_2_u8_defined\ntypedef struct mn_array_2_u8 {\n    uint8_t items[2];\n} mn_array_2_u8;\n#endif\n\nchar mn_zero_sized;\n\nint main() {\n    mn_array_2_u8 array = (mn_array_2_u8){ .items = { 1u, 2u } };\n    array.items[0u] = mn_main_first_1(array);\n    mn_main_count_1((mn_slice_u8){ .items = (uint8_t *)\"ab\", .length = 2 });\n    mn_main_count_2(array);\n    mn_main_count_3(&array);\n}\n\nuint8_t mn_main_first_1(mn_array_2_u8 values) {\n    return values.items[0u];\n}\n\nsize_t mn_main_count_1(mn_slice_u8 values) {\n    return values.length;\n}\n\nsize_t mn_main_count_2([[maybe_unused]] mn_array_2_u8 values) {\n    return 2u;\n}\n\nsize_t mn_main_count_3([[maybe_unused]] struct mn_array_2_u8 * values) {\n    return 2u;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateLiftedJump: returns, breaks and continues from the fallback of orelse and catch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure:\n    bad\nfn parse(text: u8) -> Failure!u8:\n    if text == 0: return Failure::bad\n    return text\nfn safe(text: u8) -> u8:\n    const digit = parse(text) catch return 9\n    return digit\nfn add(one: i32, two: i32) -> i32: return one + two\nfn total(values: [4]?i32) -> i32:\n    var sum: i32 = 0\n    var index: usize = 0\n    while index < 4:\n        index += 1\n        const value = values[index - 1] orelse continue\n        sum = add(sum, value)\n    return sum\nfn first(values: [4]?i32) -> i32:\n    var index: usize = 0\n    @outer while true:\n        while index < 4:\n            const value = values[index] orelse break @outer\n            index += 1\n            if value > 2: return value\n    return -1\nfn guard(value: ?i32, log: *i32) -> i32:\n    defer log.* = log.* * 10 + 1\n    const found = value orelse return 0\n    defer log.* = log.* * 10 + 2\n    return add(value orelse return 1, found)\nfn pick(value: ?i32) -> i32:\n    var result: i32 = 0\n    result = value orelse return 1\n    return result" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_Failure {\n    uint32_t tag;\n} mn_main_Failure;\n\ntypedef struct mn_result_main_Failure_u8 mn_result_main_Failure_u8;\ntypedef struct mn_array_4_optional_i32 mn_array_4_optional_i32;\ntypedef struct mn_optional_i32 mn_optional_i32;\n\nmn_result_main_Failure_u8 mn_main_parse(uint8_t text);\nuint8_t mn_main_safe(uint8_t text);\nint32_t mn_main_add(int32_t one, int32_t two);\nint32_t mn_main_total(mn_array_4_optional_i32 values);\nint32_t mn_main_first(mn_array_4_optional_i32 values);\nint32_t mn_main_guard(mn_optional_i32 value, int32_t * log);\nint32_t mn_main_pick(mn_optional_i32 value);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_result_main_Failure_u8_defined\n#define mn_result_main_Failure_u8_defined\ntypedef struct mn_result_main_Failure_u8 {\n    mn_main_Failure error;\n    uint8_t value;\n} mn_result_main_Failure_u8;\n#endif\n\n#ifndef mn_optional_i32_defined\n#define mn_optional_i32_defined\ntypedef struct mn_optional_i32 {\n    int32_t value;\n    bool present;\n} mn_optional_i32;\n#endif\n\n#ifndef mn_array_4_optional_i32_defined\n#define mn_array_4_optional_i32_defined\ntypedef struct mn_array_4_optional_i32 {\n    mn_optional_i32 items[4];\n} mn_array_4_optional_i32;\n#endif\n\nmn_result_main_Failure_u8 mn_main_parse(uint8_t text) {\n    if ((text == 0u)) {\n        return (mn_result_main_Failure_u8){ .error = (mn_main_Failure){ .tag = 1 } };\n    }\n    return (mn_result_main_Failure_u8){ .error.tag = 0, .value = text };\n}\n\nuint8_t mn_main_safe(uint8_t text) {\n    mn_result_main_Failure_u8 mn_temporary_1;\n    uint8_t mn_temporary_2;\n    mn_temporary_1 = mn_main_parse(text);\n    if (mn_temporary_1.error.tag != 0) {\n        return 9u;\n    } else {\n        mn_temporary_2 = mn_temporary_1.value;\n    }\n    const uint8_t digit = mn_temporary_2;\n    return digit;\n}\n\nint32_t mn_main_add(int32_t one, int32_t two) {\n    return (one + two);\n}\n\nint32_t mn_main_total(mn_array_4_optional_i32 values) {\n    int32_t sum = 0;\n    size_t index = 0u;\n    while ((index < 4u)) {\n        index = (index + 1u);\n        mn_optional_i32 mn_temporary_1;\n        int32_t mn_temporary_2;\n        mn_temporary_1 = values.items[(index - 1u)];\n        if (!(mn_temporary_1.present)) {\n            continue;\n        } else {\n            mn_temporary_2 = mn_temporary_1.value;\n        }\n        const int32_t value = mn_temporary_2;\n        sum = mn_main_add(sum, value);\n    }\n    return sum;\n}\n\nint32_t mn_main_first(mn_array_4_optional_i32 values) {\n    size_t index = 0u;\n    while (true) {\n        while ((index < 4u)) {\n            mn_optional_i32 mn_temporary_1;\n            int32_t mn_temporary_2;\n            mn_temporary_1 = values.items[index];\n            if (!(mn_temporary_1.present)) {\n                goto mn_break_1;\n            } else {\n                mn_temporary_2 = mn_temporary_1.value;\n            }\n            const int32_t value = mn_temporary_2;\n            index = (index + 1u);\n            if ((value > 2)) {\n                return value;\n            }\n        }\n    }\n    mn_break_1:;\n    return -1;\n}\n\nint32_t mn_main_guard(mn_optional_i32 value, int32_t * log) {\n    int32_t mn_temporary_1;\n    if (!(value.present)) {\n        const int32_t mn_returned = 0;\n        (*log) = (((*log) * 10) + 1);\n        return mn_returned;\n    } else {\n        mn_temporary_1 = value.value;\n    }\n    const int32_t found = mn_temporary_1;\n    int32_t mn_temporary_2;\n    if (!(value.present)) {\n        const int32_t mn_returned = 1;\n        (*log) = (((*log) * 10) + 2);\n        (*log) = (((*log) * 10) + 1);\n        return mn_returned;\n    } else {\n        mn_temporary_2 = value.value;\n    }\n    const int32_t mn_returned = mn_main_add(mn_temporary_2, found);\n    (*log) = (((*log) * 10) + 2);\n    (*log) = (((*log) * 10) + 1);\n    return mn_returned;\n}\n\nint32_t mn_main_pick(mn_optional_i32 value) {\n    int32_t result = 0;\n    int32_t mn_temporary_1;\n    if (!(value.present)) {\n        return 1;\n    } else {\n        mn_temporary_1 = value.value;\n    }\n    result = mn_temporary_1;\n    return result;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateLiftedJump: jumps to the enclosing loop from a loop condition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(index: i32) -> ?bool:\n    if index > 3: return null\n    return index > 1\nfn count() -> i32:\n    var total: i32 = 0\n    @outer while total < 10:\n        total += 1\n        while read(total) orelse continue @outer: total += 2\n        while read(total) orelse break: total += 1\n    return total" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_optional_bool mn_optional_bool;\n\nmn_optional_bool mn_main_read(int32_t index);\nint32_t mn_main_count();\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_optional_bool_defined\n#define mn_optional_bool_defined\ntypedef struct mn_optional_bool {\n    bool value;\n    bool present;\n} mn_optional_bool;\n#endif\n\nmn_optional_bool mn_main_read(int32_t index) {\n    if ((index > 3)) {\n        return (mn_optional_bool){ .present = false };\n    }\n    return (mn_optional_bool){ .value = (index > 1), .present = true };\n}\n\nint32_t mn_main_count() {\n    int32_t total = 0;\n    while ((total < 10)) {\n        total = (total + 1);\n        mn_optional_bool mn_temporary_1;\n        bool mn_temporary_2;\n        while (true) {\n            mn_temporary_1 = mn_main_read(total);\n            if (!(mn_temporary_1.present)) {\n                goto mn_continue_1;\n            } else {\n                mn_temporary_2 = mn_temporary_1.value;\n            }\n            if (!mn_temporary_2) break;\n            {\n                total = (total + 2);\n            }\n        }\n        mn_optional_bool mn_temporary_3;\n        bool mn_temporary_4;\n        while (true) {\n            mn_temporary_3 = mn_main_read(total);\n            if (!(mn_temporary_3.present)) {\n                goto mn_break_1;\n            } else {\n                mn_temporary_4 = mn_temporary_3.value;\n            }\n            if (!mn_temporary_4) break;\n            {\n                total = (total + 1);\n            }\n        }\n        mn_continue_1:;\n    }\n    mn_break_1:;\n    return total;\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateLiftedJump: returns from an inline function through its end label" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline fn fallback(value: ?i32) -> i32:\n    const found = value orelse return 0\n    return found + 1\nfn run(value: ?i32) -> i32: return fallback(value) * 2" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_optional_i32 mn_optional_i32;\n\nint32_t mn_main_run(mn_optional_i32 value);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_optional_i32_defined\n#define mn_optional_i32_defined\ntypedef struct mn_optional_i32 {\n    int32_t value;\n    bool present;\n} mn_optional_i32;\n#endif\n\nint32_t mn_main_run(mn_optional_i32 value) {\n    int32_t mn_temporary_1;\n    {\n        [[maybe_unused]] const mn_optional_i32 mn_inline_1_value = value;\n        int32_t mn_temporary_2;\n        if (!(mn_inline_1_value.present)) {\n            mn_temporary_1 = 0;\n            goto mn_inline_end_1;\n        } else {\n            mn_temporary_2 = mn_inline_1_value.value;\n        }\n        const int32_t found = mn_temporary_2;\n        mn_temporary_1 = (found + 1);\n        goto mn_inline_end_1;\n    }\n    mn_inline_end_1:;\n    return (mn_temporary_1 * 2);\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateLiftedJump: leaves a loop from a match branch and runs the deferred statements of the loop body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    end\nfn read(token: Token) -> ?i64:\n    match token:\n        case number(digits): return digits\n        else: return null\nfn sum(tokens: []const Token) -> i64:\n    var result: i64 = 0\n    for token in tokens:\n        match token:\n            case end: noop\n            else:\n                const digits = read(token) orelse break\n                result += digits\n        const again = read(token) orelse continue\n        result += again\n    return result\nfn count(tokens: []const Token, log: *i64) -> i64:\n    var total: i64 = 0\n    for token in tokens:\n        defer log.* += 1\n        total += read(token) orelse break\n    return total" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_Token {\n    uint32_t tag;\n    union {\n        int64_t number;\n    } value;\n} mn_main_Token;\n\ntypedef struct mn_optional_i64 mn_optional_i64;\ntypedef struct mn_slice_main_Token mn_slice_main_Token;\n\nmn_optional_i64 mn_main_read(mn_main_Token token);\nint64_t mn_main_sum(mn_slice_main_Token tokens);\nint64_t mn_main_count(mn_slice_main_Token tokens, int64_t * log);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_main_Token_defined\n#define mn_slice_main_Token_defined\ntypedef struct mn_slice_main_Token {\n    struct mn_main_Token *items;\n    size_t length;\n} mn_slice_main_Token;\n#endif\n\n#ifndef mn_optional_i64_defined\n#define mn_optional_i64_defined\ntypedef struct mn_optional_i64 {\n    int64_t value;\n    bool present;\n} mn_optional_i64;\n#endif\n\nmn_optional_i64 mn_main_read(mn_main_Token token) {\n    switch (token.tag) {\n    case 0: {\n        const int64_t digits = token.value.number;\n        return (mn_optional_i64){ .value = digits, .present = true };\n    }\n    default: {\n        return (mn_optional_i64){ .present = false };\n    }\n    }\n}\n\nint64_t mn_main_sum(mn_slice_main_Token tokens) {\n    int64_t result = 0;\n    for (size_t mn_index_1 = 0; mn_index_1 < tokens.length; mn_index_1 += 1) {\n        const mn_main_Token token = tokens.items[mn_index_1];\n        switch (token.tag) {\n        case 1: break;\n        default: {\n            mn_optional_i64 mn_temporary_1;\n            int64_t mn_temporary_2;\n            mn_temporary_1 = mn_main_read(token);\n            if (!(mn_temporary_1.present)) {\n                goto mn_break_1;\n            } else {\n                mn_temporary_2 = mn_temporary_1.value;\n            }\n            const int64_t digits = mn_temporary_2;\n            result = (result + digits);\n        }\n        }\n        mn_optional_i64 mn_temporary_3;\n        int64_t mn_temporary_4;\n        mn_temporary_3 = mn_main_read(token);\n        if (!(mn_temporary_3.present)) {\n            continue;\n        } else {\n            mn_temporary_4 = mn_temporary_3.value;\n        }\n        const int64_t again = mn_temporary_4;\n        result = (result + again);\n    }\n    mn_break_1:;\n    return result;\n}\n\nint64_t mn_main_count(mn_slice_main_Token tokens, int64_t * log) {\n    int64_t total = 0;\n    for (size_t mn_index_1 = 0; mn_index_1 < tokens.length; mn_index_1 += 1) {\n        const mn_main_Token token = tokens.items[mn_index_1];\n        int64_t mn_temporary_2;\n        mn_optional_i64 mn_temporary_3;\n        int64_t mn_temporary_4;\n        mn_temporary_2 = total;\n        mn_temporary_3 = mn_main_read(token);\n        if (!(mn_temporary_3.present)) {\n            {\n                int64_t * mn_temporary_1;\n                mn_temporary_1 = &(*log), (*mn_temporary_1) = ((*mn_temporary_1) + 1);\n            }\n            break;\n        } else {\n            mn_temporary_4 = mn_temporary_3.value;\n        }\n        total = (mn_temporary_2 + mn_temporary_4);\n        {\n            int64_t * mn_temporary_1;\n            mn_temporary_1 = &(*log), (*mn_temporary_1) = ((*mn_temporary_1) + 1);\n        }\n    }\n    return total;\n}\n",
         files[1].contents,
     );
 }
@@ -15438,6 +15712,87 @@ test "generateBuiltinCall: casts pointers and aligns a multiple value pointer th
     );
 }
 
+test "generateWrapping: computes in the unsigned type of the operands and converts back" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::math\nfn add_u8(value: u8) -> u8: return math::add_wrapping(value, 1)\nfn subtract_i8(value: i8) -> i8: return math::subtract_wrapping(value, 1)\nfn multiply_u16(one: u16, two: u16) -> u16: return math::multiply_wrapping(one, two)\nfn add_u64(value: u64) -> u64: return math::add_wrapping(value, 1)\nfn multiply_i64(one: i64, two: i64) -> i64: return math::multiply_wrapping(one, two)\nfn next() -> i32: return 7\nfn ignore(value: i32): _ = math::add_wrapping(value, next())" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\nuint8_t mn_main_add_u8(uint8_t value);\nint8_t mn_main_subtract_i8(int8_t value);\nuint16_t mn_main_multiply_u16(uint16_t one, uint16_t two);\nuint64_t mn_main_add_u64(uint64_t value);\nint64_t mn_main_multiply_i64(int64_t one, int64_t two);\nint32_t mn_main_next();\nvoid mn_main_ignore(int32_t value);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nuint8_t mn_main_add_u8(uint8_t value) {\n    return ((uint8_t)(1u * (uint8_t)(value) + (uint8_t)(1u)));\n}\n\nint8_t mn_main_subtract_i8(int8_t value) {\n    return ((int8_t)(uint8_t)(1u * (uint8_t)(value) - (uint8_t)(1)));\n}\n\nuint16_t mn_main_multiply_u16(uint16_t one, uint16_t two) {\n    return ((uint16_t)(1u * (uint16_t)(one) * (uint16_t)(two)));\n}\n\nuint64_t mn_main_add_u64(uint64_t value) {\n    return ((uint64_t)(1u * (uint64_t)(value) + (uint64_t)(1u)));\n}\n\nint64_t mn_main_multiply_i64(int64_t one, int64_t two) {\n    return ((int64_t)(uint64_t)(1u * (uint64_t)(one) * (uint64_t)(two)));\n}\n\nint32_t mn_main_next() {\n    return 7;\n}\n\nvoid mn_main_ignore(int32_t value) {\n    (void)(((int32_t)(uint32_t)(1u * (uint32_t)(value) + (uint32_t)(mn_main_next()))));\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateFunction: generates mn::random with its generator, range and entropy" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::random\nimport mn::random::Generator\nfn roll(generator: *random::Xoshiro256) -> usize: return generator.range(1..7)\nfn main():\n    var generator = random::Xoshiro256::new(random::entropy())\n    _ = roll(&generator)\n    _ = Generator::next(&generator)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings("main.h", files[0].path);
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_mn_random_Xoshiro256 mn_mn_random_Xoshiro256;\n\nsize_t mn_main_roll(struct mn_mn_random_Xoshiro256 * generator);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings("main.c", files[1].path);
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n#include \"mn/random.h\"\n#include \"mn.h\"\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\nchar mn_zero_sized;\n\nsize_t mn_main_roll(struct mn_mn_random_Xoshiro256 * generator) {\n    return mn_mn_random_Xoshiro256_Generator_range(generator, (mn_mn_Range){ .start = 1u, .end = (mn_optional_usize){ .value = 7u, .present = true } });\n}\n\nint main() {\n    mn_mn_random_Xoshiro256 generator = mn_mn_random_Xoshiro256_new(mn_runtime_random_entropy());\n    mn_main_roll(&generator);\n    mn_mn_random_Xoshiro256_Generator_next(&generator);\n}\n",
+        files[1].contents,
+    );
+    try std.testing.expectEqualStrings("mn.h", files[2].path);
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\ntypedef struct mn_mn_Range {\n    size_t start;\n    mn_optional_usize end;\n} mn_mn_Range;\n\ntypedef struct mn_optional_tuple_1_usize mn_optional_tuple_1_usize;\n\nmn_optional_tuple_1_usize mn_mn_Range_Iterator_next(struct mn_mn_Range * iterator);\n",
+        files[2].contents,
+    );
+    try std.testing.expectEqualStrings("mn.c", files[3].path);
+    try std.testing.expectEqualStrings(
+        "#include \"mn.h\"\n\n#ifndef mn_tuple_1_usize_defined\n#define mn_tuple_1_usize_defined\ntypedef struct mn_tuple_1_usize {\n    size_t _0;\n} mn_tuple_1_usize;\n#endif\n\n#ifndef mn_optional_tuple_1_usize_defined\n#define mn_optional_tuple_1_usize_defined\ntypedef struct mn_optional_tuple_1_usize {\n    mn_tuple_1_usize value;\n    bool present;\n} mn_optional_tuple_1_usize;\n#endif\n\nmn_optional_tuple_1_usize mn_mn_Range_Iterator_next(struct mn_mn_Range * iterator) {\n    if (((iterator->end.present) && (iterator->start >= iterator->end.value))) {\n        return (mn_optional_tuple_1_usize){ .present = false };\n    }\n    const size_t value = iterator->start;\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &iterator->start, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n    return (mn_optional_tuple_1_usize){ .value = (mn_tuple_1_usize){ ._0 = value }, .present = true };\n}\n",
+        files[3].contents,
+    );
+    try std.testing.expectEqualStrings("mn/random.h", files[4].path);
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\n#ifndef mn_array_4_u64_defined\n#define mn_array_4_u64_defined\ntypedef struct mn_array_4_u64 {\n    uint64_t items[4];\n} mn_array_4_u64;\n#endif\n\ntypedef struct mn_mn_random_Xoshiro256 {\n    mn_array_4_u64 state;\n} mn_mn_random_Xoshiro256;\n\ntypedef struct mn_mn_Range mn_mn_Range;\n\nuint64_t mn_runtime_random_entropy();\n\nmn_mn_random_Xoshiro256 mn_mn_random_Xoshiro256_new(uint64_t seed);\nuint64_t mn_mn_random_Xoshiro256_Generator_next(struct mn_mn_random_Xoshiro256 * generator);\nuint64_t mn_mn_random_splitmix64(uint64_t * state);\nsize_t mn_mn_random_Xoshiro256_Generator_range(struct mn_mn_random_Xoshiro256 * generator, mn_mn_Range range);\n",
+        files[4].contents,
+    );
+    try std.testing.expectEqualStrings("mn/random.c", files[5].path);
+    try std.testing.expectEqualStrings(
+        "#include \"random.h\"\n#include \"../mn.h\"\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\nmn_mn_random_Xoshiro256 mn_mn_random_Xoshiro256_new(uint64_t seed) {\n    uint64_t mixer = seed;\n    uint64_t mn_temporary_1;\n    uint64_t mn_temporary_2;\n    uint64_t mn_temporary_3;\n    uint64_t mn_temporary_4;\n    return (mn_temporary_1 = mn_mn_random_splitmix64(&mixer), mn_temporary_2 = mn_mn_random_splitmix64(&mixer), mn_temporary_3 = mn_mn_random_splitmix64(&mixer), mn_temporary_4 = mn_mn_random_splitmix64(&mixer), (mn_mn_random_Xoshiro256){ .state = (mn_array_4_u64){ .items = { mn_temporary_1, mn_temporary_2, mn_temporary_3, mn_temporary_4 } } });\n}\n\nuint64_t mn_mn_random_Xoshiro256_Generator_next(struct mn_mn_random_Xoshiro256 * generator) {\n    struct mn_array_4_u64 * const state = &generator->state;\n    const uint64_t scaled = ((uint64_t)(1u * (uint64_t)(state->items[1u]) * (uint64_t)(5u)));\n    const uint64_t result = ((uint64_t)(1u * (uint64_t)((mn_shift_left_u64(scaled, 7u) | mn_shift_right_u64(scaled, 57u))) * (uint64_t)(9u)));\n    const uint64_t shifted = mn_shift_left_u64(state->items[1u], 17u);\n    uint64_t * mn_temporary_1;\n    mn_temporary_1 = &state->items[2u], (*mn_temporary_1) = ((*mn_temporary_1) ^ state->items[0u]);\n    uint64_t * mn_temporary_2;\n    mn_temporary_2 = &state->items[3u], (*mn_temporary_2) = ((*mn_temporary_2) ^ state->items[1u]);\n    uint64_t * mn_temporary_3;\n    mn_temporary_3 = &state->items[1u], (*mn_temporary_3) = ((*mn_temporary_3) ^ state->items[2u]);\n    uint64_t * mn_temporary_4;\n    mn_temporary_4 = &state->items[0u], (*mn_temporary_4) = ((*mn_temporary_4) ^ state->items[3u]);\n    uint64_t * mn_temporary_5;\n    mn_temporary_5 = &state->items[2u], (*mn_temporary_5) = ((*mn_temporary_5) ^ shifted);\n    state->items[3u] = (mn_shift_left_u64(state->items[3u], 45u) | mn_shift_right_u64(state->items[3u], 19u));\n    return result;\n}\n\nuint64_t mn_mn_random_splitmix64(uint64_t * state) {\n    (*state) = ((uint64_t)(1u * (uint64_t)((*state)) + (uint64_t)(0x9e3779b97f4a7c15u)));\n    const uint64_t mixed = ((uint64_t)(1u * (uint64_t)(((*state) ^ mn_shift_right_u64((*state), 30u))) * (uint64_t)(0xbf58476d1ce4e5b9u)));\n    const uint64_t scrambled = ((uint64_t)(1u * (uint64_t)((mixed ^ mn_shift_right_u64(mixed, 27u))) * (uint64_t)(0x94d049bb133111ebu)));\n    return (scrambled ^ mn_shift_right_u64(scrambled, 31u));\n}\n\nsize_t mn_mn_random_Xoshiro256_Generator_range(struct mn_mn_random_Xoshiro256 * generator, mn_mn_Range range) {\n    const uint64_t count = ((uint64_t)(range.end.value - range.start));\n    const uint64_t threshold = (((uint64_t)(1u * (uint64_t)(0u) - (uint64_t)(count))) % count);\n    while (true) {\n        const uint64_t bits = mn_mn_random_Xoshiro256_Generator_next(generator);\n        if ((bits >= threshold)) {\n            return (range.start + ((size_t)(bits % count)));\n        }\n    }\n}\n",
+        files[5].contents,
+    );
+    try std.testing.expectEqual(6, files.len);
+    try std.testing.expectEqual(1, generator.runtime_functions.items.len);
+    try std.testing.expectEqualStrings("mn_runtime_random_entropy", generator.runtime_functions.items[0]);
+}
+
 test "generateFunctionCall: passes a pointer to an array as a slice" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -17246,6 +17601,17 @@ test "findRuntimeFile: keeps underscores of the function name out of the path" {
     const path = try findRuntimeFile(arena.allocator(), std.testing.io, plugin_directory.dir, "mn_runtime_stdout_write_line");
 
     try std.testing.expectEqualStrings("runtime/stdout.c", path);
+}
+
+test "findRuntimeFile: finds the runtime file of mn::random::entropy among the plugin's files" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const plugin_directory = try std.Io.Dir.cwd().openDir(std.testing.io, "plugins/c", .{});
+    defer plugin_directory.close(std.testing.io);
+
+    const path = try findRuntimeFile(arena.allocator(), std.testing.io, plugin_directory, "mn_runtime_random_entropy");
+
+    try std.testing.expectEqualStrings("runtime/random.c", path);
 }
 
 test "findRuntimeFile: rejects a name that leads to no file" {
