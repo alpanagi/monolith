@@ -1,5 +1,11 @@
-fn strip(bytes: []Const(u8)) -> []Const(u8):
-    const length = bytes.length
-    if length >= 2 and bytes[length - 2] == '\r' and bytes[length - 1] == '\n': return bytes[..length - 2]
-    if length >= 1 and bytes[length - 1] == '\n': return bytes[..length - 1]
-    return bytes
+fn strip(bytes: []Const(u8)) -> []Const(u8)
+    var start: usize = 0
+    var end = bytes.length
+    while (start < end and is_whitespace(bytes[start])) start += 1
+    while (end > start and is_whitespace(bytes[end - 1])) end -= 1
+    return bytes[start..end]
+
+fn is_whitespace(byte: u8) -> bool
+    return match byte
+        case (' ', '\t', '\n', '\r', 0x0b, 0x0c) true
+        else false

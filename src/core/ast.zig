@@ -112,6 +112,7 @@ pub const StatementKind = union(enum) {
     @"defer": Defer,
     @"break": Jump,
     @"continue": Jump,
+    value: Expression,
 };
 
 pub const ConstantDeclaration = struct {
@@ -239,6 +240,7 @@ pub const If = struct {
     else_body: ?[]Statement = null,
     known: ?bool = null,
     dropped_ends: bool = false,
+    produces: bool = false,
 };
 
 pub const While = struct {
@@ -275,6 +277,7 @@ pub const Match = struct {
     value: Expression,
     branches: []Branch,
     names: []ElementName,
+    produces: bool = false,
 };
 
 pub const Branch = struct {
@@ -363,6 +366,7 @@ pub const ExpressionKind = union(enum) {
     range: *Range,
     struct_type: *StructType,
     jump: *Statement,
+    branching: *Statement,
 };
 
 pub const Call = struct {
@@ -857,6 +861,7 @@ pub fn extractBlocks(statement: Statement) [2][]const Statement {
         .@"defer",
         .@"break",
         .@"continue",
+        .value,
         => .{ &.{}, &.{} },
     };
 }
@@ -882,7 +887,7 @@ fn isEndingStatement(module: Module, statement: Statement) bool {
             }
             return true;
         },
-        .noop, .discard, .constant_declaration, .tuple_declaration, .variable_declaration, .assignment, .@"while", .@"for", .@"defer" => false,
+        .noop, .discard, .constant_declaration, .tuple_declaration, .variable_declaration, .assignment, .@"while", .@"for", .@"defer", .value => false,
     };
 }
 
@@ -890,7 +895,7 @@ pub fn extractExpressions(statement: *const Statement) Expressions {
     var expressions: Expressions = .{};
     switch (statement.kind) {
         .@"return" => |*value| if (value.*) |*returned| expressions.append(returned),
-        .discard, .call => |*expression| expressions.append(expression),
+        .discard, .call, .value => |*expression| expressions.append(expression),
         .constant_declaration => |*constant| expressions.append(&constant.value),
         .tuple_declaration => |*declaration| expressions.append(&declaration.value),
         .variable_declaration => |*variable| expressions.append(&variable.value),
@@ -973,7 +978,80 @@ pub fn collectJumps(
                 if (statement.kind.@"return") |*value| try collectJumps(allocator, jumps, value);
             }
         },
+        .branching => {},
     }
+}
+
+pub fn collectBranchings(
+    allocator: std.mem.Allocator,
+    branchings: *std.ArrayList(*Statement),
+    expression: *const Expression,
+) std.mem.Allocator.Error!void {
+    switch (expression.kind) {
+        .integer_literal,
+        .float_literal,
+        .boolean_literal,
+        .string_literal,
+        .undefined,
+        .null,
+        .identifier,
+        .path_expression,
+        .array_type,
+        .slice_type,
+        .pointer_type,
+        .optional_type,
+        .tuple_type,
+        .function_type,
+        .struct_type,
+        => {},
+        .member => |member| try collectBranchings(allocator, branchings, member.owner),
+        .call => |call| {
+            if (call.callee == .member) try collectBranchings(allocator, branchings, call.callee.member.owner);
+            for (call.arguments) |*argument| try collectBranchings(allocator, branchings, &argument.value);
+        },
+        .method_call => |call| {
+            try collectBranchings(allocator, branchings, call.receiver);
+            for (call.arguments) |*argument| try collectBranchings(allocator, branchings, &argument.value);
+        },
+        .composite_literal => |literal| {
+            for (literal.elements) |*element| try collectBranchings(allocator, branchings, &element.value);
+        },
+        .binary => |binary| {
+            try collectBranchings(allocator, branchings, binary.left);
+            try collectBranchings(allocator, branchings, binary.right);
+        },
+        .unary => |unary| try collectBranchings(allocator, branchings, unary.operand),
+        .negation, .address_of, .dereference, .unwrap, .@"try" => |operand| try collectBranchings(allocator, branchings, operand),
+        .index => |indexing| {
+            try collectBranchings(allocator, branchings, indexing.value);
+            try collectBranchings(allocator, branchings, indexing.index);
+        },
+        .slice => |slice| {
+            try collectBranchings(allocator, branchings, slice.value);
+            if (slice.start) |start| try collectBranchings(allocator, branchings, start);
+            if (slice.end) |end| try collectBranchings(allocator, branchings, end);
+        },
+        .field_access => |access| try collectBranchings(allocator, branchings, access.value),
+        .range => |range| {
+            try collectBranchings(allocator, branchings, &range.start);
+            if (range.end) |*end| try collectBranchings(allocator, branchings, end);
+        },
+        .jump => |statement| {
+            if (statement.kind == .@"return") {
+                if (statement.kind.@"return") |*value| try collectBranchings(allocator, branchings, value);
+            }
+        },
+        .branching => |statement| try branchings.append(allocator, statement),
+    }
+}
+
+pub fn collectStatementBranchings(
+    allocator: std.mem.Allocator,
+    branchings: *std.ArrayList(*Statement),
+    statement: *const Statement,
+) std.mem.Allocator.Error!void {
+    const expressions = extractExpressions(statement);
+    for (expressions.items[0..expressions.count]) |expression| try collectBranchings(allocator, branchings, expression);
 }
 
 pub fn collectStatementJumps(
@@ -1024,6 +1102,19 @@ pub fn iterateBlocks(statement: Statement) Blocks {
     return .{ .statement = statement };
 }
 
+pub fn findBranching(statement: *const Statement) ?*Statement {
+    const value = switch (statement.kind) {
+        .@"return" => |value| value orelse return null,
+        .constant_declaration => |constant| constant.value,
+        .tuple_declaration => |declaration| declaration.value,
+        .variable_declaration => |variable| variable.value,
+        .assignment => |assignment| assignment.value,
+        .noop, .discard, .call, .@"if", .@"while", .@"for", .match, .@"defer", .@"break", .@"continue", .value => return null,
+    };
+    if (value.kind != .branching) return null;
+    return value.kind.branching;
+}
+
 pub fn extractLabel(statement: Statement) ?[]const u8 {
     return switch (statement.kind) {
         .@"while" => |loop| loop.label,
@@ -1041,6 +1132,7 @@ pub fn extractLabel(statement: Statement) ?[]const u8 {
         .@"defer",
         .@"break",
         .@"continue",
+        .value,
         => null,
     };
 }
@@ -1075,6 +1167,7 @@ pub fn extractElementNames(statement: Statement) []ElementName {
         .@"defer",
         .@"break",
         .@"continue",
+        .value,
         => unreachable,
     };
 }
@@ -1243,7 +1336,8 @@ pub fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std
             cloned.* = .{ .fields = struct_type.fields, .functions = struct_type.functions };
             break :kind .{ .struct_type = cloned };
         },
-        .jump => |statement| .{ .jump = try cloneJump(allocator, statement) },
+        .jump => |statement| .{ .jump = try cloneNestedStatement(allocator, statement) },
+        .branching => |statement| .{ .branching = try cloneNestedStatement(allocator, statement) },
     };
     return .{ .kind = kind, .location = expression.location };
 }
@@ -1362,11 +1456,12 @@ fn cloneStatement(allocator: std.mem.Allocator, statement: Statement) std.mem.Al
         .@"defer" => |deferred| .{ .@"defer" = try cloneDefer(allocator, deferred) },
         .@"break" => |jump| .{ .@"break" = .{ .label = jump.label } },
         .@"continue" => |jump| .{ .@"continue" = .{ .label = jump.label } },
+        .value => |expression| .{ .value = try cloneExpression(allocator, expression) },
     };
     return .{ .kind = kind, .location = statement.location };
 }
 
-fn cloneJump(allocator: std.mem.Allocator, statement: *const Statement) std.mem.Allocator.Error!*Statement {
+fn cloneNestedStatement(allocator: std.mem.Allocator, statement: *const Statement) std.mem.Allocator.Error!*Statement {
     const cloned = try allocator.create(Statement);
     cloned.* = try cloneStatement(allocator, statement.*);
     return cloned;
@@ -1500,6 +1595,29 @@ test "iterateBlocks: walks the body of every branch of a match" {
     try std.testing.expectEqual(@as([]const Statement, &one), blocks.next().?);
     try std.testing.expectEqual(@as([]const Statement, &two), blocks.next().?);
     try std.testing.expectEqual(null, blocks.next());
+}
+
+test "findBranching: finds the if that gives the value of a declaration" {
+    const location: token.Location = .{ .row = 1, .column = 1 };
+    var one = [_]Statement{.{ .kind = .noop, .location = location }};
+    var two = [_]Statement{.{ .kind = .noop, .location = location }};
+    var conditional: Statement = .{
+        .kind = .{ .@"if" = .{
+            .condition = .{ .kind = .{ .identifier = .{ .name = "ready" } }, .location = location },
+            .body = &one,
+            .else_body = &two,
+        } },
+        .location = location,
+    };
+    const declaration: Statement = .{
+        .kind = .{ .constant_declaration = .{
+            .name = "value",
+            .value = .{ .kind = .{ .branching = &conditional }, .location = location },
+        } },
+        .location = location,
+    };
+
+    try std.testing.expectEqual(&conditional, findBranching(&declaration).?);
 }
 
 test "extractElementType: finds the element of the array a pointer points to" {

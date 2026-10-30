@@ -4,100 +4,100 @@ import mn::reflection
 
 typeclass Tuple(type T)
 
-typeclass Iterator(type I):
+typeclass Iterator(type I)
     fn Element() -> type
     fn next(iterator: *I) -> ?Element()
 
-struct Range:
+struct Range
     start: usize
     end: ?usize
 
-instance Iterator(Range):
-    fn Element() -> type: return [usize]
-    fn next(iterator: *Range) -> ?Element():
-        if iterator.end != null and iterator.start >= iterator.end.?: return null
+instance Iterator(Range)
+    fn Element() -> type = [usize]
+    fn next(iterator: *Range) -> ?Element()
+        if (iterator.end != null and iterator.start >= iterator.end.?) return null
         const value = iterator.start
         iterator.start += 1
         return {value}
 
-instance(type T) Iterator([]T):
-    fn Element() -> type: return [T]
-    fn next(iterator: *[]T) -> ?Element():
-        for element in iterator.*:
+instance(type T) Iterator([]T)
+    fn Element() -> type = [T]
+    fn next(iterator: *[]T) -> ?Element()
+        for element in iterator.*
             iterator.* = iterator.*[1..]
             return {element}
         return null
 
-instance(type T) Iterator([]Const(T)):
-    fn Element() -> type: return [T]
-    fn next(iterator: *[]Const(T)) -> ?Element():
-        for element in iterator.*:
+instance(type T) Iterator([]Const(T))
+    fn Element() -> type = [T]
+    fn next(iterator: *[]Const(T)) -> ?Element()
+        for element in iterator.*
             iterator.* = iterator.*[1..]
             return {element}
         return null
 
-typeclass Zip(type T):
+typeclass Zip(type T)
     fn zip(iterators: T) -> Zipped(T)
 
-fn Zipped(type T) -> type:
-    return struct:
+fn Zipped(type T) -> type
+    return struct
         iterators: T
 
-instance(type T: Tuple) Zip(T):
-    fn zip(iterators: T) -> Zipped(T): return Zipped(T){iterators = iterators}
+instance(type T: Tuple) Zip(T)
+    fn zip(iterators: T) -> Zipped(T) = Zipped(T){iterators = iterators}
 
-instance(type T: Tuple) Iterator(Zipped(T)):
-    fn Element() -> type: return ZippedElement(T, 0)
-    fn next(iterator: *Zipped(T)) -> ?Element():
+instance(type T: Tuple) Iterator(Zipped(T))
+    fn Element() -> type = ZippedElement(T, 0)
+    fn next(iterator: *Zipped(T)) -> ?Element()
         var element: ZippedElement(T, 0) = undefined
         const filled = fillZipped(T, 0, 0, &iterator.iterators, &element)
-        if filled: return element
+        if (filled) return element
         return null
 
-fn ZippedElement(type T, comptime index: usize) -> type:
-    if index == reflection::length(T): return []
-    else: return reflection::join(Iterator(T[index])::Element(), ZippedElement(T, index + 1))
+fn ZippedElement(type T, comptime index: usize) -> type
+    if (index == reflection::length(T)) return []
+    else return reflection::join(Iterator(T[index])::Element(), ZippedElement(T, index + 1))
 
-fn fillZipped(type T, comptime index: usize, comptime offset: usize, iterators: *T, element: *ZippedElement(T, 0)) -> bool:
-    if index == reflection::length(T): return true
-    else:
+fn fillZipped(type T, comptime index: usize, comptime offset: usize, iterators: *T, element: *ZippedElement(T, 0)) -> bool
+    if (index == reflection::length(T)) return true
+    else
         const item = Iterator::next(&iterators.*[index])
-        if item == null: return false
+        if (item == null) return false
         const Item = Iterator(T[index])::Element()
         copyElements(Item, ZippedElement(T, 0), offset, 0, item.?, element)
         return fillZipped(T, index + 1, offset + reflection::length(Item), iterators, element)
 
-fn copyElements(type S, type D, comptime offset: usize, comptime position: usize, source: S, destination: *D):
-    if position == reflection::length(S): noop
-    else:
+fn copyElements(type S, type D, comptime offset: usize, comptime position: usize, source: S, destination: *D)
+    if (position == reflection::length(S)) noop
+    else
         destination.*[offset + position] = source[position]
         copyElements(S, D, offset, position + 1, source, destination)
 
-fn List(type T) -> type:
-    return struct:
+fn List(type T) -> type
+    return struct
         items: []T
         capacity: usize
 
-        fn new() -> Self: return Self{items = {}, capacity = 0}
+        fn new() -> Self = Self{items = {}, capacity = 0}
 
-        fn append(self: *Self, allocator: *memory::Allocator, value: T) -> memory::Error!void:
+        fn append(self: *Self, allocator: *memory::Allocator, value: T) -> memory::Error!void
             const length = self.items.length
-            if length == self.capacity:
+            if length == self.capacity
                 var capacity: usize = 8
-                if self.capacity > 0: capacity = self.capacity * 2
+                if (self.capacity > 0) capacity = self.capacity * 2
                 const bytes = ::cast(*Many(u8), self.items.pointer)[0..self.capacity * ::size(T)]
-                if self.capacity > 0 and Allocator::resize(allocator, bytes, ::alignment(T), capacity * ::size(T)):
+                if self.capacity > 0 and Allocator::resize(allocator, bytes, ::alignment(T), capacity * ::size(T))
                     self.capacity = capacity
-                else:
+                else
                     const items = try memory::allocate(allocator, T, capacity)
-                    for index in 0..length: items[index] = self.items[index]
-                    if self.capacity > 0: memory::free(allocator, self.items.pointer[0..self.capacity])
+                    for (index in 0..length) items[index] = self.items[index]
+                    if (self.capacity > 0) memory::free(allocator, self.items.pointer[0..self.capacity])
                     self.items = items[0..length]
                     self.capacity = capacity
             self.items = self.items.pointer[0..length + 1]
             self.items[length] = value
 
-        fn free(self: *Self, allocator: *memory::Allocator):
-            if self.capacity > 0: memory::free(allocator, self.items.pointer[0..self.capacity])
+        fn free(self: *Self, allocator: *memory::Allocator)
+            if (self.capacity > 0) memory::free(allocator, self.items.pointer[0..self.capacity])
             self.items = self.items[0..0]
             self.capacity = 0

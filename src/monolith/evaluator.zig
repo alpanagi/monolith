@@ -13,6 +13,15 @@ const followPointer = types.followPointer;
 const step_limit = 1_000_000;
 const depth_limit = 512;
 
+const detached_definition: ast.FunctionDefinition = .{
+    .signature = .{
+        .name = "",
+        .parameters = &.{},
+        .return_type = .{ .kind = .undefined, .location = .{ .row = 0, .column = 0 }, .denoted = .void },
+    },
+    .body = &.{},
+};
+
 pub const Evaluator = struct {
     arena: *std.heap.ArenaAllocator,
     program: ast.Program,
@@ -25,6 +34,8 @@ pub const Evaluator = struct {
     calls: std.ArrayList(Active) = .empty,
     returned_error: ?Value.Enumeration = null,
     jumped: ?Flow = null,
+    produced: ?Value = null,
+    production_type: ?types.Type = null,
     failure: ?Failure = null,
 
     pub fn init(arena: *std.heap.ArenaAllocator, program: ast.Program) Evaluator {
@@ -94,6 +105,7 @@ pub const Evaluator = struct {
 
     pub fn findCurrentFunction(self: *const Evaluator) ?ast.Resolution.Function {
         const frame = self.frame orelse return null;
+        if (frame.definition == &detached_definition) return null;
         return frame.function;
     }
 
@@ -173,7 +185,7 @@ pub const Evaluator = struct {
             },
             .method_call => |call| calls and self.isKnownWith(call.receiver.*, calls) and self.areKnown(call.arguments, calls),
             .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type, .struct_type => true,
-            .undefined, .jump => false,
+            .undefined, .jump, .branching => false,
         };
     }
 
@@ -231,6 +243,7 @@ pub const Evaluator = struct {
             .method_call => self.fail(location, error.CannotEvaluate),
             .struct_type => unreachable,
             .jump => |statement| self.evaluateJump(location, statement),
+            .branching => self.evaluateBranching(expression),
         };
     }
 
@@ -399,6 +412,7 @@ pub const Evaluator = struct {
             .@"try",
             .range,
             .jump,
+            .branching,
             => {
                 const cell = try self.arena.allocator().create(Value);
                 cell.* = try self.evaluateExpression(&expression);
@@ -827,6 +841,33 @@ pub const Evaluator = struct {
         return error.Jumped;
     }
 
+    fn evaluateBranching(self: *Evaluator, expression: *const ast.Expression) EvaluateError!Value {
+        if (self.frame == null) return self.evaluateDetachedBranching(expression);
+        const caller_production_type = self.production_type;
+        const caller_produced = self.produced;
+        self.production_type = expression.type.?;
+        defer self.production_type = caller_production_type;
+        defer self.produced = caller_produced;
+        const flow = try self.executeStatement(expression.kind.branching);
+        if (flow != .next) {
+            self.jumped = flow;
+            return error.Jumped;
+        }
+        return self.produced.?;
+    }
+
+    fn evaluateDetachedBranching(self: *Evaluator, expression: *const ast.Expression) EvaluateError!Value {
+        var frame: Frame = .{
+            .function = .{ .module = self.module_index, .declaration = 0 },
+            .definition = &detached_definition,
+            .parameters = &.{},
+            .return_type = .void,
+        };
+        self.frame = &frame;
+        defer self.frame = null;
+        return self.evaluateBranching(expression);
+    }
+
     fn evaluateAddress(self: *Evaluator, operand: ast.Expression) EvaluateError!Value {
         switch (operand.kind) {
             inline .identifier, .path_expression, .member => |name| {
@@ -1068,6 +1109,10 @@ pub const Evaluator = struct {
             .@"defer" => unreachable,
             .@"break" => |*jump| return .{ .broke = jump.loop.? },
             .@"continue" => |*jump| return .{ .continued = jump.loop.? },
+            .value => |*expression| {
+                self.produced = try self.evaluateConverted(expression, self.production_type.?);
+                return .next;
+            },
         }
     }
 
@@ -1986,7 +2031,7 @@ test "Evaluator.isKnown: knows a local constant computed from constants but not 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const LIMIT = 4i32\nfn main():\n    var count = 1i32\n    count += 1\n    const known = LIMIT * 2\n    const unknown = count * 2\n    _ = known\n    _ = unknown" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const LIMIT = 4i32\nfn main()\n    var count = 1i32\n    count += 1\n    const known = LIMIT * 2\n    const unknown = count * 2\n    _ = known\n    _ = unknown" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2008,7 +2053,7 @@ test "Evaluator.isKnownWithoutCalls: does not know a call" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> i32: return 1\nfn main():\n    const value = one()\n    _ = value" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> i32 = return 1\nfn main()\n    const value = one()\n    _ = value" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2030,7 +2075,7 @@ test "Evaluator.evaluateConstant: rejects a constant that depends on itself thro
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const LOOP = again()\nfn again() -> i32: return LOOP" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const LOOP = again()\nfn again() -> i32 = return LOOP" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2049,7 +2094,7 @@ test "Evaluator.evaluateConstant: rejects an error that is not caught" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing_end\n    bad_digit: u8\nerror FileError:\n    missing_file\nfn digit(text: u8) -> ParseError!u8:\n    if text < 48: return ParseError::bad_digit(text)\n    return text - 48\nconst VALUE = digit(20)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    missing_end\n    bad_digit: u8\nerror FileError\n    missing_file\nfn digit(text: u8) -> ParseError!u8\n    if (text < 48) return ParseError::bad_digit(text)\n    return text - 48\nconst VALUE = digit(20)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2068,7 +2113,7 @@ test "Evaluator.evaluateDefault: evaluates a field default with a call" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn start() -> i32: return 3\nstruct Point:\n    x: i32 = start()\nconst ORIGIN = Point{}" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn start() -> i32 = return 3\nstruct Point\n    x: i32 = start()\nconst ORIGIN = Point{}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2089,7 +2134,7 @@ test "readResolution: rejects reading an undefined element" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read() -> i32:\n    var values: [2]i32 = undefined\n    values[0] = 1\n    return values[1]\nconst VALUE = read()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read() -> i32\n    var values: [2]i32 = undefined\n    values[0] = 1\n    return values[1]\nconst VALUE = read()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2108,7 +2153,7 @@ test "readResolution: rejects reading an undefined variable at compile time" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read() -> i32:\n    var count: i32 = undefined\n    const copy = count\n    count = copy\n    return count\nconst VALUE = read()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read() -> i32\n    var count: i32 = undefined\n    const copy = count\n    count = copy\n    return count\nconst VALUE = read()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2127,7 +2172,7 @@ test "findPlace: writes through a pointer to a field" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32\nfn moved() -> Point:\n    var point = Point{x = 1, y = 2}\n    const pointer = &point.y\n    pointer.* = 5\n    return point\nconst MOVED = moved()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point\n    x: i32\n    y: i32\nfn moved() -> Point\n    var point = Point{x = 1, y = 2}\n    const pointer = &point.y\n    pointer.* = 5\n    return point\nconst MOVED = moved()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2188,7 +2233,7 @@ test "evaluateFieldAccess: reads the pointer and the length of a slice at compil
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn second(values: []Const(u8)) -> u8:\n    const pointer = values.pointer\n    return pointer[1] + mn::convert(u8, values.length)\nconst VALUES: [3]u8 = {1, 2, 3}\nconst SECOND = second(&VALUES)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn second(values: []Const(u8)) -> u8\n    const pointer = values.pointer\n    return pointer[1] + mn::convert(u8, values.length)\nconst VALUES: [3]u8 = {1, 2, 3}\nconst SECOND = second(&VALUES)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2208,7 +2253,7 @@ test "evaluateFieldAccess: gives the length of arrays from their types without r
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const primes: [_]i32 = {2, 3, 5}\nconst COUNT = primes.length\nfn sizes() -> usize:\n    var buffer: [64]u8 = undefined\n    const pointer = &buffer\n    var other: [buffer.length]u16 = undefined\n    other[0] = 1\n    buffer[0] = 2\n    return buffer.length + pointer.length + other.length\nconst SIZES = sizes()\nfn twice(comptime count: usize) -> usize: return count * 2\nfn local() -> usize:\n    var buffer: [8]u8 = undefined\n    buffer[0] = 1\n    return twice(buffer.length)\nconst LOCAL = local()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const primes: [_]i32 = {2, 3, 5}\nconst COUNT = primes.length\nfn sizes() -> usize\n    var buffer: [64]u8 = undefined\n    const pointer = &buffer\n    var other: [buffer.length]u16 = undefined\n    other[0] = 1\n    buffer[0] = 2\n    return buffer.length + pointer.length + other.length\nconst SIZES = sizes()\nfn twice(comptime count: usize) -> usize = return count * 2\nfn local() -> usize\n    var buffer: [8]u8 = undefined\n    buffer[0] = 1\n    return twice(buffer.length)\nconst LOCAL = local()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2230,7 +2275,7 @@ test "evaluateFieldAccess: runs a call that gives an array before taking its len
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn bump(count: *u8) -> [2]u8:\n    count.* += 1\n    return {0, 0}\nfn run() -> u8:\n    var count: u8 = 0\n    const length = bump(&count).length\n    return count + mn::convert(u8, length)\nconst RUN = run()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn bump(count: *u8) -> [2]u8\n    count.* += 1\n    return {0, 0}\nfn run() -> u8\n    var count: u8 = 0\n    const length = bump(&count).length\n    return count + mn::convert(u8, length)\nconst RUN = run()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2249,7 +2294,7 @@ test "evaluateCall: evaluates a call with any arguments at compile time" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count(values: any) -> usize: return values.length\nconst ARRAY: [4]u8 = {1, 2, 3, 4}\nconst TOTAL = count(\"abc\") + count(ARRAY)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count(values: any) -> usize = return values.length\nconst ARRAY: [4]u8 = {1, 2, 3, 4}\nconst TOTAL = count(\"abc\") + count(ARRAY)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2258,7 +2303,7 @@ test "evaluateCall: evaluates a call with any arguments at compile time" {
     try std.testing.expectEqual(Value{ .integer = 7 }, loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.*);
 }
 
-test "evaluateCall: strips one line ending with mn::text::strip at compile time" {
+test "strip: removes whitespace from both ends at compile time" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -2268,22 +2313,19 @@ test "evaluateCall: strips one line ending with mn::text::strip at compile time"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::text\nconst NEWLINE = memory::equal(text::strip(\"y\\n\"), \"y\")\nconst CARRIAGE = memory::equal(text::strip(\"y\\r\\n\"), \"y\")\nconst PLAIN = memory::equal(text::strip(\"y\"), \"y\")\nconst EMPTY = memory::equal(text::strip(\"\"), \"\")\nconst ALONE = memory::equal(text::strip(\"\\n\"), \"\")\nconst DOUBLE = memory::equal(text::strip(\"y\\n\\n\"), \"y\\n\")\nconst RETURN = memory::equal(text::strip(\"y\\r\"), \"y\\r\")\nfn mutable() -> bool:\n    var buffer: [2]u8 = {'y', '\\n'}\n    buffer[0] = 'y'\n    return memory::equal(text::strip(buffer[..]), \"y\")\nconst MUTABLE = mutable()\nconst LENGTH = text::strip(\"y\\n\\n\").length" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::text\nconst NEWLINE = memory::equal(text::strip(\"y\\n\"), \"y\")\nconst CARRIAGE = memory::equal(text::strip(\"y\\r\\n\"), \"y\")\nconst BOTH = memory::equal(text::strip(\" \\t y \\n\\n\"), \"y\")\nconst INSIDE = memory::equal(text::strip(\" a b \"), \"a b\")\nconst PLAIN = memory::equal(text::strip(\"y\"), \"y\")\nconst EMPTY = memory::equal(text::strip(\"\"), \"\")\nconst ONLY = memory::equal(text::strip(\" \\r\\n\\t\"), \"\")\nfn mutable() -> bool\n    var buffer: [3]u8 = {' ', 'y', '\\n'}\n    buffer[1] = 'y'\n    return memory::equal(text::strip(buffer[..]), \"y\")\nconst MUTABLE = mutable()\nconst OTHER = text::strip(\"\\u{b}\\u{c}y\\u{b}\\u{c}\").length\nconst LENGTH = text::strip(\"\\0y\").length" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expect(declarations[2].kind.constant_declaration.known.?.boolean);
-    try std.testing.expect(declarations[3].kind.constant_declaration.known.?.boolean);
-    try std.testing.expect(declarations[4].kind.constant_declaration.known.?.boolean);
-    try std.testing.expect(declarations[5].kind.constant_declaration.known.?.boolean);
-    try std.testing.expect(declarations[6].kind.constant_declaration.known.?.boolean);
-    try std.testing.expect(declarations[7].kind.constant_declaration.known.?.boolean);
-    try std.testing.expect(declarations[8].kind.constant_declaration.known.?.boolean);
+    for (declarations[2..9]) |declaration| {
+        try std.testing.expect(declaration.kind.constant_declaration.known.?.boolean);
+    }
     try std.testing.expect(declarations[10].kind.constant_declaration.known.?.boolean);
-    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[11].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[11].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[12].kind.constant_declaration.known.?.*);
 }
 
 test "Xoshiro256: gives the reference numbers and stays inside a range at compile time" {
@@ -2296,7 +2338,7 @@ test "Xoshiro256: gives the reference numbers and stays inside a range at compil
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::random\nimport mn::random::Generator\nfn mix(seed: u64) -> [4]u64:\n    var state = seed\n    return {random::splitmix64(&state), random::splitmix64(&state), random::splitmix64(&state), random::splitmix64(&state)}\nfn reference() -> [6]u64:\n    var generator = random::Xoshiro256{state = {1, 2, 3, 4}}\n    return {Generator::next(&generator), Generator::next(&generator), Generator::next(&generator), Generator::next(&generator), Generator::next(&generator), Generator::next(&generator)}\nfn seeded() -> [4]u64:\n    var generator = random::Xoshiro256::new(42)\n    return {generator.next(), generator.next(), generator.next(), generator.next()}\nfn repeats() -> bool:\n    var one = random::Xoshiro256::new(42)\n    var two = random::Xoshiro256::new(42)\n    for _ in 0..100:\n        if Generator::next(&one) != Generator::next(&two): return false\n    return true\nfn stays_inside() -> bool:\n    var generator = random::Xoshiro256::new(7)\n    var seen: [6]bool = {false, false, false, false, false, false}\n    for _ in 0..1000:\n        const value = generator.range(1..7)\n        if value < 1 or value >= 7: return false\n        seen[value - 1] = true\n        if Generator::range(&generator, 0..1) != 0: return false\n    for found in seen:\n        if !found: return false\n    return true\nconst MIX = mix(0)\nconst REFERENCE = reference()\nconst SEEDED = seeded()\nconst REPEATS = repeats()\nconst STAYS_INSIDE = stays_inside()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::random\nimport mn::random::Generator\nfn mix(seed: u64) -> [4]u64\n    var state = seed\n    return {random::splitmix64(&state), random::splitmix64(&state), random::splitmix64(&state), random::splitmix64(&state)}\nfn reference() -> [6]u64\n    var generator = random::Xoshiro256{state = {1, 2, 3, 4}}\n    return {Generator::next(&generator), Generator::next(&generator), Generator::next(&generator), Generator::next(&generator), Generator::next(&generator), Generator::next(&generator)}\nfn seeded() -> [4]u64\n    var generator = random::Xoshiro256::new(42)\n    return {generator.next(), generator.next(), generator.next(), generator.next()}\nfn repeats() -> bool\n    var one = random::Xoshiro256::new(42)\n    var two = random::Xoshiro256::new(42)\n    for _ in 0..100\n        if (Generator::next(&one) != Generator::next(&two)) return false\n    return true\nfn stays_inside() -> bool\n    var generator = random::Xoshiro256::new(7)\n    var seen: [6]bool = {false, false, false, false, false, false}\n    for _ in 0..1000\n        const value = generator.range(1..7)\n        if (value < 1 or value >= 7) return false\n        seen[value - 1] = true\n        if (Generator::range(&generator, 0..1) != 0) return false\n    for found in seen\n        if (!found) return false\n    return true\nconst MIX = mix(0)\nconst REFERENCE = reference()\nconst SEEDED = seeded()\nconst REPEATS = repeats()\nconst STAYS_INSIDE = stays_inside()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2329,7 +2371,7 @@ test "Default: is Xoshiro256" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::random\nimport mn::random::Generator\nfn next(generator: *random::Xoshiro256) -> u64: return generator.next()\nfn first() -> u64:\n    var generator = random::Default::new(42)\n    return next(&generator)\nconst FIRST = first()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::random\nimport mn::random::Generator\nfn next(generator: *random::Xoshiro256) -> u64 = return generator.next()\nfn first() -> u64\n    var generator = random::Default::new(42)\n    return next(&generator)\nconst FIRST = first()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2349,7 +2391,7 @@ test "List: grows in place or by moving and reports running out of memory at com
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Buffer:\n    bytes: []u8\n    used: usize\n    last: usize\n    resizes: usize\n    frees: usize\ninstance Allocator(Buffer):\n    fn allocate(buffer: *Buffer, size: usize, _: usize) -> memory::Error![]u8:\n        if buffer.used + size > buffer.bytes.length: return memory::Error::out_of_memory\n        buffer.last = buffer.used\n        buffer.used += size\n        return buffer.bytes[buffer.last..buffer.used]\n    fn resize(buffer: *Buffer, bytes: []u8, _: usize, size: usize) -> bool:\n        if bytes.length != buffer.used - buffer.last or buffer.last + size > buffer.bytes.length: return false\n        buffer.used = buffer.last + size\n        buffer.resizes += 1\n        return true\n    fn free(buffer: *Buffer, _: []u8, _: usize): buffer.frees += 1\nfn grow() -> memory::Error![6]usize:\n    var storage: [256]u8 = undefined\n    var buffer = Buffer{bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0}\n    var list = mn::List(u8)::new()\n    for index in 0..20: try list.append(&buffer, mn::truncate(u8, index))\n    const in_place = buffer.resizes\n    _ = try memory::allocate(&buffer, u8, 4)\n    for index in 20..40: try list.append(&buffer, mn::truncate(u8, index))\n    var sum: usize = 0\n    for item in list.items: sum += mn::convert(usize, item)\n    const length = list.items.length\n    list.free(&buffer)\n    return {in_place, buffer.frees, length, sum, list.items.length, list.capacity}\nfn fill(list: *mn::List(u8), buffer: *Buffer, count: usize) -> memory::Error!u8:\n    for _ in 0..count: try list.append(buffer, 3)\n    return 0\nfn exhaust() -> u8:\n    var storage: [8]u8 = undefined\n    var buffer = Buffer{bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0}\n    var list = mn::List(u8)::new()\n    const filled = fill(&list, &buffer, 8) catch return 1\n    const more = fill(&list, &buffer, 1) catch return 2\n    return filled + more\nconst GROW = grow() catch {0, 0, 0, 0, 0, 0}\nconst EXHAUST = exhaust()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Buffer\n    bytes: []u8\n    used: usize\n    last: usize\n    resizes: usize\n    frees: usize\ninstance Allocator(Buffer)\n    fn allocate(buffer: *Buffer, size: usize, _: usize) -> memory::Error![]u8\n        if (buffer.used + size > buffer.bytes.length) return memory::Error::out_of_memory\n        buffer.last = buffer.used\n        buffer.used += size\n        return buffer.bytes[buffer.last..buffer.used]\n    fn resize(buffer: *Buffer, bytes: []u8, _: usize, size: usize) -> bool\n        if (bytes.length != buffer.used - buffer.last or buffer.last + size > buffer.bytes.length) return false\n        buffer.used = buffer.last + size\n        buffer.resizes += 1\n        return true\n    fn free(buffer: *Buffer, _: []u8, _: usize) = buffer.frees += 1\nfn grow() -> memory::Error![6]usize\n    var storage: [256]u8 = undefined\n    var buffer = Buffer{bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0}\n    var list = mn::List(u8)::new()\n    for (index in 0..20) try list.append(&buffer, mn::truncate(u8, index))\n    const in_place = buffer.resizes\n    _ = try memory::allocate(&buffer, u8, 4)\n    for (index in 20..40) try list.append(&buffer, mn::truncate(u8, index))\n    var sum: usize = 0\n    for (item in list.items) sum += mn::convert(usize, item)\n    const length = list.items.length\n    list.free(&buffer)\n    return {in_place, buffer.frees, length, sum, list.items.length, list.capacity}\nfn fill(list: *mn::List(u8), buffer: *Buffer, count: usize) -> memory::Error!u8\n    for (_ in 0..count) try list.append(buffer, 3)\n    return 0\nfn exhaust() -> u8\n    var storage: [8]u8 = undefined\n    var buffer = Buffer{bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0}\n    var list = mn::List(u8)::new()\n    const filled = fill(&list, &buffer, 8) catch return 1\n    const more = fill(&list, &buffer, 1) catch return 2\n    return filled + more\nconst GROW = grow() catch {0, 0, 0, 0, 0, 0}\nconst EXHAUST = exhaust()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2421,7 +2463,7 @@ test "castPointer: casts a pointer through a pointer to void and back at compile
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn round(value: i32) -> i32:\n    var copy = value\n    const hidden: *void = &copy\n    const back = mn::cast(*i32, hidden)\n    back.* += 1\n    return copy\nconst ROUND = round(4)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn round(value: i32) -> i32\n    var copy = value\n    const hidden: *void = &copy\n    const back = mn::cast(*i32, hidden)\n    back.* += 1\n    return copy\nconst ROUND = round(4)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2441,7 +2483,7 @@ test "castPointer: rejects a cast to another target type at compile time" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn reinterpret(value: i32) -> u8:\n    var copy = value\n    const bytes = mn::cast(*u8, &copy)\n    return bytes.*\nconst BYTE = reinterpret(4)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn reinterpret(value: i32) -> u8\n    var copy = value\n    const bytes = mn::cast(*u8, &copy)\n    return bytes.*\nconst BYTE = reinterpret(4)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2460,7 +2502,7 @@ test "evaluateBuiltin: rejects aligning a pointer at compile time" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn move(values: []Const(u8)) -> usize:\n    const aligned = mn::align(values.pointer, 4)\n    _ = aligned\n    return 0\nconst VALUES: [2]u8 = {1, 2}\nconst MOVED = move(&VALUES)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn move(values: []Const(u8)) -> usize\n    const aligned = mn::align(values.pointer, 4)\n    _ = aligned\n    return 0\nconst VALUES: [2]u8 = {1, 2}\nconst MOVED = move(&VALUES)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2502,7 +2544,7 @@ test "evaluateBinary: orders the cases of a combined error set by the declaratio
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Alpha:\n    first\nerror Beta:\n    second\n    third\nfn convert(value: Beta || Alpha) -> Alpha || Beta: return value" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Alpha\n    first\nerror Beta\n    second\n    third\nfn convert(value: Beta || Alpha) -> Alpha || Beta = return value" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2527,7 +2569,7 @@ test "evaluateBinary: rejects combining types that are not error sets" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32 || bool): _ = value" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32 || bool) = _ = value" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2545,7 +2587,7 @@ test "evaluateBinary: rejects combining enums" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Alpha:\n    first\nenum Beta:\n    second\nfn take(value: Alpha || Beta): _ = value" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Alpha\n    first\nenum Beta\n    second\nfn take(value: Alpha || Beta) = _ = value" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2564,7 +2606,7 @@ test "evaluateBinary: rejects a result of a type that is not an error set" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn f() -> i32!u8: return 1" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn f() -> i32!u8 = return 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2583,7 +2625,7 @@ test "evaluateBinary: evaluates the fallback of catch only for an error" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing_end\n    bad_digit: u8\nerror FileError:\n    missing_file\nfn digit(text: u8) -> ParseError!u8:\n    if text < 48: return ParseError::bad_digit(text)\n    return text - 48\nfn broken(zero: u8) -> u8: return 1 / zero\nconst VALUE = digit(50) catch broken(0)\nconst FALLBACK = digit(20) catch 7" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    missing_end\n    bad_digit: u8\nerror FileError\n    missing_file\nfn digit(text: u8) -> ParseError!u8\n    if (text < 48) return ParseError::bad_digit(text)\n    return text - 48\nfn broken(zero: u8) -> u8 = return 1 / zero\nconst VALUE = digit(50) catch broken(0)\nconst FALLBACK = digit(20) catch 7" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2625,7 +2667,7 @@ test "evaluateBinary: takes the right operand of orelse for null" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const maybe: ?i32 = null\n    const value = maybe orelse 3\n    _ = value" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main()\n    const maybe: ?i32 = null\n    const value = maybe orelse 3\n    _ = value" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2646,7 +2688,7 @@ test "evaluateBinary: leaves out the right operand of and when the left decides"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn divide(value: i32) -> i32: return 1 / value\nconst SAFE = false and divide(0) == 1" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn divide(value: i32) -> i32 = return 1 / value\nconst SAFE = false and divide(0) == 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2745,13 +2787,13 @@ test "computeInteger: rejects a division by zero inside a call" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn divide(value: i32) -> i32: return 1 / value\nconst QUOTIENT = divide(0)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn divide(value: i32) -> i32 = return 1 / value\nconst QUOTIENT = divide(0)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.DivisionByZero, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 38 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 39 }, analyzer.failure.?.location.?);
 }
 
 test "computeInteger: reports a division by zero in the module where it happens" {
@@ -2759,7 +2801,7 @@ test "computeInteger: reports a division by zero in the module where it happens"
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
     defer program_directory.cleanup();
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "math.mn", .data = "fn divide(value: i32) -> i32: return 1 / value" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "math.mn", .data = "fn divide(value: i32) -> i32 = return 1 / value" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -2772,7 +2814,7 @@ test "computeInteger: reports a division by zero in the module where it happens"
 
     try std.testing.expectError(error.DivisionByZero, analyzer.analyze());
     try std.testing.expectEqualStrings("math", analyzer.failure.?.module.?[0]);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 38 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 39 }, analyzer.failure.?.location.?);
 }
 
 test "evaluateCompositeLiteral: takes missing fields from their defaults" {
@@ -2785,7 +2827,7 @@ test "evaluateCompositeLiteral: takes missing fields from their defaults" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\n    y: i32 = 7\nconst ORIGIN = Point{x = 1}" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point\n    x: i32\n    y: i32 = 7\nconst ORIGIN = Point{x = 1}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2807,7 +2849,7 @@ test "evaluateCompositeLiteral: gives empty braces where a slice is expected a s
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count() -> usize:\n    const items: []i32 = {}\n    var bytes: []u8 = {}\n    bytes = bytes[0..0]\n    return items.length + bytes.length\nconst COUNT = count()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count() -> usize\n    const items: []i32 = {}\n    var bytes: []u8 = {}\n    bytes = bytes[0..0]\n    return items.length + bytes.length\nconst COUNT = count()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2826,7 +2868,7 @@ test "evaluateCompositeLiteral: makes a read-only slice from braces with element
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const WORDS: []Const(u8) = {104, 105}\nfn local() -> usize:\n    const values: []Const(usize) = {7, 8, 9}\n    return values.length + values[2]\nconst FIRST = WORDS[1]\nconst LOCAL = local()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const WORDS: []Const(u8) = {104, 105}\nfn local() -> usize\n    const values: []Const(usize) = {7, 8, 9}\n    return values.length + values[2]\nconst FIRST = WORDS[1]\nconst LOCAL = local()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2847,7 +2889,7 @@ test "evaluateSlice: slices an array and reads an element" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn second() -> i32:\n    const values = [3]i32{1, 2, 3}\n    const tail = values[1..]\n    return tail[0]\nconst SECOND = second()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn second() -> i32\n    const values = [3]i32{1, 2, 3}\n    const tail = values[1..]\n    return tail[0]\nconst SECOND = second()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2867,7 +2909,7 @@ test "evaluateSlice: rejects bounds outside the length" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn outside() -> []Const(i32):\n    const values = [3]i32{1, 2, 3}\n    return values[1..4]\nconst OUTSIDE = outside()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn outside() -> []Const(i32)\n    const values = [3]i32{1, 2, 3}\n    return values[1..4]\nconst OUTSIDE = outside()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2886,7 +2928,7 @@ test "evaluateUnwrap: rejects unwrapping null" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main():\n    const maybe: ?i32 = null\n    const value = maybe.?\n    _ = value" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main()\n    const maybe: ?i32 = null\n    const value = maybe.?\n    _ = value" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2908,7 +2950,7 @@ test "evaluateTry: returns the error of a result from the function" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing_end\n    bad_digit: u8\nerror FileError:\n    missing_file\nfn digit(text: u8) -> ParseError!u8:\n    if text < 48: return ParseError::bad_digit(text)\n    return text - 48\nfn total(one: u8, two: u8) -> ParseError || FileError!u8: return try digit(one) + try digit(two)\nconst GOOD = total(49, 50) catch 0\nconst BAD = total(49, 20) catch 99" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    missing_end\n    bad_digit: u8\nerror FileError\n    missing_file\nfn digit(text: u8) -> ParseError!u8\n    if (text < 48) return ParseError::bad_digit(text)\n    return text - 48\nfn total(one: u8, two: u8) -> ParseError || FileError!u8 = return try digit(one) + try digit(two)\nconst GOOD = total(49, 50) catch 0\nconst BAD = total(49, 20) catch 99" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2929,7 +2971,7 @@ test "evaluateJump: returns, breaks and continues from inside an expression at c
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure:\n    bad\nfn parse(text: u8) -> Failure!u8:\n    if text == 0: return Failure::bad\n    return text\nfn safe(text: u8) -> u8:\n    const digit = parse(text) catch return 9\n    return digit\nfn total(values: [4]?i32) -> i32:\n    var sum: i32 = 0\n    var index: usize = 0\n    while index < 4:\n        index += 1\n        const value = values[index - 1] orelse continue\n        sum += value\n    return sum\nfn first(values: [4]?i32) -> i32:\n    var index: usize = 0\n    @outer while true:\n        while index < 4:\n            const value = values[index] orelse break @outer\n            index += 1\n            if value > 2: return value\n    return -1\nfn guard(value: ?i32, log: *i32) -> i32:\n    defer log.* = log.* * 10 + 1\n    const found = value orelse return 0\n    defer log.* = log.* * 10 + 2\n    return found\nfn check() -> [7]i32:\n    var missing_log: i32 = 0\n    const missing = guard(null, &missing_log)\n    var present_log: i32 = 0\n    const present = guard(5, &present_log)\n    const one: [4]?i32 = {1, null, 3, null}\n    const two: [4]?i32 = {1, 2, 4, null}\n    const three: [4]?i32 = {1, null, 4, 0}\n    return {total(one), first(two), first(three), missing * 100 + missing_log, present * 100 + present_log, safe(0), safe(4)}\nconst RESULTS = check()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure\n    bad\nfn parse(text: u8) -> Failure!u8\n    if (text == 0) return Failure::bad\n    return text\nfn safe(text: u8) -> u8\n    const digit = parse(text) catch return 9\n    return digit\nfn total(values: [4]?i32) -> i32\n    var sum: i32 = 0\n    var index: usize = 0\n    while index < 4\n        index += 1\n        const value = values[index - 1] orelse continue\n        sum += value\n    return sum\nfn first(values: [4]?i32) -> i32\n    var index: usize = 0\n    @outer while true\n        while index < 4\n            const value = values[index] orelse break @outer\n            index += 1\n            if (value > 2) return value\n    return -1\nfn guard(value: ?i32, log: *i32) -> i32\n    defer log.* = log.* * 10 + 1\n    const found = value orelse return 0\n    defer log.* = log.* * 10 + 2\n    return found\nfn check() -> [7]i32\n    var missing_log: i32 = 0\n    const missing = guard(null, &missing_log)\n    var present_log: i32 = 0\n    const present = guard(5, &present_log)\n    const one: [4]?i32 = {1, null, 3, null}\n    const two: [4]?i32 = {1, 2, 4, null}\n    const three: [4]?i32 = {1, null, 4, 0}\n    return {total(one), first(two), first(three), missing * 100 + missing_log, present * 100 + present_log, safe(0), safe(4)}\nconst RESULTS = check()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2945,6 +2987,113 @@ test "evaluateJump: returns, breaks and continues from inside an expression at c
     try std.testing.expectEqual(Value{ .integer = 4 }, elements[6]);
 }
 
+test "evaluateBranching: gives the value of the block a run-time condition chooses at compile time, nested" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(one: bool, two: bool) -> i32\n    const value: i32 = if one\n        if (two) 1\n        else 2\n    else 3\n    return value\nconst BOTH = pick(true, true)\nconst FIRST = pick(true, false)\nconst NEITHER = pick(false, true)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 3 }, declarations[3].kind.constant_declaration.known.?.*);
+}
+
+test "evaluateBranching: gives the value of a match branch converted to the written type at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn grade(score: u8, bonus: u8) -> u16\n    return match score\n        case (0) bonus\n        case (1, 2) 300\n        else 400\nconst ZERO = grade(0, 7)\nconst TWO = grade(2, 7)\nconst OTHER = grade(9, 7)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 7 }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 300 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 400 }, declarations[3].kind.constant_declaration.known.?.*);
+}
+
+test "evaluateBranching: takes the value of the block a compile-time condition chooses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const DEBUG = false\nfn level() -> i32\n    const value: i32 = if (DEBUG) 1 else 2\n    return value\nconst LEVEL = level()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[2].kind.constant_declaration.known.?.*);
+}
+
+test "evaluateBranching: continues a loop from a block of a value at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn total(limit: i32) -> i32\n    var sum: i32 = 0\n    var index: i32 = 0\n    while index < limit\n        index += 1\n        const step: i32 = if (index == 2) continue\n        else index\n        sum += step\n    return sum\nconst TOTAL = total(4)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 8 }, declarations[1].kind.constant_declaration.known.?.*);
+}
+
+test "evaluateDetachedBranching: gives top-level constants the value of an if and of a match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count() -> u8 = 2\nconst STRICT = count() > 1\nconst LIMIT: u32 = if (STRICT) 10 else 20\nconst OTHER: u32 = if (count() > 5) 10\nelse 20\nconst SIZE: u32 = match count()\n    case (1) 100\n    case (2) 200\n    else 300\nconst TOTAL: u32 = LIMIT + (if (count() == 2) 1 else 2)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 10 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 20 }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 200 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 11 }, declarations[5].kind.constant_declaration.known.?.*);
+}
+
 test "evaluateCall: evaluates an inline function at compile time like any function" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2955,7 +3104,7 @@ test "evaluateCall: evaluates an inline function at compile time like any functi
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline fn double(value: i32) -> i32: return value * 2\nfn log(count: *i32): count.* += 10\ninline fn deferred(count: *i32) -> i32:\n    defer log(count)\n    return count.*\nfn run() -> i32:\n    var count: i32 = 1\n    const before = deferred(&count)\n    return before + count\nconst FOUR = double(2)\nconst RUN = run()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline fn double(value: i32) -> i32 = return value * 2\nfn log(count: *i32) = count.* += 10\ninline fn deferred(count: *i32) -> i32\n    defer log(count)\n    return count.*\nfn run() -> i32\n    var count: i32 = 1\n    const before = deferred(&count)\n    return before + count\nconst FOUR = double(2)\nconst RUN = run()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2976,7 +3125,7 @@ test "evaluateCall: runs a function at compile time" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn square(value: i32) -> i32: return value * value\nconst NINE = square(3)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn square(value: i32) -> i32 = return value * value\nconst NINE = square(3)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2996,7 +3145,7 @@ test "evaluateCall: calls through a pointer to a function" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn twice(value: i32) -> i32: return value * 2\nfn apply(function: *fn(i32) -> i32, value: i32) -> i32: return function(value)\nconst APPLIED = apply(&twice, 4)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn twice(value: i32) -> i32 = return value * 2\nfn apply(function: *fn(i32) -> i32, value: i32) -> i32 = return function(value)\nconst APPLIED = apply(&twice, 4)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3016,7 +3165,7 @@ test "evaluateCall: calls methods with value and pointer receivers" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter:\n    count: i32\n    fn increment(self: *Self): self.count += 1\n    fn read(self: Self) -> i32: return self.count\nfn counted() -> i32:\n    var counter = Counter{count = 0}\n    counter.increment()\n    counter.increment()\n    return counter.read()\nconst COUNTED = counted()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    count: i32\n    fn increment(self: *Self) = self.count += 1\n    fn read(self: Self) -> i32 = return self.count\nfn counted() -> i32\n    var counter = Counter{count = 0}\n    counter.increment()\n    counter.increment()\n    return counter.read()\nconst COUNTED = counted()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3036,7 +3185,7 @@ test "evaluateCall: calls a default implementation with a pointer receiver" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn double(self: *Const(T)) -> i32: return self.area() * 2\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side * self.side\nfn make() -> i32:\n    const square = Square{side = 3}\n    return square.double()\nconst DOUBLE = make()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n    fn area(self: T) -> i32\n    fn double(self: *Const(T)) -> i32 = return self.area() * 2\nstruct Square\n    side: i32\ninstance Shape(Square)\n    fn area(self: Square) -> i32 = return self.side * self.side\nfn make() -> i32\n    const square = Square{side = 3}\n    return square.double()\nconst DOUBLE = make()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3075,13 +3224,13 @@ test "evaluateCall: rejects a recursion that does not end" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn forever(value: i32) -> i32: return forever(value)\nconst NEVER = forever(1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn forever(value: i32) -> i32 = return forever(value)\nconst NEVER = forever(1)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.CallDepth, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 39 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 40 }, analyzer.failure.?.location.?);
 }
 
 test "findCached: evaluates a call with the same arguments once" {
@@ -3094,7 +3243,7 @@ test "findCached: evaluates a call with the same arguments once" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn slow(count: i32) -> i32:\n    var index = 0i32\n    while index < count: index += 1\n    return index\nconst TOTAL = slow(300000) + slow(300000) + slow(300000) + slow(300000)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn slow(count: i32) -> i32\n    var index = 0i32\n    while (index < count) index += 1\n    return index\nconst TOTAL = slow(300000) + slow(300000) + slow(300000) + slow(300000)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3114,7 +3263,7 @@ test "isSameKey: tells floats apart bit for bit" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn same(value: f64) -> f64: return value\nconst POSITIVE = same(0.0f64)\nconst NEGATIVE = same(-0.0f64)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn same(value: f64) -> f64 = return value\nconst POSITIVE = same(0.0f64)\nconst NEGATIVE = same(-0.0f64)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3134,7 +3283,7 @@ test "recordOrigin: gives the origin only to the struct that a call returns" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Box(type T) -> type:\n    return struct:\n        value: T\nfn Pair(type T) -> type:\n    const Inner = struct:\n        value: T\n    return [2]Inner\nfn take(box: Box(i32), pair: Pair(i32)):\n    _ = box\n    _ = pair" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Box(type T) -> type\n    return struct\n        value: T\nfn Pair(type T) -> type\n    const Inner = struct\n        value: T\n    return [2]Inner\nfn take(box: Box(i32), pair: Pair(i32))\n    _ = box\n    _ = pair" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3158,7 +3307,7 @@ test "executeDeferringBlock: runs deferred statements in reverse order after the
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn run(total: *i32) -> i32:\n    defer total.* = total.* * 10 + 1\n    defer total.* = total.* * 10 + 2\n    total.* = 3\n    return total.*\nfn check() -> [2]i32:\n    var total: i32 = 0\n    const returned = run(&total)\n    return {returned, total}\nconst ORDER = check()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn run(total: *i32) -> i32\n    defer total.* = total.* * 10 + 1\n    defer total.* = total.* * 10 + 2\n    total.* = 3\n    return total.*\nfn check() -> [2]i32\n    var total: i32 = 0\n    const returned = run(&total)\n    return {returned, total}\nconst ORDER = check()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3179,7 +3328,7 @@ test "executeDeferringBlock: runs errdefer only when the function returns an err
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure:\n    bad\nfn inner(fail: bool) -> Failure!i32:\n    if fail: return Failure::bad\n    return 1\nfn step(total: *i32, fail: bool, tried: bool) -> Failure!i32:\n    errdefer total.* += 100\n    defer total.* += 1\n    if tried: return try inner(fail) + 1\n    if fail: return Failure::bad\n    return 0\nfn tally(fail: bool, tried: bool) -> i32:\n    var total: i32 = 0\n    const value = step(&total, fail, tried) catch 7\n    return total * 10 + value\nconst SUCCESS = tally(false, false)\nconst FAILURE = tally(true, false)\nconst TRIED = tally(true, true)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure\n    bad\nfn inner(fail: bool) -> Failure!i32\n    if (fail) return Failure::bad\n    return 1\nfn step(total: *i32, fail: bool, tried: bool) -> Failure!i32\n    errdefer total.* += 100\n    defer total.* += 1\n    if (tried) return try inner(fail) + 1\n    if (fail) return Failure::bad\n    return 0\nfn tally(fail: bool, tried: bool) -> i32\n    var total: i32 = 0\n    const value = step(&total, fail, tried) catch 7\n    return total * 10 + value\nconst SUCCESS = tally(false, false)\nconst FAILURE = tally(true, false)\nconst TRIED = tally(true, true)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3201,7 +3350,7 @@ test "executeDeferringBlock: runs the deferred statements of a loop body on brea
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count() -> i32:\n    var total: i32 = 0\n    var index: i32 = 0\n    while index < 5:\n        defer total += 1\n        index += 1\n        if index == 2: continue\n        if index == 4: break\n    return total * 10 + index\nconst COUNT = count()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count() -> i32\n    var total: i32 = 0\n    var index: i32 = 0\n    while index < 5\n        defer total += 1\n        index += 1\n        if (index == 2) continue\n        if (index == 4) break\n    return total * 10 + index\nconst COUNT = count()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3209,6 +3358,29 @@ test "executeDeferringBlock: runs the deferred statements of a loop body on brea
 
     const known = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*;
     try std.testing.expectEqual(Value{ .integer = 44 }, known);
+}
+
+test "executeStatement: returns the last line of a function and of each block at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn add(one: i32, two: i32) -> i32 = one + two\nfn sign(value: i32) -> i32\n    if (value < 0) -1\n    else if (value == 0) 0\n    else 1\nconst SUM = add(2, 3)\nconst NEGATIVE = sign(-5)\nconst ZERO = sign(0)\nconst POSITIVE = sign(9)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = -1 }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 0 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[5].kind.constant_declaration.known.?.*);
 }
 
 test "executeTupleDeclaration: takes a tuple apart" {
@@ -3221,7 +3393,7 @@ test "executeTupleDeclaration: takes a tuple apart" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn swap(pair: [i32, bool]) -> [bool, i32]:\n    const (number, flag) = pair\n    return {flag, number}\nconst SWAPPED = swap({1, true})" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn swap(pair: [i32, bool]) -> [bool, i32]\n    const (number, flag) = pair\n    return {flag, number}\nconst SWAPPED = swap({1, true})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3243,7 +3415,7 @@ test "executeMatch: runs the branch of the case and binds its value" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    flag: bool\n    end\nfn score(token: Token) -> i64:\n    match token:\n        case number(digits): return digits\n        case flag(on):\n            if on: return 1\n            return 2\n        case end: return 3\nconst NUMBER = score(Token::number(40))\nconst FLAG = score(Token::flag(false))\nconst END = score(Token::end)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token\n    number: i64\n    flag: bool\n    end\nfn score(token: Token) -> i64\n    match token\n        case (number(digits)) return digits\n        case flag(on)\n            if (on) return 1\n            return 2\n        case (end) return 3\nconst NUMBER = score(Token::number(40))\nconst FLAG = score(Token::flag(false))\nconst END = score(Token::end)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3265,7 +3437,7 @@ test "executeMatch: writes through a pointer to the value of a case" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    flag: bool\n    end\nfn bump(value: Token) -> Token:\n    var token = value\n    match token:\n        case number(*digits): digits.* += 1\n        else: noop\n    return token\nconst BUMPED = bump(Token::number(1))" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token\n    number: i64\n    flag: bool\n    end\nfn bump(value: Token) -> Token\n    var token = value\n    match token\n        case (number(*digits)) digits.* += 1\n        else noop\n    return token\nconst BUMPED = bump(Token::number(1))" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3285,7 +3457,7 @@ test "executeMatch: runs the else branch and a branch that names a case through 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing_end\n    bad_digit: u8\nerror FileError:\n    missing_end\nfn code(failure: ParseError || FileError) -> u8:\n    match failure:\n        case FileError::missing_end: return 2\n        else: return 1\nconst PARSE = code(ParseError::missing_end)\nconst FILE = code(FileError::missing_end)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    missing_end\n    bad_digit: u8\nerror FileError\n    missing_end\nfn code(failure: ParseError || FileError) -> u8\n    match failure\n        case (FileError::missing_end) return 2\n        else return 1\nconst PARSE = code(ParseError::missing_end)\nconst FILE = code(FileError::missing_end)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3306,7 +3478,7 @@ test "executeMatch: runs a match in an instance of a function with a type parame
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    flag: bool\n    end\nfn pick(type T, token: Token, one: T, two: T) -> T:\n    match token:\n        case number(digits):\n            if digits > 0: return one\n            return two\n        else: return two\nconst PICKED = pick(i32, Token::number(1), 3, 4)\nconst OTHER = pick(bool, Token::end, true, false)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token\n    number: i64\n    flag: bool\n    end\nfn pick(type T, token: Token, one: T, two: T) -> T\n    match token\n        case number(digits)\n            if (digits > 0) return one\n            return two\n        else return two\nconst PICKED = pick(i32, Token::number(1), 3, 4)\nconst OTHER = pick(bool, Token::end, true, false)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3327,7 +3499,7 @@ test "executeMatch: runs the branch of the error or the value of a result" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing_end\n    bad_digit: u8\nfn parse(text: u8) -> ParseError!i64:\n    if text == 0: return ParseError::missing_end\n    if text == 1: return ParseError::bad_digit(7)\n    return 40\nfn score(text: u8) -> i64:\n    match parse(text):\n        case i64 as value: return value + 2\n        case bad_digit(digit):\n            if digit == 7: return 5\n            return 6\n        case missing_end: return 1\nconst VALUE = score(2)\nconst BAD = score(1)\nconst MISSING = score(0)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    missing_end\n    bad_digit: u8\nfn parse(text: u8) -> ParseError!i64\n    if (text == 0) return ParseError::missing_end\n    if (text == 1) return ParseError::bad_digit(7)\n    return 40\nfn score(text: u8) -> i64\n    match parse(text)\n        case (i64 as value) return value + 2\n        case bad_digit(digit)\n            if (digit == 7) return 5\n            return 6\n        case (missing_end) return 1\nconst VALUE = score(2)\nconst BAD = score(1)\nconst MISSING = score(0)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3349,7 +3521,7 @@ test "executeMatch: takes the value of a result whose type is a type constructor
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError:\n    missing\nfn Box(type T) -> type:\n    return struct:\n        value: T\nfn parse(ready: bool) -> ParseError!Box(i32):\n    if ready: return Box(i32){value = 3}\n    return ParseError::missing\nfn score(ready: bool) -> i32:\n    match parse(ready):\n        case Box(i32) as box: return box.value\n        case missing: return 0\nfn check(ready: bool) -> i32:\n    match parse(ready):\n        case Box(i32): return 1\n        case missing: return 0\nconst VALUE = score(true)\nconst MISSING = score(false)\nconst CHECKED = check(true)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    missing\nfn Box(type T) -> type\n    return struct\n        value: T\nfn parse(ready: bool) -> ParseError!Box(i32)\n    if (ready) return Box(i32){value = 3}\n    return ParseError::missing\nfn score(ready: bool) -> i32\n    match parse(ready)\n        case (Box(i32) as box) return box.value\n        case (missing) return 0\nfn check(ready: bool) -> i32\n    match parse(ready)\n        case (Box(i32)) return 1\n        case (missing) return 0\nconst VALUE = score(true)\nconst MISSING = score(false)\nconst CHECKED = check(true)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3371,7 +3543,7 @@ test "executeMatch: runs the branch of an optional and writes through a pointer 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn bump(start: ?i64) -> i64:\n    var value = start\n    match value:\n        case i64 as *count: count.* += 1\n        case null: return 0\n    return value.?\nconst BUMPED = bump(4)\nconst NOTHING = bump(null)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn bump(start: ?i64) -> i64\n    var value = start\n    match value\n        case (i64 as *count) count.* += 1\n        case (null) return 0\n    return value.?\nconst BUMPED = bump(4)\nconst NOTHING = bump(null)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3392,7 +3564,7 @@ test "executeMatch: runs the branch whose value or range holds an integer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn kind(value: i16) -> u8:\n    match value:\n        case 0: return 1\n        case 3..10, 20: return 2\n        case 200..: return 3\n        case -5..0: return 5\n        else: return 4\nconst ZERO = kind(0)\nconst NINE = kind(9)\nconst TEN = kind(10)\nconst TWENTY = kind(20)\nconst LAST = kind(32767)\nconst NEGATIVE = kind(-1)\nconst LOW = kind(-6)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn kind(value: i16) -> u8\n    match value\n        case (0) return 1\n        case (3..10, 20) return 2\n        case (200..) return 3\n        case (-5..0) return 5\n        else return 4\nconst ZERO = kind(0)\nconst NINE = kind(9)\nconst TEN = kind(10)\nconst TWENTY = kind(20)\nconst LAST = kind(32767)\nconst NEGATIVE = kind(-1)\nconst LOW = kind(-6)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3418,7 +3590,7 @@ test "executeUnrolled: runs the block once for each element of a tuple with its 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn total(values: mn::Tuple) -> usize:\n    var sum: usize = 0\n    for value in values: sum += mn::convert(usize, value)\n    return sum\nfn run() -> usize:\n    const small: u8 = 4\n    const large: u64 = 5\n    const middle: i32 = 3\n    return total({middle, small, large})\nconst RUN = run()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn total(values: mn::Tuple) -> usize\n    var sum: usize = 0\n    for (value in values) sum += mn::convert(usize, value)\n    return sum\nfn run() -> usize\n    const small: u8 = 4\n    const large: u64 = 5\n    const middle: i32 = 3\n    return total({middle, small, large})\nconst RUN = run()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3438,7 +3610,7 @@ test "executeUnrolled: breaks, continues and runs the else block" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn count(values: mn::Tuple, limit: usize) -> usize:\n    var seen: usize = 0\n    for value in values:\n        _ = value\n        seen += 1\n        if seen == 1: continue\n        if seen == limit: break\n        seen += 10\n    else: seen += 100\n    return seen\nfn run(limit: usize) -> usize:\n    const one: i32 = 1\n    const flag = true\n    return count({one, flag, one}, limit)\nconst BROKEN = run(2)\nconst FINISHED = run(5)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn count(values: mn::Tuple, limit: usize) -> usize\n    var seen: usize = 0\n    for value in values\n        _ = value\n        seen += 1\n        if (seen == 1) continue\n        if (seen == limit) break\n        seen += 10\n    else seen += 100\n    return seen\nfn run(limit: usize) -> usize\n    const one: i32 = 1\n    const flag = true\n    return count({one, flag, one}, limit)\nconst BROKEN = run(2)\nconst FINISHED = run(5)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3459,7 +3631,7 @@ test "executeUnrolled: points into the elements of a tuple and takes them apart"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn bump() -> [i32, u8]:\n    var pair: [i32, u8] = {1, 2}\n    for *value in pair: value.* += 1\n    return pair\nfn add() -> i32:\n    var sum: i32 = 0\n    const first: [i32, i32] = {1, 2}\n    const second: [i32, i32] = {3, 4}\n    for (left, right) in {first, second}: sum += left * right\n    return sum\nconst BUMPED = bump()\nconst ADDED = add()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn bump() -> [i32, u8]\n    var pair: [i32, u8] = {1, 2}\n    for (*value in pair) value.* += 1\n    return pair\nfn add() -> i32\n    var sum: i32 = 0\n    const first: [i32, i32] = {1, 2}\n    const second: [i32, i32] = {3, 4}\n    for ((left, right) in {first, second}) sum += left * right\n    return sum\nconst BUMPED = bump()\nconst ADDED = add()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3482,7 +3654,7 @@ test "executeIteration: calls next on a copy of the iterator until it gives null
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Countdown:\n    count: u32\ninstance mn::Iterator(Countdown):\n    fn Element() -> type: return [u32]\n    fn next(iterator: *Countdown) -> ?Element():\n        if iterator.count == 0: return null\n        iterator.count -= 1\n        return {iterator.count + 1}\nfn total(start: u32) -> [2]u32:\n    var sum: u32 = 0\n    var countdown = Countdown{count = start}\n    for value in countdown: sum += value\n    countdown.count += 1\n    return {sum, countdown.count}\nfn indexes(count: usize) -> usize:\n    var sum: usize = 0\n    const range = 2..count\n    for (index) in range:\n        if index == 4: continue\n        sum += index\n    return sum\nconst TOTAL = total(3)\nconst INDEXES = indexes(6)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Countdown\n    count: u32\ninstance mn::Iterator(Countdown)\n    fn Element() -> type = return [u32]\n    fn next(iterator: *Countdown) -> ?Element()\n        if (iterator.count == 0) return null\n        iterator.count -= 1\n        return {iterator.count + 1}\nfn total(start: u32) -> [2]u32\n    var sum: u32 = 0\n    var countdown = Countdown{count = start}\n    for (value in countdown) sum += value\n    countdown.count += 1\n    return {sum, countdown.count}\nfn indexes(count: usize) -> usize\n    var sum: usize = 0\n    const range = 2..count\n    for (index) in range\n        if (index == 4) continue\n        sum += index\n    return sum\nconst TOTAL = total(3)\nconst INDEXES = indexes(6)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3505,7 +3677,7 @@ test "executeIteration: zips iterators until the shortest ends" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::Zip\nfn sum(cards: []u32, count: usize) -> u32:\n    var total: u32 = 0\n    for (card, index) in Zip::zip({cards, 0..count}):\n        total += card * mn::convert(u32, index)\n    return total\nfn run(count: usize) -> u32:\n    var cards = [3]u32{1, 2, 3}\n    return sum(cards[..], count)\nconst ALL = run(5)\nconst SHORT = run(2)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::Zip\nfn sum(cards: []u32, count: usize) -> u32\n    var total: u32 = 0\n    for (card, index) in Zip::zip({cards, 0..count})\n        total += card * mn::convert(u32, index)\n    return total\nfn run(count: usize) -> u32\n    var cards = [3]u32{1, 2, 3}\n    return sum(cards[..], count)\nconst ALL = run(5)\nconst SHORT = run(2)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3526,7 +3698,7 @@ test "executeIteration: zips a read-only slice and a range" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::Zip\nfn sum(cards: []Const(u32)) -> u32:\n    var total: u32 = 0\n    for (card, index) in Zip::zip({cards, 0..}):\n        total += card * mn::convert(u32, index)\n    return total\nconst CARDS = [3]u32{1, 2, 3}\nconst SUM = sum(CARDS[..])" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::Zip\nfn sum(cards: []Const(u32)) -> u32\n    var total: u32 = 0\n    for (card, index) in Zip::zip({cards, 0..})\n        total += card * mn::convert(u32, index)\n    return total\nconst CARDS = [3]u32{1, 2, 3}\nconst SUM = sum(CARDS[..])" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3546,7 +3718,7 @@ test "executeIteration: takes the first element of a read-only slice and shorten
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::Iterator\nfn take() -> [u32, u32]:\n    const cards = [3]u32{7, 8, 9}\n    var rest = cards[..]\n    const first = Iterator::next(&rest)\n    const second = Iterator::next(&rest)\n    return {first.?[0], second.?[0]}\nconst TAKEN = take()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::Iterator\nfn take() -> [u32, u32]\n    const cards = [3]u32{7, 8, 9}\n    var rest = cards[..]\n    const first = Iterator::next(&rest)\n    const second = Iterator::next(&rest)\n    return {first.?[0], second.?[0]}\nconst TAKEN = take()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3567,7 +3739,7 @@ test "executeIteration: takes the first element of a slice and shortens it" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::Iterator\nfn take() -> [u32, u32]:\n    var cards = [3]u32{7, 8, 9}\n    var rest = cards[..]\n    const first = Iterator::next(&rest)\n    const second = Iterator::next(&rest)\n    return {first.?[0], second.?[0]}\nconst TAKEN = take()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::Iterator\nfn take() -> [u32, u32]\n    var cards = [3]u32{7, 8, 9}\n    var rest = cards[..]\n    const first = Iterator::next(&rest)\n    const second = Iterator::next(&rest)\n    return {first.?[0], second.?[0]}\nconst TAKEN = take()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3588,7 +3760,7 @@ test "enterCondition: binds the value of an optional in an if and runs the else 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?i64) -> i64:\n    if value as found: return found * 2\n    else: return 1\nconst SOME = pick(4)\nconst NONE = pick(null)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?i64) -> i64\n    if (value as found) return found * 2\n    else return 1\nconst SOME = pick(4)\nconst NONE = pick(null)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3609,7 +3781,7 @@ test "enterCondition: writes through a pointer to the value of an optional in an
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn bump(start: ?i64) -> i64:\n    var value = start\n    if value as *count: count.* += 10\n    return value orelse 0\nconst BUMPED = bump(1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn bump(start: ?i64) -> i64\n    var value = start\n    if (value as *count) count.* += 10\n    return value orelse 0\nconst BUMPED = bump(1)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3629,7 +3801,7 @@ test "enterCondition: evaluates the optional of a while loop before each run" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next(count: *u8) -> ?u8:\n    if count.* == 0: return null\n    count.* -= 1\n    return count.*\nfn total(start: u8) -> u8:\n    var count = start\n    var sum: u8 = 0\n    while next(&count) as value: sum += value\n    else: sum += 10\n    return sum\nconst TOTAL = total(4)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next(count: *u8) -> ?u8\n    if (count.* == 0) return null\n    count.* -= 1\n    return count.*\nfn total(start: u8) -> u8\n    var count = start\n    var sum: u8 = 0\n    while (next(&count) as value) sum += value\n    else sum += 10\n    return sum\nconst TOTAL = total(4)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3649,7 +3821,7 @@ test "executeWhile: runs a loop with compound assignments" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn sum(limit: i32) -> i32:\n    var total = 0i32\n    var index = 0i32\n    while index < limit:\n        index += 1\n        total += index\n    return total\nconst TOTAL = sum(4)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn sum(limit: i32) -> i32\n    var total = 0i32\n    var index = 0i32\n    while index < limit\n        index += 1\n        total += index\n    return total\nconst TOTAL = sum(4)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3669,7 +3841,7 @@ test "executeWhile: rejects a loop that does not end" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn spin() -> i32:\n    while true: noop\nconst SPIN = spin()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn spin() -> i32\n    while (true) noop\nconst SPIN = spin()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3713,7 +3885,7 @@ test "executeFor: writes each element through a pointer name" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn double(values: [3]i32) -> [3]i32:\n    var result = values\n    for *value in result: value.* = value.* * 2\n    return result\nconst DOUBLED = double({1, 2, 3})" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn double(values: [3]i32) -> [3]i32\n    var result = values\n    for (*value in result) value.* = value.* * 2\n    return result\nconst DOUBLED = double({1, 2, 3})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3736,7 +3908,7 @@ test "executeFor: leaves an outer loop through its label" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(limit: usize) -> usize:\n    var found = 0usize\n    @outer for row in 0..limit:\n        for column in 0..limit:\n            if row * column == 6:\n                found = row\n                break @outer\n    return found\nconst FIRST = first(5)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(limit: usize) -> usize\n    var found = 0usize\n    @outer for row in 0..limit\n        for column in 0..limit\n            if row * column == 6\n                found = row\n                break @outer\n    return found\nconst FIRST = first(5)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3756,7 +3928,7 @@ test "executeFor: runs the else block of a loop that ends" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn search(limit: usize) -> usize:\n    var result = 0usize\n    for index in 0..limit:\n        if index == 10:\n            result = index\n            break\n    else:\n        result = 99\n    return result\nconst SEARCHED = search(3)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn search(limit: usize) -> usize\n    var result = 0usize\n    for index in 0..limit\n        if index == 10\n            result = index\n            break\n    else\n        result = 99\n    return result\nconst SEARCHED = search(3)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3776,7 +3948,7 @@ test "executeFor: takes the elements of each tuple apart" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn total(pairs: [2][i32, i32]) -> i32:\n    var sum = 0i32\n    for (left, right) in pairs: sum += left * right\n    return sum\nconst TOTAL = total({{1, 2}, {3, 4}})" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn total(pairs: [2][i32, i32]) -> i32\n    var sum = 0i32\n    for ((left, right) in pairs) sum += left * right\n    return sum\nconst TOTAL = total({{1, 2}, {3, 4}})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3796,7 +3968,7 @@ test "makeString: decodes the escapes of a string" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count(text: []Const(u8)) -> usize:\n    var total = 0usize\n    for _ in text: total += 1\n    return total\nconst LENGTH = count(\"a\\n\\u{e9}\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count(text: []Const(u8)) -> usize\n    var total = 0usize\n    for (_ in text) total += 1\n    return total\nconst LENGTH = count(\"a\\n\\u{e9}\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3836,7 +4008,7 @@ test "isEqual: compares optionals of optionals by their level" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn empty(maybe: ??i32) -> bool: return maybe == null\nconst EMPTY = empty(null)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn empty(maybe: ??i32) -> bool = return maybe == null\nconst EMPTY = empty(null)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);

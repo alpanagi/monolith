@@ -35,6 +35,8 @@ pub const Parser = struct {
     offset: usize = 0,
     declarations: std.ArrayList(ast.Declaration) = .empty,
     methods: std.ArrayList(ast.Declaration) = .empty,
+    same_line_block: ?usize = null,
+    line_if: ?usize = null,
     failure: ?Failure = null,
 
     pub fn init(tokens: []const token.Token) Parser {
@@ -82,7 +84,7 @@ pub const Parser = struct {
             if (try self.parseFunctionDefinition(allocator, offset, null, 0)) |function| {
                 break :kind .{ .function_definition = function };
             }
-            if (try self.parseConstantDeclaration(allocator, offset)) |constant| {
+            if (try self.parseConstantDeclaration(allocator, offset, 0)) |constant| {
                 break :kind .{ .constant_declaration = constant };
             }
             if (try self.parseStructDefinition(allocator, offset)) |definition| {
@@ -115,7 +117,8 @@ pub const Parser = struct {
         const signature = (try self.parseFunctionSignature(allocator, &position, null)) orelse {
             return self.fail(position, error.ExpectedFunctionKeyword);
         };
-        if (self.tokens[position].kind == .colon) {
+        const next = self.tokens[position].kind;
+        if (next == .colon or next == .equals or self.opensBlock(position)) {
             return self.fail(position, error.ExternalFunctionBody);
         }
 
@@ -138,11 +141,23 @@ pub const Parser = struct {
             return null;
         };
         signature.@"inline" = inlined;
-        _ = try self.expect(&position, .colon, error.ExpectedColon);
-        const body = try self.parseBlock(allocator, &position, depth);
+        const body = (try self.parseFunctionBody(allocator, &position, depth)) orelse {
+            return self.fail(position, error.ExpectedBlock);
+        };
 
         offset.* = position;
         return .{ .signature = signature, .body = body };
+    }
+
+    fn parseFunctionBody(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        depth: usize,
+    ) ParseError!?[]ast.Statement {
+        if (self.match(offset, .equals) != null) return try self.parseSameLineBlock(allocator, offset, depth, false);
+        if (!try self.opensHeaderBlock(offset.*)) return null;
+        return try self.parseHeaderBlock(allocator, offset, depth);
     }
 
     fn parseFunctionSignature(
@@ -155,9 +170,11 @@ pub const Parser = struct {
         _ = self.match(&position, .keyword_fn) orelse return null;
         const declared = try self.parseTypeParameters(allocator, &position);
         const name = try self.expectName(&position);
-        _ = try self.expect(&position, .left_parenthesis, error.ExpectedLeftParenthesis);
-        const parameters = try self.parseParameters(allocator, &position);
-        _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
+        var parameters: []ast.TypedName = &.{};
+        if (self.match(&position, .left_parenthesis) != null) {
+            parameters = try self.parseParameters(allocator, &position);
+            _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
+        }
         const return_type = try self.parseReturnType(allocator, &position);
 
         offset.* = position;
@@ -283,16 +300,79 @@ pub const Parser = struct {
         };
     }
 
-    fn parseBlock(
+    fn parseHeaderBlock(
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
         outer: usize,
     ) ParseError![]ast.Statement {
-        if (self.tokens[offset.*].kind == .indent) {
-            return self.parseIndentedBlock(allocator, offset, outer);
-        }
+        try self.expectHeaderEnd(offset.*);
+        const caller_same_line_block = self.same_line_block;
+        defer self.same_line_block = caller_same_line_block;
+        self.same_line_block = null;
+        return self.parseIndentedBlock(allocator, offset, outer);
+    }
+
+    fn parseSameLineBlock(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        outer: usize,
+        clause: bool,
+    ) ParseError![]ast.Statement {
+        const caller_same_line_block = self.same_line_block;
+        defer self.same_line_block = caller_same_line_block;
+        self.same_line_block = if (clause) offset.* else null;
         return self.parseInlineBlock(allocator, offset, outer);
+    }
+
+    fn opensBlock(self: *const Parser, offset: usize) bool {
+        const indentation = self.findLineIndentation(offset);
+        var position = offset;
+        while (true) : (position += 1) {
+            switch (self.tokens[position].kind) {
+                .indent => |next| return next > indentation,
+                .eof => return false,
+                else => {},
+            }
+        }
+    }
+
+    fn opensHeaderBlock(self: *Parser, offset: usize) ParseError!bool {
+        if (self.tokens[offset].kind == .colon) return self.fail(offset, error.HeaderColon);
+        return self.opensBlock(offset);
+    }
+
+    fn expectHeaderEnd(self: *Parser, offset: usize) ParseError!void {
+        switch (self.tokens[offset].kind) {
+            .indent => {},
+            .colon => return self.fail(offset, error.HeaderColon),
+            else => return self.fail(offset, error.UnexpectedToken),
+        }
+    }
+
+    fn openSameLineHeader(self: *Parser, offset: *usize, keyword: usize) ParseError!void {
+        if (self.match(offset, .left_parenthesis) != null) return;
+        if (self.findHeaderColon(offset.*)) |colon| return self.fail(colon, error.HeaderColon);
+        if (self.opensBlock(offset.*)) return self.fail(keyword, error.MisplacedBranching);
+        return self.fail(offset.*, error.ExpectedLeftParenthesis);
+    }
+
+    fn findHeaderColon(self: *const Parser, offset: usize) ?usize {
+        var depth: usize = 0;
+        var position = offset;
+        while (true) : (position += 1) {
+            switch (self.tokens[position].kind) {
+                .indent, .eof => return null,
+                .left_parenthesis, .left_bracket, .left_brace => depth += 1,
+                .right_parenthesis, .right_bracket, .right_brace => {
+                    if (depth == 0) return null;
+                    depth -= 1;
+                },
+                .colon => if (depth == 0) return position,
+                else => {},
+            }
+        }
     }
 
     fn parseIndentedBlock(
@@ -305,14 +385,47 @@ pub const Parser = struct {
         const depth = try self.expectBlock(position, outer);
         var statements: std.ArrayList(ast.Statement) = .empty;
         while (try self.matchBlockLine(&position, depth, outer)) {
-            const statement = (try self.parseStatement(allocator, &position, depth)) orelse {
-                return self.fail(position, error.ExpectedStatement);
-            };
+            const start = position;
+            const statement = try self.parseBlockLine(allocator, &position, depth, true);
+            if (statement.kind == .value and self.continuesBlock(position, depth)) {
+                return self.fail(start, error.ExpectedStatement);
+            }
             try statements.append(allocator, statement);
         }
 
         offset.* = position;
         return statements.items;
+    }
+
+    fn parseBlockLine(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        depth: usize,
+        owner: bool,
+    ) ParseError!ast.Statement {
+        if (try self.parseStatement(allocator, offset, depth, owner)) |statement| return statement;
+        var position = offset.*;
+        const value = (try self.parseExpression(allocator, &position)) orelse {
+            return self.fail(offset.*, error.ExpectedStatement);
+        };
+        if (!self.endsValueLine(position)) return self.fail(offset.*, error.ExpectedStatement);
+
+        offset.* = position;
+        return .{ .kind = .{ .value = value }, .location = value.location };
+    }
+
+    fn endsValueLine(self: *const Parser, offset: usize) bool {
+        return switch (self.tokens[offset].kind) {
+            .indent, .eof, .keyword_else => true,
+            .right_parenthesis, .right_bracket, .right_brace, .comma => self.line_if != null,
+            else => false,
+        };
+    }
+
+    fn continuesBlock(self: *const Parser, offset: usize, depth: usize) bool {
+        const current = self.tokens[offset];
+        return current.kind == .indent and current.kind.indent >= depth;
     }
 
     fn parseInlineBlock(
@@ -321,9 +434,7 @@ pub const Parser = struct {
         offset: *usize,
         outer: usize,
     ) ParseError![]ast.Statement {
-        const statement = (try self.parseStatement(allocator, offset, outer)) orelse {
-            return self.fail(offset.*, error.ExpectedStatement);
-        };
+        const statement = try self.parseBlockLine(allocator, offset, outer, false);
         return allocator.dupe(ast.Statement, &.{statement});
     }
 
@@ -332,31 +443,33 @@ pub const Parser = struct {
         allocator: std.mem.Allocator,
         offset: *usize,
         depth: usize,
+        owner: bool,
     ) ParseError!?ast.Statement {
         const location = self.tokens[offset.*].location;
         if (self.match(offset, .keyword_noop) != null) {
             return .{ .kind = .noop, .location = location };
         }
-        if (try self.parseReturn(allocator, offset)) |statement| return statement;
+        const value_depth: ?usize = if (owner) depth else null;
+        if (try self.parseReturn(allocator, offset, value_depth)) |statement| return statement;
         const else_depth: ?usize = if (self.tokens[offset.* - 1].kind == .indent) depth else null;
-        if (try self.parseIf(allocator, offset, depth, else_depth)) |statement| return statement;
+        if (try self.parseIf(allocator, offset, depth, else_depth, owner)) |statement| return statement;
         if (self.isColonLabel(offset.*)) return self.fail(offset.*, error.LabelWithoutSigil);
-        if (try self.parseWhile(allocator, offset, depth, else_depth)) |statement| return statement;
-        if (try self.parseFor(allocator, offset, depth, else_depth)) |statement| return statement;
-        if (try self.parseMatch(allocator, offset, depth)) |statement| return statement;
+        if (try self.parseWhile(allocator, offset, depth, else_depth, owner)) |statement| return statement;
+        if (try self.parseFor(allocator, offset, depth, else_depth, owner)) |statement| return statement;
+        if (try self.parseMatch(allocator, offset, depth, owner)) |statement| return statement;
         if (try self.parseJump(offset)) |statement| return statement;
-        if (try self.parseDefer(allocator, offset)) |statement| return statement;
+        if (try self.parseDefer(allocator, offset, value_depth)) |statement| return statement;
         if (try self.parseDiscard(allocator, offset)) |statement| return statement;
-        if (try self.parseTupleDeclaration(allocator, offset)) |declaration| {
+        if (try self.parseTupleDeclaration(allocator, offset, value_depth)) |declaration| {
             return .{ .kind = .{ .tuple_declaration = declaration }, .location = location };
         }
-        if (try self.parseConstantDeclaration(allocator, offset)) |constant| {
+        if (try self.parseConstantDeclaration(allocator, offset, value_depth)) |constant| {
             return .{ .kind = .{ .constant_declaration = constant }, .location = location };
         }
-        if (try self.parseVariableDeclaration(allocator, offset)) |variable| {
+        if (try self.parseVariableDeclaration(allocator, offset, value_depth)) |variable| {
             return .{ .kind = .{ .variable_declaration = variable }, .location = location };
         }
-        if (try self.parseAssignment(allocator, offset)) |statement| return statement;
+        if (try self.parseAssignment(allocator, offset, value_depth)) |statement| return statement;
         return self.parseCallStatement(allocator, offset);
     }
 
@@ -364,19 +477,52 @@ pub const Parser = struct {
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
+        depth: ?usize,
     ) ParseError!?ast.Statement {
         var position = offset.*;
         const keyword = self.match(&position, .keyword_return) orelse return null;
         var value: ?ast.Expression = null;
-        const next = self.tokens[position].kind;
-        if (next != .indent and next != .eof) {
-            value = (try self.parseExpression(allocator, &position)) orelse {
+        switch (self.tokens[position].kind) {
+            .indent, .eof, .keyword_else, .right_parenthesis, .comma => {},
+            else => value = (try self.parseValue(allocator, &position, depth)) orelse {
                 return self.fail(position, error.ExpectedExpression);
-            };
+            },
         }
 
         offset.* = position;
         return .{ .kind = .{ .@"return" = value }, .location = keyword.location };
+    }
+
+    fn parseValue(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        depth: ?usize,
+    ) ParseError!?ast.Expression {
+        const owner_depth = depth orelse return self.parseExpression(allocator, offset);
+        const keyword = self.tokens[offset.*];
+        const parsed = if (keyword.kind == .keyword_if)
+            try self.parseIf(allocator, offset, owner_depth, owner_depth, true)
+        else
+            try self.parseMatch(allocator, offset, owner_depth, true);
+        const branching = parsed orelse return self.parseExpression(allocator, offset);
+        const statement = try allocator.create(ast.Statement);
+        statement.* = branching;
+        return .{ .kind = .{ .branching = statement }, .location = keyword.location };
+    }
+
+    fn parseLineIf(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.Expression {
+        const keyword = self.tokens[offset.*];
+        const caller_line_if = self.line_if;
+        self.line_if = offset.*;
+        defer self.line_if = caller_line_if;
+        const statement = try allocator.create(ast.Statement);
+        statement.* = (try self.parseIf(allocator, offset, 0, null, false)).?;
+        return .{ .kind = .{ .branching = statement }, .location = keyword.location };
     }
 
     fn parseIf(
@@ -385,21 +531,33 @@ pub const Parser = struct {
         offset: *usize,
         depth: usize,
         else_depth: ?usize,
+        owner: bool,
     ) ParseError!?ast.Statement {
         var position = offset.*;
+        const start = position;
         const keyword = self.match(&position, .keyword_if) orelse return null;
+        const block = owner and self.opensBlock(position);
+        if (!block) try self.openSameLineHeader(&position, start);
         const condition = (try self.parseExpression(allocator, &position)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
         const names = try self.parseConditionNames(allocator, &position);
-        _ = try self.expect(&position, .colon, error.ExpectedColon);
-        const body = try self.parseBlock(allocator, &position, depth);
+        if (!block) {
+            _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
+            try self.expectSameLineIf(start);
+        }
+        const body = if (block)
+            try self.parseHeaderBlock(allocator, &position, depth)
+        else
+            try self.parseSameLineBlock(allocator, &position, depth, true);
         var else_body: ?[]ast.Statement = null;
-        if (self.matchElse(&position, else_depth)) {
-            if (try self.parseIf(allocator, &position, depth, else_depth)) |chained| {
+        const same_line_else = self.match(&position, .keyword_else) != null;
+        const next_line_else = !same_line_else and self.matchElse(&position, else_depth);
+        if (same_line_else or next_line_else) {
+            if (try self.parseIf(allocator, &position, depth, else_depth, next_line_else)) |chained| {
                 else_body = try allocator.dupe(ast.Statement, &.{chained});
             } else {
-                else_body = try self.parseElseBlock(allocator, &position, depth);
+                else_body = try self.parseElseBlock(allocator, &position, depth, next_line_else);
             }
         }
 
@@ -408,26 +566,39 @@ pub const Parser = struct {
         return .{ .kind = .{ .@"if" = conditional }, .location = keyword.location };
     }
 
+    fn expectSameLineIf(self: *Parser, keyword: usize) ParseError!void {
+        const start = self.same_line_block orelse return;
+        if (isBracketed(self.tokens[start..keyword])) return;
+        return self.fail(keyword, error.NestedSameLineIf);
+    }
+
     fn parseWhile(
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
         depth: usize,
         else_depth: ?usize,
+        owner: bool,
     ) ParseError!?ast.Statement {
         var position = offset.*;
         const location = self.tokens[position].location;
         const label = self.parseLabel(&position);
+        const keyword = position;
         if (self.match(&position, .keyword_while) == null) return null;
+        const block = owner and self.opensBlock(position);
+        if (!block) try self.openSameLineHeader(&position, keyword);
         const condition = (try self.parseExpression(allocator, &position)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
         const names = try self.parseConditionNames(allocator, &position);
-        _ = try self.expect(&position, .colon, error.ExpectedColon);
-        const body = try self.parseBlock(allocator, &position, depth);
+        if (!block) _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
+        const body = if (block)
+            try self.parseHeaderBlock(allocator, &position, depth)
+        else
+            try self.parseSameLineBlock(allocator, &position, depth, true);
         var else_body: ?[]ast.Statement = null;
         if (self.matchElse(&position, else_depth)) {
-            else_body = try self.parseElseBlock(allocator, &position, depth);
+            else_body = try self.parseElseBlock(allocator, &position, depth, true);
         }
 
         offset.* = position;
@@ -457,20 +628,27 @@ pub const Parser = struct {
         offset: *usize,
         depth: usize,
         else_depth: ?usize,
+        owner: bool,
     ) ParseError!?ast.Statement {
         var position = offset.*;
         const location = self.tokens[position].location;
         const label = self.parseLabel(&position);
+        const keyword = position;
         if (self.match(&position, .keyword_for) == null) return null;
+        const block = owner and self.opensBlock(position);
+        if (!block) try self.openSameLineHeader(&position, keyword);
         const tuple = self.tokens[position].kind == .left_parenthesis;
         const names = try self.parseElementNames(allocator, &position);
         _ = try self.expect(&position, .keyword_in, error.ExpectedIn);
         const sequence = try self.parseSequence(allocator, &position);
-        _ = try self.expect(&position, .colon, error.ExpectedColon);
-        const body = try self.parseBlock(allocator, &position, depth);
+        if (!block) _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
+        const body = if (block)
+            try self.parseHeaderBlock(allocator, &position, depth)
+        else
+            try self.parseSameLineBlock(allocator, &position, depth, true);
         var else_body: ?[]ast.Statement = null;
         if (self.matchElse(&position, else_depth)) {
-            else_body = try self.parseElseBlock(allocator, &position, depth);
+            else_body = try self.parseElseBlock(allocator, &position, depth, true);
         }
 
         offset.* = position;
@@ -545,13 +723,16 @@ pub const Parser = struct {
         allocator: std.mem.Allocator,
         offset: *usize,
         depth: usize,
+        owner: bool,
     ) ParseError!?ast.Statement {
         var position = offset.*;
         const keyword = self.match(&position, .keyword_match) orelse return null;
         const value = (try self.parseExpression(allocator, &position)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
-        _ = try self.expect(&position, .colon, error.ExpectedColon);
+        if (self.tokens[position].kind == .colon) return self.fail(position, error.HeaderColon);
+        if (!owner or !self.opensBlock(position)) return self.fail(position, error.ExpectedBlock);
+        try self.expectHeaderEnd(position);
         var branches: std.ArrayList(ast.Branch) = .empty;
         var names: std.ArrayList(ast.ElementName) = .empty;
         const branch_depth = try self.expectBlock(position, depth);
@@ -581,8 +762,11 @@ pub const Parser = struct {
         var cases: std.ArrayList(ast.BranchCase) = .empty;
         var name: ast.ElementName = .{ .name = "_", .location = location };
         var naming: ast.Naming = .none;
+        const block = self.opensBlock(position);
         if (self.match(&position, .keyword_else) == null) {
+            const keyword = position;
             _ = try self.expect(&position, .keyword_case, error.ExpectedCaseOrElse);
+            if (!block) try self.openSameLineHeader(&position, keyword);
             while (true) {
                 try cases.append(allocator, try self.parseBranchCase(allocator, &position));
                 if (self.isPayloadName(position)) {
@@ -601,13 +785,26 @@ pub const Parser = struct {
                 name = try self.parseValueName(&position);
                 naming = .value;
             }
+            if (!block) _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
         }
-        _ = try self.expect(&position, .colon, error.ExpectedColon);
-        const body = try self.parseBlock(allocator, &position, depth);
+        const body = if (block)
+            try self.parseHeaderBlock(allocator, &position, depth)
+        else
+            try self.parseBranchLine(allocator, &position, depth);
         try names.append(allocator, name);
 
         offset.* = position;
         return .{ .cases = cases.items, .naming = naming, .body = body, .location = location };
+    }
+
+    fn parseBranchLine(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        depth: usize,
+    ) ParseError![]ast.Statement {
+        if (self.tokens[offset.*].kind == .colon) return self.fail(offset.*, error.HeaderColon);
+        return self.parseSameLineBlock(allocator, offset, depth, false);
     }
 
     fn parseBranchCase(
@@ -682,9 +879,11 @@ pub const Parser = struct {
         allocator: std.mem.Allocator,
         offset: *usize,
         depth: usize,
+        owner: bool,
     ) ParseError![]ast.Statement {
-        _ = try self.expect(offset, .colon, error.ExpectedColon);
-        return self.parseBlock(allocator, offset, depth);
+        if (self.tokens[offset.*].kind == .colon) return self.fail(offset.*, error.HeaderColon);
+        if (owner and self.opensBlock(offset.*)) return self.parseHeaderBlock(allocator, offset, depth);
+        return self.parseSameLineBlock(allocator, offset, depth, true);
     }
 
     fn parseJump(self: *Parser, offset: *usize) ParseError!?ast.Statement {
@@ -710,6 +909,7 @@ pub const Parser = struct {
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
+        depth: ?usize,
     ) ParseError!?ast.Statement {
         var position = offset.*;
         const keyword = self.tokens[position];
@@ -717,7 +917,7 @@ pub const Parser = struct {
         position += 1;
         const start = position;
         const statement = (try self.parseDiscard(allocator, &position)) orelse
-            (try self.parseAssignment(allocator, &position)) orelse
+            (try self.parseAssignment(allocator, &position, depth)) orelse
             (try self.parseCallStatement(allocator, &position)) orelse
             return self.fail(start, error.ExpectedDeferredStatement);
         const inner = try allocator.create(ast.Statement);
@@ -748,13 +948,14 @@ pub const Parser = struct {
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
+        depth: ?usize,
     ) ParseError!?ast.VariableDeclaration {
         var position = offset.*;
         _ = self.match(&position, .keyword_var) orelse return null;
         const name = try self.expect(&position, .identifier, error.ExpectedIdentifier);
         const written_type = try self.parseWrittenType(allocator, &position);
         _ = try self.expect(&position, .equals, error.ExpectedEquals);
-        const value = (try self.parseExpression(allocator, &position)) orelse {
+        const value = (try self.parseValue(allocator, &position, depth)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
 
@@ -766,6 +967,7 @@ pub const Parser = struct {
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
+        depth: ?usize,
     ) ParseError!?ast.Statement {
         var position = offset.*;
         const target = (try self.parseExpression(allocator, &position)) orelse return null;
@@ -780,7 +982,7 @@ pub const Parser = struct {
             .identifier, .field_access, .index, .dereference => {},
             else => return self.fail(offset.*, error.ExpectedTarget),
         }
-        const value = (try self.parseExpression(allocator, &position)) orelse {
+        const value = (try self.parseValue(allocator, &position, depth)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
 
@@ -806,13 +1008,14 @@ pub const Parser = struct {
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
+        depth: ?usize,
     ) ParseError!?ast.TupleDeclaration {
         var position = offset.*;
         _ = self.match(&position, .keyword_const) orelse return null;
         if (self.tokens[position].kind != .left_parenthesis) return null;
         const names = try self.parseElementNames(allocator, &position);
         _ = try self.expect(&position, .equals, error.ExpectedEquals);
-        const value = (try self.parseExpression(allocator, &position)) orelse {
+        const value = (try self.parseValue(allocator, &position, depth)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
 
@@ -824,13 +1027,14 @@ pub const Parser = struct {
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
+        depth: ?usize,
     ) ParseError!?ast.ConstantDeclaration {
         var position = offset.*;
         _ = self.match(&position, .keyword_const) orelse return null;
         const name = try self.expect(&position, .identifier, error.ExpectedIdentifier);
         const written_type = try self.parseWrittenType(allocator, &position);
         _ = try self.expect(&position, .equals, error.ExpectedEquals);
-        const value = (try self.parseExpression(allocator, &position)) orelse {
+        const value = (try self.parseValue(allocator, &position, depth)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
 
@@ -861,7 +1065,8 @@ pub const Parser = struct {
         const name_location = self.tokens[position].location;
         const name = try self.expectName(&position);
         var fields: []ast.Field = &.{};
-        if (self.match(&position, .colon) != null) {
+        if (try self.opensHeaderBlock(position)) {
+            try self.expectHeaderEnd(position);
             const receiver = try buildReceiverExpression(allocator, name, name_location);
             fields = try self.parseMembers(allocator, &position, receiver, 0, &self.methods);
         }
@@ -885,7 +1090,8 @@ pub const Parser = struct {
         const name_location = self.tokens[position].location;
         const name = try self.expectName(&position);
         var cases: std.ArrayList(ast.EnumCase) = .empty;
-        if (self.match(&position, .colon) != null) {
+        if (try self.opensHeaderBlock(position)) {
+            try self.expectHeaderEnd(position);
             const receiver = try buildReceiverExpression(allocator, name, name_location);
             const depth = try self.expectBlock(position, 0);
             while (try self.matchBlockLine(&position, depth, 0)) {
@@ -1034,7 +1240,8 @@ pub const Parser = struct {
         _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
         var functions: std.ArrayList(ast.FunctionSignature) = .empty;
         var defaults: std.ArrayList(?ast.Default) = .empty;
-        if (self.match(&position, .colon) != null) {
+        if (try self.opensHeaderBlock(position)) {
+            try self.expectHeaderEnd(position);
             const depth = try self.expectBlock(position, 0);
             while (try self.matchBlockLine(&position, depth, 0)) {
                 const start = position;
@@ -1046,12 +1253,11 @@ pub const Parser = struct {
                 signature.self_parameter = findTypeclassSelfParameter(signature, parameters.items);
                 signature.@"inline" = inlined;
                 try functions.append(allocator, signature);
-                if (self.match(&position, .colon) == null) {
+                const body = (try self.parseFunctionBody(allocator, &position, depth)) orelse {
                     if (inlined) return self.fail(start, error.InlineSignature);
                     try defaults.append(allocator, null);
                     continue;
-                }
-                const body = try self.parseBlock(allocator, &position, depth);
+                };
                 const definition: ast.FunctionDefinition = .{ .signature = signature, .body = body };
                 const template = try ast.cloneFunctionDefinition(allocator, definition);
                 try defaults.append(allocator, .{ .body = body, .template = template });
@@ -1125,7 +1331,8 @@ pub const Parser = struct {
         }
         _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
         var count: usize = 0;
-        if (self.match(&position, .colon) != null) {
+        if (try self.opensHeaderBlock(position)) {
+            try self.expectHeaderEnd(position);
             const depth = try self.expectBlock(position, 0);
             while (try self.matchBlockLine(&position, depth, 0)) {
                 const location = self.tokens[position].location;
@@ -1511,6 +1718,9 @@ pub const Parser = struct {
         if (self.tokens[offset.*].kind == .keyword_any) return self.fail(offset.*, error.MisplacedAny);
         if (self.isTypeConstructor(offset.*, "Const")) return self.fail(offset.*, error.MisplacedConst);
         if (self.isTypeConstructor(offset.*, "Many")) return self.fail(offset.*, error.MisplacedMany);
+        const keyword = self.tokens[offset.*].kind;
+        if (keyword == .keyword_match) return self.fail(offset.*, error.MisplacedBranching);
+        if (keyword == .keyword_if) return self.parseLineIf(allocator, offset);
         if (self.tokens[offset.*].kind == .left_brace) {
             return try self.parseCompositeLiteral(allocator, offset, null);
         }
@@ -1533,7 +1743,8 @@ pub const Parser = struct {
     ) ParseError!?ast.Expression {
         var position = offset.*;
         const keyword = self.match(&position, .keyword_struct) orelse return null;
-        _ = try self.expect(&position, .colon, error.ExpectedColon);
+        if (!try self.opensHeaderBlock(position)) return self.fail(position, error.ExpectedBlock);
+        try self.expectHeaderEnd(position);
         const receiver: ast.Expression = .{ .kind = .{ .identifier = .{ .name = "Self" } }, .location = keyword.location };
         var functions: std.ArrayList(ast.Declaration) = .empty;
         const outer = self.findLineIndentation(offset.*);
@@ -1749,16 +1960,17 @@ pub const Parser = struct {
     ) ParseError!?ast.Expression {
         var position = offset.*;
         const keyword = self.match(&position, .keyword_fn) orelse return null;
-        _ = self.match(&position, .left_parenthesis) orelse return null;
         var parameters: std.ArrayList(ast.Expression) = .empty;
-        while (self.tokens[position].kind != .right_parenthesis) {
-            const parameter = (try self.parseExpression(allocator, &position)) orelse {
-                return self.fail(position, error.ExpectedType);
-            };
-            try parameters.append(allocator, parameter);
-            if (self.match(&position, .comma) == null) break;
+        if (self.match(&position, .left_parenthesis) != null) {
+            while (self.tokens[position].kind != .right_parenthesis) {
+                const parameter = (try self.parseExpression(allocator, &position)) orelse {
+                    return self.fail(position, error.ExpectedType);
+                };
+                try parameters.append(allocator, parameter);
+                if (self.match(&position, .comma) == null) break;
+            }
+            _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
         }
-        _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
         const return_type = try allocator.create(ast.Expression);
         return_type.* = try self.parseReturnType(allocator, &position);
 
@@ -2059,6 +2271,9 @@ pub const ParseError = error{
     ManyPointerSyntax,
     MisplacedConst,
     MisplacedMany,
+    MisplacedBranching,
+    NestedSameLineIf,
+    HeaderColon,
     ConstOutsideMany,
     ExpectedEquals,
     ExpectedStatement,
@@ -2177,6 +2392,18 @@ fn isCallOrTriedCall(expression: ast.Expression) bool {
     return call.kind == .call or call.kind == .method_call;
 }
 
+fn isBracketed(tokens: []const token.Token) bool {
+    var depth: isize = 0;
+    for (tokens) |item| {
+        switch (item.kind) {
+            .left_parenthesis, .left_bracket, .left_brace => depth += 1,
+            .right_parenthesis, .right_bracket, .right_brace => depth -= 1,
+            else => {},
+        }
+    }
+    return depth > 0;
+}
+
 fn buildName(path: ast.Path) ast.Name {
     if (path.len == 1) return .{ .identifier = .{ .name = path[0] } };
     return .{ .path_expression = .{ .path = path } };
@@ -2209,6 +2436,9 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.ManyPointerSyntax => "write *Many(T) instead of *many T, and *Many(Const(T)) instead of *many const T",
         error.MisplacedConst => "Const(T) is allowed only as what *, *Many or [] points to, e.g. *Const(T) or []Const(T)",
         error.MisplacedMany => "Many(T) is allowed only right after *, e.g. *Many(T)",
+        error.HeaderColon => "a block has no ':' before it; write the header alone with the block indented below, e.g. `if count > limit`, or one statement on the same line, e.g. `if (count > limit) trim(list)`, `else 20` or `fn one -> u8 = 1`",
+        error.NestedSameLineIf => "an if with its block on the same line cannot be in the same-line block of another if, an else or a loop; write else if, or put the inner if in parentheses",
+        error.MisplacedBranching => "a match, or an if whose blocks are not all on one line, used as a value must end its statement: after = in a declaration or assignment, after return, as the last line of a function body, or as a branch's value",
         error.ConstOutsideMany => "write *Many(Const(T)) instead of *Const(Many(T))",
         error.ExpectedEquals => "expected '='",
         error.ExpectedStatement => "expected a statement",
@@ -2243,7 +2473,7 @@ fn describeError(parse_error: ParseError) []const u8 {
 test "Parser.parse: parses several functions" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn one(): noop\nfn two():\n    noop\n");
+    var lexer = @import("lexer.zig").Lexer.init("fn one() = noop\nfn two()\n    noop\n");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2256,7 +2486,7 @@ test "Parser.parse: parses several functions" {
 test "Parser.parse: skips blank lines" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("\nfn one():\n    noop\n\n    noop\n\nfn two(): noop\n\n");
+    var lexer = @import("lexer.zig").Lexer.init("\nfn one()\n    noop\n\n    noop\n\nfn two() = noop\n\n");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2271,7 +2501,7 @@ test "Parser.parse: skips blank lines" {
 test "Parser.parse: rejects statement at top level" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): noop\nnoop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = noop\nnoop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2282,7 +2512,18 @@ test "Parser.parse: rejects statement at top level" {
 test "parseTopLevelStatement: rejects indentation at top level" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): noop\n    noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = noop\n    noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.UnexpectedIndentation, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
+}
+
+test "parseTopLevelStatement: rejects a deeper line after a constant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("const LIMIT = 1\n    use(LIMIT)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2293,7 +2534,7 @@ test "parseTopLevelStatement: rejects indentation at top level" {
 test "parseTopLevelStatement: parses constants between functions" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const one = two\nfn main(): noop\nconst three = four");
+    var lexer = @import("lexer.zig").Lexer.init("const one = two\nfn main() = noop\nconst three = four");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2307,7 +2548,7 @@ test "parseTopLevelStatement: parses constants between functions" {
 test "parseFunctionDeclaration: parses an external function" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("external fn stdout_write(text: []Const(u8))\nfn main(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("external fn stdout_write(text: []Const(u8))\nfn main() = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2321,12 +2562,12 @@ test "parseFunctionDeclaration: parses an external function" {
 test "parseFunctionDeclaration: rejects a body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("external fn log(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("external fn log() = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExternalFunctionBody, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
 }
 
 test "parseFunctionDeclaration: rejects external without fn" {
@@ -2343,7 +2584,7 @@ test "parseFunctionDeclaration: rejects external without fn" {
 test "parseFunctionDefinition: parses an indented body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    noop\n");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    noop\n");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2359,7 +2600,7 @@ test "parseFunctionDefinition: parses an indented body" {
 test "parseFunctionDefinition: parses an inline function at the top level and in a struct" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("inline fn double(value: i32) -> i32: return value * 2\nfn plain(): noop\nstruct Box:\n    value: i32\n    inline fn get(self: Self) -> i32: return self.value");
+    var lexer = @import("lexer.zig").Lexer.init("inline fn double(value: i32) -> i32 = return value * 2\nfn plain() = noop\nstruct Box\n    value: i32\n    inline fn get(self: Self) -> i32 = return self.value");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2394,7 +2635,7 @@ test "parseFunctionDeclaration: rejects an external inline function" {
 test "parseFunctionDefinition: parses an inline body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2403,13 +2644,25 @@ test "parseFunctionDefinition: parses an inline body" {
     try std.testing.expectEqualStrings("main", module.declarations[0].kind.function_definition.signature.name);
     try std.testing.expectEqual(1, module.declarations[0].kind.function_definition.body.len);
     try std.testing.expect(module.declarations[0].kind.function_definition.body[0].kind == .noop);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, module.declarations[0].kind.function_definition.body[0].location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, module.declarations[0].kind.function_definition.body[0].location);
+}
+
+test "parseFunctionDefinition: parses a body after an equals sign" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn add(a: i32, b: i32) -> i32 = a + b");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(ast.BinaryOperator.add, body[0].kind.value.kind.binary.operator);
 }
 
 test "parseFunctionSignature: accepts a reserved word as the name of a function" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn match(pattern: []Const(u8)) -> bool: return true");
+    var lexer = @import("lexer.zig").Lexer.init("fn match(pattern: []Const(u8)) -> bool = return true");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2420,7 +2673,7 @@ test "parseFunctionSignature: accepts a reserved word as the name of a function"
 test "parseFunctionSignature: parses the types a function declares after fn" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("inline fn(type Item, type Other: Show) pair(item: Item, other: Other) -> usize: return 2");
+    var lexer = @import("lexer.zig").Lexer.init("inline fn(type Item, type Other: Show) pair(item: Item, other: Other) -> usize = return 2");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2439,7 +2692,7 @@ test "parseFunctionSignature: parses the types a function declares after fn" {
 test "parseFunctionSignature: rejects a reserved word as the name of a parameter" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn find(match: []Const(u8)) -> bool: return true");
+    var lexer = @import("lexer.zig").Lexer.init("fn find(match: []Const(u8)) -> bool = return true");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2447,21 +2700,59 @@ test "parseFunctionSignature: rejects a reserved word as the name of a parameter
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 9 }, parser.failure.?.location.?);
 }
 
-test "parseFunctionSignature: rejects missing parenthesis" {
+test "parseFunctionSignature: rejects parameters without parentheses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main x: i32) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
-    try std.testing.expectError(error.ExpectedLeftParenthesis, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 8 }, parser.failure.?.location.?);
+    try std.testing.expectError(error.ExpectedArrow, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 9 }, parser.failure.?.location.?);
+}
+
+test "parseFunctionSignature: parses a function without parentheses and an indented body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main\n    noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const function = module.declarations[0].kind.function_definition;
+    try std.testing.expectEqualStrings("main", function.signature.name);
+    try std.testing.expectEqual(0, function.signature.parameters.len);
+    try std.testing.expect(function.body[0].kind == .noop);
+}
+
+test "parseFunctionSignature: parses a return type without parentheses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn answer -> i32 = 42");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const function = module.declarations[0].kind.function_definition;
+    try std.testing.expectEqualStrings("i32", function.signature.return_type.kind.identifier.name);
+    try std.testing.expectEqualStrings("42", function.body[0].kind.value.kind.integer_literal.text);
+}
+
+test "opensHeaderBlock: rejects a colon after a function signature" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.HeaderColon, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 10 }, parser.failure.?.location.?);
 }
 
 test "parseParameters: parses each parameter" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn add(left: i32, right: u8) -> i32: return 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn add(left: i32, right: u8) -> i32 = return 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2479,7 +2770,7 @@ test "parseParameters: parses each parameter" {
 test "parseParameters: accepts a trailing comma" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn add(left: i32, right: i32,) -> i32: return 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn add(left: i32, right: i32,) -> i32 = return 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2490,7 +2781,7 @@ test "parseParameters: accepts a trailing comma" {
 test "parseParameter: parses an underscore as a discarded parameter" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f(_: i32): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn f(_: i32) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2504,7 +2795,7 @@ test "parseParameter: parses an underscore as a discarded parameter" {
 test "parseAnyParameter: parses a parameter of type any" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn count(values: any, _: any) -> usize: return 0");
+    var lexer = @import("lexer.zig").Lexer.init("fn count(values: any, _: any) -> usize = return 0");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2519,7 +2810,7 @@ test "parseAnyParameter: parses a parameter of type any" {
 test "parseOperand: rejects any as the type of a variable" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    var value: any = 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    var value: any = 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2530,7 +2821,7 @@ test "parseOperand: rejects any as the type of a variable" {
 test "parseOperand: rejects any as the type of a field" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct Point:\n    x: any");
+    var lexer = @import("lexer.zig").Lexer.init("struct Point\n    x: any");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2541,7 +2832,7 @@ test "parseOperand: rejects any as the type of a field" {
 test "parseOperand: rejects any as a return type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn make() -> any: return 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn make() -> any = return 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2552,7 +2843,7 @@ test "parseOperand: rejects any as a return type" {
 test "parseOperand: rejects any as the element of a slice type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn take(values: []any): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn take(values: []any) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2563,7 +2854,7 @@ test "parseOperand: rejects any as the element of a slice type" {
 test "parseOperand: rejects any as the target of a pointer type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn take(value: *any): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn take(value: *any) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2574,7 +2865,7 @@ test "parseOperand: rejects any as the target of a pointer type" {
 test "parseOperand: rejects Const as the type of a variable" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    var limit: Const(u32) = 1\n    limit = 2");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    var limit: Const(u32) = 1\n    limit = 2");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2585,7 +2876,7 @@ test "parseOperand: rejects Const as the type of a variable" {
 test "parseOperand: rejects Const as the type of a field" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct Point:\n    x: Const(i32)");
+    var lexer = @import("lexer.zig").Lexer.init("struct Point\n    x: Const(i32)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2596,7 +2887,7 @@ test "parseOperand: rejects Const as the type of a field" {
 test "parseOperand: rejects Const as the element of an array" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(values: [2]Const(i32)): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(values: [2]Const(i32)) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2607,7 +2898,7 @@ test "parseOperand: rejects Const as the element of an array" {
 test "parseOperand: rejects Const as the type of a parameter" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(value: Const(i32)): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: Const(i32)) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2618,7 +2909,7 @@ test "parseOperand: rejects Const as the type of a parameter" {
 test "parseOperand: rejects Const as a return type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn make() -> Const(i32): return 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn make() -> Const(i32) = return 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2629,7 +2920,7 @@ test "parseOperand: rejects Const as a return type" {
 test "parseOperand: rejects Many without an asterisk" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: Many(u8)): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: Many(u8)) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2640,7 +2931,7 @@ test "parseOperand: rejects Many without an asterisk" {
 test "parseOperand: rejects Many without an asterisk in an optional" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: ?Many(u8)): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: ?Many(u8)) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2651,7 +2942,7 @@ test "parseOperand: rejects Many without an asterisk in an optional" {
 test "parseOperand: rejects any as the type of a comptime parameter" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn take(comptime value: any): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn take(comptime value: any) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2659,10 +2950,75 @@ test "parseOperand: rejects any as the type of a comptime parameter" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, parser.failure.?.location.?);
 }
 
+test "parseOperand: ends the last block of a one-line if argument at the comma and the closing parenthesis" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = run(if (fast) high else low, rest)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const call = body[0].kind.call.kind.call;
+    try std.testing.expectEqual(2, call.arguments.len);
+    try std.testing.expectEqualStrings("low", call.arguments[0].value.kind.branching.kind.@"if".else_body.?[0].kind.value.kind.identifier.name);
+    try std.testing.expectEqualStrings("rest", call.arguments[1].value.kind.identifier.name);
+}
+
+test "parseOperand: extends the last block of a one-line if after an operator to the end of the line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const total: u32 = base + if (bonus) 10 else low + high\n    use(total)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const sum = body[0].kind.constant_declaration.value.kind.binary;
+    const conditional = sum.right.kind.branching.kind.@"if";
+    try std.testing.expectEqualStrings("high", conditional.else_body.?[0].kind.value.kind.binary.right.kind.identifier.name);
+}
+
+test "parseOperand: parses a one-line if in parentheses after an operator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const total: u32 = base + (if (bonus) 10 else 0)\n    use(total)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const sum = body[0].kind.constant_declaration.value.kind.binary;
+    try std.testing.expectEqualStrings("base", sum.left.kind.identifier.name);
+    try std.testing.expectEqualStrings("bonus", sum.right.kind.branching.kind.@"if".condition.kind.identifier.name);
+}
+
+test "parseOperand: rejects an if inside an expression whose block is not on its line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const total: i32 = 1 + if big\n        high\n    else low");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedBranching, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 28 }, parser.failure.?.location.?);
+}
+
+test "parseOperand: rejects a match as an argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = use(match token)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedBranching, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 17 }, parser.failure.?.location.?);
+}
+
 test "parseParameter: parses a type parameter" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn make(type T, value: T) -> T: return value");
+    var lexer = @import("lexer.zig").Lexer.init("fn make(type T, value: T) -> T = return value");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2677,7 +3033,7 @@ test "parseParameter: parses a type parameter" {
 test "parseParameter: parses the requirement of a type parameter" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn make(type T: Default) -> T: return Default(T)::value()");
+    var lexer = @import("lexer.zig").Lexer.init("fn make(type T: Default) -> T = return Default(T)::value()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2690,7 +3046,7 @@ test "parseParameter: parses the requirement of a type parameter" {
 test "parseParameter: parses a comptime parameter" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn repeat(comptime count: usize): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn repeat(comptime count: usize) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2704,7 +3060,7 @@ test "parseParameter: parses a comptime parameter" {
 test "parseParameter: rejects comptime without a name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn repeat(comptime): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn repeat(comptime) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2715,7 +3071,7 @@ test "parseParameter: rejects comptime without a name" {
 test "parseParameter: rejects a default value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn draw(width: i32 = 1): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn draw(width: i32 = 1) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2737,7 +3093,7 @@ test "parseParameter: rejects a default value of an external function" {
 test "parseReturnType: reads a written return type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn answer() -> i32: return 42");
+    var lexer = @import("lexer.zig").Lexer.init("fn answer() -> i32 = return 42");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2750,31 +3106,31 @@ test "parseReturnType: reads a written return type" {
 test "parseReturnType: returns void when no type is written" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const return_type = module.declarations[0].kind.function_definition.signature.return_type;
     try std.testing.expectEqualStrings("void", return_type.kind.identifier.name);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 10 }, return_type.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 11 }, return_type.location);
 }
 
 test "parseReturnType: rejects an arrow without a type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn answer() ->: return 42");
+    var lexer = @import("lexer.zig").Lexer.init("fn answer() -> = return 42");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedType, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 15 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
 }
 
 test "parseReturnType: rejects a type without an arrow" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn answer() i32: return 42");
+    var lexer = @import("lexer.zig").Lexer.init("fn answer() i32 = return 42");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2829,7 +3185,7 @@ test "parseReturnType: rejects a tuple type without an arrow" {
 test "parseIndentedBlock: rejects line that is not a statement" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    noop\n    fn");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    noop\n    =");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -2837,10 +3193,32 @@ test "parseIndentedBlock: rejects line that is not a statement" {
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, parser.failure.?.location.?);
 }
 
+test "parseIndentedBlock: rejects a deeper line after a line that cannot open a block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const count = 1\n        use(count)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.UnexpectedIndentation, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 1 }, parser.failure.?.location.?);
+}
+
+test "parseIndentedBlock: rejects a deeper line after a same-line body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if (ready) start()\n        stop()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.UnexpectedToken, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 16 }, parser.failure.?.location.?);
+}
+
 test "parseIndentedBlock: ends nested blocks at the depth of an enclosing block" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while one:\n        while two:\n            step()\n    done()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while one\n        while two\n            step()\n    done()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2856,7 +3234,7 @@ test "parseIndentedBlock: ends nested blocks at the depth of an enclosing block"
 test "parseIndentedBlock: accepts a return as the last statement of a block" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    a = 1\n    return\nfn other(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    a = 1\n    return\nfn other() = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2869,7 +3247,7 @@ test "parseIndentedBlock: accepts a return as the last statement of a block" {
 test "parseIndentedBlock: accepts a statement after a loop whose inline block returns" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while true: return\n    a = 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while (true) return\n    a = 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2879,21 +3257,49 @@ test "parseIndentedBlock: accepts a statement after a loop whose inline block re
     try std.testing.expect(body[1].kind == .assignment);
 }
 
+test "parseBlockLine: parses an expression on the last line of a block as a value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn pick() -> i32\n    step()\n    one + two");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(2, body.len);
+    try std.testing.expectEqualStrings("one", body[1].kind.value.kind.binary.left.kind.identifier.name);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, body[1].location);
+}
+
 test "parseInlineBlock: rejects line that is not a statement" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): fn");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = =");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedStatement, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, parser.failure.?.location.?);
+}
+
+test "parseInlineBlock: parses an expression as a value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn pick(one: bool) -> i32\n    if (one) first\n    else second");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const conditional = body[0].kind.@"if";
+    try std.testing.expectEqualStrings("first", conditional.body[0].kind.value.kind.identifier.name);
+    try std.testing.expectEqualStrings("second", conditional.else_body.?[0].kind.value.kind.identifier.name);
 }
 
 test "parseStatement: parses a constant inside a function" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    const limit: i32 = 5\n    noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const limit: i32 = 5\n    noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2908,7 +3314,7 @@ test "parseStatement: parses a constant inside a function" {
 test "parseReturn: parses return with a value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn answer() -> u8:\n    return 42\n");
+    var lexer = @import("lexer.zig").Lexer.init("fn answer() -> u8\n    return 42\n");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2923,7 +3329,7 @@ test "parseReturn: parses return with a value" {
 test "parseReturn: parses return without a value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    return\n");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    return\n");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2935,18 +3341,105 @@ test "parseReturn: parses return without a value" {
 test "parseReturn: rejects return followed by a non-expression" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): return fn");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = return =");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 20 }, parser.failure.?.location.?);
+}
+
+test "parseValue: parses an if after the equals sign of a constant with its else on the next line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const limit: u32 = if (strict) low\n    else high\n    use(limit)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(2, body.len);
+    const conditional = body[0].kind.constant_declaration.value.kind.branching.kind.@"if";
+    try std.testing.expectEqualStrings("low", conditional.body[0].kind.value.kind.identifier.name);
+    try std.testing.expectEqualStrings("high", conditional.else_body.?[0].kind.value.kind.identifier.name);
+    try std.testing.expectEqualStrings("use", body[1].kind.call.kind.call.callee.identifier.name);
+}
+
+test "parseValue: gives the block of a constant line to its match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const kind = match token\n        case (end) first\n        else second\n    use(kind)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(2, body.len);
+    const matching = body[0].kind.constant_declaration.value.kind.branching.kind.match;
+    try std.testing.expectEqualStrings("second", matching.branches[1].body[0].kind.value.kind.identifier.name);
+}
+
+test "parseValue: gives the blocks of a return line to its if and else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn pick(big: bool) -> i32\n    return if big\n        high\n    else\n        low");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const conditional = body[0].kind.@"return".?.kind.branching.kind.@"if";
+    try std.testing.expectEqualStrings("high", conditional.body[0].kind.value.kind.identifier.name);
+    try std.testing.expectEqualStrings("low", conditional.else_body.?[0].kind.value.kind.identifier.name);
+}
+
+test "parseValue: gives the block of an assignment line to its if" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    total = if big\n        high\n    else low");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const conditional = body[0].kind.assignment.value.kind.branching.kind.@"if";
+    try std.testing.expectEqualStrings("high", conditional.body[0].kind.value.kind.identifier.name);
+    try std.testing.expectEqualStrings("low", conditional.else_body.?[0].kind.value.kind.identifier.name);
+}
+
+test "parseValue: parses a match after return with its branches indented under the line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn pick(token: Token) -> i32\n    return match token\n        case (number) first\n        else second");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(1, body.len);
+    const matching = body[0].kind.@"return".?.kind.branching.kind.match;
+    try std.testing.expectEqual(2, matching.branches.len);
+    try std.testing.expectEqualStrings("second", matching.branches[1].body[0].kind.value.kind.identifier.name);
+}
+
+test "parseValue: parses an if after the equals sign of an assignment and of a variable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    var total = if (big) high\n    else low\n    total = if (big) low\n    else high");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(2, body.len);
+    try std.testing.expectEqualStrings("high", body[0].kind.variable_declaration.value.kind.branching.kind.@"if".body[0].kind.value.kind.identifier.name);
+    try std.testing.expectEqualStrings("low", body[1].kind.assignment.value.kind.branching.kind.@"if".body[0].kind.value.kind.identifier.name);
 }
 
 test "parseIf: parses a condition and a body without an else" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    if ready:\n        step()\n    done()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if ready\n        step()\n    done()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2961,10 +3454,101 @@ test "parseIf: parses a condition and a body without an else" {
     try std.testing.expect(body[1].kind == .call);
 }
 
+test "parseIf: takes the rest of the line as the condition before a block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if count > limit\n        trim(list)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const conditional = body[0].kind.@"if";
+    try std.testing.expectEqual(ast.BinaryOperator.greater_than, conditional.condition.kind.binary.operator);
+    try std.testing.expectEqualStrings("trim", conditional.body[0].kind.call.kind.call.callee.identifier.name);
+}
+
+test "parseIf: takes the whole line as the condition when a block follows a group in parentheses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if (ready or late) and valid\n        start()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const condition = body[0].kind.@"if".condition.kind.binary;
+    try std.testing.expectEqual(ast.BinaryOperator.@"and", condition.operator);
+    try std.testing.expectEqual(ast.BinaryOperator.@"or", condition.left.kind.binary.operator);
+}
+
+test "parseIf: takes the group in parentheses as the condition when no block follows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if (ready) start()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const conditional = body[0].kind.@"if";
+    try std.testing.expectEqualStrings("ready", conditional.condition.kind.identifier.name);
+    try std.testing.expectEqualStrings("start", conditional.body[0].kind.call.kind.call.callee.identifier.name);
+}
+
+test "parseIf: parses an else block and an else with its statement on the same line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if ready\n        start()\n    else\n        stop()\n    if late\n        hurry()\n    else wait()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqualStrings("stop", body[0].kind.@"if".else_body.?[0].kind.call.kind.call.callee.identifier.name);
+    try std.testing.expectEqualStrings("wait", body[1].kind.@"if".else_body.?[0].kind.call.kind.call.callee.identifier.name);
+}
+
+test "parseIf: parses a value name inside the parentheses of a same-line condition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if (found as card) show(card)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const conditional = body[0].kind.@"if";
+    try std.testing.expectEqualStrings("card", conditional.names[0].name);
+    try std.testing.expectEqualStrings("found", conditional.condition.kind.identifier.name);
+}
+
+test "expectHeaderEnd: rejects a colon after a condition before a block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if ready:\n        start()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.HeaderColon, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 13 }, parser.failure.?.location.?);
+}
+
+test "openSameLineHeader: rejects a colon after a same-line condition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = if ready: start()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.HeaderColon, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 21 }, parser.failure.?.location.?);
+}
+
 test "parseIf: parses an else block on the line after the body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    if ready:\n        step()\n    else:\n        wait()\n        stop()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if ready\n        step()\n    else\n        wait()\n        stop()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2979,7 +3563,7 @@ test "parseIf: parses an else block on the line after the body" {
 test "parseIf: parses an else if chain" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    if one:\n        first()\n    else if two:\n        second()\n    else:\n        third()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if one\n        first()\n    else if two\n        second()\n    else\n        third()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -2998,7 +3582,7 @@ test "parseIf: parses an else if chain" {
 test "parseIf: parses an else after an inline body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    if ready: step()\n    else: wait()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if (ready) step()\n    else wait()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3010,21 +3594,176 @@ test "parseIf: parses an else after an inline body" {
     try std.testing.expectEqualStrings("wait", conditional.else_body.?[0].kind.call.kind.call.callee.identifier.name);
 }
 
-test "parseIf: rejects a missing colon" {
+test "parseIf: parses an else on the same line as an inline body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): if ready step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = if (ready) start() else wait()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const conditional = body[0].kind.@"if";
+    try std.testing.expectEqualStrings("start", conditional.body[0].kind.call.kind.call.callee.identifier.name);
+    try std.testing.expectEqualStrings("wait", conditional.else_body.?[0].kind.call.kind.call.callee.identifier.name);
+}
+
+test "parseIf: parses an else if chain on one line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = if (ready) start() else if (late) hurry() else wait()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const chained = body[0].kind.@"if".else_body.?[0].kind.@"if";
+    try std.testing.expectEqualStrings("hurry", chained.body[0].kind.call.kind.call.callee.identifier.name);
+    try std.testing.expectEqualStrings("wait", chained.else_body.?[0].kind.call.kind.call.callee.identifier.name);
+}
+
+test "parseIf: parses an else on the same line in a value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const limit: u32 = if (strict) low else high\n    use(limit)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(2, body.len);
+    const conditional = body[0].kind.constant_declaration.value.kind.branching.kind.@"if";
+    try std.testing.expectEqualStrings("high", conditional.else_body.?[0].kind.value.kind.identifier.name);
+}
+
+test "parseIf: gives an else on the next line to the last if of a chain on one line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if (ready) start() else if (late) hurry()\n    else wait()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(1, body.len);
+    const chained = body[0].kind.@"if".else_body.?[0].kind.@"if";
+    try std.testing.expectEqualStrings("wait", chained.else_body.?[0].kind.call.kind.call.callee.identifier.name);
+}
+
+test "parseIf: rejects an if with a same-line block in the same-line block of another if" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = if (ready) if (valid) start() else stop()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
-    try std.testing.expectError(error.ExpectedColon, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 21 }, parser.failure.?.location.?);
+    try std.testing.expectError(error.NestedSameLineIf, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, parser.failure.?.location.?);
+}
+
+test "parseIf: parses an if after a same-line else as a chain" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const size: u32 = if (small) 1 else if (huge) 3 else 2\n    use(size)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const chained = body[0].kind.constant_declaration.value.kind.branching.kind.@"if".else_body.?[0].kind.@"if";
+    try std.testing.expectEqualStrings("2", chained.else_body.?[0].kind.value.kind.integer_literal.text);
+}
+
+test "parseIf: rejects an if with a same-line block after the equals sign in the same-line block of another if" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = if (ready) total = if (fast) 1 else 2");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.NestedSameLineIf, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 32 }, parser.failure.?.location.?);
+}
+
+test "parseIf: rejects an if with a same-line block in the same-line block of a loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = while (ready) if (valid) start()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.NestedSameLineIf, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 27 }, parser.failure.?.location.?);
+}
+
+test "parseIf: accepts an if in parentheses in the same-line block of an else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const size: u32 = if (small) 1 else (if (huge) 3 else 2)\n    use(size)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const conditional = body[0].kind.constant_declaration.value.kind.branching.kind.@"if";
+    const inner = conditional.else_body.?[0].kind.value.kind.branching.kind.@"if";
+    try std.testing.expectEqualStrings("2", inner.else_body.?[0].kind.value.kind.integer_literal.text);
+}
+
+test "parseIf: accepts an if in the arguments of a call in the same-line block of another if" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = if (ready) run(if (fast) 1 else 2)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const call = body[0].kind.@"if".body[0].kind.call.kind.call;
+    const inner = call.arguments[0].value.kind.branching.kind.@"if";
+    try std.testing.expectEqualStrings("1", inner.body[0].kind.value.kind.integer_literal.text);
+}
+
+test "parseIf: accepts an if in the same-line block of a function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn sign(x: i32) -> i32 = if (x < 0) -1 else 1");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqualStrings("1", body[0].kind.@"if".else_body.?[0].kind.value.kind.integer_literal.text);
+}
+
+test "parseIf: accepts an if in the same-line block of a case" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn pick(value: u8, flag: bool) -> u8\n    match value\n        case (0) if (flag) 1 else 2\n        else 3");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const conditional = body[0].kind.match.branches[0].body[0].kind.@"if";
+    try std.testing.expectEqualStrings("2", conditional.else_body.?[0].kind.value.kind.integer_literal.text);
+}
+
+test "parseIf: rejects a same-line condition without parentheses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = if ready step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedLeftParenthesis, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
 }
 
 test "parseWhile: parses a condition and an indented body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while running:\n        step()\n        stop()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while running\n        step()\n        stop()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3036,10 +3775,38 @@ test "parseWhile: parses a condition and an indented body" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, statement.location);
 }
 
+test "parseWhile: parses a condition before a block and a same-line body after parentheses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while index < count\n        step()\n    while (running) step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(ast.BinaryOperator.less_than, body[0].kind.@"while".condition.kind.binary.operator);
+    try std.testing.expectEqualStrings("running", body[1].kind.@"while".condition.kind.identifier.name);
+    try std.testing.expectEqualStrings("step", body[1].kind.@"while".body[0].kind.call.kind.call.callee.identifier.name);
+}
+
+test "parseWhile: gives the block to the while and keeps a one-line if in its condition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while index < (if (strict) high else low)\n        step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const loop = body[0].kind.@"while";
+    try std.testing.expectEqualStrings("strict", loop.condition.kind.binary.right.kind.branching.kind.@"if".condition.kind.identifier.name);
+    try std.testing.expectEqualStrings("step", loop.body[0].kind.call.kind.call.callee.identifier.name);
+}
+
 test "parseWhile: parses an inline body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): while running: step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = while (running) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3049,21 +3816,21 @@ test "parseWhile: parses an inline body" {
     try std.testing.expect(loop.body[0].kind == .call);
 }
 
-test "parseWhile: rejects a missing colon" {
+test "parseWhile: rejects a same-line condition without parentheses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): while running step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = while running step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
-    try std.testing.expectError(error.ExpectedColon, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, parser.failure.?.location.?);
+    try std.testing.expectError(error.ExpectedLeftParenthesis, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
 }
 
 test "parseWhile: parses a label before the loop" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    @outer while running: step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    @outer while (running) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3078,7 +3845,7 @@ test "parseWhile: parses a label before the loop" {
 test "parseWhile: parses an else block" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while running:\n        step()\n    else:\n        stop()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while running\n        step()\n    else\n        stop()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3090,21 +3857,21 @@ test "parseWhile: parses an else block" {
     try std.testing.expectEqualStrings("stop", loop.else_body.?[0].kind.call.kind.call.callee.identifier.name);
 }
 
-test "parseWhile: rejects an else if" {
+test "parseWhile: rejects an if with a same-line block in the same-line else of a loop" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while running: step()\n    else if done: stop()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while (running) step()\n    else if (done) stop()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
-    try std.testing.expectError(error.ExpectedColon, parser.parse(&arena));
+    try std.testing.expectError(error.NestedSameLineIf, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 10 }, parser.failure.?.location.?);
 }
 
 test "parseConditionNames: parses a value name after an if condition" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    if found as *card: noop\n    else: noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if (found as *card) noop\n    else noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3120,7 +3887,7 @@ test "parseConditionNames: parses a value name after an if condition" {
 test "parseConditionNames: parses a value name after a while condition" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while queue.pop() as job: run(job)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while (queue.pop() as job) run(job)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3134,7 +3901,7 @@ test "parseConditionNames: parses a value name after a while condition" {
 test "parseConditionNames: leaves a condition without as unnamed" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    if ready: noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if (ready) noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3145,7 +3912,7 @@ test "parseConditionNames: leaves a condition without as unnamed" {
 test "parseFor: parses a name, a sequence and an indented body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    for item in items:\n        step()\n        stop()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    for item in items\n        step()\n        stop()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3160,10 +3927,26 @@ test "parseFor: parses a name, a sequence and an indented body" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, statement.location);
 }
 
+test "parseFor: parses a header before a block and a same-line body after parentheses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    for card in cards\n        show(card)\n    for ((name, score) in pairs) show(name, score)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqualStrings("card", body[0].kind.@"for".names[0].name);
+    const loop = body[1].kind.@"for";
+    try std.testing.expect(loop.tuple);
+    try std.testing.expectEqualStrings("score", loop.names[1].name);
+    try std.testing.expectEqualStrings("pairs", loop.sequence.value.kind.identifier.name);
+}
+
 test "parseFor: parses a label, an inline body and an else block" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    @outer for item in items: step()\n    else: stop()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    @outer for (item in items) step()\n    else stop()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3180,29 +3963,29 @@ test "parseFor: parses a label, an inline body and an else block" {
 test "parseFor: rejects a missing in" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): for item items: step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = for (item items) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedIn, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 21 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, parser.failure.?.location.?);
 }
 
-test "parseFor: rejects a missing colon" {
+test "parseFor: rejects a same-line header without parentheses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): for item in items step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = for item in items step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
-    try std.testing.expectError(error.ExpectedColon, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 30 }, parser.failure.?.location.?);
+    try std.testing.expectError(error.ExpectedLeftParenthesis, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 17 }, parser.failure.?.location.?);
 }
 
 test "parseElementNames: parses names in parentheses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): for (name, *score, _) in pairs: step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = for ((name, *score, _) in pairs) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3215,13 +3998,13 @@ test "parseElementNames: parses names in parentheses" {
     try std.testing.expectEqualStrings("score", loop.names[1].name);
     try std.testing.expect(loop.names[1].pointer);
     try std.testing.expectEqualStrings("_", loop.names[2].name);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, loop.names[1].location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, loop.names[1].location);
 }
 
 test "parseElementNames: parses one name in parentheses as a tuple pattern" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): for (name) in pairs: step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = for ((name) in pairs) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3234,53 +4017,53 @@ test "parseElementNames: parses one name in parentheses as a tuple pattern" {
 test "parseElementNames: rejects names in parentheses inside names in parentheses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): for (name, (score, rank)) in pairs: step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = for ((name, (score, rank)) in pairs) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, parser.failure.?.location.?);
 }
 
 test "parseElementNames: rejects a missing closing parenthesis" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): for (name, score in pairs: step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = for ((name, score in pairs) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedRightParenthesis, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 29 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 31 }, parser.failure.?.location.?);
 }
 
 test "parseElementName: parses an underscore" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): for _ in items: step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = for (_ in items) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const loop = module.declarations[0].kind.function_definition.body[0].kind.@"for";
     try std.testing.expectEqualStrings("_", loop.names[0].name);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, loop.names[0].location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, loop.names[0].location);
 }
 
 test "parseElementName: rejects a name that is not an identifier" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): for 5 in items: step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = for (5 in items) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, parser.failure.?.location.?);
 }
 
 test "parseElementName: parses a pointer name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): for *card in cards: step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = for (*card in cards) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3289,24 +4072,24 @@ test "parseElementName: parses a pointer name" {
     try std.testing.expectEqualStrings("card", loop.names[0].name);
     try std.testing.expect(loop.names[0].pointer);
     try std.testing.expect(!loop.tuple);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, loop.names[0].location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, loop.names[0].location);
 }
 
 test "parseElementName: rejects a pointer to an underscore" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): for *_ in cards: step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = for (*_ in cards) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 17 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
 }
 
 test "parseSequence: parses ranges with and without an end" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    for index in 0..: step()\n    for index in 1..limit: step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    for (index in 0..) step()\n    for (index in 1..limit) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3323,7 +4106,7 @@ test "parseSequence: parses ranges with and without an end" {
 test "parseSequence: parses a value in parentheses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): for item in (items): step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = for (item in (items)) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3335,7 +4118,7 @@ test "parseSequence: parses a value in parentheses" {
 test "parseSequence: parses a range whose start is in parentheses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): for index in (start)..end: step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = for (index in (start)..end) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3348,18 +4131,18 @@ test "parseSequence: parses a range whose start is in parentheses" {
 test "parseSequence: rejects a missing sequence" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): for item in: step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = for (item in) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, parser.failure.?.location.?);
 }
 
 test "parseMatch: parses branches with several cases, value names and an else" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    match token:\n        case number(*digits): step()\n        case name, end:\n            stop()\n        case Token::other(_): noop\n        else: noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match token\n        case (number(*digits)) step()\n        case name, end\n            stop()\n        case (Token::other(_)) noop\n        else noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3387,21 +4170,48 @@ test "parseMatch: parses branches with several cases, value names and an else" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, statement.location);
 }
 
-test "parseMatch: rejects a match without a block" {
+test "parseMatch: parses branches with blocks and branches on one line" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    match value\n    noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match token\n        case number(digits)\n            use(digits)\n        case (end) stop()\n        else\n            noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const branches = body[0].kind.match.branches;
+    try std.testing.expectEqual(3, branches.len);
+    try std.testing.expectEqual(ast.Naming.payload, branches[0].naming);
+    try std.testing.expectEqualStrings("stop", branches[1].body[0].kind.call.kind.call.callee.identifier.name);
+    try std.testing.expectEqual(0, branches[2].cases.len);
+}
+
+test "parseMatch: rejects a colon after the value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match token:\n        case (end) noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
-    try std.testing.expectError(error.ExpectedColon, parser.parse(&arena));
+    try std.testing.expectError(error.HeaderColon, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 16 }, parser.failure.?.location.?);
+}
+
+test "parseMatch: rejects a match without a block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match value\n    noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedBlock, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 1 }, parser.failure.?.location.?);
 }
 
 test "parseMatch: rejects a branch after else" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    match token:\n        else: noop\n        case end: noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match token\n        else noop\n        case (end) noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -3412,51 +4222,78 @@ test "parseMatch: rejects a branch after else" {
 test "parseBranch: rejects a value name in a branch with several cases" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    match token:\n        case name, end(value): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match token\n        case (name, end(value)) noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.NamedCases, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 23 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 24 }, parser.failure.?.location.?);
+}
+
+test "parseBranch: parses several cases and a payload name in parentheses on one line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match token\n        case (space, tab) true\n        case (number(digits)) total += digits\n        else false");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const branches = body[0].kind.match.branches;
+    try std.testing.expectEqual(2, branches[0].cases.len);
+    try std.testing.expect(branches[0].body[0].kind.value.kind.boolean_literal);
+    try std.testing.expectEqualStrings("digits", body[0].kind.match.names[1].name);
+    try std.testing.expect(branches[1].body[0].kind == .assignment);
+}
+
+test "parseBranch: rejects a colon after the cases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match token\n        case end:\n            noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.HeaderColon, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 17 }, parser.failure.?.location.?);
 }
 
 test "parseBranch: rejects a case after a value name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    match token:\n        case number(value), end: noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match token\n        case (number(value), end) noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.NamedCases, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 27 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 28 }, parser.failure.?.location.?);
 }
 
 test "parseBranch: rejects a name after as in a branch with several cases" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    match token:\n        case null, Card as card: noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match token\n        case (null, Card as card) noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.NamedCases, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 25 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 26 }, parser.failure.?.location.?);
 }
 
 test "parseBranch: rejects a branch without a case" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    match token:\n        case : noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match token\n        case ()) noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedBranch, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 14 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 15 }, parser.failure.?.location.?);
 }
 
 test "parseBranch: rejects a branch without the case keyword" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    match token:\n        end: noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match token\n        end: noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -3467,7 +4304,7 @@ test "parseBranch: rejects a branch without the case keyword" {
 test "parseBranchCase: parses a type with a value name, null, values and ranges" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    match token:\n        case *Card as *card: noop\n        case null: noop\n        case -1, 3..10: noop\n        case 20..: noop\n        case Box(i32) as box: noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match token\n        case (*Card as *card) noop\n        case (null) noop\n        case (-1, 3..10) noop\n        case (20..) noop\n        case (Box(i32) as box) noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3492,18 +4329,18 @@ test "parseBranchCase: parses a type with a value name, null, values and ranges"
 test "parseValueName: rejects a discarded name after as" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    match token:\n        case Card as _: noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match token\n        case (Card as _) noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.DiscardedValueName, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 22 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 23 }, parser.failure.?.location.?);
 }
 
 test "parseLabel: rejects a label before a statement that is not a loop" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    @outer noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    @outer noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -3514,7 +4351,7 @@ test "parseLabel: rejects a label before a statement that is not a loop" {
 test "matchElse: leaves an else at the indentation of an enclosing statement" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while running:\n        if ready: step()\n    else: stop()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while running\n        if (ready) step()\n    else stop()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3527,7 +4364,7 @@ test "matchElse: leaves an else at the indentation of an enclosing statement" {
 test "matchElse: leaves an else after a statement that does not start its line" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): if ready: step()\nelse: stop()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = if (ready) step()\nelse stop()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -3535,21 +4372,21 @@ test "matchElse: leaves an else after a statement that does not start its line" 
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
 }
 
-test "parseElseBlock: rejects an else without a colon" {
+test "parseElseBlock: rejects a colon after else" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    if ready: step()\n    else stop()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if (ready) step()\n    else: stop()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
-    try std.testing.expectError(error.ExpectedColon, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 10 }, parser.failure.?.location.?);
+    try std.testing.expectError(error.HeaderColon, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 9 }, parser.failure.?.location.?);
 }
 
 test "isColonLabel: rejects a label written with a colon before a while loop" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    outer: while running: step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    outer: while (running) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -3560,7 +4397,7 @@ test "isColonLabel: rejects a label written with a colon before a while loop" {
 test "isColonLabel: rejects a label written with a colon before a for loop" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    outer: for item in items: step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    outer: for (item in items) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -3571,7 +4408,7 @@ test "isColonLabel: rejects a label written with a colon before a for loop" {
 test "parseJump: parses break and continue with and without a label" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    @outer while running:\n        break\n        break @outer\n        continue\n        continue @outer");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    @outer while running\n        break\n        break @outer\n        continue\n        continue @outer");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3588,29 +4425,29 @@ test "parseJump: parses break and continue with and without a label" {
 test "parseJump: rejects a label without the at sign" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    @outer while running: break outer");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    @outer while (running) break outer");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.LabelWithoutSigil, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 33 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 34 }, parser.failure.?.location.?);
 }
 
 test "parseJump: rejects an at sign without a name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    @outer while running: continue @");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    @outer while (running) continue @");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 37 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 38 }, parser.failure.?.location.?);
 }
 
 test "parseDefer: parses defer and errdefer before a call, an assignment and a discard" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    defer close()\n    errdefer count += 1\n    defer _ = value");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    defer close()\n    errdefer count += 1\n    defer _ = value");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3627,24 +4464,24 @@ test "parseDefer: parses defer and errdefer before a call, an assignment and a d
 test "parseDefer: rejects a statement that is not a call, an assignment or a discard" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): defer return");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = defer return");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedDeferredStatement, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
 }
 
 test "parseDiscard: parses a discarded call" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): _ = add(1)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = _ = add(1)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const statement = module.declarations[0].kind.function_definition.body[0];
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, statement.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, statement.location);
     const call = statement.kind.discard.kind.call;
     try std.testing.expectEqualStrings("add", call.callee.identifier.name);
     try std.testing.expectEqual(1, call.arguments.len);
@@ -3653,7 +4490,7 @@ test "parseDiscard: parses a discarded call" {
 test "parseDiscard: parses a discarded name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(value: i32): _ = value");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: i32) = _ = value");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3665,7 +4502,7 @@ test "parseDiscard: parses a discarded name" {
 test "parseDiscard: parses a discarded method call" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): _ = card.count()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = _ = card.count()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3677,7 +4514,7 @@ test "parseDiscard: parses a discarded method call" {
 test "parseDiscard: parses a discarded tried call" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): _ = try parse()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = _ = try parse()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3689,18 +4526,18 @@ test "parseDiscard: parses a discarded tried call" {
 test "parseDiscard: rejects a missing equals sign" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): _ add(1)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = _ add(1)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedEquals, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 15 }, parser.failure.?.location.?);
 }
 
 test "parseDiscard: parses a discarded operation" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): _ = count + 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = _ = count + 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3712,7 +4549,7 @@ test "parseDiscard: parses a discarded operation" {
 test "parseDiscard: parses a discarded field access" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): _ = make().x");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = _ = make().x");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3724,18 +4561,18 @@ test "parseDiscard: parses a discarded field access" {
 test "parseDiscard: rejects a missing value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): _ =");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = _ =");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 15 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
 }
 
 test "parseVariableDeclaration: parses a variable with a written type and undefined" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    var count: i32 = undefined\n    noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    var count: i32 = undefined\n    noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3749,29 +4586,29 @@ test "parseVariableDeclaration: parses a variable with a written type and undefi
 test "parseVariableDeclaration: rejects a missing value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): var count: i32 =");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = var count: i32 =");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 29 }, parser.failure.?.location.?);
 }
 
 test "parseVariableDeclaration: rejects names in parentheses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): var (name, score) = pair");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = var (name, score) = pair");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 17 }, parser.failure.?.location.?);
 }
 
 test "parseAssignment: parses an assignment to a field" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): point.x = 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = point.x = 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3784,7 +4621,7 @@ test "parseAssignment: parses an assignment to a field" {
 test "parseAssignment: parses an assignment to an element" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): values[0] = 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = values[0] = 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3797,7 +4634,7 @@ test "parseAssignment: parses an assignment to an element" {
 test "parseAssignment: parses an assignment through a dereference" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): pointer.* = 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = pointer.* = 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3809,29 +4646,29 @@ test "parseAssignment: parses an assignment through a dereference" {
 test "parseAssignment: rejects a call as the target" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): make() = 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = make() = 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedTarget, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, parser.failure.?.location.?);
 }
 
 test "parseAssignment: rejects an unwrap as the target" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): maybe.? = 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = maybe.? = 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedTarget, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, parser.failure.?.location.?);
 }
 
 test "parseAssignment: parses each compound assignment operator" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    a += 1\n    a -= 1\n    a *= 1\n    a /= 1\n    a %= 1\n    a &= 1\n    a |= 1\n    a ^= 1\n    a <<= 1\n    a >>= 1\n");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    a += 1\n    a -= 1\n    a *= 1\n    a /= 1\n    a %= 1\n    a &= 1\n    a |= 1\n    a ^= 1\n    a <<= 1\n    a >>= 1\n");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3847,18 +4684,18 @@ test "parseAssignment: parses each compound assignment operator" {
 test "parseAssignment: rejects a call as the target of a compound assignment" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): make() += 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = make() += 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedTarget, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, parser.failure.?.location.?);
 }
 
 test "parseStatement: rejects a reserved word as the name of a local" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    const match = 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const match = 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -3869,7 +4706,7 @@ test "parseStatement: rejects a reserved word as the name of a local" {
 test "parseCallStatement: parses a call as a statement" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    log(1, true)\n");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    log(1, true)\n");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3884,42 +4721,42 @@ test "parseCallStatement: parses a call as a statement" {
 test "parseCallStatement: parses a tried call as a statement" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): try save()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = try save()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const statement = module.declarations[0].kind.function_definition.body[0];
     try std.testing.expectEqualStrings("save", statement.kind.call.kind.@"try".kind.call.callee.identifier.name);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, statement.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, statement.location);
 }
 
 test "parseCallStatement: rejects a name that is not called" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): value");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    value\n    step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedStatement, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, parser.failure.?.location.?);
 }
 
 test "parseCallStatement: rejects a field access as a statement" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): make().x");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    make().x\n    step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedStatement, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, parser.failure.?.location.?);
 }
 
 test "parseTupleDeclaration: parses names in parentheses and a value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    const (name, *score) = pair\n    step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const (name, *score) = pair\n    step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -3936,23 +4773,23 @@ test "parseTupleDeclaration: parses names in parentheses and a value" {
 test "parseTupleDeclaration: rejects a written type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): const (name, score): [i32, bool] = pair");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = const (name, score): [i32, bool] = pair");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedEquals, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 31 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 32 }, parser.failure.?.location.?);
 }
 
 test "parseTupleDeclaration: rejects names in parentheses inside names in parentheses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): const (name, (score, rank)) = pair");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = const (name, (score, rank)) = pair");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, parser.failure.?.location.?);
 }
 
 test "parseConstantDeclaration: parses a path as the value" {
@@ -4034,7 +4871,7 @@ test "parseConstantDeclaration: rejects a colon without a type" {
 test "parseConstantDeclaration: parses a struct without a name as the value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const Data = struct:\n    value: i32");
+    var lexer = @import("lexer.zig").Lexer.init("const Data = struct\n    value: i32");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4058,7 +4895,7 @@ test "parseConstantDeclaration: rejects a missing equals sign" {
 test "parseConstantDeclaration: rejects a missing value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const write =\nfn main(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("const write =\nfn main() = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4069,7 +4906,7 @@ test "parseConstantDeclaration: rejects a missing value" {
 test "parseStructDefinition: parses fields in an indented block" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct Point:\n    x: i32\n    y: f64");
+    var lexer = @import("lexer.zig").Lexer.init("struct Point\n    x: i32\n    y: f64");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4085,10 +4922,21 @@ test "parseStructDefinition: parses fields in an indented block" {
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, fields[1].location);
 }
 
+test "opensHeaderBlock: rejects a colon after the name of a struct" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("struct Card:\n    value: i32");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.HeaderColon, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, parser.failure.?.location.?);
+}
+
 test "parseStructDefinition: accepts a reserved word as the name of a struct and of an enum and an error set" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct match:\n    value: i32\nenum case:\n    first\nerror for:\n    second");
+    var lexer = @import("lexer.zig").Lexer.init("struct match\n    value: i32\nenum case\n    first\nerror for\n    second");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4101,7 +4949,7 @@ test "parseStructDefinition: accepts a reserved word as the name of a struct and
 test "parseStructDefinition: rejects a reserved word as the name of a field" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct Point:\n    match: i32");
+    var lexer = @import("lexer.zig").Lexer.init("struct Point\n    match: i32");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4112,7 +4960,7 @@ test "parseStructDefinition: rejects a reserved word as the name of a field" {
 test "parseEnumDefinition: rejects a reserved word as the name of a case" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("enum Token:\n    match");
+    var lexer = @import("lexer.zig").Lexer.init("enum Token\n    match");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4123,7 +4971,7 @@ test "parseEnumDefinition: rejects a reserved word as the name of a case" {
 test "parseStructDefinition: parses a struct without fields" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct Marker\nfn main(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("struct Marker\nfn main() = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4135,7 +4983,7 @@ test "parseStructDefinition: parses a struct without fields" {
 test "parseStructDefinition: parses an external struct" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("external struct Point:\n    x: i32\nstruct Line:\n    start: Point");
+    var lexer = @import("lexer.zig").Lexer.init("external struct Point\n    x: i32\nstruct Line\n    start: Point");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4150,18 +4998,18 @@ test "parseStructDefinition: parses an external struct" {
 test "parseStructDefinition: rejects a struct without a name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct:\n    x: i32");
+    var lexer = @import("lexer.zig").Lexer.init("struct\n    x: i32");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 7 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
 }
 
 test "parseEnumDefinition: parses cases with and without values and the functions of the block" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("enum Token:\n    number: i64\n    word: bool\n    end\n    fn is_end(self: Self) -> bool: return self == Token::end\n");
+    var lexer = @import("lexer.zig").Lexer.init("enum Token\n    number: i64\n    word: bool\n    end\n    fn is_end(self: Self) -> bool = return self == Token::end\n");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4179,7 +5027,7 @@ test "parseEnumDefinition: parses cases with and without values and the function
 test "parseEnumDefinition: parses an error set with and without cases" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("error ParseError:\n    missing_end\n    unexpected: [usize, usize]\nerror Never");
+    var lexer = @import("lexer.zig").Lexer.init("error ParseError\n    missing_end\n    unexpected: [usize, usize]\nerror Never");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4196,7 +5044,7 @@ test "parseEnumDefinition: parses an error set with and without cases" {
 test "parseEnumDefinition: rejects a function in an error set" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("error ParseError:\n    missing_end\n    fn show(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("error ParseError\n    missing_end\n    fn show() = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4224,14 +5072,14 @@ test "parseMembers: rejects a field on the line of the colon" {
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
-    try std.testing.expectError(error.ExpectedBlock, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
+    try std.testing.expectError(error.HeaderColon, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, parser.failure.?.location.?);
 }
 
 test "parseMembers: rejects a line that is not a field" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct Point:\n    noop");
+    var lexer = @import("lexer.zig").Lexer.init("struct Point\n    noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4242,7 +5090,7 @@ test "parseMembers: rejects a line that is not a field" {
 test "parseMembers: lists a method of a struct as a declaration on the struct" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct Card:\n    question: []Const(u8)\n\n    fn show(self: Self) -> []Const(u8): return self.question");
+    var lexer = @import("lexer.zig").Lexer.init("struct Card\n    question: []Const(u8)\n\n    fn show(self: Self) -> []Const(u8) = return self.question");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4262,7 +5110,7 @@ test "parseMembers: lists a method of a struct as a declaration on the struct" {
 test "parseMembers: parses a field after a method with an indented body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct Card:\n    fn show(self: Self) -> []Const(u8):\n        return self.question\n    question: []Const(u8)\nfn main(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("struct Card\n    fn show(self: Self) -> []Const(u8)\n        return self.question\n    question: []Const(u8)\nfn main() = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4275,7 +5123,7 @@ test "parseMembers: parses a field after a method with an indented body" {
 test "parseField: parses a default value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct Point:\n    x: i32 = 0\n    y: i32");
+    var lexer = @import("lexer.zig").Lexer.init("struct Point\n    x: i32 = 0\n    y: i32");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4288,7 +5136,7 @@ test "parseField: parses a default value" {
 test "parseField: rejects an equals sign without a value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct Point:\n    x: i32 =\nfn main(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("struct Point\n    x: i32 =\nfn main() = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4299,7 +5147,7 @@ test "parseField: rejects an equals sign without a value" {
 test "parseTypedName: rejects a missing colon" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn add(left i32) -> i32: return 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn add(left i32) -> i32 = return 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4310,7 +5158,7 @@ test "parseTypedName: rejects a missing colon" {
 test "parseTypedName: rejects a name without a type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct Point:\n    x:\n");
+    var lexer = @import("lexer.zig").Lexer.init("struct Point\n    x:\n");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4321,7 +5169,7 @@ test "parseTypedName: rejects a name without a type" {
 test "parseTypedName: rejects a missing type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn add(left: ) -> i32: return 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn add(left: ) -> i32 = return 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4332,7 +5180,7 @@ test "parseTypedName: rejects a missing type" {
 test "parseTypeclassDefinition: parses the functions of a typeclass" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn grow(self: T, amount: i32) -> i32");
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Shape(type T)\n    fn area(self: T) -> i32\n    fn grow(self: T, amount: i32) -> i32");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4348,7 +5196,7 @@ test "parseTypeclassDefinition: parses the functions of a typeclass" {
 test "parseTypeclassDefinition: parses the parameter of a typeclass and the receivers of its methods" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("typeclass Shape(type T):\n    fn area(shape: T) -> i32\n    fn grow(shape: *T)\n    fn read(shape: *Const(T)) -> i32\n    fn make(side: i32) -> T");
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Shape(type T)\n    fn area(shape: T) -> i32\n    fn grow(shape: *T)\n    fn read(shape: *Const(T)) -> i32\n    fn make(side: i32) -> T");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4364,18 +5212,18 @@ test "parseTypeclassDefinition: parses the parameter of a typeclass and the rece
 test "parseTypeclassDefinition: rejects a typeclass without parameters" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("typeclass Shape:\n    fn area(shape: Shape) -> i32");
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Shape\n    fn area(shape: Shape) -> i32");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedLeftParenthesis, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
 }
 
 test "parseTypeclassDefinition: rejects a parameter that is not a type parameter" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("typeclass Shape(T):\n    fn area(shape: T) -> i32");
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Shape(T)\n    fn area(shape: T) -> i32");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4386,7 +5234,7 @@ test "parseTypeclassDefinition: rejects a parameter that is not a type parameter
 test "parseTypeclassDefinition: parses several parameters and type constructors" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("typeclass Map(type K, type F(type, type), type V):\n    fn get(map: K) -> V");
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Map(type K, type F(type, type), type V)\n    fn get(map: K) -> V");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4401,7 +5249,7 @@ test "parseTypeclassDefinition: parses several parameters and type constructors"
 test "parseTypeclassDefinition: parses the requirement of a parameter" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("typeclass Ord(type T: Eq):\n    fn less(one: T, two: T) -> bool");
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Ord(type T: Eq)\n    fn less(one: T, two: T) -> bool");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4413,7 +5261,7 @@ test "parseTypeclassDefinition: parses the requirement of a parameter" {
 test "parseTypeclassDefinition: parses a function that is not a method" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("typeclass Shape(type T):\n    fn new() -> T");
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Shape(type T)\n    fn new() -> T");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4427,7 +5275,7 @@ test "parseTypeclassDefinition: parses a function that is not a method" {
 test "parseTypeclassDefinition: parses a function with a body as a default" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn double(self: T) -> i32:\n        return self.area() * 2");
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Shape(type T)\n    fn area(self: T) -> i32\n    fn double(self: T) -> i32\n        return self.area() * 2");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4444,7 +5292,7 @@ test "parseTypeclassDefinition: parses a function with a body as a default" {
 test "parseTypeclassDefinition: parses an inline default implementation" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("typeclass Show(type T):\n    fn show(value: T) -> i32\n    inline fn twice(value: T) -> i32: return 2");
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Show(type T)\n    fn show(value: T) -> i32\n    inline fn twice(value: T) -> i32 = return 2");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4458,7 +5306,7 @@ test "parseTypeclassDefinition: parses an inline default implementation" {
 test "parseTypeclassDefinition: rejects an inline function without a body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("typeclass Show(type T):\n    inline fn show(value: T) -> i32");
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Show(type T)\n    inline fn show(value: T) -> i32");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4469,7 +5317,7 @@ test "parseTypeclassDefinition: rejects an inline function without a body" {
 test "parseInstance: lists the functions of an instance as declarations" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("instance Shape([]Const(u8)):\n    fn area(self: []Const(u8)) -> i32: return 0");
+    var lexer = @import("lexer.zig").Lexer.init("instance Shape([]Const(u8))\n    fn area(self: []Const(u8)) -> i32 = return 0");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4486,7 +5334,7 @@ test "parseInstance: lists the functions of an instance as declarations" {
 test "parseInstance: parses an inline function in an instance" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("typeclass Show(type T):\n    fn show(value: T) -> i32\ninstance Show(i32):\n    inline fn show(value: i32) -> i32: return value");
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Show(type T)\n    fn show(value: T) -> i32\ninstance Show(i32)\n    inline fn show(value: i32) -> i32 = return value");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4527,7 +5375,7 @@ test "parseInstance: parses the parameters of a generic instance and several arg
 test "parseInstance: rejects a type without parentheses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("instance Shape Square:");
+    var lexer = @import("lexer.zig").Lexer.init("instance Shape Square");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4580,7 +5428,7 @@ test "parseImport: rejects a missing path" {
 test "parseImport: rejects a missing name after as" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("import mn::io::stdout as\nfn main(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("import mn::io::stdout as\nfn main() = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4602,7 +5450,7 @@ test "parseImport: rejects a reserved word as the name" {
 test "expectBlock: rejects empty block" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn one():\nfn two(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn one()\nfn two() = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4613,7 +5461,7 @@ test "expectBlock: rejects empty block" {
 test "expectBlock: rejects a nested block that is not indented more than its line" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while running:\n    step()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match value\n    case (first) step()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4624,7 +5472,7 @@ test "expectBlock: rejects a nested block that is not indented more than its lin
 test "matchBlockLine: rejects line deeper than the first" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n  noop\n    noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n  noop\n    noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4635,7 +5483,7 @@ test "matchBlockLine: rejects line deeper than the first" {
 test "matchBlockLine: rejects a dedent that matches no outer level" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    noop\n  noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    noop\n  noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4646,7 +5494,7 @@ test "matchBlockLine: rejects a dedent that matches no outer level" {
 test "matchBlockLine: rejects a dedent between two nested levels" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while running:\n        step()\n      stop()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while running\n        step()\n      stop()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4657,7 +5505,7 @@ test "matchBlockLine: rejects a dedent between two nested levels" {
 test "parseExpression: ends a range after the operations on its bounds" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    for index in 0..count + 1: step(index)\n    const range = (0..3)\n    take(range)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    for (index in 0..count + 1) step(index)\n    const range = (0..3)\n    take(range)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4670,7 +5518,7 @@ test "parseExpression: ends a range after the operations on its bounds" {
 test "parseBinary: rejects a range as the left operand" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    const value = (0..3) + 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const value = (0..3) + 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4681,7 +5529,7 @@ test "parseBinary: rejects a range as the left operand" {
 test "parseBinary: rejects a range as the right operand" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    const value = 1 + (0..3)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const value = 1 + (0..3)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4692,7 +5540,7 @@ test "parseBinary: rejects a range as the right operand" {
 test "parsePrefix: rejects a range as the operand of a unary operator" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    const value = !(0..3)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const value = !(0..3)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4703,7 +5551,7 @@ test "parsePrefix: rejects a range as the operand of a unary operator" {
 test "parsePostfix: rejects a field of a range" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    const value = (0..3).start");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const value = (0..3).start");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4714,7 +5562,7 @@ test "parsePostfix: rejects a field of a range" {
 test "parseExpression: parses each literal kind" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn one() -> u8: return 0xff_u8\nfn two() -> f64: return 2.5\nfn three() -> bool: return true\nfn four() -> bool: return false");
+    var lexer = @import("lexer.zig").Lexer.init("fn one() -> u8 = return 0xff_u8\nfn two() -> f64 = return 2.5\nfn three() -> bool = return true\nfn four() -> bool = return false");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4730,7 +5578,7 @@ test "parseExpression: parses each literal kind" {
 test "parseExpression: parses a string literal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn greeting() -> []Const(u8): return \"hello\"");
+    var lexer = @import("lexer.zig").Lexer.init("fn greeting() -> []Const(u8) = return \"hello\"");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4741,7 +5589,7 @@ test "parseExpression: parses a string literal" {
 test "parseExpression: parses null" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn nothing() -> ?i32: return null");
+    var lexer = @import("lexer.zig").Lexer.init("fn nothing() -> ?i32 = return null");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4753,7 +5601,7 @@ test "parseExpression: parses null" {
 test "parseExpression: parses a parameter reference" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn same(value: i32) -> i32: return value");
+    var lexer = @import("lexer.zig").Lexer.init("fn same(value: i32) -> i32 = return value");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4764,7 +5612,7 @@ test "parseExpression: parses a parameter reference" {
 test "parseExpression: binds and tighter than or" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> bool: return a or b and c");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> bool = return a or b and c");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4778,7 +5626,7 @@ test "parseExpression: binds and tighter than or" {
 test "parseExpression: parses operators in conditions, arguments and literal elements" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    while a < b: log(a + b, {a * b})");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while (a < b) log(a + b, {a * b})");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4794,7 +5642,7 @@ test "parseExpression: parses operators in conditions, arguments and literal ele
 test "parseExpression: parses a range outside a for as a whole expression" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    const range = 1 + 2..count\n    const open = start..\n    noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const range = 1 + 2..count\n    const open = start..\n    noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4809,7 +5657,7 @@ test "parseExpression: parses a range outside a for as a whole expression" {
 test "parseAnd: binds a prefix operator tighter than and" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> bool: return !a and b");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> bool = return !a and b");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4823,7 +5671,7 @@ test "parseAnd: binds a prefix operator tighter than and" {
 test "parseComparison: binds bitwise operators tighter than a comparison" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> bool: return a | b == c");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> bool = return a | b == c");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4832,13 +5680,13 @@ test "parseComparison: binds bitwise operators tighter than a comparison" {
     try std.testing.expectEqual(ast.BinaryOperator.equal, value.kind.binary.operator);
     try std.testing.expectEqual(ast.BinaryOperator.bitwise_or, value.kind.binary.left.kind.binary.operator);
     try std.testing.expectEqualStrings("c", value.kind.binary.right.kind.identifier.name);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 30 }, value.kind.binary.operator_location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 31 }, value.kind.binary.operator_location);
 }
 
 test "parseComparison: binds orelse tighter than a comparison" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> bool: return a orelse b == c");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> bool = return a orelse b == c");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4851,18 +5699,7 @@ test "parseComparison: binds orelse tighter than a comparison" {
 test "parseComparison: rejects a chained comparison" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> bool: return a < b < c");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.ChainedComparison, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 30 }, parser.failure.?.location.?);
-}
-
-test "parseComparison: rejects a chained equality" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> bool: return a == b != c");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> bool = return a < b < c");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -4870,10 +5707,21 @@ test "parseComparison: rejects a chained equality" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 31 }, parser.failure.?.location.?);
 }
 
+test "parseComparison: rejects a chained equality" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> bool = return a == b != c");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ChainedComparison, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 32 }, parser.failure.?.location.?);
+}
+
 test "parseComparison: parses a comparison in parentheses as an operand of a comparison" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> bool: return (a < b) == c");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> bool = return (a < b) == c");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4886,7 +5734,7 @@ test "parseComparison: parses a comparison in parentheses as an operand of a com
 test "parseOrElse: takes a return as the fallback" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return a orelse return 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return a orelse return 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4895,13 +5743,13 @@ test "parseOrElse: takes a return as the fallback" {
     try std.testing.expectEqual(ast.BinaryOperator.@"orelse", value.kind.binary.operator);
     const fallback = value.kind.binary.right.kind.jump;
     try std.testing.expectEqualStrings("1", fallback.kind.@"return".?.kind.integer_literal.text);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 32 }, fallback.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 33 }, fallback.location);
 }
 
 test "parseOrElse: binds bitwise or tighter than orelse" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return a | b orelse c | d");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return a | b orelse c | d");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4915,7 +5763,7 @@ test "parseOrElse: binds bitwise or tighter than orelse" {
 test "parseOrElse: parses catch at the level of orelse" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return a | b catch c orelse d");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return a | b catch c orelse d");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4930,7 +5778,7 @@ test "parseOrElse: parses catch at the level of orelse" {
 test "parseOrElse: groups a chain of orelse from the left" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return a orelse b orelse c");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return a orelse b orelse c");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4960,7 +5808,7 @@ test "parseResultType: binds || tighter than ! and ! tighter than catch" {
 test "parseBitwiseOr: binds exclusive or tighter than or" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return a | b ^ c");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return a | b ^ c");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4973,7 +5821,7 @@ test "parseBitwiseOr: binds exclusive or tighter than or" {
 test "parseBitwiseExclusiveOr: binds and tighter than exclusive or" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return a ^ b & c");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return a ^ b & c");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4986,7 +5834,7 @@ test "parseBitwiseExclusiveOr: binds and tighter than exclusive or" {
 test "parseBitwiseAnd: binds shifts tighter than and" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return a & b << c");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return a & b << c");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -4999,7 +5847,7 @@ test "parseBitwiseAnd: binds shifts tighter than and" {
 test "parseShift: binds addition tighter than a shift" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return a + b >> c");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return a + b >> c");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5013,7 +5861,7 @@ test "parseShift: binds addition tighter than a shift" {
 test "parseAdditive: binds multiplication tighter than addition" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return a + b * c");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return a + b * c");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5022,14 +5870,14 @@ test "parseAdditive: binds multiplication tighter than addition" {
     try std.testing.expectEqual(ast.BinaryOperator.add, value.kind.binary.operator);
     try std.testing.expectEqualStrings("a", value.kind.binary.left.kind.identifier.name);
     try std.testing.expectEqual(ast.BinaryOperator.multiply, value.kind.binary.right.kind.binary.operator);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, value.location);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, value.kind.binary.operator_location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, value.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, value.kind.binary.operator_location);
 }
 
 test "parseAdditive: groups operators of one level from the left" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return a - b - c");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return a - b - c");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5045,7 +5893,7 @@ test "parseAdditive: groups operators of one level from the left" {
 test "parseMultiplicative: binds a prefix operator tighter than multiplication" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return -a * b % c");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return -a * b % c");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5060,7 +5908,7 @@ test "parseMultiplicative: binds a prefix operator tighter than multiplication" 
 test "parseBinary: rejects an operator without a right operand" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return a +\nfn main(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return a +\nfn main() = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -5071,7 +5919,7 @@ test "parseBinary: rejects an operator without a right operand" {
 test "parsePrefix: parses a minus before a name as a negation" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return -limit");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return -limit");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5079,13 +5927,13 @@ test "parsePrefix: parses a minus before a name as a negation" {
     const value = module.declarations[0].kind.function_definition.body[0].kind.@"return".?;
     try std.testing.expectEqual(ast.UnaryOperator.negate, value.kind.unary.operator);
     try std.testing.expectEqualStrings("limit", value.kind.unary.operand.kind.identifier.name);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, value.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, value.location);
 }
 
 test "parsePrefix: keeps a minus before a number as part of the literal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return a - -5");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return a - -5");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5098,7 +5946,7 @@ test "parsePrefix: keeps a minus before a number as part of the literal" {
 test "parsePrefix: parses a prefix operator on a prefix operator" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return ~-a");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return ~-a");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5111,7 +5959,7 @@ test "parsePrefix: parses a prefix operator on a prefix operator" {
 test "parsePrefix: binds a field access tighter than a prefix operator" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return -point.x");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return -point.x");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5124,20 +5972,20 @@ test "parsePrefix: binds a field access tighter than a prefix operator" {
 test "parsePrefix: parses an ampersand before a name as an address" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> *i32: return &value");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> *i32 = return &value");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const value = module.declarations[0].kind.function_definition.body[0].kind.@"return".?;
     try std.testing.expectEqualStrings("value", value.kind.address_of.kind.identifier.name);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, value.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, value.location);
 }
 
 test "parsePrefix: takes the address of an element instead of indexing an address" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> *i32: return &values[1]");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> *i32 = return &values[1]");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5150,7 +5998,7 @@ test "parsePrefix: takes the address of an element instead of indexing an addres
 test "parsePrefix: binds indexing tighter than a minus" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return -values[1]");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return -values[1]");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5163,7 +6011,7 @@ test "parsePrefix: binds indexing tighter than a minus" {
 test "parsePrefix: parses an ampersand after a bitwise and as an address" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return mask & &value");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return mask & &value");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5176,7 +6024,7 @@ test "parsePrefix: parses an ampersand after a bitwise and as an address" {
 test "parsePrefix: applies a method call after a negative literal to the literal" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return -5.abs()");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return -5.abs()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5190,18 +6038,18 @@ test "parsePrefix: applies a method call after a negative literal to the literal
 test "parsePrefix: rejects an operator without an operand" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> bool: return !");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> bool = return !");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, parser.failure.?.location.?);
 }
 
 test "parseTry: binds try to its operand before a binary operator" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return try first() + try second()");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return try first() + try second()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5215,7 +6063,7 @@ test "parseTry: binds try to its operand before a binary operator" {
 test "parseJumpExpression: gives a return the rest of the expression as its value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return a orelse return b orelse c");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return a orelse return b orelse c");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5229,7 +6077,7 @@ test "parseJumpExpression: gives a return the rest of the expression as its valu
 test "parseJumpExpression: parses a return without a value before a closing parenthesis" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f(): g(a orelse return)");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() = g(a orelse return)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5242,7 +6090,7 @@ test "parseJumpExpression: parses a return without a value before a closing pare
 test "parseJumpExpression: parses break and continue with a label" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f():\n    const a = b orelse break @outer\n    const c = d orelse continue");
+    var lexer = @import("lexer.zig").Lexer.init("fn f()\n    const a = b orelse break @outer\n    const c = d orelse continue");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5257,26 +6105,26 @@ test "parseJumpExpression: parses break and continue with a label" {
 test "parseJumpExpression: rejects a label without the at sign" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f(): const a = b orelse break outer");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() = const a = b orelse break outer");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.LabelWithoutSigil, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 34 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 35 }, parser.failure.?.location.?);
 }
 
 test "parsePostfix: parses a chain of field accesses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): log(line.start.x)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = log(line.start.x)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const outer = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call.arguments[0].value;
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, outer.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 17 }, outer.location);
     try std.testing.expectEqualStrings("x", outer.kind.field_access.field);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 27 }, outer.kind.field_access.field_location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, outer.kind.field_access.field_location);
     const inner = outer.kind.field_access.value.kind.field_access;
     try std.testing.expectEqualStrings("start", inner.field);
     try std.testing.expectEqualStrings("line", inner.value.kind.identifier.name);
@@ -5285,7 +6133,7 @@ test "parsePostfix: parses a chain of field accesses" {
 test "parsePostfix: parses a field access on a call" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): log(make().x)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = log(make().x)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5298,7 +6146,7 @@ test "parsePostfix: parses a field access on a call" {
 test "parsePostfix: parses an element of an element" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return grid[1][2]");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return grid[1][2]");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5313,7 +6161,7 @@ test "parsePostfix: parses an element of an element" {
 test "parsePostfix: parses a field of an element" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return points[1].x");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return points[1].x");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5326,7 +6174,7 @@ test "parsePostfix: parses a field of an element" {
 test "parsePostfix: parses a field after a dereference" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return pointer.*.x");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return pointer.*.x");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5339,7 +6187,7 @@ test "parsePostfix: parses a field after a dereference" {
 test "parsePostfix: binds an unwrap tighter than a prefix operator and before a field access" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return -value.?.count");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return -value.?.count");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5353,7 +6201,7 @@ test "parsePostfix: binds an unwrap tighter than a prefix operator and before a 
 test "parseStructType: parses the fields and functions of a struct without a name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn List(type T) -> type:\n    return struct:\n        first: T\n        fn get(self: Self) -> T: return self.first\n    noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn List(type T) -> type\n    return struct\n        first: T\n        fn get(self: Self) -> T = return self.first\n    noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5369,10 +6217,23 @@ test "parseStructType: parses the fields and functions of a struct without a nam
     try std.testing.expectEqual(1, module.declarations.len);
 }
 
+test "parseStructType: gives the block of a return line to a struct without a name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn List(type T) -> type\n    return struct\n        items: []T");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const struct_type = body[0].kind.@"return".?.kind.struct_type;
+    try std.testing.expectEqualStrings("items", struct_type.fields[0].name);
+}
+
 test "parseCompositeLiteral: parses an array literal over several lines" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const values: [2]i32 = {\n    1,\n    2,\n}\nfn main(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("const values: [2]i32 = {\n    1,\n    2,\n}\nfn main() = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5453,7 +6314,7 @@ test "parseCompositeLiteral: parses empty braces" {
 test "parseCompositeLiteral: parses an array literal followed by a slice" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): take([2]i32{1, 2}[..])");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = take([2]i32{1, 2}[..])");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5477,7 +6338,7 @@ test "parseCompositeLiteral: rejects a missing closing brace" {
 test "parseCompositeLiteral: parses a name written before the braces" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn make() -> Values: return Values{1, 2}");
+    var lexer = @import("lexer.zig").Lexer.init("fn make() -> Values = return Values{1, 2}");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5490,20 +6351,20 @@ test "parseCompositeLiteral: parses a name written before the braces" {
 test "parseCompositeLiteral: parses a path written before the braces" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn make() -> pairs::Pair: return pairs::Pair{1, true}");
+    var lexer = @import("lexer.zig").Lexer.init("fn make() -> pairs::Pair = return pairs::Pair{1, true}");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const value = module.declarations[0].kind.function_definition.body[0].kind.@"return".?;
     try std.testing.expectEqual(2, value.kind.composite_literal.type.?.kind.path_expression.path.len);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 34 }, value.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 35 }, value.location);
 }
 
 test "parseCompositeLiteral: parses named values after a struct type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn make() -> Data: return Data{two = 2, one = 1}");
+    var lexer = @import("lexer.zig").Lexer.init("fn make() -> Data = return Data{two = 2, one = 1}");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5514,14 +6375,14 @@ test "parseCompositeLiteral: parses named values after a struct type" {
     try std.testing.expectEqualStrings("two", literal.elements[0].name.?);
     try std.testing.expectEqualStrings("2", literal.elements[0].value.kind.integer_literal.text);
     try std.testing.expectEqualStrings("one", literal.elements[1].name.?);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 41 }, literal.elements[1].location);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 27 }, value.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 42 }, literal.elements[1].location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, value.location);
 }
 
 test "parseCompositeLiteral: parses named values without a type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn make() -> Data: return {one = 1, two = 2}");
+    var lexer = @import("lexer.zig").Lexer.init("fn make() -> Data = return {one = 1, two = 2}");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5532,13 +6393,13 @@ test "parseCompositeLiteral: parses named values without a type" {
     try std.testing.expectEqualStrings("one", literal.elements[0].name.?);
     try std.testing.expectEqualStrings("two", literal.elements[1].name.?);
     try std.testing.expectEqualStrings("2", literal.elements[1].value.kind.integer_literal.text);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 27 }, value.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, value.location);
 }
 
 test "parseCompositeLiteral: parses named values over several lines with a trailing comma" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const data: Data = Data{\n    one = 0,\n    two = 0,\n}\nfn main(): noop");
+    var lexer = @import("lexer.zig").Lexer.init("const data: Data = Data{\n    one = 0,\n    two = 0,\n}\nfn main() = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5552,23 +6413,23 @@ test "parseCompositeLiteral: parses named values over several lines with a trail
 test "parseCompositeLiteral: rejects an unnamed value after a named value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn make() -> Data: return Data{one = 1, 2}");
+    var lexer = @import("lexer.zig").Lexer.init("fn make() -> Data = return Data{one = 1, 2}");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.MixedNamedValues, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 41 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 42 }, parser.failure.?.location.?);
 }
 
 test "parseCompositeLiteral: rejects a named value after an unnamed value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn make() -> Data: return {1, two = 2}");
+    var lexer = @import("lexer.zig").Lexer.init("fn make() -> Data = return {1, two = 2}");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.MixedNamedValues, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 31 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 32 }, parser.failure.?.location.?);
 }
 
 test "parseBrackets: parses an array type" {
@@ -5600,7 +6461,7 @@ test "parseBrackets: parses an array type with a length to infer" {
 test "parseBrackets: reads brackets with two types as a tuple type when a type follows" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(pair: [i32, bool] value: i32): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(pair: [i32, bool] value: i32) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -5622,7 +6483,7 @@ test "parseBrackets: rejects a missing closing bracket" {
 test "parseBrackets: parses a slice type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: []u8): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: []u8) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5636,7 +6497,7 @@ test "parseBrackets: parses a slice type" {
 test "parseBrackets: parses a constant slice type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: []Const(u8)): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: []Const(u8)) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5650,7 +6511,7 @@ test "parseBrackets: parses a constant slice type" {
 test "parseBrackets: parses an array of pointers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(values: [2]*i32): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(values: [2]*i32) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5663,7 +6524,7 @@ test "parseBrackets: parses an array of pointers" {
 test "parseBrackets: parses a tuple type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(pair: [i32, bool]): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(pair: [i32, bool]) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5678,7 +6539,7 @@ test "parseBrackets: parses a tuple type" {
 test "parseBrackets: parses a tuple type with a trailing comma" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(pair: [i32, bool,]): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(pair: [i32, bool,]) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5690,7 +6551,7 @@ test "parseBrackets: parses a tuple type with a trailing comma" {
 test "parseBrackets: parses one type in brackets as a tuple type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(value: [i32]): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: [i32]) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5705,7 +6566,7 @@ test "parseBrackets: parses one type in brackets as a tuple type" {
 test "parseBrackets: parses empty brackets as the empty tuple type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(value: []): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: []) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5718,7 +6579,7 @@ test "parseBrackets: parses empty brackets as the empty tuple type" {
 test "parseBrackets: parses a name in brackets followed by a type as an array type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(values: [count]i32): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(values: [count]i32) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5732,7 +6593,7 @@ test "parseBrackets: parses a name in brackets followed by a type as an array ty
 test "parseBrackets: reads brackets with a trailing comma as a tuple type when a type follows" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(values: [4,]i32): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(values: [4,]i32) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -5743,7 +6604,7 @@ test "parseBrackets: reads brackets with a trailing comma as a tuple type when a
 test "parseBrackets: rejects const after empty brackets and names the new form" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: []const u8): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: []const u8) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -5754,7 +6615,7 @@ test "parseBrackets: rejects const after empty brackets and names the new form" 
 test "parseBrackets: rejects Many after empty brackets" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: []Many(u8)): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: []Many(u8)) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -5765,7 +6626,7 @@ test "parseBrackets: rejects Many after empty brackets" {
 test "parseBrackets: rejects Const inside the Const of a slice" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: []Const(Const(u8))): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: []Const(Const(u8))) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -5776,7 +6637,7 @@ test "parseBrackets: rejects Const inside the Const of a slice" {
 test "parsePointerType: rejects const after an asterisk and names the new form" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(card: *const Card): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(card: *const Card) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -5787,7 +6648,7 @@ test "parsePointerType: rejects const after an asterisk and names the new form" 
 test "parsePointerType: rejects many after an asterisk and names the new form" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: *many u8): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: *many u8) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -5798,7 +6659,7 @@ test "parsePointerType: rejects many after an asterisk and names the new form" {
 test "parsePointerType: rejects many const after an asterisk" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: *many const u8): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: *many const u8) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -5809,7 +6670,7 @@ test "parsePointerType: rejects many const after an asterisk" {
 test "parsePointerType: rejects Const around Many" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: *Const(Many(u8))): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(bytes: *Const(Many(u8))) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -5820,7 +6681,7 @@ test "parsePointerType: rejects Const around Many" {
 test "parsePointerType: reads many as the name of a target type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(value: *many): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: *many) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5833,7 +6694,7 @@ test "parsePointerType: reads many as the name of a target type" {
 test "parsePointerType: parses Many and Const after an asterisk" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(a: *Many(Const(u8)), b: *Const(Card), c: *Many(i32), d: ?*Many(u8)): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(a: *Many(Const(u8)), b: *Const(Card), c: *Many(i32), d: ?*Many(u8)) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5853,7 +6714,7 @@ test "parsePointerType: parses Many and Const after an asterisk" {
 test "parseParentheses: reads one type in parentheses as that type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(value: (i32)): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: (i32)) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5865,7 +6726,7 @@ test "parseParentheses: reads one type in parentheses as that type" {
 test "parseParentheses: groups an expression" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return (a + b) * c");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return (a + b) * c");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5878,7 +6739,7 @@ test "parseParentheses: groups an expression" {
 test "parseParentheses: rejects a comma between types" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(pair: (i32, bool)): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(pair: (i32, bool)) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -5889,7 +6750,7 @@ test "parseParentheses: rejects a comma between types" {
 test "parseParentheses: rejects a comma after one type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(value: (i32,)): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: (i32,)) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -5900,7 +6761,7 @@ test "parseParentheses: rejects a comma after one type" {
 test "parseParentheses: rejects empty parentheses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(value: ()): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: ()) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -5911,7 +6772,7 @@ test "parseParentheses: rejects empty parentheses" {
 test "parsePointerType: parses a pointer to a single value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(value: *bool): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: *bool) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5927,7 +6788,7 @@ test "parsePointerType: parses a pointer to a single value" {
 test "parsePointerType: parses a read-only pointer to multiple values" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(values: *Many(Const(i32))): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(values: *Many(Const(i32))) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5942,7 +6803,7 @@ test "parsePointerType: parses a read-only pointer to multiple values" {
 test "parsePointerType: parses a pointer to a pointer" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(value: **Const(u8)): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: **Const(u8)) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5956,7 +6817,7 @@ test "parsePointerType: parses a pointer to a pointer" {
 test "parsePointerType: rejects a pointer without a target" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(value: *): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: *) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -5967,7 +6828,7 @@ test "parsePointerType: rejects a pointer without a target" {
 test "parseOptionalType: parses an optional type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(value: ?i32): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: ?i32) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5980,7 +6841,7 @@ test "parseOptionalType: parses an optional type" {
 test "parseOptionalType: parses an optional of an optional" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(value: ??*i32): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: ??*i32) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5993,7 +6854,7 @@ test "parseOptionalType: parses an optional of an optional" {
 test "parseOptionalType: rejects a question mark without a type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(value: ?): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: ?) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -6004,7 +6865,7 @@ test "parseOptionalType: rejects a question mark without a type" {
 test "parseFunctionType: parses the parameter types and the return type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn apply(callback: fn(i32, bool,) -> u8): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn apply(callback: fn(i32, bool,) -> u8) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6020,7 +6881,7 @@ test "parseFunctionType: parses the parameter types and the return type" {
 test "parseFunctionType: returns void when no return type is written" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn apply(callback: fn(i32), other: i32): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn apply(callback: fn(i32), other: i32) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6030,10 +6891,26 @@ test "parseFunctionType: returns void when no return type is written" {
     try std.testing.expectEqualStrings("other", parameters[1].name);
 }
 
+test "parseFunctionType: parses function types without parentheses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn take(callback: *fn -> i32, other: *fn) = noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const parameters = module.declarations[0].kind.function_definition.signature.parameters;
+    const callback = parameters[0].type.kind.pointer_type.target.kind.function_type;
+    try std.testing.expectEqual(0, callback.parameters.len);
+    try std.testing.expectEqualStrings("i32", callback.return_type.kind.identifier.name);
+    const other = parameters[1].type.kind.pointer_type.target.kind.function_type;
+    try std.testing.expectEqualStrings("void", other.return_type.kind.identifier.name);
+}
+
 test "parseFunctionType: parses an optional function type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn apply(callback: ?fn(i32) -> i32): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn apply(callback: ?fn(i32) -> i32) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6046,7 +6923,7 @@ test "parseFunctionType: parses an optional function type" {
 test "parseFunctionType: rejects a function type with a type but no arrow" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn apply(callback: fn(i32) i32): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn apply(callback: fn(i32) i32) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -6057,7 +6934,7 @@ test "parseFunctionType: rejects a function type with a type but no arrow" {
 test "parseCall: parses nested calls" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): log(add(1, 2))");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = log(add(1, 2))");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6072,13 +6949,13 @@ test "parseCall: parses nested calls" {
 test "parseCall: parses a path as the callee" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): mn::stdout::write(1)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = mn::stdout::write(1)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const expression = module.declarations[0].kind.function_definition.body[0].kind.call;
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, expression.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, expression.location);
     const call = expression.kind.call;
     const path = call.callee.path_expression.path;
     try std.testing.expectEqual(3, path.len);
@@ -6091,18 +6968,18 @@ test "parseCall: parses a path as the callee" {
 test "parseCall: rejects a missing closing parenthesis" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): log(1 2)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = log(1 2)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedRightParenthesis, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
 }
 
 test "parseNameExpression: parses a path used as a value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn value() -> i32: return utils::value");
+    var lexer = @import("lexer.zig").Lexer.init("fn value() -> i32 = return utils::value");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6116,7 +6993,7 @@ test "parseNameExpression: parses a path used as a value" {
 test "parsePathStart: parses a path that starts with the separator as a path from the module" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): ::match(::Point::new())");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = ::match(::Point::new())");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6134,12 +7011,12 @@ test "parsePathStart: parses a path that starts with the separator as a path fro
 test "parsePathStart: rejects a separator without a name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): ::(1)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = ::(1)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 15 }, parser.failure.?.location.?);
 }
 
 test "parsePath: rejects a separator without a name after it" {
@@ -6156,7 +7033,7 @@ test "parsePath: rejects a separator without a name after it" {
 test "expectName: accepts reserved words after the separator" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): mn::comptime::error(\"stop\")");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = mn::comptime::error(\"stop\")");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6169,20 +7046,20 @@ test "expectName: accepts reserved words after the separator" {
 test "parseNegation: wraps a number literal in a negation" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn value() -> i32: return -5");
+    var lexer = @import("lexer.zig").Lexer.init("fn value() -> i32 = return -5");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const value = module.declarations[0].kind.function_definition.body[0].kind.@"return".?;
     try std.testing.expectEqualStrings("5", value.kind.negation.kind.integer_literal.text);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 27 }, value.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, value.location);
 }
 
 test "parseNegation: allows a space before the number" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn value() -> f64: return - 2.5");
+    var lexer = @import("lexer.zig").Lexer.init("fn value() -> f64 = return - 2.5");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6194,7 +7071,7 @@ test "parseNegation: allows a space before the number" {
 test "parseNegation: rejects a minus before a literal that is not a number" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(value: *-true): noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn show(value: *-true) = noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -6205,7 +7082,7 @@ test "parseNegation: rejects a minus before a literal that is not a number" {
 test "parseArguments: accepts a trailing comma" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): log(1, 2,)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = log(1, 2,)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6216,18 +7093,18 @@ test "parseArguments: accepts a trailing comma" {
 test "parseArguments: rejects a missing argument" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): log(1, , 2)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = log(1, , 2)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 20 }, parser.failure.?.location.?);
 }
 
 test "parseArgument: parses named arguments" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): log(Point{x = 1, y = 2}, 3)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = log(Point{x = 1, y = 2}, 3)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6238,24 +7115,24 @@ test "parseArgument: parses named arguments" {
     try std.testing.expectEqualStrings("x", inner.elements[0].name.?);
     try std.testing.expectEqualStrings("1", inner.elements[0].value.kind.integer_literal.text);
     try std.testing.expectEqualStrings("y", inner.elements[1].name.?);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 29 }, inner.elements[1].location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 30 }, inner.elements[1].location);
 }
 
 test "parseArgument: rejects a name without a value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): log(Point{x = })");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = log(Point{x = })");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 27 }, parser.failure.?.location.?);
 }
 
 test "parseMemberCall: parses a call to a function of a type that a call gives" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): _ = List(i32)::new(1)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = _ = List(i32)::new(1)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6270,7 +7147,7 @@ test "parseMemberCall: parses a call to a function of a type that a call gives" 
 test "parseMemberCall: parses a literal of a type that a call gives" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main():\n    const list = List(i32){first = 1}\n    _ = list");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const list = List(i32){first = 1}\n    _ = list");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6283,7 +7160,7 @@ test "parseMemberCall: parses a literal of a type that a call gives" {
 test "parseMember: parses a method call" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): card.show(1)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = card.show(1)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6291,51 +7168,51 @@ test "parseMember: parses a method call" {
     const call = module.declarations[0].kind.function_definition.body[0].kind.call.kind.method_call;
     try std.testing.expectEqualStrings("card", call.receiver.kind.identifier.name);
     try std.testing.expectEqualStrings("show", call.name);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 17 }, call.name_location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, call.name_location);
     try std.testing.expectEqual(1, call.arguments.len);
 }
 
 test "parseMember: parses a dereference" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return pointer.*");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return pointer.*");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const value = module.declarations[0].kind.function_definition.body[0].kind.@"return".?;
     try std.testing.expectEqualStrings("pointer", value.kind.dereference.kind.identifier.name);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, value.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, value.location);
 }
 
 test "parseMember: parses an optional unwrap" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return value.?");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return value.?");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const value = module.declarations[0].kind.function_definition.body[0].kind.@"return".?;
     try std.testing.expectEqualStrings("value", value.kind.unwrap.kind.identifier.name);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, value.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, value.location);
 }
 
 test "parseMember: rejects a dot without a name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): log(point.)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = log(point.)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 22 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, parser.failure.?.location.?);
 }
 
 test "parseSubscript: parses an index" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32: return values[position]");
+    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return values[position]");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6343,13 +7220,13 @@ test "parseSubscript: parses an index" {
     const value = module.declarations[0].kind.function_definition.body[0].kind.@"return".?;
     try std.testing.expectEqualStrings("values", value.kind.index.value.kind.identifier.name);
     try std.testing.expectEqualStrings("position", value.kind.index.index.kind.identifier.name);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, value.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, value.location);
 }
 
 test "parseSubscript: parses a slice of a whole array" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): take(buffer[..])");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = take(buffer[..])");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6359,13 +7236,13 @@ test "parseSubscript: parses a slice of a whole array" {
     try std.testing.expectEqualStrings("buffer", slice.kind.slice.value.kind.identifier.name);
     try std.testing.expectEqual(null, slice.kind.slice.start);
     try std.testing.expectEqual(null, slice.kind.slice.end);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 17 }, slice.location);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, slice.location);
 }
 
 test "parseSubscript: parses a slice with a start and an end" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): take(values[1..3])");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = take(values[1..3])");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6378,7 +7255,7 @@ test "parseSubscript: parses a slice with a start and an end" {
 test "parseSubscript: parses a slice with only a start" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): take(values[start..])");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = take(values[start..])");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6391,7 +7268,7 @@ test "parseSubscript: parses a slice with only a start" {
 test "parseSubscript: parses a slice with only an end" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): take(values[..end])");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = take(values[..end])");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6404,7 +7281,7 @@ test "parseSubscript: parses a slice with only an end" {
 test "parseSubscript: parses a slice of a slice" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): take(values[1..][..2])");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = take(values[1..][..2])");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -6417,29 +7294,29 @@ test "parseSubscript: parses a slice of a slice" {
 test "parseSubscript: rejects a missing closing bracket" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): take(buffer[..)");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = take(buffer[..)");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedRightBracket, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 27 }, parser.failure.?.location.?);
 }
 
 test "parseSubscript: rejects brackets without an index" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): take(values[])");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = take(values[])");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, parser.failure.?.location.?);
 }
 
 test "parseBound: parses an operation as a bound" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main(): take(values[start + 1..end])");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = take(values[start + 1..end])");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);

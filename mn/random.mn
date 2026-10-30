@@ -1,24 +1,24 @@
 import mn
 import mn::math
 
-typeclass Generator(type G):
+typeclass Generator(type G)
     fn next(generator: *G) -> u64
-    fn range(generator: *G, range: mn::Range) -> usize:
+    fn range(generator: *G, range: mn::Range) -> usize
         const count = mn::convert(u64, range.end.? - range.start)
         const threshold = math::subtract_wrapping(0, count) % count
-        while true:
+        while true
             const bits = Generator::next(generator)
-            if bits >= threshold: return range.start + mn::convert(usize, bits % count)
+            if (bits >= threshold) return range.start + mn::convert(usize, bits % count)
 
-struct Xoshiro256:
+struct Xoshiro256
     state: [4]u64
 
-    fn new(seed: u64) -> Xoshiro256:
+    fn new(seed: u64) -> Xoshiro256
         var mixer = seed
         return Xoshiro256{state = {splitmix64(&mixer), splitmix64(&mixer), splitmix64(&mixer), splitmix64(&mixer)}}
 
-instance Generator(Xoshiro256):
-    fn next(generator: *Xoshiro256) -> u64:
+instance Generator(Xoshiro256)
+    fn next(generator: *Xoshiro256) -> u64
         const state = &generator.state
         const scaled = math::multiply_wrapping(state[1], 5)
         const result = math::multiply_wrapping((scaled << 7) | (scaled >> 57), 9)
@@ -33,7 +33,7 @@ instance Generator(Xoshiro256):
 
 const Default = Xoshiro256
 
-fn splitmix64(state: *u64) -> u64:
+fn splitmix64(state: *u64) -> u64
     state.* = math::add_wrapping(state.*, 0x9e3779b97f4a7c15)
     const mixed = math::multiply_wrapping(state.* ^ (state.* >> 30), 0xbf58476d1ce4e5b9)
     const scrambled = math::multiply_wrapping(mixed ^ (mixed >> 27), 0x94d049bb133111eb)

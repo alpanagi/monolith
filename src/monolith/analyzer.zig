@@ -107,18 +107,18 @@ test "collectCallTrace: lists the calls that created nested instances in order" 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn inner(comptime flag: bool):\n    if flag: mn::comptime::error(\"boom\")\nfn outer(comptime flag: bool): inner(flag)\nfn main(): outer(true)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn inner(comptime flag: bool)\n    if (flag) mn::comptime::error(\"boom\")\nfn outer(comptime flag: bool) = inner(flag)\nfn main() = outer(true)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.ComptimeError, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 14 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 15 }, analyzer.failure.?.location.?);
     const trace = try analyzer.collectCallTrace(arena.allocator(), analyzer.failure.?);
     try std.testing.expectEqual(2, trace.len);
-    try std.testing.expectEqual(token.Location{ .row = 4, .column = 32 }, trace[0].location);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 33 }, trace[0].location);
     try std.testing.expectEqual(1, trace[0].count);
-    try std.testing.expectEqual(token.Location{ .row = 5, .column = 12 }, trace[1].location);
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 13 }, trace[1].location);
     try std.testing.expectEqual(1, trace[1].count);
 }
 
@@ -132,18 +132,18 @@ test "collectCallTrace: folds a call repeated by recursive instances into one no
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn count(comptime n: usize):\n    if n == 0: mn::comptime::error(\"done\")\n    else: count(n - 1)\nfn main(): count(3)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn count(comptime n: usize)\n    if (n == 0) mn::comptime::error(\"done\")\n    else count(n - 1)\nfn main() = count(3)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.ComptimeError, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 16 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 17 }, analyzer.failure.?.location.?);
     const trace = try analyzer.collectCallTrace(arena.allocator(), analyzer.failure.?);
     try std.testing.expectEqual(2, trace.len);
-    try std.testing.expectEqual(token.Location{ .row = 4, .column = 11 }, trace[0].location);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 10 }, trace[0].location);
     try std.testing.expectEqual(3, trace[0].count);
-    try std.testing.expectEqual(token.Location{ .row = 5, .column = 12 }, trace[1].location);
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 13 }, trace[1].location);
     try std.testing.expectEqual(1, trace[1].count);
 }
 
@@ -157,12 +157,12 @@ test "collectCallTrace: gives no notes for an error outside an instance" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn main(): mn::comptime::error(\"plain\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn main() = mn::comptime::error(\"plain\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.ComptimeError, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 13 }, analyzer.failure.?.location.?);
     try std.testing.expectEqual(0, (try analyzer.collectCallTrace(arena.allocator(), analyzer.failure.?)).len);
 }

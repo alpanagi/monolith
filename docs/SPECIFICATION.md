@@ -85,24 +85,24 @@
 
 ### Function Types
 
-- A function type is written like a function signature without parameter names, e.g. `fn(i32, bool) -> i32` (see Functions). Functions exist only at compile time.
+- A function type is written like a function signature without parameter names, e.g. `fn(i32, bool) -> i32` (see Functions). Without parameters it has no parentheses, e.g. `fn -> i32` and `*fn`. Functions exist only at compile time.
 - A pointer to a function is written without `Const`, e.g. `*fn(i32, bool) -> i32`, since a function cannot be modified.
 
 ## Structs
 
-- A struct is a type with named fields. It is declared with `struct`, its name, and its fields in an indented block, each with a name and a type, e.g. `struct Point:` followed by the fields `x: i32` and `y: i32`.
+- A struct is a type with named fields. It is declared with `struct`, its name, and its fields in an indented block, each with a name and a type, e.g. `struct Point` followed by the fields `x: i32` and `y: i32`.
 - A struct without fields has no block, e.g. `struct Marker`.
 - Named structs are declared at the top level of a module.
 - Field names must be unique within a struct.
 - A field can have a default value after `=`, e.g. `count: u32 = 0`. The default must be known at compile time.
 - Two structs with the same fields are different types.
 - The compiler chooses the order of a struct's fields in memory.
-- `external struct` declares a struct whose layout the language does not manage: its fields stay in declaration order, and the target the program is generated for decides their alignment and padding, e.g. `external struct Point:`.
+- `external struct` declares a struct whose layout the language does not manage: its fields stay in declaration order, and the target the program is generated for decides their alignment and padding, e.g. `external struct Point`.
 - An external struct's fields are numbers, `bool`, pointers, optional pointers, function pointers, arrays of these and external structs.
 - A struct cannot hold a value of its own type, directly or through other structs, arrays or tuples. A pointer to its own type is allowed, e.g. `next: ?*Node`.
 - Structs are values. Assigning or passing a struct copies all its fields.
 - `value.field` gives a field of a struct.
-- A struct's block can also declare functions, e.g. `fn area(self: Self) -> i32: return self.side`. In the block, `Self` is the struct's type.
+- A struct's block can also declare functions, e.g. `fn area(self: Self) -> i32 = self.side`. In the block, `Self` is the struct's type.
 - A function in a struct's block is reached through the struct's name and `::`, e.g. `Square::new()`.
 - A function whose first parameter's type is written `Self`, `*Self` or `*Const(Self)` is a method. `value.name(arguments)` calls it with `value` as the first argument, e.g. `square.area()`.
 - When the first parameter is a pointer, the call takes the value's address automatically, e.g. `counter.increment()` passes `&counter`. It is allowed only where `&` is allowed, and `*Self` needs a pointer that can modify the value (see Pointer Operations).
@@ -112,7 +112,7 @@
 
 ## Enums
 
-- An enum is a type whose value is one of several cases. It is declared with `enum`, its name, and its cases in an indented block, e.g. `enum Token:` followed by `number: i64`, `name: []Const(u8)` and `end`.
+- An enum is a type whose value is one of several cases. It is declared with `enum`, its name, and its cases in an indented block, e.g. `enum Token` followed by `number: i64`, `name: []Const(u8)` and `end`.
 - A case can carry a value of the type written after `:`. A case without a type carries no value.
 - Case names must be unique within an enum.
 - `Enum::case` gives a case without a value, e.g. `Token::end`. `Enum::case(value)` gives a case with its value, e.g. `Token::number(42)`.
@@ -327,10 +327,14 @@
 
 ### Blocks
 
-- A block is a sequence of statements, one per line, indented deeper than the line that opens it. A block of one statement can follow the `:` on the same line, e.g. `fn one() -> u8: return 1`.
-- A block cannot be empty. `noop` is a statement that does nothing, e.g. `while running(): noop`.
+- A block is a sequence of statements, one per line, indented deeper than the line that opens it, e.g. `if count > limit` followed by an indented `trim(list)`. There is no `:` before a block.
+- Only these lines can open a block: `fn`, `struct`, `enum`, `error`, `typeclass`, `instance`, `if`, `else`, `while`, `for`, `match`, `case`, and a line whose value is an `if`, a `match` or a `struct` without a name. A deeper line after any other line is a compile-time error. Lines continued inside open brackets are not affected.
+- The block belongs to the statement that begins the line. When that statement cannot take a block, it belongs to the `if`, `match` or `struct` in its value, e.g. `const kind = match token` followed by its branches.
+- A header followed by a block runs to the end of its line and needs no parentheses, e.g. `while index < count`.
+- A block of one statement can follow on the same line instead. Then the header of `if`, `while`, `for` and `case` is in parentheses and the statement follows it, e.g. `if (byte_count == 0) return null`. The statement follows `else` directly, e.g. `else 20`, and a function's body follows `=`, e.g. `fn one -> u8 = 1`. `struct`, `enum`, `error`, `typeclass`, `instance` and `match` always take an indented block.
+- A block cannot be empty. `noop` is a statement that does nothing, e.g. `while (running()) noop`.
 - A name declared in a block can be used from its declaration to the end of the block.
-- A statement that can never run is a compile-time error, e.g. one after a `return`. Conditions are not evaluated at compile time for this, e.g. `return 2` after `if T == i32: return 1` can run.
+- A statement that can never run is a compile-time error, e.g. one after a `return`. Conditions are not evaluated at compile time for this, e.g. `return 2` after `if (T == i32) return 1` can run.
 
 ### Calls
 
@@ -351,7 +355,9 @@
 ### Return
 
 - `return value` ends the function and gives its result. A function without a return type uses `return` without a value.
-- Every path through a function with a return type must end with a `return`. A path that never ends, such as an endless loop, needs none.
+- In a function with a return type, the last line of the body can be an expression, which is the function's result, e.g. `fn add(a: i32, b: i32) -> i32` followed by an indented `a + b`. A `return` on the last line is also allowed.
+- Every path through a function with a return type must end with a `return` or with the body's last line giving the result. A path that never ends, such as an endless loop, needs none.
+- In a function without a return type, the last line is a statement like any other.
 
 ### Defer
 
@@ -364,58 +370,65 @@
 
 ### If
 
-- `if condition:` runs its block when the condition is true. The condition is a `bool`.
-- `else:` runs its block when the condition is false. It is on the line after the `if` block, at the same indentation as `if`.
-- `else if condition:` checks another condition when the previous ones are false, e.g. `if a:` followed by `else if b:` and `else:`.
-- A condition that is known at compile time as a whole is evaluated at compile time, and only the block it chooses is checked and compiled, e.g. `if T == i32:` in a function with a `type T` parameter or `if format[0] == '{':` in a function with a `comptime format: []Const(u8)` parameter. Any other condition is evaluated at run time and every block is checked, e.g. `if T == i32 and flag:` with a run-time `flag`.
-- `if optional as name:` runs its block when the optional is not `null`, with `name` holding its value, e.g. `if found as card:`. `*name` holds a pointer to the value instead of a copy. The name can be used only in the block.
+- `if condition` followed by a block runs the block when the condition is true. The condition is a `bool`. On one line it is written `if (condition) statement`.
+- `else` followed by a block runs it when the condition is false. It is on the line after the `if` block, at the same indentation as `if`.
+- When an `if` block is on the same line as `if`, its `else` or `else if` can follow on that line, e.g. `if (strict) 10 else 20`. It belongs to that `if`.
+- An `if` whose block is on the same line cannot be in the same-line block of another `if`, an `else` or a loop, unless it is inside brackets opened within that block, e.g. `if (ready) if (valid) start() else stop()` is a compile-time error, while `else (if (huge) 3 else 2)` and `if (ready) run(if (fast) 1 else 2)` are allowed. A same-line block of `fn` or `case` takes no `else`, so an `if` in it is allowed, e.g. `case (0) if (flag) 1 else 2`.
+- An `if` used as a value that is written on one line can be part of any expression, e.g. `total + (if (bonus) 10 else 0)`. Its last block extends to the end of the line or to the closing bracket around it.
+- An `if` can be used as a value, e.g. `const limit: u32 = if (strict) 10 else 20`, or as the last line of a function with a return type. Each block's value is the expression on its last line. An `if` used as a value needs `else`. When it starts after other code on a line, its `else` is on the line after its block, at that line's indentation.
+- `else if condition` checks another condition when the previous ones are false, e.g. `if a` followed by `else if b` and `else`, each with a block.
+- A condition that is known at compile time as a whole is evaluated at compile time, and only the block it chooses is checked and compiled, e.g. `if T == i32` in a function with a `type T` parameter or `if format[0] == '{'` in a function with a `comptime format: []Const(u8)` parameter. Any other condition is evaluated at run time and every block is checked, e.g. `if T == i32 and flag` with a run-time `flag`.
+- `if optional as name` runs its block when the optional is not `null`, with `name` holding its value, e.g. `if found as card`, or `if (found as card) show(card)` on one line. `*name` holds a pointer to the value instead of a copy. The name can be used only in the block.
 
 ### While
 
-- `while condition:` runs its block as long as the condition is true. The condition is a `bool`, evaluated before each run of the block.
-- `while optional as name:` runs its block as long as the optional is not `null`, with `name` holding its value, e.g. `while queue.pop() as job:`. The optional is evaluated before each run of the block.
-- `else:` runs its block when the condition is false, but not when the loop is left with `break` or `return`. It is on the line after the `while` block, at the same indentation as `while`. Its block is not part of the loop, so `break` and `continue` in it act on an enclosing loop.
+- `while condition` runs its block as long as the condition is true. On one line it is written `while (condition) statement`. The condition is a `bool`, evaluated before each run of the block.
+- `while optional as name` runs its block as long as the optional is not `null`, with `name` holding its value, e.g. `while queue.pop() as job`. The optional is evaluated before each run of the block.
+- `else` runs its block when the condition is false, but not when the loop is left with `break` or `return`. It is on the line after the `while` block, at the same indentation as `while`. Its block is not part of the loop, so `break` and `continue` in it act on an enclosing loop.
 
 ### For
 
-- `for name in sequence:` runs its block once for each element of the sequence, in order, with `name` holding the element. A sequence is an array, a slice, a pointer to an array, a range, an iterator or a tuple.
-- `start..end` is a range of the `usize` values from `start` up to, but not including, `end`, e.g. `for index in 0..count:`. `start..` is a range without an end. A start after the end is illegal behavior.
+- `for name in sequence` runs its block once for each element of the sequence, in order, with `name` holding the element. On one line it is written `for (name in sequence) statement`, e.g. `for (card in cards) total += card.value`. A sequence is an array, a slice, a pointer to an array, a range, an iterator or a tuple.
+- `start..end` is a range of the `usize` values from `start` up to, but not including, `end`, e.g. `for index in 0..count`. `start..` is a range without an end. A start after the end is illegal behavior.
 - A range is also a value of the type `mn::Range`, which is an iterator over its values, e.g. as an argument.
 - An iterator is a value whose type has an instance of `mn`'s typeclass `Iterator(I)`. Its `Element() -> type` gives the type of the elements, and its `next(iterator: *I) -> ?Element()` gives the elements until it returns `null`, e.g. `Iterator(Countdown)::Element()`. The loop calls `next` on its own copy of the iterator.
-- An iterator's elements are tuples. A single name without parentheses takes apart a one-element tuple, e.g. `for count in countdown:` over an iterator whose `Element()` is `[u32]` gives each `u32`. A single name over elements with more than one value is a compile-time error.
+- An iterator's elements are tuples. A single name without parentheses takes apart a one-element tuple, e.g. `for count in countdown` over an iterator whose `Element()` is `[u32]` gives each `u32`. A single name over elements with more than one value is a compile-time error.
 - An iterator gives its elements by value, so `*name` over an iterator is a compile-time error.
-- Over a tuple, the block is compiled once for each element, with `name` holding that element with its own type, e.g. `for value in values:`.
+- Over a tuple, the block is compiled once for each element, with `name` holding that element with its own type, e.g. `for value in values`.
 - The sequence is evaluated once, before the first run of the block. An array is not copied: the loop goes over the array itself.
-- Names in parentheses take each element apart, e.g. `for (name, score) in pairs:`, and `*name` holds a pointer to each element instead of a copy, e.g. `for *card in cards:`, as in a constant declaration (see Variables and Constants).
+- Names in parentheses take each element apart, e.g. `for (name, score) in pairs`, and `*name` holds a pointer to each element instead of a copy, e.g. `for *card in cards`, as in a constant declaration (see Variables and Constants).
 - The names are constants and can be used only in the block.
-- A name `_` leaves the element without a name, and the block cannot refer to it, e.g. `for _ in 0..3:`.
+- A name `_` leaves the element without a name, and the block cannot refer to it, e.g. `for _ in 0..3`.
 - An unused name is a compile-time error.
-- `else:` runs its block when the sequence ends, but not when the loop is left with `break` or `return`. It is on the line after the `for` block, at the same indentation as `for`. Its block is not part of the loop, so `break` and `continue` in it act on an enclosing loop.
+- `else` runs its block when the sequence ends, but not when the loop is left with `break` or `return`. It is on the line after the `for` block, at the same indentation as `for`. Its block is not part of the loop, so `break` and `continue` in it act on an enclosing loop.
 
 ### Match
 
-- `match value:` runs the branch that fits the value. Its branches are in an indented block, each written `case` with one or more cases and a block, e.g. `case end: noop`.
+- `match value` runs the branch that fits the value. Its branches are in an indented block, each written `case` with one or more cases and a block, e.g. `case end` followed by an indented block, or `case (end) noop` on one line.
 - `match` works on enums, error sets, results, optionals and integers.
-- On an enum, a case is a case name. A branch can name the value a case carries, e.g. `case number(digits): total += digits`. `*digits` holds a pointer to it instead of a copy, as in a constant declaration (see Variables and Constants), and `_` leaves it without a name.
-- On an error set, a case is an error. A branch can name an error through its enum or error set, e.g. `case ParseError::missing_end:`. This is needed when a combined error set has two cases with the same name.
-- On a result, a case is an error, or the value's type, which takes the value, e.g. `case Token as token:` for a `ParseError!Token`.
-- On an optional, a case is `null`, or the value's type, which takes the value, e.g. `case Card as card:` for a `?Card`.
+- A `match` can be used as a value, e.g. `return match byte` followed by `case (' ', '\t') true` and `else false`. Each branch's value is the expression on its last line.
+- Without a type expected from the surrounding code, every block of an `if` or `match` used as a value must give the same type, otherwise the type must be written, e.g. `const found: ?Card = match …`. A block that ends with `return`, `break`, `continue` or `mn::comptime::error` gives no value and fits any type.
+- On an enum, a case is a case name. A branch can name the value a case carries, e.g. `case (number(digits)) total += digits`. `*digits` holds a pointer to it instead of a copy, as in a constant declaration (see Variables and Constants), and `_` leaves it without a name.
+- On an error set, a case is an error. A branch can name an error through its enum or error set, e.g. `case ParseError::missing_end`. This is needed when a combined error set has two cases with the same name.
+- On a result, a case is an error, or the value's type, which takes the value, e.g. `case Token as token` for a `ParseError!Token`.
+- On an optional, a case is `null`, or the value's type, which takes the value, e.g. `case Card as card` for a `?Card`.
 - `as name` names the value, `as *name` holds a pointer to it instead of a copy, and a value's type without `as` leaves it without a name.
-- On an integer, a case is a value known at compile time or a range, e.g. `case 0:` or `case 3..10:`. Cases cannot overlap.
-- A branch with several cases separated by commas cannot name their values, e.g. `case name, end: noop`.
-- The branches must cover every case exactly once. `else:` as the last branch covers the remaining cases, but never a result's or optional's value. A match on an integer needs `else:` unless its cases cover every value of the type.
+- On an integer, a case is a value known at compile time or a range, e.g. `case 0` or `case 3..10`. Cases cannot overlap.
+- A branch with several cases separated by commas cannot name their values, e.g. `case (name, end) noop`.
+- The branches must cover every case exactly once. `else` as the last branch covers the remaining cases, but never a result's or optional's value. A match on an integer needs `else` unless its cases cover every value of the type.
 
 ### Break and Continue
 
 - `break` leaves the innermost loop. `continue` ends the current run of its block: a `while` evaluates its condition again, and a `for` goes on with the next element.
-- A loop can have a label, written `@` and a name before `while` or `for`, e.g. `@outer while running:`. `break @outer` and `continue @outer` act on that loop instead of the innermost one.
+- A loop can have a label, written `@` and a name before `while` or `for`, e.g. `@outer while running`. `break @outer` and `continue @outer` act on that loop instead of the innermost one.
 - A label cannot repeat the label of an enclosing loop. An unused label is a compile-time error.
 - `break` and `continue` outside a loop are a compile-time error.
 - `return`, `break` and `continue` are also expressions that never produce a value, so they can be used wherever a value is expected, e.g. `const input = read_input(&buffer) orelse break`. Code that can never run because of them is a compile-time error, e.g. `count + return 5`.
 
 ## Functions
 
-- A function is declared with `fn`, its name, its parameters in parentheses, an optional return type after `->`, and its body after `:`, e.g. `fn add(a: i32, b: i32) -> i32: return a + b`.
+- A function is declared with `fn`, its name, its parameters in parentheses, an optional return type after `->`, and its body in an indented block or after `=` on the same line, e.g. `fn add(a: i32, b: i32) -> i32 = a + b`.
+- A function without parameters can leave out the parentheses, e.g. `fn main`.
 - A function without a return type returns `void`.
 - Each parameter has a name and a type. Parameter names must be unique.
 - Parameters cannot be modified, including their elements and fields.
@@ -427,12 +440,12 @@
 - A struct in an external function's parameters or return type, directly or through pointers or arrays, must be an external struct.
 - `inline fn` declares a function whose every call is replaced by its body, e.g. `inline fn is_answer(input: []Const(u8)) -> bool`. It is called like any other function and behaves the same.
 - An inline function that calls itself, directly or through other functions, is a compile-time error. Using one as a value is a compile-time error, e.g. `&is_answer`. An external function cannot be inline.
-- `main` has no parameters and either no return type or a result without a value, e.g. `ParseError!void`. It cannot be called, used as a value, be external or be inline.
+- `main` has no parameters. Its return type is left out, `void`, or a result without a value, e.g. `ParseError!void`. It cannot be called, used as a value, be external or be inline.
 - An error that ends `main` writes the case's name to the standard error stream and ends the program with a nonzero status.
 
 ## Errors
 
-- An error set is declared with `error`, its name, and its cases in an indented block, e.g. `error ParseError:` followed by `unexpected: [usize, usize]` and `missing_end`. Its cases are written, compared and matched like an enum's, e.g. `ParseError::missing_end`.
+- An error set is declared with `error`, its name, and its cases in an indented block, e.g. `error ParseError` followed by `unexpected: [usize, usize]` and `missing_end`. Its cases are written, compared and matched like an enum's, e.g. `ParseError::missing_end`.
 - An error set without cases has no block, e.g. `error Never`. A result with it cannot hold an error.
 - Error sets are declared at the top level of a module.
 - `One || Two` is an error set with the cases of both. Each case keeps the set that declares it, e.g. `ParseError::missing_end` is a case of `ParseError || FileError`. A value of an error set converts implicitly to an error set combined from it.
@@ -462,17 +475,17 @@
 
 ## Typeclasses
 
-- A typeclass is declared with `typeclass`, its name, its parameters in parentheses, and its functions in an indented block, e.g. `typeclass Show(type T):` followed by `fn show(value: T, output: *Writer)`.
+- A typeclass is declared with `typeclass`, its name, its parameters in parentheses, and its functions in an indented block, e.g. `typeclass Show(type T)` followed by `fn show(value: T, output: *Writer)`.
 - A parameter is a type, e.g. `type T`, or a type constructor written with the types it takes, e.g. `type F(type)`.
-- A parameter can require instances of other typeclasses, e.g. `typeclass Ord(type T: Eq):`. Every instance of `Ord(T)` then needs an instance of `Eq(T)`, and `Ord`'s functions can use `Eq`'s.
+- A parameter can require instances of other typeclasses, e.g. `typeclass Ord(type T: Eq)`. Every instance of `Ord(T)` then needs an instance of `Eq(T)`, and `Ord`'s functions can use `Eq`'s.
 - A typeclass's function without a body only declares its signature. With a body, the body is its default implementation.
 - A default implementation can use only the functions of its typeclass and of the typeclasses its parameters require.
 - A typeclass's function can take its own `type` parameters, e.g. `fn map(type A, type B, value: F(A), function: *fn(A) -> B) -> F(B)`.
-- An instance is declared with `instance`, the typeclass with its arguments, and its functions in an indented block, e.g. `instance Show(Card):`.
-- An instance can cover every instantiation of a type through its own parameters, e.g. `instance(type A: Show) Show(List(A)):`.
+- An instance is declared with `instance`, the typeclass with its arguments, and its functions in an indented block, e.g. `instance Show(Card)`.
+- An instance can cover every instantiation of a type through its own parameters, e.g. `instance(type A: Show) Show(List(A))`.
 - An instance defines each function of the typeclass with the typeclass's signature, with the arguments in place of the parameters. A function with a default implementation can be left out, and the default implementation is used.
 - An instance can only define the typeclass's functions.
-- Two instances of a typeclass cannot cover the same arguments, e.g. `instance Show(List(u8)):` next to `instance(type A: Show) Show(List(A)):`.
+- Two instances of a typeclass cannot cover the same arguments, e.g. `instance Show(List(u8))` next to `instance(type A: Show) Show(List(A))`.
 - Instances are declared at the top level of a module.
 - A typeclass's functions can be called only in modules that declare or import the typeclass, e.g. `import shapes::Shape`.
 - A typeclass's function is called through the typeclass, e.g. `Show::show(card, output)`, with the instance chosen by the types of the arguments. If more than one instance fits, the call is a compile-time error.
@@ -496,7 +509,7 @@
 - Each declared type must appear in a parameter's type. Arguments that give a declared type two different types, or that do not fit the parameter's type, are a compile-time error.
 - A function gets its own instance for each different set of arguments to its `type` and `comptime` parameters, for each different set of types of the arguments to its `any` parameters, and for each different set of its declared types.
 - A function with `type`, `comptime` or `any` parameters or declared types is checked for everything that does not depend on them, even if it is never called.
-- `struct:` followed by an indented block, written like a struct's, is a struct without a name, e.g. `return struct:` followed by `items: []T`.
+- `struct` followed by an indented block, written like a struct's, is a struct without a name, e.g. `return struct` followed by `items: []T`.
 - A call evaluated at compile time gives the same result for the same arguments, e.g. `List(i32)` is the same type everywhere.
 - Any function can be evaluated at compile time, unless it reaches an external function.
 - Illegal behavior during compile-time evaluation is a compile-time error.

@@ -1,62 +1,62 @@
 import mn
 
-error Error:
+error Error
     out_of_memory
 
-typeclass Allocator(type A):
+typeclass Allocator(type A)
     fn allocate(allocator: *A, size: usize, alignment: usize) -> Error![]u8
     fn resize(allocator: *A, bytes: []u8, alignment: usize, size: usize) -> bool
     fn free(allocator: *A, bytes: []u8, alignment: usize)
 
-fn equal(one: []Const(u8), two: []Const(u8)) -> bool:
-    if one.length != two.length: return false
-    for index in 0..one.length:
-        if one[index] != two[index]: return false
+fn equal(one: []Const(u8), two: []Const(u8)) -> bool
+    if (one.length != two.length) return false
+    for index in 0..one.length
+        if (one[index] != two[index]) return false
     return true
 
-fn allocate(allocator: *Allocator, type T, count: usize) -> Error![]T:
+fn allocate(allocator: *Allocator, type T, count: usize) -> Error![]T
     const bytes = try Allocator::allocate(allocator, mn::size(T) * count, mn::alignment(T))
     return mn::cast(*Many(T), bytes.pointer)[0..count]
 
-fn(type Item) free(allocator: *Allocator, items: []Const(Item)):
+fn(type Item) free(allocator: *Allocator, items: []Const(Item))
     const bytes = mn::cast(*Many(u8), items.pointer)[0..items.length * mn::size(Item)]
     Allocator::free(allocator, bytes, mn::alignment(Item))
 
-fn create(allocator: *Allocator, type T) -> Error!*T:
+fn create(allocator: *Allocator, type T) -> Error!*T
     const bytes = try Allocator::allocate(allocator, mn::size(T), mn::alignment(T))
     return mn::cast(*T, bytes.pointer)
 
-fn(type Item) destroy(allocator: *Allocator, pointer: *Const(Item)):
+fn(type Item) destroy(allocator: *Allocator, pointer: *Const(Item))
     const bytes = mn::cast(*Many(u8), pointer)[0..mn::size(Item)]
     Allocator::free(allocator, bytes, mn::alignment(Item))
 
 struct System
 
-instance Allocator(System):
-    fn allocate(_: *System, size: usize, alignment: usize) -> Error![]u8:
+instance Allocator(System)
+    fn allocate(_: *System, size: usize, alignment: usize) -> Error![]u8
         const pointer = mn_runtime_memory_allocate(size, alignment) orelse return Error::out_of_memory
         return pointer[0..size]
 
-    fn resize(_: *System, bytes: []u8, _: usize, size: usize) -> bool: return size <= bytes.length
+    fn resize(_: *System, bytes: []u8, _: usize, size: usize) -> bool = size <= bytes.length
 
-    fn free(_: *System, bytes: []u8, _: usize): mn_runtime_memory_free(bytes.pointer)
+    fn free(_: *System, bytes: []u8, _: usize) = mn_runtime_memory_free(bytes.pointer)
 
 external fn mn_runtime_memory_allocate(size: usize, alignment: usize) -> ?*Many(u8)
 
 external fn mn_runtime_memory_free(pointer: *Many(u8))
 
-fn Arena(type P: Allocator) -> type:
-    return struct:
+fn Arena(type P: Allocator) -> type
+    return struct
         parent: P
         block: ?*Many(u8)
         used: usize
         capacity: usize
         last: usize
 
-        fn new(parent: P) -> Self: return Self{parent = parent, block = null, used = 0, capacity = 0, last = 0}
+        fn new(parent: P) -> Self = Self{parent = parent, block = null, used = 0, capacity = 0, last = 0}
 
-        fn free_all(self: *Self):
-            while self.block as block:
+        fn free_all(self: *Self)
+            while self.block as block
                 const header = mn::cast(*ArenaBlock, block)
                 self.block = header.previous
                 Allocator::free(&self.parent, block[0..header.size], mn::alignment(ArenaBlock))
@@ -64,24 +64,24 @@ fn Arena(type P: Allocator) -> type:
             self.capacity = 0
             self.last = 0
 
-struct ArenaBlock:
+struct ArenaBlock
     previous: ?*Many(u8)
     size: usize
 
 const arena_block_size: usize = 4096
 
-instance(type P: Allocator) Allocator(Arena(P)):
-    fn allocate(arena: *Arena(P), size: usize, alignment: usize) -> Error![]u8:
-        if arena.block as block:
+instance(type P: Allocator) Allocator(Arena(P))
+    fn allocate(arena: *Arena(P), size: usize, alignment: usize) -> Error![]u8
+        if arena.block as block
             const start = mn::align(block + arena.used, alignment)
             const offset = mn::convert(usize, start - block)
-            if offset + size <= arena.capacity:
+            if offset + size <= arena.capacity
                 arena.last = offset
                 arena.used = offset + size
                 return start[0..size]
         const header_size = mn::size(ArenaBlock)
         var capacity = header_size + size + alignment
-        if capacity < arena_block_size: capacity = arena_block_size
+        if (capacity < arena_block_size) capacity = arena_block_size
         const bytes = try Allocator::allocate(&arena.parent, capacity, mn::alignment(ArenaBlock))
         mn::cast(*ArenaBlock, bytes.pointer).* = ArenaBlock{previous = arena.block, size = capacity}
         const start = mn::align(bytes.pointer + header_size, alignment)
@@ -92,11 +92,11 @@ instance(type P: Allocator) Allocator(Arena(P)):
         arena.used = offset + size
         return start[0..size]
 
-    fn resize(arena: *Arena(P), bytes: []u8, _: usize, size: usize) -> bool:
-        if size <= bytes.length: return true
+    fn resize(arena: *Arena(P), bytes: []u8, _: usize, size: usize) -> bool
+        if (size <= bytes.length) return true
         const block = arena.block orelse return false
-        if bytes.pointer != block + arena.last or arena.last + size > arena.capacity: return false
+        if (bytes.pointer != block + arena.last or arena.last + size > arena.capacity) return false
         arena.used = arena.last + size
         return true
 
-    fn free(_: *Arena(P), _: []u8, _: usize): noop
+    fn free(_: *Arena(P), _: []u8, _: usize) = noop

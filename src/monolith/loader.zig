@@ -221,7 +221,7 @@ test "loadMainModule: rejects a program with its own mn module" {
     defer program_directory.cleanup();
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
-    try program_directory.dir.writeFile(io, .{ .sub_path = "mn.mn", .data = "fn one(): noop" });
+    try program_directory.dir.writeFile(io, .{ .sub_path = "mn.mn", .data = "fn one() = noop" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -267,7 +267,7 @@ test "loadRoot: loads a module at the top" {
     defer program_directory.cleanup();
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
-    try program_directory.dir.writeFile(io, .{ .sub_path = "utils.mn", .data = "fn one(): noop" });
+    try program_directory.dir.writeFile(io, .{ .sub_path = "utils.mn", .data = "fn one() = noop" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -295,7 +295,7 @@ test "loadRoot: reads mn from the compiler's directory" {
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
     try compiler_directory.dir.createDirPath(io, "mn");
-    try compiler_directory.dir.writeFile(io, .{ .sub_path = "mn/stdout.mn", .data = "fn one(): noop" });
+    try compiler_directory.dir.writeFile(io, .{ .sub_path = "mn/stdout.mn", .data = "fn one() = noop" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -373,7 +373,7 @@ test "loadMember: loads each module once" {
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
     try program_directory.dir.createDirPath(io, "utils");
-    try program_directory.dir.writeFile(io, .{ .sub_path = "utils/math.mn", .data = "fn add(): noop" });
+    try program_directory.dir.writeFile(io, .{ .sub_path = "utils/math.mn", .data = "fn add() = noop" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -425,7 +425,7 @@ test "loadModule: reports failures in the module they are in" {
     defer program_directory.cleanup();
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
-    try program_directory.dir.writeFile(io, .{ .sub_path = "utils.mn", .data = "fn one():\n\tnoop" });
+    try program_directory.dir.writeFile(io, .{ .sub_path = "utils.mn", .data = "fn one()\n\tnoop" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -462,8 +462,8 @@ test "loadModule: describes a parse error in a module it reaches" {
     try program_directory.dir.writeFile(io, .{ .sub_path = "main.mn", .data = "" });
     try loader.loadMainModule(&arena, io, "main");
 
-    try std.testing.expectError(error.ExpectedColon, loader.loadRoot(&arena, io, "utils"));
-    try std.testing.expectEqualStrings("expected ':'", loader.failure.?.message);
+    try std.testing.expectError(error.ExpectedBlock, loader.loadRoot(&arena, io, "utils"));
+    try std.testing.expectEqualStrings("expected an indented block", loader.failure.?.message);
 }
 
 test "loadModule: records the file it cannot read" {
