@@ -597,6 +597,7 @@ pub const NameResolver = struct {
         defer self.bindings = caller_bindings;
         self.module_index = module_index;
         self.self_type = null;
+        self.self_name = "Self";
         self.typeclass = null;
         self.bindings = definition.bindings;
         const caller_owner_name = self.owner_name;
@@ -5573,6 +5574,32 @@ test "resolveFunctionSignature: resolves the receiver and self of a method" {
     const signature = loader.modules.items[0].declarations[1].kind.function_definition.signature;
     try std.testing.expectEqualStrings("Card", ast.extractType(signature.receiver.?).@"struct".name);
     try std.testing.expectEqualStrings("Card", ast.extractType(signature.parameters[0].type).@"struct".name);
+}
+
+test "resolveFunctionSignature: resolves Self in a method of mn::fs reached after the file's reader instance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io\nimport mn::io::Reader\n\nfn size(path: []Const(u8)) -> io::Error!usize\n    const file = fs::File::open(path) catch return 0\n    defer file.close()\n    var buffer: [64]u8 = undefined\n    const count = try file.read(&buffer)\n    return count + try file.length()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const files = for (loader.modules.items) |module| {
+        if (std.mem.eql(u8, module.path[module.path.len - 1], "fs")) break module;
+    } else unreachable;
+    const length = for (files.declarations) |declaration| {
+        if (declaration.kind != .function_definition) continue;
+        if (std.mem.eql(u8, declaration.kind.function_definition.signature.name, "length")) break declaration.kind.function_definition;
+    } else unreachable;
+    try std.testing.expect(ast.extractType(length.signature.parameters[0].type) == .@"struct");
 }
 
 test "resolveFunctionSignature: rejects a signature that depends on itself at compile time" {

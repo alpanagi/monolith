@@ -1,0 +1,50 @@
+import mn
+
+external fn mn_runtime_io_read(descriptor: i32, buffer: []u8) -> isize
+
+external fn mn_runtime_io_write(descriptor: i32, bytes: []Const(u8)) -> isize
+
+const stdin = Stdin{}
+const stdout = Stdout{}
+
+error Error
+    broken_pipe
+    input_output
+    is_directory
+    no_space
+    other
+
+typeclass Reader(type R)
+    fn read(reader: R, buffer: []u8) -> Error!usize
+
+typeclass Writer(type W)
+    fn write(writer: W, bytes: []Const(u8)) -> Error!void
+    fn println(writer: W, text: []Const(u8), _: []) -> Error!void
+        try Writer::write(writer, text)
+        try Writer::write(writer, "\n")
+
+struct Stdin
+
+instance Reader(Stdin)
+    fn read(_: Stdin, buffer: []u8) -> Error!usize = read_descriptor(0, buffer)
+
+fn read_descriptor(descriptor: i32, buffer: []u8) -> Error!usize
+    const count = mn_runtime_io_read(descriptor, buffer)
+    if (count < 0) return find_error(count)
+    return mn::convert(usize, count)
+
+fn find_error(code: isize) -> Error = match code
+    case (-1) Error::broken_pipe
+    case (-2) Error::input_output
+    case (-3) Error::is_directory
+    case (-4) Error::no_space
+    else Error::other
+
+struct Stdout
+
+instance Writer(Stdout)
+    fn write(_: Stdout, bytes: []Const(u8)) -> Error!void = write_descriptor(1, bytes)
+
+fn write_descriptor(descriptor: i32, bytes: []Const(u8)) -> Error!void
+    const code = mn_runtime_io_write(descriptor, bytes)
+    if (code < 0) return find_error(code)

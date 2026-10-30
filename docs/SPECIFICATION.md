@@ -356,7 +356,7 @@
 
 - `return value` ends the function and gives its result. A function without a return type uses `return` without a value.
 - In a function with a return type, the last line of the body can be an expression, which is the function's result, e.g. `fn add(a: i32, b: i32) -> i32` followed by an indented `a + b`. A `return` on the last line is also allowed.
-- Every path through a function with a return type must end with a `return` or with the body's last line giving the result. A path that never ends, such as an endless loop, needs none.
+- Reaching the end of a function's body gives `void`, so a path can end there only when `void` converts to the return type. Any other path must end with a `return` or with the body's last line giving the result. A path that never ends, such as an endless loop, needs none.
 - In a function without a return type, the last line is a statement like any other.
 
 ### Defer
@@ -465,7 +465,7 @@
 - `mn::math::add_wrapping(a, b)`, `mn::math::subtract_wrapping(a, b)` and `mn::math::multiply_wrapping(a, b)` take two integers of the same type and give a result of that type that wraps around on overflow instead of being illegal behavior, e.g. `math::add_wrapping(value, 1)` is 0 for a `u8` `value` of 255.
 - `mn::comptime::error(message)` stops compilation with the message wherever the code containing it is checked, e.g. in the block a condition chooses at compile time. Like `return`, it ends its block, so a function returning a value needs no `return` after it. The message is a `[]Const(u8)` known at compile time. The error shows the location of the call and each call that led to it.
 - `mn::reflection` holds the built-in functions that inspect and build types. `mn::reflection::length(T)` gives a tuple type's number of elements as a `usize`. `mn::reflection::join(A, B)` gives the tuple type with the elements of `A` followed by those of `B`, e.g. `mn::reflection::join([Card], [usize])` is `[Card, usize]`.
-- `import path` makes the last name of the path available in the module. The path names a directory, a module or a declaration in a module, e.g. `import mn::io::stdout` allows `stdout::write("hi")`.
+- `import path` makes the last name of the path available in the module. The path names a directory, a module or a declaration in a module, e.g. `import mn::text` allows `text::strip(input)` and `import mn::io::stdout` allows `stdout`.
 - `import path as name` makes it available as `name` instead, e.g. `import mn::io::stdout as out`.
 - An import that would make a reserved name available is a compile-time error, e.g. `import mn::comptime`.
 - A path that starts with `::` names a top-level declaration of the current module, e.g. `::match(pattern)`.

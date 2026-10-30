@@ -6712,12 +6712,12 @@ test "Generator.generate: builds an executable when the main module defines main
     var output_directory = std.testing.tmpDir(.{});
     defer output_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "mn");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []Const(u8))\nconst write = mn_runtime_stdout_write" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/stdout.mn", .data = "external fn mn_runtime_io_write(descriptor: i32, bytes: []Const(u8)) -> isize\nconst write = mn_runtime_io_write" });
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
     const compiler_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &compiler_directory.sub_path });
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "hello.mn", .data = "import mn\nfn main() = mn::stdout::write(\"hi\\n\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "hello.mn", .data = "import mn\nfn main() = _ = mn::stdout::write(1, \"hi\\n\")" });
     try loader.loadMainModule(&arena, std.testing.io, "hello");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -6731,6 +6731,33 @@ test "Generator.generate: builds an executable when the main module defines main
 
     const executable = try output_directory.dir.statFile(std.testing.io, "build/hello", .{});
     try std.testing.expectEqual(.file, executable.kind);
+}
+
+test "Generator.generate: builds an executable that uses the standard streams and a file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io\nimport mn::io::Reader\nimport mn::io::Writer\nimport mn::io::stdin\nimport mn::io::stdout\n\nfn main() -> io::Error!void\n    try stdout.println(\"hi\", {})\n    var buffer: [64]u8 = undefined\n    const count = try stdin.read(&buffer)\n    try stdout.write(buffer[..count])\n    _ = try size(\"cards.toml\")\n\nfn size(path: []Const(u8)) -> io::Error!usize\n    const file = fs::File::open(path) catch return 0\n    defer file.close()\n    var buffer: [64]u8 = undefined\n    const count = try file.read(&buffer)\n    return count + try file.length()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+
+    const executable = try output_directory.dir.statFile(std.testing.io, "build/main", .{});
+    try std.testing.expectEqual(.file, executable.kind);
+    const io_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "plugins/c/runtime/io.c", allocator, .unlimited);
+    const fs_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "plugins/c/runtime/fs.c", allocator, .unlimited);
+    try std.testing.expectEqualStrings(io_source, try output_directory.dir.readFileAlloc(std.testing.io, "build/source/runtime/io.c", allocator, .unlimited));
+    try std.testing.expectEqualStrings(fs_source, try output_directory.dir.readFileAlloc(std.testing.io, "build/source/runtime/fs.c", allocator, .unlimited));
 }
 
 test "generateFiles: writes a header and a source file per module" {
@@ -9463,6 +9490,34 @@ test "generateStatement: returns the last line of a function and of each block" 
     );
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\nint32_t mn_main_add(int32_t one, int32_t two) {\n    return (one + two);\n}\n\nint32_t mn_main_sign(int32_t value) {\n    if ((value < 0)) {\n        return -1;\n    } else if ((value == 0)) {\n        return 0;\n    } else {\n        return 1;\n    }\n}\n\nuint8_t mn_main_grade(uint8_t score) {\n    if ((score == 0u)) {\n        return 1u;\n    } else {\n        return 2u;\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateStatement: returns the last line of a function whose result has no value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure\n    broken\nfn check(bad: bool) -> Failure!void\n    if (bad) return Failure::broken\nfn run(bad: bool) -> Failure!void = check(bad)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_Failure {\n    uint32_t tag;\n} mn_main_Failure;\n\ntypedef struct mn_result_main_Failure_void mn_result_main_Failure_void;\n\nmn_result_main_Failure_void mn_main_check(bool bad);\nmn_result_main_Failure_void mn_main_run(bool bad);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_result_main_Failure_void_defined\n#define mn_result_main_Failure_void_defined\ntypedef struct mn_result_main_Failure_void {\n    mn_main_Failure error;\n} mn_result_main_Failure_void;\n#endif\n\nmn_result_main_Failure_void mn_main_check(bool bad) {\n    if (bad) {\n        return (mn_result_main_Failure_void){ .error = (mn_main_Failure){ .tag = 1 } };\n    }\n    return (mn_result_main_Failure_void){ .error.tag = 0 };\n}\n\nmn_result_main_Failure_void mn_main_run(bool bad) {\n    return mn_main_check(bad);\n}\n",
         files[1].contents,
     );
 }
@@ -18014,6 +18069,19 @@ test "findRuntimeFile: finds the runtime file of mn::random::entropy among the p
     try std.testing.expectEqualStrings("runtime/random.c", path);
 }
 
+test "findRuntimeFile: finds the runtime files of mn::io and mn::fs among the plugin's files" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const plugin_directory = try std.Io.Dir.cwd().openDir(std.testing.io, "plugins/c", .{});
+    defer plugin_directory.close(std.testing.io);
+
+    const io_path = try findRuntimeFile(arena.allocator(), std.testing.io, plugin_directory, "mn_runtime_io_write");
+    const fs_path = try findRuntimeFile(arena.allocator(), std.testing.io, plugin_directory, "mn_runtime_fs_open");
+
+    try std.testing.expectEqualStrings("runtime/io.c", io_path);
+    try std.testing.expectEqualStrings("runtime/fs.c", fs_path);
+}
+
 test "findRuntimeFile: rejects a name that leads to no file" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -18107,7 +18175,7 @@ test "integration: checks a run-time condition that calls a function with a type
     );
     var loader = @import("monolith").Loader.init(program_path, ".");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "cards.mn", .data = "struct Card\n    question: []Const(u8)\n    answer:   []Const(u8)\n\nconst cards: [_]Card = {\n    { question = \"Question 1\", answer = \"Answer 1\" },\n    { question = \"Question 2\", answer = \"Answer 2\" },\n}\n" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io::stdout\nimport mn::io::stdin\nimport mn::memory\nimport mn::text\n\nimport cards::cards\n\n\nfn main()\n    var input_buffer: [4096]u8 = undefined\n    var byte_count: usize = 0\n    var card_index: usize = 0\n\n    while card_index < cards.length\n        stdout::println(cards[card_index].question, {})\n        byte_count = stdin::read(&input_buffer)\n        if (byte_count == 0) break\n\n        stdout::println(cards[card_index].answer, {})\n        byte_count = stdin::read(&input_buffer)\n        if (byte_count == 0) break\n\n        if memory::equal(text::strip(input_buffer[..byte_count]), \"y\")\n           card_index += 1\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io\nimport mn::io::Reader\nimport mn::io::Writer\nimport mn::io::stdin\nimport mn::io::stdout\nimport mn::memory\nimport mn::text\n\nimport cards::cards\n\n\nfn main() -> io::Error!void\n    var input_buffer: [4096]u8 = undefined\n    var byte_count: usize = 0\n    var card_index: usize = 0\n\n    while card_index < cards.length\n        try stdout.println(cards[card_index].question, {})\n        byte_count = try stdin.read(&input_buffer)\n        if (byte_count == 0) break\n\n        try stdout.println(cards[card_index].answer, {})\n        byte_count = try stdin.read(&input_buffer)\n        if (byte_count == 0) break\n\n        if memory::equal(text::strip(input_buffer[..byte_count]), \"y\")\n           card_index += 1\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -18115,11 +18183,62 @@ test "integration: checks a run-time condition that calls a function with a type
     var generator = Generator.init(program);
     const files = try generator.generateFiles(arena.allocator());
 
-    try std.testing.expectEqual(13, files.len);
+    try std.testing.expectEqual(12, files.len);
     var main_file: []const u8 = "";
     for (files) |file| {
         if (std.mem.eql(u8, file.path, "main.c")) main_file = file.contents;
     }
     try std.testing.expect(std.mem.indexOf(u8, main_file, "while ((card_index < 2u)) {") != null);
     try std.testing.expect(std.mem.indexOf(u8, main_file, "if (mn_mn_memory_equal(mn_mn_text_strip((mn_slice_u8){ .items = input_buffer.items, .length = byte_count }), (mn_slice_u8){ .items = (uint8_t *)\"y\", .length = 1 })) {") != null);
+}
+
+test "integration: generates the standard streams and a file read through the library" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io\nimport mn::io::Reader\nimport mn::io::Writer\nimport mn::io::stdin\nimport mn::io::stdout\n\nfn main() -> io::Error!void\n    try stdout.println(\"hi\", {})\n    var buffer: [64]u8 = undefined\n    const count = try stdin.read(&buffer)\n    try stdout.write(buffer[..count])\n    _ = try size(\"cards.toml\")\n\nfn size(path: []Const(u8)) -> io::Error!usize\n    const file = fs::File::open(path) catch return 0\n    defer file.close()\n    var buffer: [64]u8 = undefined\n    const count = try file.read(&buffer)\n    return count + try file.length()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqual(10, files.len);
+    try std.testing.expectEqualStrings("main.h", files[0].path);
+    try std.testing.expectEqualStrings("main.c", files[1].path);
+    try std.testing.expectEqualStrings("mn/fs.h", files[4].path);
+    try std.testing.expectEqualStrings("mn/fs.c", files[5].path);
+    try std.testing.expectEqualStrings("mn/io.h", files[6].path);
+    try std.testing.expectEqualStrings("mn/io.c", files[7].path);
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_result_mn_io_Error_void mn_result_mn_io_Error_void;\ntypedef struct mn_slice_u8 mn_slice_u8;\ntypedef struct mn_result_mn_io_Error_usize mn_result_mn_io_Error_usize;\n\nmn_result_mn_io_Error_usize mn_main_size(mn_slice_u8 path);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n#include \"mn/io.h\"\n#include \"mn/fs.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_result_mn_io_Error_void_defined\n#define mn_result_mn_io_Error_void_defined\ntypedef struct mn_result_mn_io_Error_void {\n    mn_mn_io_Error error;\n} mn_result_mn_io_Error_void;\n#endif\n\n#ifndef mn_array_64_u8_defined\n#define mn_array_64_u8_defined\ntypedef struct mn_array_64_u8 {\n    uint8_t items[64];\n} mn_array_64_u8;\n#endif\n\n#ifndef mn_result_mn_io_Error_usize_defined\n#define mn_result_mn_io_Error_usize_defined\ntypedef struct mn_result_mn_io_Error_usize {\n    mn_mn_io_Error error;\n    size_t value;\n} mn_result_mn_io_Error_usize;\n#endif\n\n#ifndef mn_result_mn_fs_Error_mn_fs_File_defined\n#define mn_result_mn_fs_Error_mn_fs_File_defined\ntypedef struct mn_result_mn_fs_Error_mn_fs_File {\n    mn_mn_fs_Error error;\n    mn_mn_fs_File value;\n} mn_result_mn_fs_Error_mn_fs_File;\n#endif\n\nmax_align_t mn_zero_sized;\n\nvoid mn_runtime_error_report(char const *name);\n\nmn_result_mn_io_Error_void mn_main_main() {\n    mn_result_mn_io_Error_void mn_temporary_1;\n    mn_temporary_1 = mn_mn_io_Stdout_Writer_println((mn_slice_u8){ .items = (uint8_t *)\"hi\", .length = 2 });\n    if (mn_temporary_1.error.tag != 0) return (mn_result_mn_io_Error_void){ .error = mn_temporary_1.error };\n    mn_array_64_u8 buffer;\n    mn_result_mn_io_Error_usize mn_temporary_2;\n    size_t mn_temporary_3;\n    mn_temporary_2 = mn_mn_io_Stdin_Reader_read((mn_slice_u8){ .items = (&buffer)->items, .length = 64 });\n    if (mn_temporary_2.error.tag != 0) return (mn_result_mn_io_Error_void){ .error = mn_temporary_2.error };\n    mn_temporary_3 = mn_temporary_2.value;\n    const size_t count = mn_temporary_3;\n    mn_result_mn_io_Error_void mn_temporary_4;\n    mn_temporary_4 = mn_mn_io_Stdout_Writer_write((mn_slice_u8){ .items = buffer.items, .length = count });\n    if (mn_temporary_4.error.tag != 0) return (mn_result_mn_io_Error_void){ .error = mn_temporary_4.error };\n    mn_result_mn_io_Error_usize mn_temporary_5;\n    mn_temporary_5 = mn_main_size((mn_slice_u8){ .items = (uint8_t *)\"cards.toml\", .length = 10 });\n    if (mn_temporary_5.error.tag != 0) return (mn_result_mn_io_Error_void){ .error = mn_temporary_5.error };\n    return (mn_result_mn_io_Error_void){ .error.tag = 0 };\n}\n\nint main() {\n    mn_result_mn_io_Error_void result = mn_main_main();\n    if (result.error.tag == 0) return 0;\n    switch (result.error.tag) {\n    case 1: mn_runtime_error_report(\"broken_pipe\"); break;\n    case 2: mn_runtime_error_report(\"input_output\"); break;\n    case 3: mn_runtime_error_report(\"is_directory\"); break;\n    case 4: mn_runtime_error_report(\"no_space\"); break;\n    case 5: mn_runtime_error_report(\"other\"); break;\n    }\n    return 1;\n}\n\nmn_result_mn_io_Error_usize mn_main_size(mn_slice_u8 path) {\n    mn_result_mn_fs_Error_mn_fs_File mn_temporary_1;\n    mn_mn_fs_File mn_temporary_2;\n    mn_temporary_1 = mn_mn_fs_File_open(path);\n    if (mn_temporary_1.error.tag != 0) {\n        return (mn_result_mn_io_Error_usize){ .error.tag = 0, .value = 0u };\n    } else {\n        mn_temporary_2 = mn_temporary_1.value;\n    }\n    const mn_mn_fs_File file = mn_temporary_2;\n    mn_array_64_u8 buffer;\n    mn_result_mn_io_Error_usize mn_temporary_3;\n    size_t mn_temporary_4;\n    mn_temporary_3 = mn_mn_fs_File_Reader_read(file, (mn_slice_u8){ .items = (&buffer)->items, .length = 64 });\n    if (mn_temporary_3.error.tag != 0) {\n        mn_mn_fs_File_close(file);\n        return (mn_result_mn_io_Error_usize){ .error = mn_temporary_3.error };\n    }\n    mn_temporary_4 = mn_temporary_3.value;\n    const size_t count = mn_temporary_4;\n    mn_result_mn_io_Error_usize mn_temporary_5;\n    size_t mn_temporary_6;\n    mn_temporary_5 = mn_mn_fs_File_length(file);\n    if (mn_temporary_5.error.tag != 0) {\n        mn_mn_fs_File_close(file);\n        return (mn_result_mn_io_Error_usize){ .error = mn_temporary_5.error };\n    }\n    mn_temporary_6 = mn_temporary_5.value;\n    const mn_result_mn_io_Error_usize mn_returned = (mn_result_mn_io_Error_usize){ .error.tag = 0, .value = (count + mn_temporary_6) };\n    mn_mn_fs_File_close(file);\n    return mn_returned;\n}\n",
+        files[1].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\ntypedef struct mn_mn_fs_File {\n    int32_t descriptor;\n} mn_mn_fs_File;\n\ntypedef struct mn_mn_fs_Error {\n    uint32_t tag;\n} mn_mn_fs_Error;\n\ntypedef struct mn_slice_u8 mn_slice_u8;\ntypedef struct mn_result_mn_fs_Error_mn_fs_File mn_result_mn_fs_Error_mn_fs_File;\ntypedef struct mn_result_mn_io_Error_usize mn_result_mn_io_Error_usize;\n\nvoid mn_runtime_fs_close(int32_t descriptor);\nptrdiff_t mn_runtime_fs_length(int32_t descriptor);\nint32_t mn_runtime_fs_open(mn_slice_u8 path);\n\nmn_result_mn_fs_Error_mn_fs_File mn_mn_fs_File_open(mn_slice_u8 path);\nmn_result_mn_io_Error_usize mn_mn_fs_File_length(mn_mn_fs_File self);\nvoid mn_mn_fs_File_close(mn_mn_fs_File self);\nmn_mn_fs_Error mn_mn_fs_find_error(int32_t code);\nmn_result_mn_io_Error_usize mn_mn_fs_File_Reader_read(mn_mn_fs_File file, mn_slice_u8 buffer);\n",
+        files[4].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"fs.h\"\n#include \"io.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_result_mn_fs_Error_mn_fs_File_defined\n#define mn_result_mn_fs_Error_mn_fs_File_defined\ntypedef struct mn_result_mn_fs_Error_mn_fs_File {\n    mn_mn_fs_Error error;\n    mn_mn_fs_File value;\n} mn_result_mn_fs_Error_mn_fs_File;\n#endif\n\n#ifndef mn_result_mn_io_Error_usize_defined\n#define mn_result_mn_io_Error_usize_defined\ntypedef struct mn_result_mn_io_Error_usize {\n    mn_mn_io_Error error;\n    size_t value;\n} mn_result_mn_io_Error_usize;\n#endif\n\nmn_result_mn_fs_Error_mn_fs_File mn_mn_fs_File_open(mn_slice_u8 path) {\n    const int32_t descriptor = mn_runtime_fs_open(path);\n    if ((descriptor < 0)) {\n        return (mn_result_mn_fs_Error_mn_fs_File){ .error = mn_mn_fs_find_error(descriptor) };\n    }\n    return (mn_result_mn_fs_Error_mn_fs_File){ .error.tag = 0, .value = (mn_mn_fs_File){ .descriptor = descriptor } };\n}\n\nmn_result_mn_io_Error_usize mn_mn_fs_File_length(mn_mn_fs_File self) {\n    const ptrdiff_t length = mn_runtime_fs_length(self.descriptor);\n    if ((length < 0)) {\n        return (mn_result_mn_io_Error_usize){ .error = mn_mn_io_find_error(length) };\n    }\n    return (mn_result_mn_io_Error_usize){ .error.tag = 0, .value = ((size_t)length) };\n}\n\nvoid mn_mn_fs_File_close(mn_mn_fs_File self) {\n    mn_runtime_fs_close(self.descriptor);\n}\n\nmn_mn_fs_Error mn_mn_fs_find_error(int32_t code) {\n    if ((code == -1)) {\n        return (mn_mn_fs_Error){ .tag = 7 };\n    } else if ((code == -2)) {\n        return (mn_mn_fs_Error){ .tag = 8 };\n    } else if ((code == -3)) {\n        return (mn_mn_fs_Error){ .tag = 9 };\n    } else if ((code == -4)) {\n        return (mn_mn_fs_Error){ .tag = 10 };\n    } else {\n        return (mn_mn_fs_Error){ .tag = 11 };\n    }\n}\n\nmn_result_mn_io_Error_usize mn_mn_fs_File_Reader_read(mn_mn_fs_File file, mn_slice_u8 buffer) {\n    return mn_mn_io_read_descriptor(file.descriptor, buffer);\n}\n",
+        files[5].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\ntypedef struct mn_mn_io_Error {\n    uint32_t tag;\n} mn_mn_io_Error;\n\ntypedef struct mn_slice_u8 mn_slice_u8;\ntypedef struct mn_result_mn_io_Error_usize mn_result_mn_io_Error_usize;\ntypedef struct mn_result_mn_io_Error_void mn_result_mn_io_Error_void;\n\nptrdiff_t mn_runtime_io_read(int32_t descriptor, mn_slice_u8 buffer);\nptrdiff_t mn_runtime_io_write(int32_t descriptor, mn_slice_u8 bytes);\n\nmn_result_mn_io_Error_usize mn_mn_io_Stdin_Reader_read(mn_slice_u8 buffer);\nmn_result_mn_io_Error_usize mn_mn_io_read_descriptor(int32_t descriptor, mn_slice_u8 buffer);\nmn_mn_io_Error mn_mn_io_find_error(ptrdiff_t code);\nmn_result_mn_io_Error_void mn_mn_io_Stdout_Writer_write(mn_slice_u8 bytes);\nmn_result_mn_io_Error_void mn_mn_io_write_descriptor(int32_t descriptor, mn_slice_u8 bytes);\nmn_result_mn_io_Error_void mn_mn_io_Stdout_Writer_println(mn_slice_u8 text);\n",
+        files[6].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"io.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_result_mn_io_Error_usize_defined\n#define mn_result_mn_io_Error_usize_defined\ntypedef struct mn_result_mn_io_Error_usize {\n    mn_mn_io_Error error;\n    size_t value;\n} mn_result_mn_io_Error_usize;\n#endif\n\n#ifndef mn_result_mn_io_Error_void_defined\n#define mn_result_mn_io_Error_void_defined\ntypedef struct mn_result_mn_io_Error_void {\n    mn_mn_io_Error error;\n} mn_result_mn_io_Error_void;\n#endif\n\nmn_result_mn_io_Error_usize mn_mn_io_Stdin_Reader_read(mn_slice_u8 buffer) {\n    return mn_mn_io_read_descriptor(0, buffer);\n}\n\nmn_result_mn_io_Error_usize mn_mn_io_read_descriptor(int32_t descriptor, mn_slice_u8 buffer) {\n    const ptrdiff_t count = mn_runtime_io_read(descriptor, buffer);\n    if ((count < 0)) {\n        return (mn_result_mn_io_Error_usize){ .error = mn_mn_io_find_error(count) };\n    }\n    return (mn_result_mn_io_Error_usize){ .error.tag = 0, .value = ((size_t)count) };\n}\n\nmn_mn_io_Error mn_mn_io_find_error(ptrdiff_t code) {\n    if ((code == -1)) {\n        return (mn_mn_io_Error){ .tag = 1 };\n    } else if ((code == -2)) {\n        return (mn_mn_io_Error){ .tag = 2 };\n    } else if ((code == -3)) {\n        return (mn_mn_io_Error){ .tag = 3 };\n    } else if ((code == -4)) {\n        return (mn_mn_io_Error){ .tag = 4 };\n    } else {\n        return (mn_mn_io_Error){ .tag = 5 };\n    }\n}\n\nmn_result_mn_io_Error_void mn_mn_io_Stdout_Writer_write(mn_slice_u8 bytes) {\n    return mn_mn_io_write_descriptor(1, bytes);\n}\n\nmn_result_mn_io_Error_void mn_mn_io_write_descriptor(int32_t descriptor, mn_slice_u8 bytes) {\n    const ptrdiff_t code = mn_runtime_io_write(descriptor, bytes);\n    if ((code < 0)) {\n        return (mn_result_mn_io_Error_void){ .error = mn_mn_io_find_error(code) };\n    }\n    return (mn_result_mn_io_Error_void){ .error.tag = 0 };\n}\n\nmn_result_mn_io_Error_void mn_mn_io_Stdout_Writer_println(mn_slice_u8 text) {\n    mn_result_mn_io_Error_void mn_temporary_1;\n    mn_temporary_1 = mn_mn_io_Stdout_Writer_write(text);\n    if (mn_temporary_1.error.tag != 0) return (mn_result_mn_io_Error_void){ .error = mn_temporary_1.error };\n    mn_result_mn_io_Error_void mn_temporary_2;\n    mn_temporary_2 = mn_mn_io_Stdout_Writer_write((mn_slice_u8){ .items = (uint8_t *)\"\\n\", .length = 1 });\n    if (mn_temporary_2.error.tag != 0) return (mn_result_mn_io_Error_void){ .error = mn_temporary_2.error };\n    return (mn_result_mn_io_Error_void){ .error.tag = 0 };\n}\n",
+        files[7].contents,
+    );
 }

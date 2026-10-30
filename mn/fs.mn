@@ -1,0 +1,40 @@
+import mn
+import mn::io
+
+external fn mn_runtime_fs_close(descriptor: i32)
+
+external fn mn_runtime_fs_length(descriptor: i32) -> isize
+
+external fn mn_runtime_fs_open(path: []Const(u8)) -> i32
+
+error Error
+    is_directory
+    name_too_long
+    not_found
+    permission_denied
+    other
+
+struct File
+    descriptor: i32
+
+    fn open(path: []Const(u8)) -> Error!File
+        const descriptor = mn_runtime_fs_open(path)
+        if (descriptor < 0) return find_error(descriptor)
+        return File{descriptor = descriptor}
+
+    fn length(self: Self) -> io::Error!usize
+        const length = mn_runtime_fs_length(self.descriptor)
+        if (length < 0) return io::find_error(length)
+        return mn::convert(usize, length)
+
+    fn close(self: Self) = mn_runtime_fs_close(self.descriptor)
+
+fn find_error(code: i32) -> Error = match code
+    case (-1) Error::is_directory
+    case (-2) Error::name_too_long
+    case (-3) Error::not_found
+    case (-4) Error::permission_denied
+    else Error::other
+
+instance io::Reader(File)
+    fn read(file: File, buffer: []u8) -> io::Error!usize = io::read_descriptor(file.descriptor, buffer)

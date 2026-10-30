@@ -395,8 +395,12 @@ pub const TypeChecker = struct {
         body: []ast.Statement,
     ) TypeError!void {
         const return_type = ast.extractType(signature.return_type);
-        if (returnsNoValue(return_type) or body.len == 0) return self.checkBlock(signature, body);
-        var production: Production = .{ .expected = return_type, .result = true };
+        if (return_type == .void or body.len == 0) return self.checkBlock(signature, body);
+        var production: Production = .{
+            .expected = return_type,
+            .result = true,
+            .ends_with_void = isConvertible(.void, return_type),
+        };
         const caller_production = self.production;
         self.production = &production;
         defer self.production = caller_production;
@@ -435,6 +439,7 @@ pub const TypeChecker = struct {
             .@"if" => |*conditional| conditional.produces = true,
             .match => |*matching| matching.produces = true,
             .@"while", .@"for" => {
+                if (self.endsWithVoid()) return;
                 const production = self.production orelse return self.fail(statement.location, error.MissingBranchValue);
                 if (!production.result or !isEndless(statement.*)) return self.fail(statement.location, error.MissingBranchValue);
             },
@@ -445,8 +450,13 @@ pub const TypeChecker = struct {
             .variable_declaration,
             .assignment,
             .@"defer",
-            => return self.fail(statement.location, error.MissingBranchValue),
+            => if (!self.endsWithVoid()) return self.fail(statement.location, error.MissingBranchValue),
         }
+    }
+
+    fn endsWithVoid(self: *const TypeChecker) bool {
+        const production = self.production orelse return false;
+        return production.ends_with_void;
     }
 
     fn checkBranching(
@@ -718,7 +728,7 @@ pub const TypeChecker = struct {
                 }
             },
             .@"if" => |*conditional| {
-                if (conditional.produces and conditional.else_body == null) {
+                if (conditional.produces and conditional.else_body == null and !self.endsWithVoid()) {
                     return self.fail(statement.location, error.ValueIfWithoutElse);
                 }
                 if (conditional.names.len > 0) {
@@ -3680,6 +3690,7 @@ const Production = struct {
     expected: ?types.Type,
     found: ?types.Type = null,
     result: bool = false,
+    ends_with_void: bool = false,
 };
 
 const Trace = struct {
@@ -6390,6 +6401,87 @@ test "checkFunctionBody: returns the value of each branch of a match on the last
 
     const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
     for (body[0].kind.match.branches) |branch| try std.testing.expect(branch.body[0].kind == .@"return");
+}
+
+test "checkFunctionBody: returns a last line whose result has no value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure\n    broken\nfn check() -> Failure!void = noop\nfn count() -> i32 = 1\nfn log() = noop\nfn run() -> Failure!void = check()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[4].kind.function_definition.body;
+    try std.testing.expect(body[0].kind == .@"return");
+}
+
+test "checkFunctionBody: keeps a void call on the last line of a function whose result has no value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure\n    broken\nfn check() -> Failure!void = noop\nfn count() -> i32 = 1\nfn log() = noop\nfn run() -> Failure!void\n    _ = count()\n    log()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[4].kind.function_definition.body;
+    try std.testing.expect(body[1].kind == .call);
+}
+
+test "checkFunctionBody: lets the end of the body give void after a last if without else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure\n    broken\nfn check() -> Failure!void = noop\nfn count() -> i32 = 1\nfn log() = noop\nfn run(bad: bool) -> Failure!void\n    if (bad) return Failure::broken" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[4].kind.function_definition.body;
+    const conditional = body[0].kind.@"if";
+    try std.testing.expectEqual(null, conditional.else_body);
+    try std.testing.expect(conditional.body[0].kind == .@"return");
+}
+
+test "checkFunctionBody: rejects a last line whose type does not convert to a result without a value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure\n    broken\nfn check() -> Failure!void = noop\nfn count() -> i32 = 1\nfn log() = noop\nfn run() -> Failure!void = count()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 28 }, analyzer.failure.?.location.?);
 }
 
 test "prepareValueLine: rejects a block that ends without a value" {

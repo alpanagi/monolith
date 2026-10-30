@@ -1,3 +1,0 @@
-external fn mn_runtime_stdin_read(buffer: []u8) -> usize
-
-const read = mn_runtime_stdin_read
