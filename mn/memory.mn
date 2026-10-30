@@ -1,5 +1,11 @@
 import mn
 
+external fn mn_runtime_memory_allocate(size: usize, alignment: usize) -> ?*Many(u8)
+
+external fn mn_runtime_memory_free(pointer: *Many(u8))
+
+const arena_block_size: usize = 4096
+
 error Error
     out_of_memory
 
@@ -41,10 +47,6 @@ instance Allocator(System)
 
     fn free(_: *System, bytes: []u8, _: usize) = mn_runtime_memory_free(bytes.pointer)
 
-external fn mn_runtime_memory_allocate(size: usize, alignment: usize) -> ?*Many(u8)
-
-external fn mn_runtime_memory_free(pointer: *Many(u8))
-
 fn Arena(type P: Allocator) -> type
     return struct
         parent: P
@@ -67,8 +69,6 @@ fn Arena(type P: Allocator) -> type
 struct ArenaBlock
     previous: ?*Many(u8)
     size: usize
-
-const arena_block_size: usize = 4096
 
 instance(type P: Allocator) Allocator(Arena(P))
     fn allocate(arena: *Arena(P), size: usize, alignment: usize) -> Error![]u8
