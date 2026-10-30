@@ -5,7 +5,6 @@ fn strip(bytes: []Const(u8)) -> []Const(u8)
     while (end > start and is_whitespace(bytes[end - 1])) end -= 1
     return bytes[start..end]
 
-fn is_whitespace(byte: u8) -> bool
-    return match byte
-        case (' ', '\t', '\n', '\r', 0x0b, 0x0c) true
-        else false
+fn is_whitespace(byte: u8) -> bool = match byte
+    case (' ', '\t', '\n', '\r', 0x0b, 0x0c) true
+    else false

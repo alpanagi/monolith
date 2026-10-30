@@ -9467,6 +9467,34 @@ test "generateStatement: returns the last line of a function and of each block" 
     );
 }
 
+test "generateStatement: returns the value after the equals sign of a function whose block belongs to it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn is_space(byte: u8) -> bool = match byte\n    case (' ', '\\t') true\n    else false\nfn sign(value: i32) -> i32 = if value < 0\n    -1\nelse\n    1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\nbool mn_main_is_space(uint8_t byte);\nint32_t mn_main_sign(int32_t value);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\nbool mn_main_is_space(uint8_t byte) {\n    if ((byte == 32u) || (byte == 9u)) {\n        return true;\n    } else {\n        return false;\n    }\n}\n\nint32_t mn_main_sign(int32_t value) {\n    if ((value < 0)) {\n        return -1;\n    } else {\n        return 1;\n    }\n}\n",
+        files[1].contents,
+    );
+}
+
 test "hasOutput: writes nothing for discards" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

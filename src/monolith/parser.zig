@@ -155,9 +155,26 @@ pub const Parser = struct {
         offset: *usize,
         depth: usize,
     ) ParseError!?[]ast.Statement {
-        if (self.match(offset, .equals) != null) return try self.parseSameLineBlock(allocator, offset, depth, false);
+        if (self.match(offset, .equals) != null) return try self.parseEqualsBody(allocator, offset, depth);
         if (!try self.opensHeaderBlock(offset.*)) return null;
         return try self.parseHeaderBlock(allocator, offset, depth);
+    }
+
+    fn parseEqualsBody(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        depth: usize,
+    ) ParseError![]ast.Statement {
+        const caller_same_line_block = self.same_line_block;
+        defer self.same_line_block = caller_same_line_block;
+        self.same_line_block = null;
+        const owner = switch (self.tokens[offset.*].kind) {
+            .keyword_while, .keyword_for, .at_sign => false,
+            else => true,
+        };
+        const statement = try self.parseBlockLine(allocator, offset, depth, owner);
+        return allocator.dupe(ast.Statement, &.{statement});
     }
 
     fn parseFunctionSignature(
@@ -354,7 +371,8 @@ pub const Parser = struct {
     fn openSameLineHeader(self: *Parser, offset: *usize, keyword: usize) ParseError!void {
         if (self.match(offset, .left_parenthesis) != null) return;
         if (self.findHeaderColon(offset.*)) |colon| return self.fail(colon, error.HeaderColon);
-        if (self.opensBlock(offset.*)) return self.fail(keyword, error.MisplacedBranching);
+        const branching = self.tokens[keyword].kind == .keyword_if;
+        if (branching and self.opensBlock(offset.*)) return self.fail(keyword, error.MisplacedBranching);
         return self.fail(offset.*, error.ExpectedLeftParenthesis);
     }
 
@@ -451,7 +469,7 @@ pub const Parser = struct {
         }
         const value_depth: ?usize = if (owner) depth else null;
         if (try self.parseReturn(allocator, offset, value_depth)) |statement| return statement;
-        const else_depth: ?usize = if (self.tokens[offset.* - 1].kind == .indent) depth else null;
+        const else_depth: ?usize = if (owner) depth else null;
         if (try self.parseIf(allocator, offset, depth, else_depth, owner)) |statement| return statement;
         if (self.isColonLabel(offset.*)) return self.fail(offset.*, error.LabelWithoutSigil);
         if (try self.parseWhile(allocator, offset, depth, else_depth, owner)) |statement| return statement;
@@ -2659,6 +2677,86 @@ test "parseFunctionDefinition: parses a body after an equals sign" {
     try std.testing.expectEqual(ast.BinaryOperator.add, body[0].kind.value.kind.binary.operator);
 }
 
+test "parseEqualsBody: gives the block of a function line to the match after the equals sign" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn is_space(byte: u8) -> bool = match byte\n    case (space, tab) true\n    else false");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(1, module.declarations.len);
+    const branches = body[0].kind.match.branches;
+    try std.testing.expectEqual(2, branches[0].cases.len);
+    try std.testing.expect(!branches[1].body[0].kind.value.kind.boolean_literal);
+}
+
+test "parseEqualsBody: gives the blocks of a function line to the if after the equals sign and its else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn sign(value: i32) -> i32 = if value < 0\n    low\nelse\n    high");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqual(1, module.declarations.len);
+    const conditional = body[0].kind.@"if";
+    try std.testing.expectEqualStrings("low", conditional.body[0].kind.value.kind.identifier.name);
+    try std.testing.expectEqualStrings("high", conditional.else_body.?[0].kind.value.kind.identifier.name);
+}
+
+test "parseEqualsBody: gives the block of a function line to a struct without a name after the equals sign" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn Make(type T) -> type = struct\n    item: T");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqualStrings("item", body[0].kind.value.kind.struct_type.fields[0].name);
+}
+
+test "parseEqualsBody: gives the block to the value after the equals sign of an inline function in a struct" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("struct Card\n    value: i32\n    inline fn rank(self: Self) -> i32 = match self.value\n        case (1) high\n        else low");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const function = module.declarations[1].kind.function_definition;
+    try std.testing.expect(function.signature.@"inline");
+    try std.testing.expectEqual(2, function.body[0].kind.match.branches.len);
+}
+
+test "parseEqualsBody: gives the block to the value after the equals sign in a typeclass and an instance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Show(type T)\n    fn show(value: T) -> i32 = match value\n        case (end) first\n        else second\ninstance Show(Card)\n    fn show(value: Card) -> i32 = if value.ready\n        first\n    else\n        second");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const default = module.declarations[0].kind.typeclass_definition.defaults[0].?;
+    try std.testing.expectEqual(2, default.body[0].kind.match.branches.len);
+    const function = module.declarations[2].kind.function_definition;
+    try std.testing.expectEqualStrings("second", function.body[0].kind.@"if".else_body.?[0].kind.value.kind.identifier.name);
+}
+
+test "parseEqualsBody: rejects a deeper line after a body without an if, a match or a struct" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn add(a: i32, b: i32) -> i32 = a + b\n    use(a)");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.UnexpectedIndentation, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
+}
+
 test "parseFunctionSignature: accepts a reserved word as the name of a function" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4364,12 +4462,15 @@ test "matchElse: leaves an else at the indentation of an enclosing statement" {
 test "matchElse: leaves an else after a statement that does not start its line" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main() = if (ready) step()\nelse stop()");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match token\n        case (end) if (ready) step()\n        else stop()");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
 
-    try std.testing.expectError(error.UnexpectedToken, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
+    const branches = module.declarations[0].kind.function_definition.body[0].kind.match.branches;
+    try std.testing.expectEqual(2, branches.len);
+    try std.testing.expectEqual(null, branches[0].body[0].kind.@"if".else_body);
+    try std.testing.expectEqualStrings("stop", branches[1].body[0].kind.call.kind.call.callee.identifier.name);
 }
 
 test "parseElseBlock: rejects a colon after else" {
