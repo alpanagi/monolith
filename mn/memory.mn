@@ -14,12 +14,6 @@ typeclass Allocator(type A)
     fn resize(allocator: *A, bytes: []u8, alignment: usize, size: usize) -> bool
     fn free(allocator: *A, bytes: []u8, alignment: usize)
 
-fn equal(one: []Const(u8), two: []Const(u8)) -> bool
-    if (one.length != two.length) return false
-    for index in 0..one.length
-        if (one[index] != two[index]) return false
-    return true
-
 fn allocate(allocator: *Allocator, type T, count: usize) -> Error![]T
     const bytes = try Allocator::allocate(allocator, mn::size(T) * count, mn::alignment(T))
     return mn::cast(*Many(T), bytes.pointer)[0..count]
@@ -100,3 +94,9 @@ instance(type P: Allocator) Allocator(Arena(P))
         return true
 
     fn free(_: *Arena(P), _: []u8, _: usize) = noop
+
+fn equal(one: []Const(u8), two: []Const(u8)) -> bool
+    if (one.length != two.length) return false
+    for index in 0..one.length
+        if (one[index] != two[index]) return false
+    return true
