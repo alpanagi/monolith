@@ -3622,7 +3622,7 @@ fn describeError(name_error: NameError) []const u8 {
         error.ReservedImport => "an import cannot make a reserved name available, use 'as' to name it",
         error.NotExternalField => "an external struct's fields must be numbers, bool, pointers, optional pointers, function pointers, arrays of these or external structs",
         error.InternalStructInExternalFunction => "a struct in an external function's parameters or return type must be an external struct",
-        error.ManyVoidPointer => "a pointer to void cannot point to multiple values",
+        error.ManyVoidPointer => "*Many(void) is not allowed, use *void",
         error.NotAssignable => "only variables and their fields can be assigned",
         error.MethodIsCase => "function has the name of a case",
         error.DuplicateCase => "case is already defined",
@@ -3661,8 +3661,8 @@ fn describeError(name_error: NameError) []const u8 {
         error.CannotEvaluate => "cannot be evaluated at compile time",
         error.TypeMismatch => "value does not match the expected type",
         error.FunctionWithoutPointer => "function types need a pointer",
-        error.ManyFunctionPointer => "functions need a single value pointer",
-        error.ConstantFunctionPointer => "function pointers cannot be const",
+        error.ManyFunctionPointer => "a function pointer is written *fn(...), not *Many(fn(...))",
+        error.ConstantFunctionPointer => "a function pointer is written without Const",
         error.DuplicateLabel => "label is already used by an enclosing loop",
         error.UnusedLabel => "label is unused",
         error.UnknownLabel => "label does not name an enclosing loop",
@@ -3780,7 +3780,9 @@ fn countConstants(modules: []const ast.Module) usize {
 }
 
 fn isReservedName(module_path: ast.Path, name: []const u8) bool {
-    if (std.mem.eql(u8, name, "void") or std.mem.eql(u8, name, "Self")) return true;
+    for ([_][]const u8{ "void", "Self", "Const", "Many" }) |reserved| {
+        if (std.mem.eql(u8, name, reserved)) return true;
+    }
     return !isStandardLibrary(module_path) and hasReservedPrefix(name);
 }
 
@@ -4451,7 +4453,7 @@ test "NameResolver.resolve: resolves calls to external functions" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn stdout_write(text: []const u8)\nfn main(): stdout_write(\"hi\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn stdout_write(text: []Const(u8))\nfn main(): stdout_write(\"hi\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4646,7 +4648,7 @@ test "resolveModule: allows reserved names in the standard library" {
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "mn");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []const u8)\nconst write = mn_runtime_stdout_write" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []Const(u8))\nconst write = mn_runtime_stdout_write" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -5124,7 +5126,7 @@ test "resolveInstance: matches the typeclass parameter with the instance type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn merge(self: T, others: []const T) -> T\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn merge(self: Square, others: []const Square) -> Square:\n        _ = others\n        return self" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn merge(self: T, others: []Const(T)) -> T\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn merge(self: Square, others: []Const(Square)) -> Square:\n        _ = others\n        return self" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5144,7 +5146,7 @@ test "resolveInstance: matches the typeclass parameter behind a pointer with the
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn grow(self: T, other: *const T)\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn grow(self: Square, other: *const Square):\n        _ = self\n        _ = other" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn grow(self: T, other: *Const(T))\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn grow(self: Square, other: *Const(Square)):\n        _ = self\n        _ = other" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5165,7 +5167,7 @@ test "resolveInstance: rejects a pointer of another mutability than the typeclas
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn grow(self: T, other: *const T)\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn grow(self: Square, other: *Square):\n        _ = self\n        _ = other" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn grow(self: T, other: *Const(T))\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn grow(self: Square, other: *Square):\n        _ = self\n        _ = other" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5517,7 +5519,7 @@ test "resolveFunctionSignature: resolves the receiver and self of a method" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []const u8\n    fn show(self: Self) -> []const u8: return self.question" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []Const(u8)\n    fn show(self: Self) -> []Const(u8): return self.question" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5597,7 +5599,7 @@ test "resolveDeclaredTypes: rejects a declared type that appears in no parameter
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn(type Item, type Unused) count(items: []const Item) -> usize: return items.length" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn(type Item, type Unused) count(items: []Const(Item)) -> usize: return items.length" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5824,7 +5826,7 @@ test "expectUniqueMethod: rejects a method with the name of a field" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []const u8\n    fn question(self: Self): _ = self" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []Const(u8)\n    fn question(self: Self): _ = self" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7715,7 +7717,7 @@ test "resolveLoop: ends the names of a for loop at the end of its body" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn show(items: []const i32):\n    for item in items: take(item)\n    take(item)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn show(items: []Const(i32)):\n    for item in items: take(item)\n    take(item)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7734,7 +7736,7 @@ test "resolveLoop: leaves the names of a for loop out of its else block" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn show(items: []const i32):\n    for item in items: take(item)\n    else: take(item)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn show(items: []Const(i32)):\n    for item in items: take(item)\n    else: take(item)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7753,13 +7755,13 @@ test "resolveLoop: rejects an unused name of a for loop" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn show(items: []const i32): for item in items: step()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn step(): noop\nfn show(items: []Const(i32)): for item in items: step()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.UnusedLoopName, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 34 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 35 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveLoop: accepts an underscore in place of a name of a for loop" {
@@ -7913,7 +7915,7 @@ test "declareElements: resolves the name to its loop" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn show(items: []const i32): for item in items: take(item)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn show(items: []Const(i32)): for item in items: take(item)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7934,13 +7936,13 @@ test "declareElements: rejects a reserved name" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn show(items: []const i32): for mn_item in items: take(mn_item)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32): _ = value\nfn show(items: []Const(i32)): for mn_item in items: take(mn_item)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.ReservedName, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 34 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 35 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveBranches: resolves a value name to its branch and a case named through its enum" {
@@ -8247,6 +8249,25 @@ test "resolveLocalConstant: rejects a reserved name" {
 
     try std.testing.expectError(error.ReservedName, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 12 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveLocalConstant: rejects Const and Many as names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> i32:\n    const Many = 1i32\n    return Many" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ReservedName, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, analyzer.failure.?.location.?);
 }
 
 test "resolveLocalConstant: leaves a call to a struct's function through a path for later and sees the import it shadows" {
@@ -8772,13 +8793,13 @@ test "resolveTarget: rejects assigning to a name of a for loop" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(items: []const i32): for item in items: item = 1" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(items: []Const(i32)): for item in items: item = 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.NotAssignable, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 49 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 50 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveTarget: rejects an unknown name" {
@@ -8894,7 +8915,7 @@ test "resolveDiscardedName: discards a name of a for loop" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(items: []const i32): for item in items: _ = item" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(items: []Const(i32)): for item in items: _ = item" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9047,7 +9068,7 @@ test "resolveNamesInExpression: resolves the names in an index" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(values: []const i32, position: usize) -> i32: return values[position]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(values: []Const(i32), position: usize) -> i32: return values[position]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9801,7 +9822,7 @@ test "resolveSliceType: resolves a slice type through a constant" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Bytes = []const u8\nfn show(bytes: Bytes): _ = bytes" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Bytes = []Const(u8)\nfn show(bytes: Bytes): _ = bytes" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9843,7 +9864,7 @@ test "resolveSlice: resolves the names in the bounds" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(values: []const i32, start: usize, end: usize) -> []const i32: return values[start..end]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(values: []Const(i32), start: usize, end: usize) -> []Const(i32): return values[start..end]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9919,7 +9940,7 @@ test "resolvePointerType: resolves the target, count and mutability" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(values: *many const u8): _ = values" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(values: *Many(Const(u8))): _ = values" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9942,7 +9963,7 @@ test "resolvePointerType: resolves a pointer type through a constant" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Bytes = *many u8\nfn show(bytes: Bytes): _ = bytes" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Bytes = *Many(u8)\nfn show(bytes: Bytes): _ = bytes" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9984,7 +10005,7 @@ test "resolvePointerType: rejects a read-only pointer to a function" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn apply(callback: *const fn()): _ = callback" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn apply(callback: *Const(fn())): _ = callback" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10003,7 +10024,7 @@ test "resolvePointerType: rejects a multiple value pointer to a function" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn apply(callbacks: *many fn()): _ = callbacks" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn apply(callbacks: *Many(fn())): _ = callbacks" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10022,7 +10043,7 @@ test "resolvePointerType: rejects a read-only pointer to an alias of a function 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Callback = fn()\nfn apply(callback: *const Callback): _ = callback" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const Callback = fn()\nfn apply(callback: *Const(Callback)): _ = callback" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10041,7 +10062,7 @@ test "resolvePointerType: rejects a multiple value pointer to void" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(pointer: *many void): _ = pointer" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(pointer: *Many(void)): _ = pointer" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10598,7 +10619,7 @@ test "resolveName: resolves the typeclass parameter to the instance type in a de
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn copy(self: T) -> T: return self\ninstance Shape([]const u8):\n    fn area(self: []const u8) -> i32:\n        _ = self\n        return 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn copy(self: T) -> T: return self\ninstance Shape([]Const(u8)):\n    fn area(self: []Const(u8)) -> i32:\n        _ = self\n        return 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10925,7 +10946,7 @@ test "resolveFirstNamespace: resolves a path that starts with the separator to a
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn match(pattern: []const u8) -> bool: return pattern.length > 0\nstruct Point:\n    x: i32\nfn make() -> ::Point: return ::Point{x = 1}\nfn main():\n    _ = ::match(\"x\")\n    _ = make()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn match(pattern: []Const(u8)) -> bool: return pattern.length > 0\nstruct Point:\n    x: i32\nfn make() -> ::Point: return ::Point{x = 1}\nfn main():\n    _ = ::match(\"x\")\n    _ = make()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10946,7 +10967,7 @@ test "resolveMember: reaches a function with a reserved name in another module t
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "parser.mn", .data = "fn match(pattern: []const u8) -> bool: return pattern.length > 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "parser.mn", .data = "fn match(pattern: []Const(u8)) -> bool: return pattern.length > 0" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import parser\nfn main():\n    _ = parser::match(\"x\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -10965,7 +10986,7 @@ test "resolveMember: reaches the built-ins through the current module's path ins
     defer program_directory.cleanup();
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn.mn", .data = "fn width(type T) -> usize: return ::size(T) + ::alignment(T)\nfn same(pointer: *const i32) -> *i32: return ::cast(*i32, pointer)" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn.mn", .data = "fn width(type T) -> usize: return ::size(T) + ::alignment(T)\nfn same(pointer: *Const(i32)) -> *i32: return ::cast(*i32, pointer)" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -11033,7 +11054,7 @@ test "resolveModule: rejects an import of a function with a reserved name" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "parser.mn", .data = "fn match(pattern: []const u8) -> bool: return pattern.length > 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "parser.mn", .data = "fn match(pattern: []Const(u8)) -> bool: return pattern.length > 0" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import parser::match" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -12096,7 +12117,7 @@ test "resolveEnum: accepts an enum that points to itself" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum List:\n    end\n    next: *const List\nfn take(list: List): _ = list" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum List:\n    end\n    next: *Const(List)\nfn take(list: List): _ = list" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12135,7 +12156,7 @@ test "resolveExternalSignature: rejects a struct that is not external through a 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nexternal fn take(points: []const *Point)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nexternal fn take(points: []Const(*Point))" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12272,7 +12293,7 @@ test "expectExternalFields: accepts numbers, bool, pointers, optional pointers, 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Inner:\n    value: f64\nstruct Hidden:\n    value: u8\nexternal struct Outer:\n    count: u128\n    flag: bool\n    pointer: *Hidden\n    maybe: ?*const u8\n    callback: *fn(i32) -> i32\n    values: [4][2]i16\n    inner: Inner\n    inners: [2]Inner\nfn use(outer: Outer): _ = outer" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Inner:\n    value: f64\nstruct Hidden:\n    value: u8\nexternal struct Outer:\n    count: u128\n    flag: bool\n    pointer: *Hidden\n    maybe: ?*Const(u8)\n    callback: *fn(i32) -> i32\n    values: [4][2]i16\n    inner: Inner\n    inners: [2]Inner\nfn use(outer: Outer): _ = outer" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12293,7 +12314,7 @@ test "expectExternalFields: rejects a slice field" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Text:\n    bytes: []const u8\nfn use(text: Text): _ = text" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Text:\n    bytes: []Const(u8)\nfn use(text: Text): _ = text" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);

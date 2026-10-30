@@ -6,7 +6,6 @@ pub const keywords = std.StaticStringMap(token.TokenKind).initComptime(.{
     .{ "fn", .keyword_fn },
     .{ "external", .keyword_external },
     .{ "const", .keyword_const },
-    .{ "many", .keyword_many },
     .{ "var", .keyword_var },
     .{ "struct", .keyword_struct },
     .{ "typeclass", .keyword_typeclass },

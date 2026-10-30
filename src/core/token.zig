@@ -7,7 +7,6 @@ pub const TokenKind = union(enum) {
     keyword_fn,
     keyword_external,
     keyword_const,
-    keyword_many,
     keyword_var,
     keyword_struct,
     keyword_typeclass,

@@ -8,7 +8,7 @@ typeclass Allocator(type A):
     fn resize(allocator: *A, bytes: []u8, alignment: usize, size: usize) -> bool
     fn free(allocator: *A, bytes: []u8, alignment: usize)
 
-fn equal(one: []const u8, two: []const u8) -> bool:
+fn equal(one: []Const(u8), two: []Const(u8)) -> bool:
     if one.length != two.length: return false
     for index in 0..one.length:
         if one[index] != two[index]: return false
@@ -16,18 +16,18 @@ fn equal(one: []const u8, two: []const u8) -> bool:
 
 fn allocate(allocator: *Allocator, type T, count: usize) -> Error![]T:
     const bytes = try Allocator::allocate(allocator, mn::size(T) * count, mn::alignment(T))
-    return mn::cast(*many T, bytes.pointer)[0..count]
+    return mn::cast(*Many(T), bytes.pointer)[0..count]
 
-fn(type Item) free(allocator: *Allocator, items: []const Item):
-    const bytes = mn::cast(*many u8, items.pointer)[0..items.length * mn::size(Item)]
+fn(type Item) free(allocator: *Allocator, items: []Const(Item)):
+    const bytes = mn::cast(*Many(u8), items.pointer)[0..items.length * mn::size(Item)]
     Allocator::free(allocator, bytes, mn::alignment(Item))
 
 fn create(allocator: *Allocator, type T) -> Error!*T:
     const bytes = try Allocator::allocate(allocator, mn::size(T), mn::alignment(T))
     return mn::cast(*T, bytes.pointer)
 
-fn(type Item) destroy(allocator: *Allocator, pointer: *const Item):
-    const bytes = mn::cast(*many u8, pointer)[0..mn::size(Item)]
+fn(type Item) destroy(allocator: *Allocator, pointer: *Const(Item)):
+    const bytes = mn::cast(*Many(u8), pointer)[0..mn::size(Item)]
     Allocator::free(allocator, bytes, mn::alignment(Item))
 
 struct System
@@ -41,14 +41,14 @@ instance Allocator(System):
 
     fn free(_: *System, bytes: []u8, _: usize): mn_runtime_memory_free(bytes.pointer)
 
-external fn mn_runtime_memory_allocate(size: usize, alignment: usize) -> ?*many u8
+external fn mn_runtime_memory_allocate(size: usize, alignment: usize) -> ?*Many(u8)
 
-external fn mn_runtime_memory_free(pointer: *many u8)
+external fn mn_runtime_memory_free(pointer: *Many(u8))
 
 fn Arena(type P: Allocator) -> type:
     return struct:
         parent: P
-        block: ?*many u8
+        block: ?*Many(u8)
         used: usize
         capacity: usize
         last: usize
@@ -65,7 +65,7 @@ fn Arena(type P: Allocator) -> type:
             self.last = 0
 
 struct ArenaBlock:
-    previous: ?*many u8
+    previous: ?*Many(u8)
     size: usize
 
 const arena_block_size: usize = 4096

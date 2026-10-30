@@ -2188,7 +2188,7 @@ test "evaluateFieldAccess: reads the pointer and the length of a slice at compil
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn second(values: []const u8) -> u8:\n    const pointer = values.pointer\n    return pointer[1] + mn::convert(u8, values.length)\nconst VALUES: [3]u8 = {1, 2, 3}\nconst SECOND = second(&VALUES)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn second(values: []Const(u8)) -> u8:\n    const pointer = values.pointer\n    return pointer[1] + mn::convert(u8, values.length)\nconst VALUES: [3]u8 = {1, 2, 3}\nconst SECOND = second(&VALUES)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2460,7 +2460,7 @@ test "evaluateBuiltin: rejects aligning a pointer at compile time" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn move(values: []const u8) -> usize:\n    const aligned = mn::align(values.pointer, 4)\n    _ = aligned\n    return 0\nconst VALUES: [2]u8 = {1, 2}\nconst MOVED = move(&VALUES)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn move(values: []Const(u8)) -> usize:\n    const aligned = mn::align(values.pointer, 4)\n    _ = aligned\n    return 0\nconst VALUES: [2]u8 = {1, 2}\nconst MOVED = move(&VALUES)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2826,7 +2826,7 @@ test "evaluateCompositeLiteral: makes a read-only slice from braces with element
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const WORDS: []const u8 = {104, 105}\nfn local() -> usize:\n    const values: []const usize = {7, 8, 9}\n    return values.length + values[2]\nconst FIRST = WORDS[1]\nconst LOCAL = local()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const WORDS: []Const(u8) = {104, 105}\nfn local() -> usize:\n    const values: []Const(usize) = {7, 8, 9}\n    return values.length + values[2]\nconst FIRST = WORDS[1]\nconst LOCAL = local()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2867,7 +2867,7 @@ test "evaluateSlice: rejects bounds outside the length" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn outside() -> []const i32:\n    const values = [3]i32{1, 2, 3}\n    return values[1..4]\nconst OUTSIDE = outside()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn outside() -> []Const(i32):\n    const values = [3]i32{1, 2, 3}\n    return values[1..4]\nconst OUTSIDE = outside()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3036,7 +3036,7 @@ test "evaluateCall: calls a default implementation with a pointer receiver" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn double(self: *const T) -> i32: return self.area() * 2\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side * self.side\nfn make() -> i32:\n    const square = Square{side = 3}\n    return square.double()\nconst DOUBLE = make()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\n    fn double(self: *Const(T)) -> i32: return self.area() * 2\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn area(self: Square) -> i32: return self.side * self.side\nfn make() -> i32:\n    const square = Square{side = 3}\n    return square.double()\nconst DOUBLE = make()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3526,7 +3526,7 @@ test "executeIteration: zips a read-only slice and a range" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::Zip\nfn sum(cards: []const u32) -> u32:\n    var total: u32 = 0\n    for (card, index) in Zip::zip({cards, 0..}):\n        total += card * mn::convert(u32, index)\n    return total\nconst CARDS = [3]u32{1, 2, 3}\nconst SUM = sum(CARDS[..])" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::Zip\nfn sum(cards: []Const(u32)) -> u32:\n    var total: u32 = 0\n    for (card, index) in Zip::zip({cards, 0..}):\n        total += card * mn::convert(u32, index)\n    return total\nconst CARDS = [3]u32{1, 2, 3}\nconst SUM = sum(CARDS[..])" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3796,7 +3796,7 @@ test "makeString: decodes the escapes of a string" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count(text: []const u8) -> usize:\n    var total = 0usize\n    for _ in text: total += 1\n    return total\nconst LENGTH = count(\"a\\n\\u{e9}\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count(text: []Const(u8)) -> usize:\n    var total = 0usize\n    for _ in text: total += 1\n    return total\nconst LENGTH = count(\"a\\n\\u{e9}\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);

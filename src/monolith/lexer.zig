@@ -881,14 +881,14 @@ test "lexWord: recognizes the const keyword" {
     try std.testing.expectEqualStrings("constant", lexer.tokens.items[2].kind.identifier);
 }
 
-test "lexWord: recognizes the many keyword" {
+test "lexWord: reads many as a name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = Lexer.init("many manyfold");
+    var lexer = Lexer.init("many Many");
     try lexer.lex(&arena);
 
-    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_many);
-    try std.testing.expectEqualStrings("manyfold", lexer.tokens.items[2].kind.identifier);
+    try std.testing.expectEqualStrings("many", lexer.tokens.items[1].kind.identifier);
+    try std.testing.expectEqualStrings("Many", lexer.tokens.items[2].kind.identifier);
 }
 
 test "lexWord: recognizes the struct keyword" {

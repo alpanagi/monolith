@@ -28,9 +28,9 @@ instance(type T) Iterator([]T):
             return {element}
         return null
 
-instance(type T) Iterator([]const T):
+instance(type T) Iterator([]Const(T)):
     fn Element() -> type: return [T]
-    fn next(iterator: *[]const T) -> ?Element():
+    fn next(iterator: *[]Const(T)) -> ?Element():
         for element in iterator.*:
             iterator.* = iterator.*[1..]
             return {element}
@@ -85,7 +85,7 @@ fn List(type T) -> type:
             if length == self.capacity:
                 var capacity: usize = 8
                 if self.capacity > 0: capacity = self.capacity * 2
-                const bytes = ::cast(*many u8, self.items.pointer)[0..self.capacity * ::size(T)]
+                const bytes = ::cast(*Many(u8), self.items.pointer)[0..self.capacity * ::size(T)]
                 if self.capacity > 0 and Allocator::resize(allocator, bytes, ::alignment(T), capacity * ::size(T)):
                     self.capacity = capacity
                 else:

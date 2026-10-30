@@ -22,8 +22,8 @@
 - Identifiers are case-sensitive. By convention only types and type constructors start with a capital letter.
 - The single character `_` is reserved and cannot be used as an identifier by the user.
 - The following identifier names are reserved and cannot be used as identifiers by the user:
-    `and`, `any`, `as`, `break`, `case`, `catch`, `comptime`, `const`, `continue`, `defer`, `else`, `enum`, `errdefer`, `error`, `external`, `false`, `fn`, `for`, `if`, `import`, `in`, `inline`, `instance`, `many`, `match`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `true`, `try`, `typeclass`, `undefined`, `var`, `void`, `while`
-- A reserved name can be the name of a function, struct, enum or error set, and a name after `::`, e.g. `fn match(pattern: []const u8) -> bool` called as `parser::match(pattern)`. Elsewhere it is reached through a path.
+    `and`, `any`, `as`, `break`, `case`, `catch`, `comptime`, `const`, `Const`, `continue`, `defer`, `else`, `enum`, `errdefer`, `error`, `external`, `false`, `fn`, `for`, `if`, `import`, `in`, `inline`, `instance`, `Many`, `match`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `true`, `try`, `typeclass`, `undefined`, `var`, `void`, `while`
+- A reserved name can be the name of a function, struct, enum or error set, and a name after `::`, e.g. `fn match(pattern: []Const(u8)) -> bool` called as `parser::match(pattern)`. Elsewhere it is reached through a path.
 
 ## Built-In Types
 
@@ -33,18 +33,19 @@
 - Unsigned integers: `u8`, `u16`, `u32`, `u64`, `u128`, and `usize` which has the target's pointer size.
 - Floating point numbers: `f16`, `f32`, `f64`, `f128` as defined for IEEE 754 binary formats.
 - Booleans: `bool` with `true` and `false` as values.
-- `void`: represents no result, i.e. the result of a function that returns nothing. It has no size and can be used anywhere a type can, except as the target of a multiple value pointer. `*void` is a pointer whose target is unknown (see Pointer Types).
+- `void`: represents no result, i.e. the result of a function that returns nothing. It has no size and can be used anywhere a type can, except in `*Many(void)`. `*void` is a pointer whose target is unknown (see Pointer Types).
 
 ### Pointer Types
 
-- Monolith supports pointers. A pointer's type is the target type prefixed with `*`, e.g. `*bool`.
-- Pointers either point to a single value or multiple. Pointers to multiple values use the `*many` prefix, e.g. `*many bool`.
-- Read-only pointers are marked `const`, e.g. `*const bool`, `*many const i32`. Values cannot be modified through a read-only pointer.
-- A pointer converts implicitly to a read-only pointer of the same kind, e.g. `*T` to `*const T`. The reverse is a compile-time error.
-- Pointer arithmetic and indexing are supported only for multiple value pointers.
+- Monolith supports pointers. A pointer's type is the target type prefixed with `*`, e.g. `*bool`. It points to a single value.
+- `*Many(T)` is a pointer to any number of values of type `T`, like a C pointer, e.g. `*Many(bool)`. It has no length.
+- Pointer arithmetic and indexing are supported only for `*Many(T)`.
+- `*T`, `*Many(T)` and slices `[]T` are the pointer forms. `Const(T)` as what a pointer form points to makes it read-only, e.g. `*Const(bool)`, `*Many(Const(i32))` and `[]Const(u8)`. Values cannot be modified through a read-only pointer.
+- `Const` and `Many` are built-in type constructors. `Many(T)` is allowed only right after `*`, and `Const(T)` only as what a pointer form points to, inside `Many` when both are used. Anywhere else they are a compile-time error, e.g. `var limit: Const(u32)`, `*Const(Many(u8))` or `[]Many(u8)`.
+- A pointer converts implicitly to a read-only pointer of the same kind, e.g. `*T` to `*Const(T)` and `*Many(T)` to `*Many(Const(T))`. The reverse is a compile-time error.
 - Pointers are never allowed to be `null` but can be `undefined` (see Undefined).
 - A pointer never holds address 0.
-- `*void` is a pointer whose target is unknown, like C's `void *`. It cannot be dereferenced, indexed or moved. Any pointer except a pointer to a function converts implicitly to `*void`, or to `*const void` if it is read-only.
+- `*void` is a pointer whose target is unknown, like C's `void *`. It cannot be dereferenced, indexed or moved. Any pointer except a pointer to a function converts implicitly to `*void`, or to `*Const(void)` if it is read-only.
 
 ### Array Types
 
@@ -60,12 +61,11 @@
 
 ### Slice Types
 
-- A slice is a multiple value pointer and a `usize` length. Its type is the element type prefixed with `[]`, e.g. `[]i32`.
-- Read-only slices are marked `const`, e.g. `[]const i32`. Values cannot be modified through a read-only slice.
-- A slice converts implicitly to a read-only slice, e.g. `[]T` to `[]const T`. The reverse is a compile-time error.
+- A slice is a `*Many(T)` and a `usize` length. Its type is the element type prefixed with `[]`, e.g. `[]i32`.
+- A slice converts implicitly to a read-only slice, e.g. `[]T` to `[]Const(T)`. The reverse is a compile-time error.
 - A pointer to an array converts implicitly to a slice, with the length taken from the array type, e.g. `*[4]u8` to `[]u8`. A read-only pointer gives a read-only slice.
 - Slices support indexing, starting at 0.
-- `slice.pointer` gives a slice's multiple value pointer and `slice.length` its length. They can be read but not assigned.
+- `slice.pointer` gives a slice's `*Many(T)` and `slice.length` its length. They can be read but not assigned.
 
 ### Optional Types
 
@@ -81,12 +81,12 @@
 - Tuple types can span multiple lines. A comma after the last element type is allowed.
 - Tuples support indexing with an index known at compile time, starting at 0.
 - Indexing a tuple type with an index known at compile time gives the type of that element, e.g. `T[0]`.
-- Every tuple type has an instance of `mn`'s typeclass `mn::Tuple`, which the compiler provides. A program cannot declare an instance of `mn::Tuple`. A parameter that requires it takes any tuple, e.g. `fn print(comptime format: []const u8, values: mn::Tuple)`, and code that depends on the tuple's elements is checked in each instance of the function.
+- Every tuple type has an instance of `mn`'s typeclass `mn::Tuple`, which the compiler provides. A program cannot declare an instance of `mn::Tuple`. A parameter that requires it takes any tuple, e.g. `fn print(comptime format: []Const(u8), values: mn::Tuple)`, and code that depends on the tuple's elements is checked in each instance of the function.
 
 ### Function Types
 
 - A function type is written like a function signature without parameter names, e.g. `fn(i32, bool) -> i32` (see Functions). Functions exist only at compile time.
-- A pointer to a function is written without `const`, e.g. `*fn(i32, bool) -> i32`, since a function cannot be modified.
+- A pointer to a function is written without `Const`, e.g. `*fn(i32, bool) -> i32`, since a function cannot be modified.
 
 ## Structs
 
@@ -104,7 +104,7 @@
 - `value.field` gives a field of a struct.
 - A struct's block can also declare functions, e.g. `fn area(self: Self) -> i32: return self.side`. In the block, `Self` is the struct's type.
 - A function in a struct's block is reached through the struct's name and `::`, e.g. `Square::new()`.
-- A function whose first parameter's type is written `Self`, `*Self` or `*const Self` is a method. `value.name(arguments)` calls it with `value` as the first argument, e.g. `square.area()`.
+- A function whose first parameter's type is written `Self`, `*Self` or `*Const(Self)` is a method. `value.name(arguments)` calls it with `value` as the first argument, e.g. `square.area()`.
 - When the first parameter is a pointer, the call takes the value's address automatically, e.g. `counter.increment()` passes `&counter`. It is allowed only where `&` is allowed, and `*Self` needs a pointer that can modify the value (see Pointer Operations).
 - A method can also be called on a pointer to the value, which is dereferenced automatically, one level only, e.g. `pointer.area()`. If the pointer's own type has a method with the same name, that method is called.
 - A method is found by the exact type of the value.
@@ -112,7 +112,7 @@
 
 ## Enums
 
-- An enum is a type whose value is one of several cases. It is declared with `enum`, its name, and its cases in an indented block, e.g. `enum Token:` followed by `number: i64`, `name: []const u8` and `end`.
+- An enum is a type whose value is one of several cases. It is declared with `enum`, its name, and its cases in an indented block, e.g. `enum Token:` followed by `number: i64`, `name: []Const(u8)` and `end`.
 - A case can carry a value of the type written after `:`. A case without a type carries no value.
 - Case names must be unique within an enum.
 - `Enum::case` gives a case without a value, e.g. `Token::end`. `Enum::case(value)` gives a case with its value, e.g. `Token::number(42)`.
@@ -162,7 +162,7 @@
 - Array literals are written as the array type followed by the elements in braces, separated by commas, e.g. `[3]i32{1, 2, 3}`.
 - The type can be left out when it is known from the surrounding code, e.g. `{1, 2, 3}`.
 - `_` takes the length from the literal, e.g. `[_]i32{1, 2, 3}`.
-- A braced literal can initialize a read-only slice when its elements are known at compile time, e.g. `const primes: []const i32 = {2, 3, 5}`.
+- A braced literal can initialize a read-only slice when its elements are known at compile time, e.g. `const primes: []Const(i32) = {2, 3, 5}`.
 - `{}` where a slice is expected gives a slice of length 0, read-only or not, e.g. `items = {}` for a field of type `[]T`. It needs no storage, since it has no elements to read or write.
 - The number of elements must match the array's length. A mismatch is a compile-time error.
 - Array literals can span multiple lines.
@@ -171,7 +171,7 @@
 ### String Literals
 
 - Strings are enclosed in double quotes and are always single-line strings.
-- A string literal is a `[]const u8` holding its text encoded as UTF-8, including `\u{...}` escapes.
+- A string literal is a `[]Const(u8)` holding its text encoded as UTF-8, including `\u{...}` escapes.
 - Strings allow for the following escapes, `\n`, `\t`, `\\`, `\'`, `\"`, `\r`, `\0`, and `\u{...}`. `\u{...}` takes 1 to 6 hexadecimal digits and must be a Unicode scalar value.
 
 ### Tuple Literals
@@ -255,10 +255,10 @@
 
 ### Pointer Casts
 
-- `mn::cast(T, pointer)` gives the pointer as the pointer type `T`, with the same address. It changes the target type or switches between single and multiple value pointers, e.g. `mn::cast(*const Header, buffer.pointer)`.
-- A cast can remove `const`, e.g. `mn::cast(*many u8, items.pointer)` for an `items` of type `[]const Card`. Writing through it to memory that cannot be modified, such as a string literal, is illegal behavior.
+- `mn::cast(T, pointer)` gives the pointer as the pointer type `T`, with the same address. It changes the target type or switches between `*T` and `*Many(T)`, e.g. `mn::cast(*Const(Header), buffer.pointer)`.
+- A cast can remove `Const`, e.g. `mn::cast(*Many(u8), items.pointer)` for an `items` of type `[]Const(Card)`. Writing through it to memory that cannot be modified, such as a string literal, is illegal behavior.
 - An address that is not a multiple of the target type's alignment is illegal behavior.
-- `mn::align(pointer, alignment)` moves a multiple value pointer forward to the next address that is a multiple of `alignment`, e.g. `mn::align(next, mn::alignment(Card))`. An alignment that is not a power of two is illegal behavior.
+- `mn::align(pointer, alignment)` moves a `*Many(T)` forward to the next address that is a multiple of `alignment`, e.g. `mn::align(next, mn::alignment(Card))`. An alignment that is not a power of two is illegal behavior.
 
 ### Arithmetic Operators
 
@@ -275,7 +275,7 @@
 - Two types are equal when they are the same type, e.g. `T == i32`.
 - Slices cannot be compared with `==` and `!=`, since a slice points to its elements. Their bytes are compared with `mn::memory::equal` (see the standard library).
 - Two enum values, or two errors, are equal when they are the same case and their values are equal. An error can be compared with a value of an error set combined from its set, e.g. `failure == ParseError::missing_end`.
-- `<`, `<=`, `>` and `>=` work on numbers and multiple value pointers.
+- `<`, `<=`, `>` and `>=` work on numbers and `*Many(T)`s.
 - A comparison gives a `bool`.
 
 ### Logical Operators
@@ -293,7 +293,7 @@
 
 ### Indexing
 
-- `a[i]` gives the element at index `i` of an array, slice, multiple value pointer or tuple. The index is a `usize`.
+- `a[i]` gives the element at index `i` of an array, slice, `*Many(T)` or tuple. The index is a `usize`.
 - An index outside the length of an array or slice is illegal behavior. An index known at compile time outside an array's length is a compile-time error.
 - A tuple's index must be known at compile time.
 - Indexing a pointer to an array dereferences it automatically.
@@ -301,7 +301,7 @@
 ### Slicing
 
 - `a[i..j]` gives a slice of the elements from index `i` up to, but not including, `j`. Either bound can be left out to start at 0 or end at the length, e.g. `a[..]`.
-- Arrays, slices and multiple value pointers can be sliced. A multiple value pointer needs an end bound.
+- Arrays, slices and `*Many(T)`s can be sliced. A `*Many(T)` needs an end bound.
 - An array can be sliced only if it is a variable, constant, element or field.
 - Slicing a pointer to an array slices the array.
 - Slicing gives a read-only slice if the elements cannot be modified, e.g. a constant array, a read-only slice or a read-only pointer.
@@ -313,9 +313,9 @@
 - `pointer.*` gives the value a pointer points to.
 - Reading or writing through a pointer to invalid memory, such as a dangling or `undefined` pointer, is illegal behavior.
 - Field access dereferences a pointer automatically, one level only, e.g. `pointer.field`.
-- Adding a `usize` to a multiple value pointer, or subtracting one from it, moves it by that many elements.
+- Adding a `usize` to a `*Many(T)`, or subtracting one from it, moves it by that many elements.
 - Pointer arithmetic that gives address 0 is illegal behavior.
-- Subtracting two multiple value pointers of the same type gives the number of elements between them as an `isize`.
+- Subtracting two `*Many(T)`s of the same type gives the number of elements between them as an `isize`.
 
 ### Optional Operations
 
@@ -367,7 +367,7 @@
 - `if condition:` runs its block when the condition is true. The condition is a `bool`.
 - `else:` runs its block when the condition is false. It is on the line after the `if` block, at the same indentation as `if`.
 - `else if condition:` checks another condition when the previous ones are false, e.g. `if a:` followed by `else if b:` and `else:`.
-- A condition that is known at compile time as a whole is evaluated at compile time, and only the block it chooses is checked and compiled, e.g. `if T == i32:` in a function with a `type T` parameter or `if format[0] == '{':` in a function with a `comptime format: []const u8` parameter. Any other condition is evaluated at run time and every block is checked, e.g. `if T == i32 and flag:` with a run-time `flag`.
+- A condition that is known at compile time as a whole is evaluated at compile time, and only the block it chooses is checked and compiled, e.g. `if T == i32:` in a function with a `type T` parameter or `if format[0] == '{':` in a function with a `comptime format: []Const(u8)` parameter. Any other condition is evaluated at run time and every block is checked, e.g. `if T == i32 and flag:` with a run-time `flag`.
 - `if optional as name:` runs its block when the optional is not `null`, with `name` holding its value, e.g. `if found as card:`. `*name` holds a pointer to the value instead of a copy. The name can be used only in the block.
 
 ### While
@@ -423,9 +423,9 @@
 - An unused parameter is a compile-time error.
 - Arguments are given in the order of the parameters.
 - `&name` gives a pointer to a function, e.g. to pass it as an argument. A pointer to a function is called like a function.
-- `external fn` declares a function defined outside the program, without a body, e.g. `external fn write(text: []const u8)`.
+- `external fn` declares a function defined outside the program, without a body, e.g. `external fn write(text: []Const(u8))`.
 - A struct in an external function's parameters or return type, directly or through pointers or arrays, must be an external struct.
-- `inline fn` declares a function whose every call is replaced by its body, e.g. `inline fn is_answer(input: []const u8) -> bool`. It is called like any other function and behaves the same.
+- `inline fn` declares a function whose every call is replaced by its body, e.g. `inline fn is_answer(input: []Const(u8)) -> bool`. It is called like any other function and behaves the same.
 - An inline function that calls itself, directly or through other functions, is a compile-time error. Using one as a value is a compile-time error, e.g. `&is_answer`. An external function cannot be inline.
 - `main` has no parameters and either no return type or a result without a value, e.g. `ParseError!void`. It cannot be called, used as a value, be external or be inline.
 - An error that ends `main` writes the case's name to the standard error stream and ends the program with a nonzero status.
@@ -450,7 +450,7 @@
 - `mn` is the module that comes with the language. It holds the built-in functions, which the compiler provides, and the standard library. A program's own `mn.mn` or `mn` directory is a compile-time error.
 - The built-in functions are `mn::size(T)` and `mn::alignment(T)`, which give a type's size and alignment in bytes as a `usize`, and `mn::convert(T, value)` and `mn::truncate(T, value)` (see Number Conversions), and `mn::cast(T, pointer)` and `mn::align(pointer, alignment)` (see Pointer Casts).
 - `mn::math::add_wrapping(a, b)`, `mn::math::subtract_wrapping(a, b)` and `mn::math::multiply_wrapping(a, b)` take two integers of the same type and give a result of that type that wraps around on overflow instead of being illegal behavior, e.g. `math::add_wrapping(value, 1)` is 0 for a `u8` `value` of 255.
-- `mn::comptime::error(message)` stops compilation with the message wherever the code containing it is checked, e.g. in the block a condition chooses at compile time. Like `return`, it ends its block, so a function returning a value needs no `return` after it. The message is a `[]const u8` known at compile time. The error shows the location of the call and each call that led to it.
+- `mn::comptime::error(message)` stops compilation with the message wherever the code containing it is checked, e.g. in the block a condition chooses at compile time. Like `return`, it ends its block, so a function returning a value needs no `return` after it. The message is a `[]Const(u8)` known at compile time. The error shows the location of the call and each call that led to it.
 - `mn::reflection` holds the built-in functions that inspect and build types. `mn::reflection::length(T)` gives a tuple type's number of elements as a `usize`. `mn::reflection::join(A, B)` gives the tuple type with the elements of `A` followed by those of `B`, e.g. `mn::reflection::join([Card], [usize])` is `[Card, usize]`.
 - `import path` makes the last name of the path available in the module. The path names a directory, a module or a declaration in a module, e.g. `import mn::io::stdout` allows `stdout::write("hi")`.
 - `import path as name` makes it available as `name` instead, e.g. `import mn::io::stdout as out`.
@@ -480,8 +480,8 @@
 - A typeclass's function whose first parameter's type is a parameter of the typeclass, or a pointer to one, can also be called as a method, e.g. `card.show(output)` (see Structs).
 - A function in a struct's block shadows a typeclass's function with the same name. A method that a type gets from two typeclasses cannot be called as `value.name()`.
 - A parameter whose type is a typeclass with one parameter takes a value of any type with an instance, e.g. `fn report(value: Show)` called as `report(card)`. Each different type gets its own instance of the function.
-- A parameter whose type is a pointer to such a typeclass, `*Class` or `*const Class`, takes a pointer to a value of any type with an instance, e.g. `fn allocate(allocator: *Allocator, type T, count: usize)` called as `allocate(&system, Card, 10)`. Each different type gets its own instance of the function.
-- A `type` parameter can require instances, e.g. `fn parse(type T: Parse, text: []const u8) -> T`.
+- A parameter whose type is a pointer to such a typeclass, `*Class` or `*Const(Class)`, takes a pointer to a value of any type with an instance, e.g. `fn allocate(allocator: *Allocator, type T, count: usize)` called as `allocate(&system, Card, 10)`. Each different type gets its own instance of the function.
+- A `type` parameter can require instances, e.g. `fn parse(type T: Parse, text: []Const(u8)) -> T`.
 - A function with such parameters is checked once, before any instance, and can use them only through the functions of the typeclasses they require.
 
 ## Compile-Time Evaluation
@@ -490,9 +490,9 @@
 - A value is known at compile time when it is a literal, a constant or parameter known at compile time, or computed from these at compile time.
 - `type` is the type of types. Types are values known at compile time, e.g. `const Number = i32`. A value whose type contains `type` exists only at compile time.
 - Top-level constants are evaluated at compile time.
-- A parameter written `type T` takes a type, e.g. `fn List(type T) -> type`. A parameter marked `comptime` takes a value known at compile time, e.g. `comptime format: []const u8`. Their arguments are evaluated at compile time.
+- A parameter written `type T` takes a type, e.g. `fn List(type T) -> type`. A parameter marked `comptime` takes a value known at compile time, e.g. `comptime format: []Const(u8)`. Their arguments are evaluated at compile time.
 - A parameter whose type is `any` takes a value of any type, e.g. `fn equal(one: any, two: any) -> bool`. `any` can only be the type of a parameter.
-- A function can declare types in parentheses after `fn`, written like an instance's parameters, e.g. `fn(type Item) free(allocator: *Allocator, items: []const Item)`. They are not passed: each is taken from the types of the arguments, e.g. `free(&system, cards)` for a `[]Card` `cards` gives `Item` as `Card`. Arguments convert implicitly as for any parameter, so a `*[4]Card` also gives `Card`.
+- A function can declare types in parentheses after `fn`, written like an instance's parameters, e.g. `fn(type Item) free(allocator: *Allocator, items: []Const(Item))`. They are not passed: each is taken from the types of the arguments, e.g. `free(&system, cards)` for a `[]Card` `cards` gives `Item` as `Card`. Arguments convert implicitly as for any parameter, so a `*[4]Card` also gives `Card`.
 - Each declared type must appear in a parameter's type. Arguments that give a declared type two different types, or that do not fit the parameter's type, are a compile-time error.
 - A function gets its own instance for each different set of arguments to its `type` and `comptime` parameters, for each different set of types of the arguments to its `any` parameters, and for each different set of its declared types.
 - A function with `type`, `comptime` or `any` parameters or declared types is checked for everything that does not depend on them, even if it is never called.

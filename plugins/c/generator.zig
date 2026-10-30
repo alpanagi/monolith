@@ -6569,7 +6569,7 @@ test "Generator.generate: writes the modules and the runtime files they use" {
     var output_directory = std.testing.tmpDir(.{});
     defer output_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "mn");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []const u8)\nconst write = mn_runtime_stdout_write" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []Const(u8))\nconst write = mn_runtime_stdout_write" });
     try plugin_directory.dir.createDirPath(std.testing.io, "runtime");
     try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/monolith.h", .data = "header" });
     try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/stdout.c", .data = "stdout" });
@@ -6637,7 +6637,7 @@ test "Generator.generate: builds an executable when the main module defines main
     var output_directory = std.testing.tmpDir(.{});
     defer output_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "mn");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []const u8)\nconst write = mn_runtime_stdout_write" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []Const(u8))\nconst write = mn_runtime_stdout_write" });
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
     const compiler_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &compiler_directory.sub_path });
@@ -6776,7 +6776,7 @@ test "generateFiles: writes the standard library at its module path" {
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "mn");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []const u8)\nconst write = mn_runtime_stdout_write" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []Const(u8))\nconst write = mn_runtime_stdout_write" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -6819,7 +6819,7 @@ test "generateFiles: calls a standard library function that takes the empty tupl
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "mn");
-    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []const u8)\n\nconst write = mn_runtime_stdout_write\n\nfn println(text: []const u8, _: []):\n    write(text)\n    write(\"\\n\")\n" });
+    try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []Const(u8))\n\nconst write = mn_runtime_stdout_write\n\nfn println(text: []Const(u8), _: []):\n    write(text)\n    write(\"\\n\")\n" });
     const program_path = try std.fs.path.join(
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
@@ -7630,7 +7630,7 @@ test "generateConstantDeclarations: declares a stored array constant in the head
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []const u8\nconst cards: [2]Card = {\n    {question = \"a\"},\n    {question = \"b\"},\n}\nfn all() -> [2]Card: return cards" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []Const(u8)\nconst cards: [2]Card = {\n    {question = \"a\"},\n    {question = \"b\"},\n}\nfn all() -> [2]Card: return cards" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7730,7 +7730,7 @@ test "generateArrayDefinition: defines an array type before the struct that hold
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []const u8\nstruct Deck:\n    cards: [2]Card\nfn show(deck: Deck): _ = deck" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []Const(u8)\nstruct Deck:\n    cards: [2]Card\nfn show(deck: Deck): _ = deck" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8117,7 +8117,7 @@ test "generateZeroSizedObject: defines the shared zero-sized object only in the 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "other.mn", .data = "struct Marker\nfn locate(marker: Marker) -> *const Marker: return &marker" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "other.mn", .data = "struct Marker\nfn locate(marker: Marker) -> *Const(Marker): return &marker" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import other\nfn main(): _ = other::locate(other::Marker{})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -8216,7 +8216,7 @@ test "generateStatics: writes a slice of a compile-time array as static data" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> []const i32:\n    const values = [3]i32{1, 2, 3}\n    return values[1..]\nconst TAIL = make()\nfn read() -> []const i32: return TAIL" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> []Const(i32):\n    const values = [3]i32{1, 2, 3}\n    return values[1..]\nconst TAIL = make()\nfn read() -> []Const(i32): return TAIL" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8246,7 +8246,7 @@ test "generateStatics: points into a compile-time array as static data" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn second(text: []const u8) -> *const u8: return &text[1]\nconst SECOND = second(\"abc\")\nfn read() -> u8: return SECOND.*" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn second(text: []Const(u8)) -> *Const(u8): return &text[1]\nconst SECOND = second(\"abc\")\nfn read() -> u8: return SECOND.*" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8306,7 +8306,7 @@ test "generateStatics: writes floats exactly and strings as text" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const THIRD = 1f32 / 3f32\nconst HUGE = 1f64 / 0f64\nconst NAME = \"a\\tb\"\nfn third() -> f32: return THIRD\nfn huge() -> f64: return HUGE\nfn name() -> []const u8: return NAME" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const THIRD = 1f32 / 3f32\nconst HUGE = 1f64 / 0f64\nconst NAME = \"a\\tb\"\nfn third() -> f32: return THIRD\nfn huge() -> f64: return HUGE\nfn name() -> []Const(u8): return NAME" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8577,7 +8577,7 @@ test "recordPointerTarget: includes the header of a struct that a usize moves a 
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Line:\n    width: i32" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn advance(lines: *many shapes::Line, count: usize) -> *many shapes::Line: return count + lines" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn advance(lines: *Many(shapes::Line), count: usize) -> *Many(shapes::Line): return count + lines" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8605,7 +8605,7 @@ test "recordPointerTarget: includes the header of a struct read through a pointe
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Line:\n    width: i32" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn width(line: *const shapes::Line) -> i32: return line.width" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\nfn width(line: *Const(shapes::Line)) -> i32: return line.width" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8633,7 +8633,7 @@ test "recordPointerTarget: defines the array behind an indexed pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(values: *const [3]i32) -> i32: return values[1]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(values: *Const([3]i32)) -> i32: return values[1]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8694,7 +8694,7 @@ test "recordModule: includes the header of a stored slice constant of another mo
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "data.mn", .data = "const values = [2]i32{1, 2}\nconst items = values[..]" });
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import data\nfn take(values: []const i32): _ = values\nfn main(): take(data::items)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import data\nfn take(values: []Const(i32)): _ = values\nfn main(): take(data::items)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -8897,7 +8897,7 @@ test "generateSignature: keeps the names of external functions" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn print_(text: []const u8)\nfn main(): print_(\"hi\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn print_(text: []Const(u8))\nfn main(): print_(\"hi\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9822,7 +9822,7 @@ test "generateLocal: declares a local with its written type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn keep(value: *const i32)\nfn main():\n    var one = 1i32\n    var two = 2i32\n    var pointer: *const i32 = &one\n    pointer = &two\n    keep(pointer)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn keep(value: *Const(i32))\nfn main():\n    var one = 1i32\n    var two = 2i32\n    var pointer: *Const(i32) = &one\n    pointer = &two\n    keep(pointer)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10239,7 +10239,7 @@ test "generateTupleDeclaration: points a pointer name to a zero-sized element at
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal fn keep(marker: *const Marker)\nfn show(pair: [Marker, i32]):\n    const (*marker, _) = pair\n    keep(marker)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal fn keep(marker: *Const(Marker))\nfn show(pair: [Marker, i32]):\n    const (*marker, _) = pair\n    keep(marker)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10272,7 +10272,7 @@ test "generateTupleDeclaration: stores a constant whose element a pointer name p
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const pair = [i32, bool]{1, true}\nexternal fn keep(value: *const i32)\nfn main():\n    const (*number, _) = pair\n    keep(number)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const pair = [i32, bool]{1, true}\nexternal fn keep(value: *Const(i32))\nfn main():\n    const (*number, _) = pair\n    keep(number)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10305,7 +10305,7 @@ test "generateMatch: writes a switch on the tag that binds the values of the cas
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    flag: bool\n    end\n    other\nerror ParseError:\n    missing_end\n    bad_digit: u8\nerror FileError:\n    missing_end\nfn total(token: Token) -> i64:\n    match token:\n        case number(digits): return digits\n        case flag, end: return 1\n        else: return 0\nfn bump(token: *Token):\n    match token.*:\n        case number(*digits): digits.* += 1\n        case flag(_): noop\n        case end, other: noop\nfn sum(tokens: []const Token) -> i64:\n    var result: i64 = 0\n    for token in tokens:\n        match token:\n            case end: break\n            case other: continue\n            case number(digits): result += digits\n            case flag: noop\n    return result\nfn first(tokens: []const Token) -> i64:\n    match tokens[0]:\n        case number(digits): return digits\n        else: return 0\nfn code(failure: ParseError || FileError) -> u8:\n    match failure:\n        case ParseError::missing_end: return 1\n        case FileError::missing_end: return 2\n        case bad_digit(digit): return digit" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    flag: bool\n    end\n    other\nerror ParseError:\n    missing_end\n    bad_digit: u8\nerror FileError:\n    missing_end\nfn total(token: Token) -> i64:\n    match token:\n        case number(digits): return digits\n        case flag, end: return 1\n        else: return 0\nfn bump(token: *Token):\n    match token.*:\n        case number(*digits): digits.* += 1\n        case flag(_): noop\n        case end, other: noop\nfn sum(tokens: []Const(Token)) -> i64:\n    var result: i64 = 0\n    for token in tokens:\n        match token:\n            case end: break\n            case other: continue\n            case number(digits): result += digits\n            case flag: noop\n    return result\nfn first(tokens: []Const(Token)) -> i64:\n    match tokens[0]:\n        case number(digits): return digits\n        else: return 0\nfn code(failure: ParseError || FileError) -> u8:\n    match failure:\n        case ParseError::missing_end: return 1\n        case FileError::missing_end: return 2\n        case bad_digit(digit): return digit" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10339,7 +10339,7 @@ test "generateBranch: points into a constant and a zero-sized value and leaves l
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    empty: [0]u8\n    end\nconst ORIGIN = Token::number(7)\nfn make() -> Token: return Token::end\nfn origin() -> i64:\n    match ORIGIN:\n        case number(*digits): return digits.*\n        else: return 0\nfn kind() -> i64:\n    match make():\n        case number: return 1\n        else: return 0\nfn take(bytes: *const [0]u8): _ = bytes\nfn hollow(token: Token):\n    match token:\n        case empty(*bytes): take(bytes)\n        else: noop\nfn scan(tokens: []const Token) -> i64:\n    var count: i64 = 0\n    while count < 10:\n        for token in tokens:\n            match token:\n                case end: break\n                else: match make():\n                    case number(digits): count += digits\n                    else: continue\n    else: count = 1\n    return count" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    empty: [0]u8\n    end\nconst ORIGIN = Token::number(7)\nfn make() -> Token: return Token::end\nfn origin() -> i64:\n    match ORIGIN:\n        case number(*digits): return digits.*\n        else: return 0\nfn kind() -> i64:\n    match make():\n        case number: return 1\n        else: return 0\nfn take(bytes: *Const([0]u8)): _ = bytes\nfn hollow(token: Token):\n    match token:\n        case empty(*bytes): take(bytes)\n        else: noop\nfn scan(tokens: []Const(Token)) -> i64:\n    var count: i64 = 0\n    while count < 10:\n        for token in tokens:\n            match token:\n                case end: break\n                else: match make():\n                    case number(digits): count += digits\n                    else: continue\n    else: count = 1\n    return count" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10691,7 +10691,7 @@ test "generateAssignment: assigns a read-only pointer to an array as a slice" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(buffer: *const [4]u8) -> u8:\n    var bytes: []const u8 = \"ab\"\n    bytes = buffer\n    return bytes[0]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(buffer: *Const([4]u8)) -> u8:\n    var bytes: []Const(u8) = \"ab\"\n    bytes = buffer\n    return bytes[0]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10772,7 +10772,7 @@ test "generateCompoundAssignment: evaluates a target with a call once and before
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn next() -> usize\nexternal fn make() -> i32\nfn update(values: *many i32): values[next()] += make()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn next() -> usize\nexternal fn make() -> i32\nfn update(values: *Many(i32)): values[next()] += make()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10853,7 +10853,7 @@ test "generateCompoundAssignment: moves a multiple value pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn advance(items: *many i32) -> *many i32:\n    var cursor = items\n    cursor += 2\n    cursor -= 1\n    return cursor" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn advance(items: *Many(i32)) -> *Many(i32):\n    var cursor = items\n    cursor += 2\n    cursor -= 1\n    return cursor" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10907,7 +10907,7 @@ test "generateTargetEffects: runs the calls of a zero-sized target from left to 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal fn locate() -> *many [2]Marker\nexternal fn position() -> usize\nexternal fn make() -> Marker\nfn main(): locate()[position()][position()] = make()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal fn locate() -> *Many([2]Marker)\nexternal fn position() -> usize\nexternal fn make() -> Marker\nfn main(): locate()[position()][position()] = make()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10961,7 +10961,7 @@ test "generateTarget: evaluates the calls in a target from left to right" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn locate() -> *many i32\nexternal fn position() -> usize\nfn main(): locate()[position()] = 1" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn locate() -> *Many(i32)\nexternal fn position() -> usize\nfn main(): locate()[position()] = 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11281,7 +11281,7 @@ test "generateFor: fills an undefined array element by element before reading it
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    value: i32\nfn total(cards: [3]Card) -> i32:\n    var pending: [cards.length]*const Card = undefined\n    for index in 0..cards.length: pending[index] = &cards[index]\n    return pending[0].value + pending[2].value" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    value: i32\nfn total(cards: [3]Card) -> i32:\n    var pending: [cards.length]*Const(Card) = undefined\n    for index in 0..cards.length: pending[index] = &cards[index]\n    return pending[0].value + pending[2].value" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11348,7 +11348,7 @@ test "generateFor: counts over a slice" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(value: i32)\nfn show(items: []const i32): for item in items: take(item)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(value: i32)\nfn show(items: []Const(i32)): for item in items: take(item)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11817,7 +11817,7 @@ test "generateLiftedJump: leaves a loop from a match branch and runs the deferre
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    end\nfn read(token: Token) -> ?i64:\n    match token:\n        case number(digits): return digits\n        else: return null\nfn sum(tokens: []const Token) -> i64:\n    var result: i64 = 0\n    for token in tokens:\n        match token:\n            case end: noop\n            else:\n                const digits = read(token) orelse break\n                result += digits\n        const again = read(token) orelse continue\n        result += again\n    return result\nfn count(tokens: []const Token, log: *i64) -> i64:\n    var total: i64 = 0\n    for token in tokens:\n        defer log.* += 1\n        total += read(token) orelse break\n    return total" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token:\n    number: i64\n    end\nfn read(token: Token) -> ?i64:\n    match token:\n        case number(digits): return digits\n        else: return null\nfn sum(tokens: []Const(Token)) -> i64:\n    var result: i64 = 0\n    for token in tokens:\n        match token:\n            case end: noop\n            else:\n                const digits = read(token) orelse break\n                result += digits\n        const again = read(token) orelse continue\n        result += again\n    return result\nfn count(tokens: []Const(Token), log: *i64) -> i64:\n    var total: i64 = 0\n    for token in tokens:\n        defer log.* += 1\n        total += read(token) orelse break\n    return total" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11845,7 +11845,7 @@ test "generateInlinedCall: writes the body of an inline function at each call" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nerror Failure:\n    bad\nfn next(counter: *i32) -> i32:\n    counter.* += 1\n    return counter.*\nfn log(counter: *i32, amount: i32): counter.* += amount\ninline fn double(value: i32) -> i32: return value * 2\ninline fn quadruple(value: i32) -> i32: return double(double(value))\ninline fn clamp(value: i32) -> i32:\n    if value > 10: return 10\n    return value\ninline fn checked(value: i32) -> Failure!i32:\n    if value < 0: return Failure::bad\n    return value\ninline fn parse(value: i32) -> Failure!i32:\n    const result = try checked(value)\n    return result + 1\ninline fn deferred(counter: *i32) -> i32:\n    defer log(counter, 100)\n    return counter.*\ninline fn guarded(counter: *i32, fail: bool) -> Failure!i32:\n    errdefer log(counter, 1000)\n    if fail: return Failure::bad\n    return 1\nstruct Box:\n    value: i32\n    inline fn get(self: Self) -> i32: return self.value\ninline fn first(type T, values: []const T) -> T: return values[0]\nfn run(counter: *i32) -> Failure!i32:\n    const value: i32 = 3\n    const doubled = double(next(counter)) + clamp(value * 5)\n    const box = Box{value = 7}\n    const values: [2]u8 = {4, 5}\n    const total = doubled + quadruple(box.get()) + deferred(counter) + mn::convert(i32, first(u8, &values))\n    const guard = try guarded(counter, total > 100)\n    return try parse(total + guard)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nerror Failure:\n    bad\nfn next(counter: *i32) -> i32:\n    counter.* += 1\n    return counter.*\nfn log(counter: *i32, amount: i32): counter.* += amount\ninline fn double(value: i32) -> i32: return value * 2\ninline fn quadruple(value: i32) -> i32: return double(double(value))\ninline fn clamp(value: i32) -> i32:\n    if value > 10: return 10\n    return value\ninline fn checked(value: i32) -> Failure!i32:\n    if value < 0: return Failure::bad\n    return value\ninline fn parse(value: i32) -> Failure!i32:\n    const result = try checked(value)\n    return result + 1\ninline fn deferred(counter: *i32) -> i32:\n    defer log(counter, 100)\n    return counter.*\ninline fn guarded(counter: *i32, fail: bool) -> Failure!i32:\n    errdefer log(counter, 1000)\n    if fail: return Failure::bad\n    return 1\nstruct Box:\n    value: i32\n    inline fn get(self: Self) -> i32: return self.value\ninline fn first(type T, values: []Const(T)) -> T: return values[0]\nfn run(counter: *i32) -> Failure!i32:\n    const value: i32 = 3\n    const doubled = double(next(counter)) + clamp(value * 5)\n    const box = Box{value = 7}\n    const values: [2]u8 = {4, 5}\n    const total = doubled + quadruple(box.get()) + deferred(counter) + mn::convert(i32, first(u8, &values))\n    const guard = try guarded(counter, total > 100)\n    return try parse(total + guard)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11925,7 +11925,7 @@ test "generateFunction: compares slices through mn::memory::equal" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn same(buffer: []const u8, length: usize) -> bool: return memory::equal(buffer[0..length], \"yes\\n\")\nfn arrays(one: [3]u8, two: [3]u8) -> bool: return memory::equal(&one, &two)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn same(buffer: []Const(u8), length: usize) -> bool: return memory::equal(buffer[0..length], \"yes\\n\")\nfn arrays(one: [3]u8, two: [3]u8) -> bool: return memory::equal(&one, &two)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12006,7 +12006,7 @@ test "generateIteration: zips a slice or a read-only slice and a range into one 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::Zip\nfn sum(cards: []u32) -> u32:\n    var total: u32 = 0\n    for (card, index) in Zip::zip({cards, 0..}):\n        total += card * mn::convert(u32, index)\n    return total\nfn constant(cards: []const u32) -> u32:\n    var total: u32 = 0\n    for (card, index) in Zip::zip({cards, 0..}):\n        total += card * mn::convert(u32, index)\n    return total" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::Zip\nfn sum(cards: []u32) -> u32:\n    var total: u32 = 0\n    for (card, index) in Zip::zip({cards, 0..}):\n        total += card * mn::convert(u32, index)\n    return total\nfn constant(cards: []Const(u32)) -> u32:\n    var total: u32 = 0\n    for (card, index) in Zip::zip({cards, 0..}):\n        total += card * mn::convert(u32, index)\n    return total" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12048,7 +12048,7 @@ test "generatePart: stores a sequence that needs temporaries" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn one() -> i32\nexternal fn two() -> i32\nexternal fn pick(left: i32, right: i32) -> []const i32\nexternal fn take(value: i32)\nfn main(): for item in pick(one(), two()): take(item)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn one() -> i32\nexternal fn two() -> i32\nexternal fn pick(left: i32, right: i32) -> []Const(i32)\nexternal fn take(value: i32)\nfn main(): for item in pick(one(), two()): take(item)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12180,7 +12180,7 @@ test "isStoredPart: stores a sequence held by a variable" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(value: i32)\nfn show(items: []const i32, others: []const i32):\n    var current = items\n    for item in current:\n        current = others\n        take(item)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(value: i32)\nfn show(items: []Const(i32), others: []Const(i32)):\n    var current = items\n    for item in current:\n        current = others\n        take(item)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12279,7 +12279,7 @@ test "generateElementDeclarations: numbers a name that shadows an outer local" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(value: i32)\nfn show(items: []const i32):\n    const item = 1i32\n    take(item)\n    for item in items: take(item)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(value: i32)\nfn show(items: []Const(i32)):\n    const item = 1i32\n    take(item)\n    for item in items: take(item)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12411,7 +12411,7 @@ test "generateElementDeclarations: points a pointer name to each element of a co
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn keep(value: *const i32)\nfn main():\n    const cards = [2]i32{1, 2}\n    for *card in cards: keep(card)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn keep(value: *Const(i32))\nfn main():\n    const cards = [2]i32{1, 2}\n    for *card in cards: keep(card)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12444,7 +12444,7 @@ test "generateLoopEnd: writes the else block of a for loop and jumps over it on 
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn step(value: i32) -> bool\nexternal fn stop()\nfn show(items: []const i32):\n    for item in items:\n        if step(item): break\n    else: stop()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn step(value: i32) -> bool\nexternal fn stop()\nfn show(items: []Const(i32)):\n    for item in items:\n        if step(item): break\n    else: stop()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12693,7 +12693,7 @@ test "generateFullExpression: stores calls in indexes in temporaries" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn first() -> usize\nexternal fn second() -> usize\nfn sum(values: []const i32) -> i32: return values[first()] + values[second()]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn first() -> usize\nexternal fn second() -> usize\nfn sum(values: []Const(i32)) -> i32: return values[first()] + values[second()]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13236,7 +13236,7 @@ test "generateLiteralElements: points an empty slice at the shared zero-sized ob
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    value: u128\nconst NOTHING: []const u8 = {}\nfn cards() -> []Card: return {}\nfn names() -> []const u8:\n    const empty: []const u8 = {}\n    return empty\nfn nothing() -> []const u8: return NOTHING" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    value: u128\nconst NOTHING: []Const(u8) = {}\nfn cards() -> []Card: return {}\nfn names() -> []Const(u8):\n    const empty: []Const(u8) = {}\n    return empty\nfn nothing() -> []Const(u8): return NOTHING" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13264,7 +13264,7 @@ test "generateLiteralElements: puts the elements of a read-only slice literal in
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const PRIMES: []const i32 = {2, 3, 5}\nfn sum(values: []const i32) -> i32:\n    var total: i32 = 0\n    for value in values: total += value\n    return total\nfn local() -> i32:\n    const squares: []const i32 = {1, 4, 9}\n    return sum(squares) + sum(PRIMES)\nfn argument() -> i32: return sum({10, 20})" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const PRIMES: []Const(i32) = {2, 3, 5}\nfn sum(values: []Const(i32)) -> i32:\n    var total: i32 = 0\n    for value in values: total += value\n    return total\nfn local() -> i32:\n    const squares: []Const(i32) = {1, 4, 9}\n    return sum(squares) + sum(PRIMES)\nfn argument() -> i32: return sum({10, 20})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13278,6 +13278,34 @@ test "generateLiteralElements: puts the elements of a read-only slice literal in
     );
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\n#ifndef mn_array_3_i32_defined\n#define mn_array_3_i32_defined\ntypedef struct mn_array_3_i32 {\n    int32_t items[3];\n} mn_array_3_i32;\n#endif\n\n#ifndef mn_array_2_i32_defined\n#define mn_array_2_i32_defined\ntypedef struct mn_array_2_i32 {\n    int32_t items[2];\n} mn_array_2_i32;\n#endif\n\nstatic mn_array_3_i32 mn_static_1;\nstatic mn_array_3_i32 mn_static_2;\nstatic mn_array_2_i32 mn_static_3;\nstatic mn_array_3_i32 mn_static_1 = { .items = { 2, 3, 5 } };\nstatic mn_array_3_i32 mn_static_2 = { .items = { 1, 4, 9 } };\nstatic mn_array_2_i32 mn_static_3 = { .items = { 10, 20 } };\n\nconst mn_slice_i32 mn_main_PRIMES = { .items = (int32_t *)mn_static_1.items, .length = 3 };\n\nint32_t mn_main_sum(mn_slice_i32 values) {\n    int32_t total = 0;\n    for (size_t mn_index_1 = 0; mn_index_1 < values.length; mn_index_1 += 1) {\n        const int32_t value = values.items[mn_index_1];\n        total = (total + value);\n    }\n    return total;\n}\n\nint32_t mn_main_local() {\n    const mn_slice_i32 squares = (mn_slice_i32){ .items = (int32_t *)mn_static_2.items, .length = 3 };\n    int32_t mn_temporary_1;\n    int32_t mn_temporary_2;\n    return (mn_temporary_1 = mn_main_sum(squares), mn_temporary_2 = mn_main_sum(mn_main_PRIMES), (mn_temporary_1 + mn_temporary_2));\n}\n\nint32_t mn_main_argument() {\n    return mn_main_sum((mn_slice_i32){ .items = (int32_t *)mn_static_3.items, .length = 2 });\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateType: writes read-only and many-value pointers as C pointers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn sum(bytes: *Many(Const(u8)), count: usize) -> u8:\n    var total: u8 = 0\n    for index in 0..count: total += bytes[index]\n    return total\nfn first(bytes: *Many(u8), point: *Const(Point), values: []Const(i32)) -> i32:\n    bytes[0] = 1\n    return point.x + values[0]" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_Point {\n    int32_t x;\n} mn_main_Point;\n\ntypedef struct mn_slice_i32 mn_slice_i32;\n\nuint8_t mn_main_sum(uint8_t const * bytes, size_t count);\nint32_t mn_main_first(uint8_t * bytes, struct mn_main_Point const * point, mn_slice_i32 values);\n",
+        files[0].contents,
+    );
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_i32_defined\n#define mn_slice_i32_defined\ntypedef struct mn_slice_i32 {\n    int32_t *items;\n    size_t length;\n} mn_slice_i32;\n#endif\n\nuint8_t mn_main_sum(uint8_t const * bytes, size_t count) {\n    uint8_t total = 0u;\n    for (size_t mn_index_1 = 0; mn_index_1 < count; mn_index_1 += 1) {\n        const size_t index = mn_index_1;\n        total = ((uint8_t)(total + bytes[index]));\n    }\n    return total;\n}\n\nint32_t mn_main_first(uint8_t * bytes, struct mn_main_Point const * point, mn_slice_i32 values) {\n    bytes[0u] = 1u;\n    return (point->x + values.items[0u]);\n}\n",
         files[1].contents,
     );
 }
@@ -13364,7 +13392,7 @@ test "generateExpression: writes strings with their length in bytes" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() -> []const u8: return \"line\\n\\\"quoted\\\"\"" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() -> []Const(u8): return \"line\\n\\\"quoted\\\"\"" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13566,7 +13594,7 @@ test "generateExpression: takes the address of a parameter" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn keep(value: *const [2]i32)\nfn show(values: [2]i32): keep(&values)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn keep(value: *Const([2]i32))\nfn show(values: [2]i32): keep(&values)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13593,7 +13621,7 @@ test "generateExpression: dereferences a pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(value: *const i32) -> i32: return value.*" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(value: *Const(i32)) -> i32: return value.*" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13620,7 +13648,7 @@ test "generateExpression: takes the address of the target of a pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn keep(value: *const i32)\nfn show(value: *const i32): keep(&value.*)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn keep(value: *Const(i32))\nfn show(value: *Const(i32)): keep(&value.*)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13647,7 +13675,7 @@ test "generateExpression: accesses a field through a pointer and after a derefer
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn read(point: *const Point) -> i32: return point.x + point.*.x" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point:\n    x: i32\nfn read(point: *Const(Point)) -> i32: return point.x + point.*.x" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14187,7 +14215,7 @@ test "generateBinary: moves a multiple value pointer by a usize" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn before(one: *many i32, two: *many i32) -> bool: return one + 1 < two" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn before(one: *Many(i32), two: *Many(i32)) -> bool: return one + 1 < two" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14511,7 +14539,7 @@ test "generatePointerDifference: casts the difference of two pointers to ptrdiff
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn distance(start: *many i32, end: *many i32) -> isize: return end - (start + 1)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn distance(start: *Many(i32), end: *Many(i32)) -> isize: return end - (start + 1)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14646,7 +14674,7 @@ test "generateZeroSizedAddress: points the addresses of zero-sized values to one
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal fn keep(marker: *const Marker)\nfn show(marker: Marker):\n    var markers: [2]Marker = undefined\n    keep(&marker)\n    keep(&markers[1])" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal fn keep(marker: *Const(Marker))\nfn show(marker: Marker):\n    var markers: [2]Marker = undefined\n    keep(&marker)\n    keep(&markers[1])" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14673,7 +14701,7 @@ test "generateZeroSizedAddress: runs the calls of a zero-sized value before its 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal fn keep(marker: *const Marker)\nexternal fn position() -> usize\nfn show(markers: [2]Marker): keep(&markers[position()])" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Marker\nexternal fn keep(marker: *Const(Marker))\nexternal fn position() -> usize\nfn show(markers: [2]Marker): keep(&markers[position()])" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14871,7 +14899,7 @@ test "generateFunctionName: writes the name of a method or an external function 
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn write_text(text: []const u8)\nstruct Point:\n    x: f32\n    fn length(self: Self) -> f32: return self.x\nfn apply(measure: *fn(Point) -> f32, write: *fn([]const u8)):\n    _ = measure\n    _ = write\nfn main(): apply(&Point::length, &write_text)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn write_text(text: []Const(u8))\nstruct Point:\n    x: f32\n    fn length(self: Self) -> f32: return self.x\nfn apply(measure: *fn(Point) -> f32, write: *fn([]Const(u8))):\n    _ = measure\n    _ = write\nfn main(): apply(&Point::length, &write_text)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15030,7 +15058,7 @@ test "generateIndex: writes an element of an array, a slice and a multiple value
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(values: [3]i32, items: []const i32, pointer: *many i32) -> i32: return values[0] + items[1] + pointer[2]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(values: [3]i32, items: []Const(i32), pointer: *Many(i32)) -> i32: return values[0] + items[1] + pointer[2]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15084,7 +15112,7 @@ test "generateIndex: indexes the array a pointer points to after a dereference" 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(values: *const [3]i32) -> i32: return values.*[1]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(values: *Const([3]i32)) -> i32: return values.*[1]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15207,7 +15235,7 @@ test "generateSlice: casts a slice of a constant to a writable pointer" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(values: []const i32): _ = values\nfn main():\n    const values = [2]i32{1, 2}\n    take(values[..])" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(values: []Const(i32)): _ = values\nfn main():\n    const values = [2]i32{1, 2}\n    take(values[..])" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15240,7 +15268,7 @@ test "generateSlice: writes a slice of a parameter without a cast" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(values: []const i32): _ = values\nfn show(values: [2]i32): take(values[..])" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(values: []Const(i32)): _ = values\nfn show(values: [2]i32): take(values[..])" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15273,7 +15301,7 @@ test "generateSlice: writes only the length of a zero-sized array" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn take(markers: []const Marker): _ = markers\nfn main():\n    const markers = [2]Marker{Marker{}, Marker{}}\n    take(markers[..])" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn take(markers: []Const(Marker)): _ = markers\nfn main():\n    const markers = [2]Marker{Marker{}, Marker{}}\n    take(markers[..])" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15381,7 +15409,7 @@ test "generateSlice: casts the items behind a read-only pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(values: *const [4]i32) -> []const i32: return values[..]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(values: *Const([4]i32)) -> []Const(i32): return values[..]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15408,7 +15436,7 @@ test "generateSlice: slices a multiple value pointer up to an end" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(items: *many const u8, count: usize) -> []const u8: return items[..count]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(items: *Many(Const(u8)), count: usize) -> []Const(u8): return items[..count]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15435,7 +15463,7 @@ test "generateSlice: writes only the length of a slice of zero-sized elements" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn part(markers: []const Marker) -> []const Marker: return markers[1..]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn part(markers: []Const(Marker)) -> []Const(Marker): return markers[1..]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15462,7 +15490,7 @@ test "generateSlice: offsets a slice of a stored constant" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const values: [3]i32 = {1, 2, 3}\nexternal fn take(items: []const i32)\nfn main(): take(values[1..])" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const values: [3]i32 = {1, 2, 3}\nexternal fn take(items: []Const(i32))\nfn main(): take(values[1..])" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15663,7 +15691,7 @@ test "generateConstant: stores an array constant" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []const u8\nconst cards: [2]Card = {\n    {question = \"a\"},\n    {question = \"b\"},\n}\nfn all() -> [2]Card: return cards" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []Const(u8)\nconst cards: [2]Card = {\n    {question = \"a\"},\n    {question = \"b\"},\n}\nfn all() -> [2]Card: return cards" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15696,7 +15724,7 @@ test "generateConstant: stores an array constant with a length to infer" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []const u8\nconst cards: [_]Card = {\n    {question = \"a\"},\n    {question = \"b\"},\n}\nfn all() -> [2]Card: return cards" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card:\n    question: []Const(u8)\nconst cards: [_]Card = {\n    {question = \"a\"},\n    {question = \"b\"},\n}\nfn all() -> [2]Card: return cards" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15756,7 +15784,7 @@ test "generateBuiltinCall: writes sizes and alignments as constants and conversi
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Pair:\n    small: u8\n    large: i32\nenum Token:\n    number: i64\n    end\nerror Failure:\n    bad: u8\nfn size() -> usize: return mn::size(Pair)\nfn alignment() -> usize: return mn::alignment(Pair)\nfn token() -> usize: return mn::size(Token)\nfn maybe() -> usize: return mn::size(?i32)\nfn text() -> usize: return mn::size([]const u8)\nfn result() -> usize: return mn::size(Failure!u16)\nfn whole(value: f64) -> i32: return mn::convert(i32, value)\nfn low(value: i32) -> u8: return mn::truncate(u8, value)\nfn wide(value: u8) -> u64: return value\nfn float(value: f32) -> f64: return value\nfn count() -> usize: return mn::reflection::length([u8, bool])\nfn pairs() -> [i32, bool]:\n    const number: i32 = 4\n    return {number, true}\nfn use(pair: Pair, token: Token, failure: Failure!u16) -> usize:\n    _ = pair\n    _ = token\n    _ = failure\n    return 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Pair:\n    small: u8\n    large: i32\nenum Token:\n    number: i64\n    end\nerror Failure:\n    bad: u8\nfn size() -> usize: return mn::size(Pair)\nfn alignment() -> usize: return mn::alignment(Pair)\nfn token() -> usize: return mn::size(Token)\nfn maybe() -> usize: return mn::size(?i32)\nfn text() -> usize: return mn::size([]Const(u8))\nfn result() -> usize: return mn::size(Failure!u16)\nfn whole(value: f64) -> i32: return mn::convert(i32, value)\nfn low(value: i32) -> u8: return mn::truncate(u8, value)\nfn wide(value: u8) -> u64: return value\nfn float(value: f32) -> f64: return value\nfn count() -> usize: return mn::reflection::length([u8, bool])\nfn pairs() -> [i32, bool]:\n    const number: i32 = 4\n    return {number, true}\nfn use(pair: Pair, token: Token, failure: Failure!u16) -> usize:\n    _ = pair\n    _ = token\n    _ = failure\n    return 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15790,7 +15818,7 @@ test "generateBuiltinCall: casts pointers and aligns a multiple value pointer th
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nexternal struct Header:\n    size: u32\n    flags: [2]u8\nfn read(buffer: []const u8) -> *const Header: return mn::cast(*const Header, buffer.pointer)\nfn next(buffer: []u8, alignment: usize) -> *many u8: return mn::align(buffer.pointer, alignment)\nfn count(buffer: *[]u8) -> usize: return buffer.length\nexternal fn keep(pointer: *const void)\nfn hide(header: *Header):\n    keep(header)\n    keep(mn::cast(*many const u8, header))" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nexternal struct Header:\n    size: u32\n    flags: [2]u8\nfn read(buffer: []Const(u8)) -> *Const(Header): return mn::cast(*Const(Header), buffer.pointer)\nfn next(buffer: []u8, alignment: usize) -> *Many(u8): return mn::align(buffer.pointer, alignment)\nfn count(buffer: *[]u8) -> usize: return buffer.length\nexternal fn keep(pointer: *Const(void))\nfn hide(header: *Header):\n    keep(header)\n    keep(mn::cast(*Many(Const(u8)), header))" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -16269,7 +16297,7 @@ test "generateFunctionCall: passes the pointer written as the first argument of 
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn grow(self: *T)\n    fn measure(self: *const T) -> i32\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn grow(self: *Square): self.side += 1\n    fn measure(self: *const Square) -> i32: return self.side\nfn main():\n    var square = Square{side = 1}\n    Shape::grow(&square)\n    _ = Shape::measure(&square)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn grow(self: *T)\n    fn measure(self: *Const(T)) -> i32\nstruct Square:\n    side: i32\ninstance Shape(Square):\n    fn grow(self: *Square): self.side += 1\n    fn measure(self: *Const(Square)) -> i32: return self.side\nfn main():\n    var square = Square{side = 1}\n    Shape::grow(&square)\n    _ = Shape::measure(&square)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -16855,7 +16883,7 @@ test "generateValue: writes a slice in a stored constant" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const values = [2]i32{1, 2}\nstruct Box:\n    items: []const i32\nconst box = Box{items = values[..]}\nfn show() -> Box: return box" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const values = [2]i32{1, 2}\nstruct Box:\n    items: []Const(i32)\nconst box = Box{items = values[..]}\nfn show() -> Box: return box" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -16882,7 +16910,7 @@ test "generateValue: writes a slice with bounds in a stored constant" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const values: [3]i32 = {1, 2, 3}\nstruct Holder:\n    items: []const i32\nconst holder: Holder = Holder{items = values[1..2]}\nfn read() -> Holder: return holder" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const values: [3]i32 = {1, 2, 3}\nstruct Holder:\n    items: []Const(i32)\nconst holder: Holder = Holder{items = values[1..2]}\nfn read() -> Holder: return holder" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -16909,7 +16937,7 @@ test "generateValue: writes the value of an operation in a stored constant" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const limit = 2i32 + 3i32\nexternal fn keep(value: *const i32)\nfn main(): keep(&limit)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const limit = 2i32 + 3i32\nexternal fn keep(value: *Const(i32))\nfn main(): keep(&limit)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -17041,7 +17069,7 @@ test "generateType: writes a pointer as a C pointer" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(value: *const i32, values: *many u8, nested: **const bool):\n    _ = value\n    _ = values\n    _ = nested" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(value: *Const(i32), values: *Many(u8), nested: **Const(bool)):\n    _ = value\n    _ = values\n    _ = nested" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -17221,7 +17249,7 @@ test "generateOperandEffects: runs the calls in the index of a zero-sized elemen
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nexternal fn position() -> usize\nfn get(markers: []const Marker) -> Marker: return markers[position()]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nexternal fn position() -> usize\nfn get(markers: []Const(Marker)) -> Marker: return markers[position()]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -17248,7 +17276,7 @@ test "isStored: stores a constant whose address is taken in one object" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const limit = 10i32\nconst pair = [i32, bool]{1, true}\nexternal fn keep(value: *const i32)\nfn main():\n    keep(&limit)\n    keep(&limit)\n    keep(&pair[0])" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const limit = 10i32\nconst pair = [i32, bool]{1, true}\nexternal fn keep(value: *Const(i32))\nfn main():\n    keep(&limit)\n    keep(&limit)\n    keep(&pair[0])" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -17380,7 +17408,7 @@ test "buildTypeName: names a slice by its elements and whether they are read-onl
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\ninstance Shape([]const u8):\n    fn area(self: []const u8) -> i32:\n        _ = self\n        return 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\ninstance Shape([]Const(u8)):\n    fn area(self: []Const(u8)) -> i32:\n        _ = self\n        return 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -17413,7 +17441,7 @@ test "buildTypeName: names a pointer by its count, mutability and target" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\ninstance Shape(*many const u8):\n    fn area(self: *many const u8) -> i32:\n        _ = self\n        return 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T):\n    fn area(self: T) -> i32\ninstance Shape(*Many(Const(u8))):\n    fn area(self: *Many(Const(u8))) -> i32:\n        _ = self\n        return 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -17575,7 +17603,7 @@ test "isStoredAsConstant: casts a slice of an element of a constant array" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(values: []const i32)\nfn main():\n    const grid = [2][2]i32{{1, 2}, {3, 4}}\n    take(grid[1][..])" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn take(values: []Const(i32))\nfn main():\n    const grid = [2][2]i32{{1, 2}, {3, 4}}\n    take(grid[1][..])" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -17602,7 +17630,7 @@ test "isStoredAsConstant: casts a slice of an array field behind a read-only poi
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Deck:\n    cards: [2]i32\nfn cards(deck: *const Deck) -> []const i32: return deck.cards[..]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Deck:\n    cards: [2]i32\nfn cards(deck: *Const(Deck)) -> []Const(i32): return deck.cards[..]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -17635,7 +17663,7 @@ test "generateText: writes a NUL escape as three octal digits" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() -> []const u8: return \"\\01\"" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() -> []Const(u8): return \"\\01\"" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -17668,7 +17696,7 @@ test "generateText: writes a unicode escape in a string as UTF-8 bytes" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() -> []const u8: return \"a\\u{E9}\\u{1F600}\"" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() -> []Const(u8): return \"a\\u{E9}\\u{1F600}\"" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -17803,7 +17831,7 @@ test "containsType: treats slices that differ only in mutability as one C type" 
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(bytes: []const u8): _ = bytes\nfn main():\n    var buffer: [4]u8 = undefined\n    var bytes = buffer[..]\n    bytes = buffer[..]\n    take(bytes)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(bytes: []Const(u8)): _ = bytes\nfn main():\n    var buffer: [4]u8 = undefined\n    var bytes = buffer[..]\n    bytes = buffer[..]\n    take(bytes)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -17836,7 +17864,7 @@ test "containsType: keeps arrays of pointers that differ in mutability apart" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(one: [2]*i32, two: [2]*const i32):\n    _ = one\n    _ = two" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(one: [2]*i32, two: [2]*Const(i32)):\n    _ = one\n    _ = two" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -17863,7 +17891,7 @@ test "integration: checks a run-time condition that calls a function with a type
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "cards.mn", .data = "struct Card:\n    question: []const u8\n    answer:   []const u8\n\nconst cards: [_]Card = {\n    { question = \"Question 1\", answer = \"Answer 1\" },\n    { question = \"Question 2\", answer = \"Answer 2\" },\n}\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "cards.mn", .data = "struct Card:\n    question: []Const(u8)\n    answer:   []Const(u8)\n\nconst cards: [_]Card = {\n    { question = \"Question 1\", answer = \"Answer 1\" },\n    { question = \"Question 2\", answer = \"Answer 2\" },\n}\n" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io::stdout\nimport mn::io::stdin\nimport mn::memory\nimport mn::text\n\nimport cards::cards\n\n\nfn main():\n    var input_buffer: [4096]u8 = undefined\n    var byte_count: usize = 0\n    var card_index: usize = 0\n\n    while card_index < cards.length:\n        stdout::println(cards[card_index].question, {})\n        byte_count = stdin::read(&input_buffer)\n        if byte_count == 0: break\n\n        stdout::println(cards[card_index].answer, {})\n        byte_count = stdin::read(&input_buffer)\n        if byte_count == 0: break\n\n        if memory::equal(text::strip(input_buffer[..byte_count]), \"y\"):\n           card_index += 1\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
