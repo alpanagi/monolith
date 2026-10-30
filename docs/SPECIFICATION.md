@@ -493,7 +493,7 @@
 - A typeclass's function whose first parameter's type is a parameter of the typeclass, or a pointer to one, can also be called as a method, e.g. `card.show(output)` (see Structs).
 - A function in a struct's block shadows a typeclass's function with the same name. A method that a type gets from two typeclasses cannot be called as `value.name()`.
 - A parameter whose type is a typeclass with one parameter takes a value of any type with an instance, e.g. `fn report(value: Show)` called as `report(card)`. Each different type gets its own instance of the function.
-- A parameter whose type is a pointer to such a typeclass, `*Class` or `*Const(Class)`, takes a pointer to a value of any type with an instance, e.g. `fn allocate(allocator: *Allocator, type T, count: usize)` called as `allocate(&system, Card, 10)`. Each different type gets its own instance of the function.
+- A parameter whose type is a pointer to such a typeclass, `*Class` or `*Const(Class)`, takes a pointer to a value of any type with an instance, e.g. `fn allocate(allocator: *Allocator, type T, count: usize)` called as `allocate(&heap, Card, 10)`. Each different type gets its own instance of the function.
 - A `type` parameter can require instances, e.g. `fn parse(type T: Parse, text: []Const(u8)) -> T`.
 - A function with such parameters is checked once, before any instance, and can use them only through the functions of the typeclasses they require.
 
@@ -505,7 +505,7 @@
 - Top-level constants are evaluated at compile time.
 - A parameter written `type T` takes a type, e.g. `fn List(type T) -> type`. A parameter marked `comptime` takes a value known at compile time, e.g. `comptime format: []Const(u8)`. Their arguments are evaluated at compile time.
 - A parameter whose type is `any` takes a value of any type, e.g. `fn equal(one: any, two: any) -> bool`. `any` can only be the type of a parameter.
-- A function can declare types in parentheses after `fn`, written like an instance's parameters, e.g. `fn(type Item) free(allocator: *Allocator, items: []Const(Item))`. They are not passed: each is taken from the types of the arguments, e.g. `free(&system, cards)` for a `[]Card` `cards` gives `Item` as `Card`. Arguments convert implicitly as for any parameter, so a `*[4]Card` also gives `Card`.
+- A function can declare types in parentheses after `fn`, written like an instance's parameters, e.g. `fn(type Item) free(allocator: *Allocator, items: []Const(Item))`. They are not passed: each is taken from the types of the arguments, e.g. `free(&heap, cards)` for a `[]Card` `cards` gives `Item` as `Card`. Arguments convert implicitly as for any parameter, so a `*[4]Card` also gives `Card`.
 - Each declared type must appear in a parameter's type. Arguments that give a declared type two different types, or that do not fit the parameter's type, are a compile-time error.
 - A function gets its own instance for each different set of arguments to its `type` and `comptime` parameters, for each different set of types of the arguments to its `any` parameters, and for each different set of its declared types.
 - A function with `type`, `comptime` or `any` parameters or declared types is checked for everything that does not depend on them, even if it is never called.

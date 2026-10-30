@@ -15021,7 +15021,7 @@ test "inferDeclaredTypes: frees read-only slices, array pointers and read-only p
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nstruct Card\n    value: i64\nfn run() -> memory::Error!void\n    var system = memory::System{}\n    var arena = memory::Arena(memory::System)::new(system)\n    const owned = try memory::allocate(&arena, Card, 4)\n    const read_only: []Const(Card) = owned\n    memory::free(&arena, read_only)\n    var fixed: [2]Card = {Card{value = 1}, Card{value = 2}}\n    memory::free(&arena, &fixed)\n    const card = try memory::create(&system, Card)\n    const pointer: *Const(Card) = card\n    memory::destroy(&system, pointer)\n    arena.free_all()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nstruct Card\n    value: i64\nfn run() -> memory::Error!void\n    var heap = memory::Heap{}\n    var arena = memory::Arena(memory::Heap)::new(heap)\n    const owned = try memory::allocate(&arena, Card, 4)\n    const read_only: []Const(Card) = owned\n    memory::free(&arena, read_only)\n    var fixed: [2]Card = {Card{value = 1}, Card{value = 2}}\n    memory::free(&arena, &fixed)\n    const card = try memory::create(&heap, Card)\n    const pointer: *Const(Card) = card\n    memory::destroy(&heap, pointer)\n    arena.free_all()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15129,7 +15129,7 @@ test "checkImplicitArgument: rejects an allocator passed by value to mn::memory"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn run() -> memory::Error!void\n    var system = memory::System{}\n    _ = try memory::allocate(system, u8, 4)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn run() -> memory::Error!void\n    var heap = memory::Heap{}\n    _ = try memory::allocate(heap, u8, 4)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);

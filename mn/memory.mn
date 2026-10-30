@@ -30,16 +30,16 @@ fn(type Item) destroy(allocator: *Allocator, pointer: *Const(Item))
     const bytes = mn::cast(*Many(u8), pointer)[0..mn::size(Item)]
     Allocator::free(allocator, bytes, mn::alignment(Item))
 
-struct System
+struct Heap
 
-instance Allocator(System)
-    fn allocate(_: *System, size: usize, alignment: usize) -> Error![]u8
+instance Allocator(Heap)
+    fn allocate(_: *Heap, size: usize, alignment: usize) -> Error![]u8
         const pointer = mn_runtime_memory_allocate(size, alignment) orelse return Error::out_of_memory
         return pointer[0..size]
 
-    fn resize(_: *System, bytes: []u8, _: usize, size: usize) -> bool = size <= bytes.length
+    fn resize(_: *Heap, bytes: []u8, _: usize, size: usize) -> bool = size <= bytes.length
 
-    fn free(_: *System, bytes: []u8, _: usize) = mn_runtime_memory_free(bytes.pointer)
+    fn free(_: *Heap, bytes: []u8, _: usize) = mn_runtime_memory_free(bytes.pointer)
 
 fn Arena(type P: Allocator) -> type
     return struct
