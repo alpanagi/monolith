@@ -82,6 +82,8 @@ pub const FunctionSignature = struct {
     self_parameter: SelfParameter = .none,
     progress: Progress = .pending,
     @"inline": bool = false,
+    inferred_error_set: ?token.Location = null,
+    error_set: ?*types.Enum = null,
 };
 
 pub const SelfParameter = enum {
@@ -1375,6 +1377,7 @@ fn cloneFunctionSignature(
         .return_type = try cloneExpression(allocator, signature.return_type),
         .self_parameter = signature.self_parameter,
         .@"inline" = signature.@"inline",
+        .inferred_error_set = signature.inferred_error_set,
     };
 }
 

@@ -31,6 +31,7 @@ fn(type Item) destroy(allocator: *Allocator, pointer: *Const(Item))
     Allocator::free(allocator, bytes, mn::alignment(Item))
 
 struct Heap
+    fn new() -> Self = Self{}
 
 instance Allocator(Heap)
     fn allocate(_: *Heap, size: usize, alignment: usize) -> Error![]u8

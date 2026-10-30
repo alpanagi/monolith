@@ -33,6 +33,8 @@ pub const TypeChecker = struct {
     return_type: ?types.Type = null,
     signature: ?*const ast.FunctionSignature = null,
     production: ?*Production = null,
+    inferring: ?*types.Enum = null,
+    empty_error_set: ?*const types.Enum = null,
     deferring: bool = false,
     current_function: ?ast.Resolution.Function = null,
     failed_function: ?ast.Resolution.Function = null,
@@ -211,9 +213,74 @@ pub const TypeChecker = struct {
         if (definition.default_of) |typeclass| {
             try self.checkDefault(definition.*, typeclass, definition.instance_arguments);
         } else {
-            try self.checkFunction(definition.*);
+            try self.checkInferringFunction(definition);
         }
         definition.check_progress = .done;
+    }
+
+    fn checkInferringFunction(self: *TypeChecker, definition: *ast.FunctionDefinition) TypeError!void {
+        const caller_inferring = self.inferring;
+        const caller_deferring = self.deferring;
+        defer self.inferring = caller_inferring;
+        defer self.deferring = caller_deferring;
+        self.inferring = definition.signature.error_set;
+        self.deferring = false;
+        try self.checkFunction(definition.*);
+        const error_set = definition.signature.error_set orelse return;
+        const allocator = self.arena.allocator();
+        const value_type = ast.extractType(definition.signature.return_type).result.value;
+        const result = try self.program.types.addResult(allocator, try self.combineErrorSets(error_set.parts), value_type);
+        definition.signature.return_type.denoted = .{ .result = result };
+    }
+
+    fn combineErrorSets(self: *TypeChecker, parts: []const *const types.Enum) std.mem.Allocator.Error!*const types.Enum {
+        if (parts.len == 0) return self.findEmptyErrorSet();
+        var combined = parts[0];
+        for (parts[1..]) |part| combined = try self.program.types.addCombined(self.arena.allocator(), combined, part);
+        return combined;
+    }
+
+    fn findEmptyErrorSet(self: *TypeChecker) std.mem.Allocator.Error!*const types.Enum {
+        if (self.empty_error_set) |error_set| return error_set;
+        const error_set = try self.arena.allocator().create(types.Enum);
+        error_set.* = .{ .module = 0, .name = "", .kind = .error_set };
+        self.empty_error_set = error_set;
+        return error_set;
+    }
+
+    fn completeInferredErrorSet(self: *TypeChecker, location: token.Location, resolution: ast.Resolution) TypeError!void {
+        if (resolution != .function) return;
+        const function = resolution.function;
+        const declaration = ast.findDeclaration(self.program.modules[function.module], function.declaration);
+        if (declaration.kind != .function_definition) return;
+        const definition = &declaration.kind.function_definition;
+        const error_set = definition.signature.error_set orelse return;
+        if (ast.extractType(definition.signature.return_type).result.error_set != error_set) return;
+        if (definition.check_progress == .running) return self.fail(location, error.InferredErrorSetLoop);
+        try self.prepareFunction(function);
+    }
+
+    fn recordInferredErrors(self: *TypeChecker, value_type: types.Type, expected: types.Type) std.mem.Allocator.Error!void {
+        const inferring = self.inferring orelse return;
+        if (expected != .result or expected.result.error_set != inferring) return;
+        const error_set = findErrorSet(value_type) orelse return;
+        const allocator = self.arena.allocator();
+        var parts: std.ArrayList(*const types.Enum) = .empty;
+        var cases: std.ArrayList(types.Case) = .empty;
+        try parts.appendSlice(allocator, inferring.parts);
+        try cases.appendSlice(allocator, inferring.cases);
+        for (error_set.parts) |part| {
+            if (std.mem.findScalar(*const types.Enum, parts.items, part) != null) continue;
+            try parts.append(allocator, part);
+            try cases.appendSlice(allocator, part.cases);
+        }
+        inferring.parts = parts.items;
+        inferring.cases = cases.items;
+    }
+
+    fn isInferring(self: *const TypeChecker, return_type: types.Type) bool {
+        const inferring = self.inferring orelse return false;
+        return return_type == .result and return_type.result.error_set == inferring;
     }
 
     pub fn isKnown(self: *TypeChecker, modules: []ast.Module, expression: ast.Expression) bool {
@@ -511,6 +578,7 @@ pub const TypeChecker = struct {
         value_type: types.Type,
     ) CheckError!void {
         if (production.expected) |expected| {
+            try self.recordInferredErrors(value_type, expected);
             if (!isConvertible(value_type, expected)) return self.fail(location, error.TypeMismatch);
             return;
         }
@@ -770,7 +838,7 @@ pub const TypeChecker = struct {
             },
             .match => |*matching| try self.checkMatch(signature, statement.location, matching),
             .@"defer" => |deferred| {
-                if (deferred.on_error and !canHoldError(return_type)) {
+                if (deferred.on_error and !canHoldError(return_type) and !self.isInferring(return_type)) {
                     return self.fail(statement.location, error.ErrdeferWithoutError);
                 }
                 const caller_deferring = self.deferring;
@@ -1441,6 +1509,7 @@ pub const TypeChecker = struct {
             .jump => try self.checkJumpValue(parameters, expression, expected),
             .branching => try self.checkBranching(expression, expected),
         };
+        try self.recordInferredErrors(value_type, expected);
         if (!isConvertible(value_type, expected)) return self.fail(expression.location, error.TypeMismatch);
         if (exact and isWidened(value_type, expected)) return self.fail(expression.location, error.TypeMismatch);
         expression.type = value_type;
@@ -2092,6 +2161,7 @@ pub const TypeChecker = struct {
         if (resolution == .function and ast.isGeneric(self.extractSignature(resolution))) {
             try self.instantiateCall(parameters, expression, resolution.function);
         }
+        try self.completeInferredErrorSet(expression.location, ast.extractResolution(expression.kind.call.callee));
         const call = expression.kind.call;
         const callee = self.extractSignature(ast.extractResolution(call.callee));
         if (callee.progress == .running) return self.fail(expression.location, error.DependencyLoop);
@@ -2766,6 +2836,7 @@ pub const TypeChecker = struct {
         if (function == .function and self.extractSignature(function).@"inline") {
             return self.fail(operand.location, error.InlineValue);
         }
+        try self.completeInferredErrorSet(operand.location, function);
         operand.type = try self.computeFunctionType(function);
         const pointer = try self.program.types.addPointer(self.arena.allocator(), .{
             .target = operand.type.?,
@@ -3013,6 +3084,7 @@ pub const TypeChecker = struct {
         if (result_type != .result) return self.fail(operand.location, error.NotResult);
         const return_type = self.return_type orelse return self.fail(expression.location, error.TryWithoutResult);
         if (return_type != .result) return self.fail(expression.location, error.TryWithoutResult);
+        try self.recordInferredErrors(result_type, return_type);
         const error_set = result_type.result.error_set;
         if (error_set.cases.len > 0 and !types.isEnumPart(error_set, return_type.result.error_set)) {
             return self.fail(expression.location, error.UnheldError);
@@ -3363,6 +3435,7 @@ pub const TypeError = AnalyzeError;
 
 pub const CheckError = error{
     OutOfMemory,
+    InferredErrorSetLoop,
     ValueIfWithoutElse,
     MissingBranchValue,
     BranchTypeMismatch,
@@ -3489,6 +3562,7 @@ fn describeError(check_error: CheckError) []const u8 {
         error.MissingReturnValue => "missing return value",
         error.UnexpectedReturnValue => "void function cannot return a value",
         error.MissingReturn => "every path must end with a return",
+        error.InferredErrorSetLoop => "the error set of this function depends on itself; write it, e.g. `-> ParseError!usize`",
         error.ValueIfWithoutElse => "an if used as a value needs an else",
         error.MissingBranchValue => "this line gives no value, but the block must end with one",
         error.BranchTypeMismatch => "every block must give the same type; write the type to convert them",
@@ -3738,6 +3812,14 @@ fn canHoldError(return_type: types.Type) bool {
 
 fn returnsNoValue(return_type: types.Type) bool {
     return return_type == .void or (return_type == .result and return_type.result.value == .void);
+}
+
+fn findErrorSet(value_type: types.Type) ?*const types.Enum {
+    return switch (value_type) {
+        .result => |result| result.error_set,
+        .@"enum" => |enumeration| if (enumeration.kind == .error_set) enumeration else null,
+        else => null,
+    };
 }
 
 fn isResultConvertible(value: types.Result, expected: types.Result) bool {
@@ -6810,6 +6892,234 @@ test "checkStatement: rejects a value if without an else" {
 
     try std.testing.expectError(error.ValueIfWithoutElse, analyzer.analyze());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 24 }, analyzer.failure.?.location.?);
+}
+
+test "checkResultMatch: covers the cases of an inferred error set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    bad\nerror FileError\n    missing\nfn parse() -> ParseError!u8 = ParseError::bad\nfn open() -> FileError!u8 = FileError::missing\nfn load() -> !u8\n    const one = try parse()\n    const two = try open()\n    return one + two\nfn main()\n    match load()\n        case (ParseError::bad) noop\n        case (u8) noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MissingCase, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 12, .column = 5 }, analyzer.failure.?.location.?);
+}
+
+test "completeInferredErrorSet: rejects functions whose error sets depend on each other" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    bad\nerror FileError\n    missing\nfn parse() -> ParseError!u8 = ParseError::bad\nfn open() -> FileError!u8 = FileError::missing\nfn ping(n: u8) -> !u8\n    if (n == 0) return ParseError::bad\n    return try pong(n - 1)\nfn pong(n: u8) -> !u8 = try ping(n)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InferredErrorSetLoop, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 10, .column = 29 }, analyzer.failure.?.location.?);
+}
+
+test "completeInferredErrorSet: rejects a function whose error set depends on itself" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    bad\nerror FileError\n    missing\nfn parse() -> ParseError!u8 = ParseError::bad\nfn open() -> FileError!u8 = FileError::missing\nfn count(n: u8) -> !u8\n    if (n == 0) return ParseError::bad\n    return try count(n - 1)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InferredErrorSetLoop, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 9, .column = 16 }, analyzer.failure.?.location.?);
+}
+
+test "checkInferringFunction: lets main infer its error set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    bad\nerror FileError\n    missing\nfn parse() -> ParseError!u8 = ParseError::bad\nfn open() -> FileError!u8 = FileError::missing\nfn main -> !void\n    _ = try parse()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const error_set = ast.extractType(loader.modules.items[0].declarations[4].kind.function_definition.signature.return_type).result.error_set;
+    try std.testing.expectEqualStrings("ParseError", error_set.name);
+}
+
+test "checkInferringFunction: gives the address of an inferring function the inferred error set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    bad\nerror FileError\n    missing\nfn parse() -> ParseError!u8 = ParseError::bad\nfn open() -> FileError!u8 = FileError::missing\nfn forward() -> !u8 = parse()\nfn main()\n    const pointer: *fn -> ParseError!u8 = &forward\n    _ = pointer" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const error_set = ast.extractType(loader.modules.items[0].declarations[4].kind.function_definition.signature.return_type).result.error_set;
+    try std.testing.expectEqualStrings("ParseError", error_set.name);
+}
+
+test "checkInferringFunction: infers an error set for each instance of a function with a type parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    bad\nerror FileError\n    missing\nfn parse() -> ParseError!u8 = ParseError::bad\nfn open() -> FileError!u8 = FileError::missing\nfn pick(type T) -> !T\n    if (T == u8) return ParseError::bad\n    return 1\nfn use() -> u16\n    const one: u16 = pick(u8) catch 0\n    const two = pick(u16) catch 0\n    return one + two" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const module = loader.modules.items[0];
+    const body = module.declarations[5].kind.function_definition.body;
+    var counts: [2]usize = undefined;
+    for (body[0..2], &counts) |statement, *count| {
+        const call = statement.kind.constant_declaration.value.kind.binary.left.kind.call;
+        const instance = ast.findDeclaration(module, ast.extractResolution(call.callee).function.declaration);
+        count.* = ast.extractType(instance.kind.function_definition.signature.return_type).result.error_set.parts.len;
+    }
+    try std.testing.expectEqual([2]usize{ 1, 0 }, counts);
+}
+
+test "checkInferringFunction: infers an empty error set from a body that returns no error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    bad\nerror FileError\n    missing\nfn parse() -> ParseError!u8 = ParseError::bad\nfn open() -> FileError!u8 = FileError::missing\nfn quiet() -> !u8 = 3" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const error_set = ast.extractType(loader.modules.items[0].declarations[4].kind.function_definition.signature.return_type).result.error_set;
+    try std.testing.expectEqual(0, error_set.parts.len);
+    try std.testing.expectEqual(0, error_set.cases.len);
+}
+
+test "checkInferringFunction: infers an error set through a call to another inferring function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    bad\nerror FileError\n    missing\nfn parse() -> ParseError!u8 = ParseError::bad\nfn open() -> FileError!u8 = FileError::missing\nfn outer() -> !u8 = try inner()\nfn inner() -> !u8 = try open()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const error_set = ast.extractType(loader.modules.items[0].declarations[4].kind.function_definition.signature.return_type).result.error_set;
+    try std.testing.expectEqualStrings("FileError", error_set.name);
+}
+
+test "checkInferringFunction: infers the error set of a returned result" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    bad\nerror FileError\n    missing\nfn parse() -> ParseError!u8 = ParseError::bad\nfn open() -> FileError!u8 = FileError::missing\nfn forward() -> !u8 = parse()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const error_set = ast.extractType(loader.modules.items[0].declarations[4].kind.function_definition.signature.return_type).result.error_set;
+    try std.testing.expectEqualStrings("ParseError", error_set.name);
+}
+
+test "checkInferringFunction: infers the error set of a returned case" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    bad\nerror FileError\n    missing\nfn parse() -> ParseError!u8 = ParseError::bad\nfn open() -> FileError!u8 = FileError::missing\nfn check(bad: bool) -> !void\n    if (bad) return FileError::missing" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const error_set = ast.extractType(loader.modules.items[0].declarations[4].kind.function_definition.signature.return_type).result.error_set;
+    try std.testing.expect(types.isDeclaredEnum(error_set));
+    try std.testing.expectEqualStrings("FileError", error_set.name);
+}
+
+test "checkInferringFunction: infers the error sets of the results a body tries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    bad\nerror FileError\n    missing\nfn parse() -> ParseError!u8 = ParseError::bad\nfn open() -> FileError!u8 = FileError::missing\nfn load() -> !u8\n    const one = try parse()\n    const two = try open()\n    return one + two" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const error_set = ast.extractType(loader.modules.items[0].declarations[4].kind.function_definition.signature.return_type).result.error_set;
+    try std.testing.expectEqual(2, error_set.parts.len);
+    try std.testing.expectEqualStrings("ParseError", error_set.parts[0].name);
+    try std.testing.expectEqualStrings("FileError", error_set.parts[1].name);
 }
 
 test "traceBlock: traces deferred statements at the end of their block" {
@@ -15113,7 +15423,7 @@ test "inferDeclaredTypes: frees read-only slices, array pointers and read-only p
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nstruct Card\n    value: i64\nfn run() -> memory::Error!void\n    var heap = memory::Heap{}\n    var arena = memory::Arena(memory::Heap)::new(heap)\n    const owned = try memory::allocate(&arena, Card, 4)\n    const read_only: []Const(Card) = owned\n    memory::free(&arena, read_only)\n    var fixed: [2]Card = {Card{value = 1}, Card{value = 2}}\n    memory::free(&arena, &fixed)\n    const card = try memory::create(&heap, Card)\n    const pointer: *Const(Card) = card\n    memory::destroy(&heap, pointer)\n    arena.free_all()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nstruct Card\n    value: i64\nfn run() -> memory::Error!void\n    var heap = memory::Heap::new()\n    var arena = memory::Arena(memory::Heap)::new(heap)\n    const owned = try memory::allocate(&arena, Card, 4)\n    const read_only: []Const(Card) = owned\n    memory::free(&arena, read_only)\n    var fixed: [2]Card = {Card{value = 1}, Card{value = 2}}\n    memory::free(&arena, &fixed)\n    const card = try memory::create(&heap, Card)\n    const pointer: *Const(Card) = card\n    memory::destroy(&heap, pointer)\n    arena.free_all()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15221,7 +15531,7 @@ test "checkImplicitArgument: rejects an allocator passed by value to mn::memory"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn run() -> memory::Error!void\n    var heap = memory::Heap{}\n    _ = try memory::allocate(heap, u8, 4)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn run() -> memory::Error!void\n    var heap = memory::Heap::new()\n    _ = try memory::allocate(heap, u8, 4)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15617,25 +15927,6 @@ test "checkWrapping: rejects operands that are not integers" {
 
     try std.testing.expectError(error.NotInteger, analyzer.analyze());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 37 }, analyzer.failure.?.location.?);
-}
-
-test "PROBE2" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nerror Failure\n    bad\ntypeclass Parse(type P)\n    fn parse(parser: *P) -> Failure!u8\nstruct Digit\n    value: u8\ninstance Parse(Digit)\n    fn parse(parser: *Digit) -> Failure!u8 = return parser.value\nfn run() -> u8\n    var total: u8 = 0\n    for (index in 0..3) total += mn::convert(u8, index)\n    return total" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
-    _ = try analyzer.analyze();
-
-    try std.testing.expectEqual(null, analyzer.failure);
 }
 
 test "checkWrapping: rejects a literal that the other operand's type cannot hold" {

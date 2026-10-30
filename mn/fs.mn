@@ -3,9 +3,9 @@ import mn::io
 
 external fn mn_runtime_fs_close(descriptor: i32)
 
-external fn mn_runtime_fs_length(descriptor: i32) -> isize
-
 external fn mn_runtime_fs_open(path: []Const(u8)) -> i32
+
+external fn mn_runtime_fs_size(descriptor: i32) -> isize
 
 error Error
     is_directory
@@ -22,10 +22,10 @@ struct File
         if (descriptor < 0) return find_error(descriptor)
         return File{descriptor = descriptor}
 
-    fn length(self: Self) -> io::Error!usize
-        const length = mn_runtime_fs_length(self.descriptor)
-        if (length < 0) return io::find_error(length)
-        return mn::convert(usize, length)
+    fn size(self: Self) -> io::Error!usize
+        const byte_count = mn_runtime_fs_size(self.descriptor)
+        if (byte_count < 0) return io::find_error(byte_count)
+        return mn::convert(usize, byte_count)
 
     fn close(self: Self) = mn_runtime_fs_close(self.descriptor)
 

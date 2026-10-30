@@ -55,7 +55,7 @@ int32_t mn_runtime_fs_open(mn_slice_u8 path) {
     return descriptor;
 }
 
-ptrdiff_t mn_runtime_fs_length(int32_t descriptor) {
+ptrdiff_t mn_runtime_fs_size(int32_t descriptor) {
     struct stat status;
     if (fstat(descriptor, &status) != 0) return errno == EIO ? -2 : -5;
     return (ptrdiff_t)status.st_size;

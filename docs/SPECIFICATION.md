@@ -440,7 +440,7 @@
 - A struct in an external function's parameters or return type, directly or through pointers or arrays, must be an external struct.
 - `inline fn` declares a function whose every call is replaced by its body, e.g. `inline fn is_answer(input: []Const(u8)) -> bool`. It is called like any other function and behaves the same.
 - An inline function that calls itself, directly or through other functions, is a compile-time error. Using one as a value is a compile-time error, e.g. `&is_answer`. An external function cannot be inline.
-- `main` has no parameters. Its return type is left out, `void`, or a result without a value, e.g. `ParseError!void`. It cannot be called, used as a value, be external or be inline.
+- `main` has no parameters. Its return type is left out, `void`, or a result without a value, e.g. `ParseError!void` or `!void`. It cannot be called, used as a value, be external or be inline.
 - An error that ends `main` writes the case's name to the standard error stream and ends the program with a nonzero status.
 
 ## Errors
@@ -450,6 +450,8 @@
 - Error sets are declared at the top level of a module.
 - `One || Two` is an error set with the cases of both. Each case keeps the set that declares it, e.g. `ParseError::missing_end` is a case of `ParseError || FileError`. A value of an error set converts implicitly to an error set combined from it.
 - `E!T` is a result: either a value of type `T`, or an error of the set `E`, e.g. `ParseError!Token`. `E!void` is a result without a value.
+- `!T` as the return type of a function with a body leaves out the error set, which the compiler infers: the combination of the sets of every error the body can return, through `try`, `return` of a case or `return` of a result, e.g. `fn load(path: []Const(u8)) -> !usize`. A body that returns no error gives a set without cases. A function with `type`, `comptime` or `any` parameters or declared types gets a set for each instance, and `&name` gives a pointer whose type has the set written out.
+- An inferred set is allowed only there, not in the functions of a typeclass or an instance, in external functions or in any other type. A function whose inferred set depends on itself, directly or through other functions, is a compile-time error, so its set must be written.
 - A value of type `T` and a case of `E` convert implicitly to `E!T`, e.g. `return token` and `return ParseError::missing_end`.
 - A result converts implicitly to a result of the same value type whose error set contains its own, e.g. `ParseError!Token` to `(ParseError || FileError)!Token`.
 - `try result` gives the result's value, or returns its error from the function. The function's own result must be able to hold that error, e.g. through `ParseError || FileError`.

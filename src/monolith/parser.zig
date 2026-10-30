@@ -192,7 +192,17 @@ pub const Parser = struct {
             parameters = try self.parseParameters(allocator, &position);
             _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
         }
-        const return_type = try self.parseReturnType(allocator, &position);
+        var inferred_error_set: ?token.Location = null;
+        var return_type: ast.Expression = undefined;
+        if (self.tokens[position].kind == .arrow and self.tokens[position + 1].kind == .exclamation_mark) {
+            inferred_error_set = self.tokens[position + 1].location;
+            position += 2;
+            return_type = (try self.parseExpression(allocator, &position)) orelse {
+                return self.fail(position, error.ExpectedType);
+            };
+        } else {
+            return_type = try self.parseReturnType(allocator, &position);
+        }
 
         offset.* = position;
         return .{
@@ -201,6 +211,7 @@ pub const Parser = struct {
             .declared = declared,
             .parameters = parameters,
             .return_type = return_type,
+            .inferred_error_set = inferred_error_set,
         };
     }
 
@@ -2834,6 +2845,43 @@ test "parseFunctionSignature: parses a return type without parentheses" {
     const function = module.declarations[0].kind.function_definition;
     try std.testing.expectEqualStrings("i32", function.signature.return_type.kind.identifier.name);
     try std.testing.expectEqualStrings("42", function.body[0].kind.value.kind.integer_literal.text);
+}
+
+test "parseFunctionSignature: parses a return type whose error set is left out" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn load(path: []Const(u8)) -> !usize = 0");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const signature = module.declarations[0].kind.function_definition.signature;
+    try std.testing.expectEqualStrings("usize", signature.return_type.kind.identifier.name);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 31 }, signature.inferred_error_set.?);
+}
+
+test "parseFunctionSignature: keeps a written error set apart from a left out one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main -> ParseError!void = noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const signature = module.declarations[0].kind.function_definition.signature;
+    try std.testing.expectEqual(null, signature.inferred_error_set);
+    try std.testing.expectEqual(ast.BinaryOperator.result, signature.return_type.kind.binary.operator);
+}
+
+test "parseFunctionSignature: rejects a left out error set without a value type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn load -> ! = 0");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedType, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, parser.failure.?.location.?);
 }
 
 test "opensHeaderBlock: rejects a colon after a function signature" {

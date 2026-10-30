@@ -153,6 +153,7 @@ pub const NameResolver = struct {
             if (findSignature(functions[0..function_index], signature.name) != null) {
                 return self.fail(declaration.location, error.DuplicateFunction);
             }
+            if (signature.inferred_error_set) |location| return self.fail(location, error.MisplacedInferredErrorSet);
             self.bindings = try self.addOwnTypeBindings(typeclass_bindings, signature.*);
             self.signature_typeclass = typeclass;
             defer self.signature_typeclass = null;
@@ -585,6 +586,9 @@ pub const NameResolver = struct {
             .pending => {},
         }
         signature.progress = .running;
+        if (signature.typeclass != null) {
+            if (signature.inferred_error_set) |location| return self.failIn(module_index, location, error.MisplacedInferredErrorSet);
+        }
         const caller_module_index = self.module_index;
         const caller_self_type = self.self_type;
         const caller_self_name = self.self_name;
@@ -1003,6 +1007,7 @@ pub const NameResolver = struct {
         for (signature.parameters) |parameter| {
             if (parameter.kind == .any) return self.fail(parameter.type.location, error.AnyInExternalFunction);
         }
+        if (signature.inferred_error_set) |location| return self.fail(location, error.MisplacedInferredErrorSet);
         try self.resolveFunctionTypes(signature);
         for (signature.parameters) |parameter| {
             if (containsInternalStruct(ast.extractType(parameter.type))) {
@@ -1728,7 +1733,17 @@ pub const NameResolver = struct {
             try self.resolveTypedName(parameter.name, parameter.location, &parameter.type);
         }
         try self.resolveNamesInExpression(.{}, &signature.return_type);
-        _ = try self.expectRuntimeType(&signature.return_type);
+        const return_type = try self.expectRuntimeType(&signature.return_type);
+        if (signature.inferred_error_set != null) try self.beginInferredErrorSet(signature, return_type);
+    }
+
+    fn beginInferredErrorSet(self: *NameResolver, signature: *ast.FunctionSignature, value_type: types.Type) ResolveError!void {
+        const allocator = self.arena.allocator();
+        const error_set = try allocator.create(types.Enum);
+        error_set.* = .{ .module = self.module_index, .name = signature.name, .kind = .error_set };
+        signature.error_set = error_set;
+        const result = try self.types.addResult(allocator, error_set, value_type);
+        signature.return_type.denoted = .{ .result = result };
     }
 
     fn resolveTypedName(
@@ -1787,6 +1802,10 @@ pub const NameResolver = struct {
                 }
                 return self.evaluateType(expression);
             },
+            .unary => |unary| {
+                if (unary.operator == .not) return self.fail(expression.location, error.MisplacedInferredErrorSet);
+                return self.fail(expression.location, error.TypeMismatch);
+            },
             .integer_literal,
             .float_literal,
             .boolean_literal,
@@ -1794,7 +1813,6 @@ pub const NameResolver = struct {
             .undefined,
             .null,
             .negation,
-            .unary,
             .address_of,
             .composite_literal,
             .slice,
@@ -3454,6 +3472,7 @@ pub const NameResolver = struct {
 pub const ResolveError = AnalyzeError;
 
 pub const NameError = error{
+    MisplacedInferredErrorSet,
     DuplicateFunction,
     DuplicateConstant,
     DuplicateStruct,
@@ -3690,6 +3709,7 @@ fn describeError(name_error: NameError) []const u8 {
         error.PointlessDiscard => "discarded name is used",
         error.CannotEvaluate => "cannot be evaluated at compile time",
         error.TypeMismatch => "value does not match the expected type",
+        error.MisplacedInferredErrorSet => "an error set can be left out only in the return type of a function with a body, e.g. `fn load() -> !usize`",
         error.FunctionWithoutPointer => "function types need a pointer",
         error.ManyFunctionPointer => "a function pointer is written *fn(...), not *Many(fn(...))",
         error.ConstantFunctionPointer => "a function pointer is written without Const",
@@ -5555,6 +5575,139 @@ test "expectSingleInstances: rejects a second instance of a typeclass for a type
     try std.testing.expectEqual(token.Location{ .row = 7, .column = 1 }, name_resolver.failure.?.location.?);
 }
 
+test "resolveExternalSignature: rejects an inferred error set in an external function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn read() -> !u8\nfn main() = _ = read() catch 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MisplacedInferredErrorSet, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, analyzer.failure.?.location.?);
+}
+
+test "resolveFunctionSignature: rejects an inferred error set in an instance function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ShowError\n    failed\ntypeclass Show(type T)\n    fn show(value: T) -> ShowError!void\nstruct Card\ninstance Show(Card)\n    fn show(value: Card) -> !void = noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MisplacedInferredErrorSet, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 7, .column = 29 }, analyzer.failure.?.location.?);
+}
+
+test "resolveTypeclass: rejects an inferred error set in a typeclass function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T)\n    fn show(value: T) -> !void" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MisplacedInferredErrorSet, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 26 }, analyzer.failure.?.location.?);
+}
+
+test "resolveFunctionTypes: rejects an inferred error set in the type of a field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card\n    value: !u8\nfn main()\n    const card = Card{value = 1}\n    _ = card" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MisplacedInferredErrorSet, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, analyzer.failure.?.location.?);
+}
+
+test "resolveFunctionTypes: rejects an inferred error set in the type of a variable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main()\n    var value: !u8 = 1\n    value = 2" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MisplacedInferredErrorSet, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 16 }, analyzer.failure.?.location.?);
+}
+
+test "resolveFunctionTypes: rejects an inferred error set in the return type of a function type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(callback: *fn -> !u8) = noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MisplacedInferredErrorSet, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, analyzer.failure.?.location.?);
+}
+
+test "resolveFunctionTypes: rejects an inferred error set in the type of a parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: !u8) = noop" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MisplacedInferredErrorSet, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, analyzer.failure.?.location.?);
+}
+
 test "resolveFunctionSignature: resolves the receiver and self of a method" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5586,7 +5739,7 @@ test "resolveFunctionSignature: resolves Self in a method of mn::fs reached afte
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io\nimport mn::io::Reader\n\nfn size(path: []Const(u8)) -> io::Error!usize\n    const file = fs::File::open(path) catch return 0\n    defer file.close()\n    var buffer: [64]u8 = undefined\n    const count = try file.read(&buffer)\n    return count + try file.length()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io\nimport mn::io::Reader\n\nfn measure(path: []Const(u8)) -> io::Error!usize\n    const file = fs::File::open(path) catch return 0\n    defer file.close()\n    var buffer: [64]u8 = undefined\n    const count = try file.read(&buffer)\n    return count + try file.size()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -5595,11 +5748,11 @@ test "resolveFunctionSignature: resolves Self in a method of mn::fs reached afte
     const files = for (loader.modules.items) |module| {
         if (std.mem.eql(u8, module.path[module.path.len - 1], "fs")) break module;
     } else unreachable;
-    const length = for (files.declarations) |declaration| {
+    const size = for (files.declarations) |declaration| {
         if (declaration.kind != .function_definition) continue;
-        if (std.mem.eql(u8, declaration.kind.function_definition.signature.name, "length")) break declaration.kind.function_definition;
+        if (std.mem.eql(u8, declaration.kind.function_definition.signature.name, "size")) break declaration.kind.function_definition;
     } else unreachable;
-    try std.testing.expect(ast.extractType(length.signature.parameters[0].type) == .@"struct");
+    try std.testing.expect(ast.extractType(size.signature.parameters[0].type) == .@"struct");
 }
 
 test "resolveFunctionSignature: rejects a signature that depends on itself at compile time" {
