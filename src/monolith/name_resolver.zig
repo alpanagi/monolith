@@ -5503,7 +5503,7 @@ test "resolveTypeclass: takes a value of any type with an instance in a typeclas
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\ntypeclass Sized(type T)\n    fn length(value: T) -> usize\n    fn size(value: T, values: mn::Tuple) -> usize = Sized::length(value) + values[0]\nstruct Data\n    length: usize\ninstance Sized(Data)\n    fn length(value: Data) -> usize = value.length\nconst ONE = Data{length = 3}.size([usize]{4})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -6017,7 +6017,7 @@ test "resolveInstance: compares next with the Element of the same instance" {
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Countdown\n    count: u32\ninstance mn::Iterator(Countdown)\n    fn Element() -> type = return [u32]\n    fn next(iterator: *Countdown) -> ?Element()\n        if (iterator.count == 0) return null\n        iterator.count -= 1\n        return {iterator.count + 1}\nconst Element = mn::Iterator(Countdown)::Element()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -6037,7 +6037,7 @@ test "resolveInstance: rejects next with another type than Element" {
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Countdown\n    count: u32\ninstance mn::Iterator(Countdown)\n    fn Element() -> type = return [u32]\n    fn next(_: *Countdown) -> ?[u8] = return null" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -6056,7 +6056,7 @@ test "resolveInstance: rejects an instance of mn::Tuple" {
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\ninstance mn::Tuple(i32)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -6075,7 +6075,7 @@ test "expandTupleLoop: resolves a copy of the block for each element of a tuple"
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count(pair: [i32, bool]) -> usize\n    var seen: usize = 0\n    for value in pair\n        const copy = value\n        _ = copy\n        seen += 1\n    return seen\nconst COUNT = count({1, true})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -6352,7 +6352,7 @@ test "resolveFunctionSignature: resolves Self in a method of mn::fs reached afte
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io\nimport mn::io::Reader\n\nfn measure(path: fs::Path) -> io::Error!usize\n    const file = fs::File::open(path, fs::File::Mode::read) catch return 0\n    defer file.deinit()\n    var buffer: [64]u8 = undefined\n    const count = try file.read(&buffer)\n    return count + try file.size()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -6378,7 +6378,7 @@ test "dropResultLines: lets a generic function whose return type depends on its 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(_: *Fixed, type T, _: usize) -> memory::Error![]T = memory::Error::out_of_memory\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn run() -> usize\n    var fixed = Fixed{used = 0}\n    const items = fixed.allocate(u8, 1) catch return 7\n    return items.length\nconst RESULT = run()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -8500,7 +8500,7 @@ test "chooseBlock: resolves only the block that a condition depending on a type 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn total(type T, comptime index: usize) -> usize\n    if (index == mn::reflection::length(T)) return 0\n    else\n        const Element = T[index]\n        return mn::size(Element) + total(T, index + 1)\nconst TOTAL = total([u8, i32, u16], 0)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -9324,7 +9324,7 @@ test "resolveLocalConstant: reports calling a pointer method on a constant made 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::random\nimport mn::random::Generator\nfn main()\n    const random = random::Xoshiro256::new(random::entropy())\n    _ = random.range(0..10)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -9343,7 +9343,7 @@ test "resolveLocalConstant: reports a method of a typeclass that is not imported
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::random\nfn main()\n    const random = random::Xoshiro256::new(random::entropy())\n    _ = random.range(0..10)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -10456,7 +10456,7 @@ test "expectLength: rejects an array length computed by a call that allocates" {
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Allocator\nfn take() -> memory::Error!usize\n    with allocator\n    const items = try allocator.allocate(u8, 1)\n    allocator.free(items)\n    return items.length\nfn main()\n    const size = take() catch 0\n    var bytes: [size]u8 = undefined\n    bytes[0] = 1\n    _ = bytes" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};

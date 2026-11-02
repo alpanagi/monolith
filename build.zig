@@ -40,12 +40,12 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     b.installDirectory(.{
-        .source_dir = b.path("mn"),
+        .source_dir = b.path("library/mn"),
         .install_dir = .bin,
         .install_subdir = "mn",
     });
 
-    b.getInstallStep().dependOn(&b.addInstallFileWithDir(b.path("mn.mn"), .bin, "mn.mn").step);
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(b.path("library/mn.mn"), .bin, "mn.mn").step);
 
     b.installDirectory(.{
         .source_dir = b.path("plugins/c/runtime"),

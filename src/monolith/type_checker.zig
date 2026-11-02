@@ -7559,7 +7559,7 @@ test "completeInferredErrorSet: leaves the copy with unknown types of a generic 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\ntypeclass Sized(type T)\n    fn size(value: T) -> usize\nstruct Data\ninstance Sized(Data)\n    fn size(_: Data) -> usize = 4\nerror Failure\n    empty\nconst LENGTH: usize = 8\nfn count(value: Sized, depth: usize) -> !usize\n    var buffer: [LENGTH]u8 = undefined\n    buffer[0] = 1\n    if (depth == 0) return Failure::empty\n    return try count(value, depth - 1) + Sized::size(value) + mn::convert(usize, buffer[0])\nfn main -> !void\n    _ = try count(Data{}, 2)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7579,7 +7579,7 @@ test "completeInferredErrorSet: checks a generic function that calls itself with
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\ntypeclass Sized(type T)\n    fn size(value: T) -> usize\nstruct Data\ninstance Sized(Data)\n    fn size(_: Data) -> usize = 4\nerror Failure\n    empty\nconst LENGTH: usize = 8\nfn count(value: Sized, depth: usize) -> Failure!usize\n    var buffer: [LENGTH]u8 = undefined\n    buffer[0] = 1\n    if (depth == 0) return Failure::empty\n    return try count(value, depth - 1) + Sized::size(value) + mn::convert(usize, buffer[0])\nfn main -> !void\n    _ = try count(Data{}, 2)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7599,7 +7599,7 @@ test "resolveAllocatorCall: gives a call the allocator of with and everything be
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn take(count: usize) -> memory::Error!usize\n    with allocator\n    const items = try allocator.allocate(u8, count)\n    return items.length\nfn middle(count: usize) -> memory::Error!usize = take(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    return try middle(4) with &fixed\nconst USED = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7625,7 +7625,7 @@ test "resolveAllocatorCall: lets the function of an instance need an allocator t
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\ntypeclass Source(type S)\n    fn read(source: S) -> !usize\nstruct Left\nstruct Right\ninstance Source(Left)\n    fn read(_: Left) -> !usize\n        with allocator\n        const items = try allocator.allocate(u8, 3)\n        return items.length\ninstance Source(Right)\n    fn read(_: Right) -> !usize = 7\nfn report(source: Source) -> !usize = source.read()\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const one = try report(Left{}) with &fixed\n    const two = report(Right{}) catch 0\n    return one * 10 + two\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7648,7 +7648,7 @@ test "resolveAllocatorCall: rejects with on an instance of a generic function th
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\ntypeclass Source(type S)\n    fn read(source: S) -> !usize\nstruct Left\nstruct Right\ninstance Source(Left)\n    fn read(_: Left) -> !usize\n        with allocator\n        const items = try allocator.allocate(u8, 3)\n        return items.length\ninstance Source(Right)\n    fn read(_: Right) -> !usize = 7\nfn report(source: Source) -> !usize = source.read()\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    return report(Right{}) with &fixed catch 0\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7667,7 +7667,7 @@ test "resolveAllocatorCall: infers the need of a generic function that calls its
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn depth(type T, count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    with allocator\n    const items = try allocator.allocate(T, 1)\n    return items.length + try depth(T, count - 1)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    return try depth(u8, 3) with &fixed\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7690,7 +7690,7 @@ test "resolveAllocatorCall: gives a chain without with the default allocator wit
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nfn take() -> memory::Error!usize\n    with allocator\n    const items = try allocator.allocate(u8, 1)\n    return items.length\nfn middle() -> memory::Error!usize = take()\nfn main -> !void\n    _ = try middle()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7715,7 +7715,7 @@ test "prepareWithoutAllocator: lets main allocate through the default allocator"
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nfn main -> !void\n    with allocator\n    const items = try allocator.allocate(u8, 1)\n    allocator.free(items)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7736,7 +7736,7 @@ test "checkFunctionAddress: points the address of a function that needs an alloc
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nfn take() -> memory::Error!usize\n    with allocator\n    const items = try allocator.allocate(u8, 1)\n    return items.length\nfn main()\n    const pointer = &take\n    _ = pointer" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7758,7 +7758,7 @@ test "resolveAllocatorCall: reaches memory::allocate at the bottom of a chain wi
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn bottom(count: usize) -> memory::Error![]u8 = memory::allocate(u8, count)\nfn middle(count: usize) -> memory::Error!usize\n    const items = try bottom(count)\n    return items.length\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const length = try middle(5) with &fixed\n    return length * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7781,7 +7781,7 @@ test "resolveAllocatorCall: allocates from the allocator of with in every functi
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn even(count: usize) -> memory::Error!usize\n    with allocator\n    _ = try allocator.allocate(u8, 1)\n    if (count == 0) return 0\n    return try odd(count - 1)\nfn odd(count: usize) -> memory::Error!usize\n    with allocator\n    _ = try allocator.allocate(u8, 2)\n    if (count == 0) return 0\n    return try even(count - 1)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try even(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7804,7 +7804,7 @@ test "resolveAllocatorCall: finds a need late through the back edge of a cycle w
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    const value = try second(count - 1)\n    with allocator\n    _ = try allocator.allocate(u8, 1)\n    return value + 1\nfn second(count: usize) -> memory::Error!usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7827,7 +7827,7 @@ test "resolveAllocatorCall: finds a need late through the forward edge of a cycl
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    const value = try second(count - 1)\n    with allocator\n    _ = try allocator.allocate(u8, 1)\n    return value + 1\nfn second(count: usize) -> memory::Error!usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try second(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7850,7 +7850,7 @@ test "resolveAllocatorCall: overrides the allocator for one call inside a cycle 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    with allocator\n    _ = try allocator.allocate(u8, 1)\n    if (count == 0) return 0\n    return try second(count)\nfn second(count: usize) -> memory::Error!usize\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try first(count - 1) with &other\n    return value + other.used * 10\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7873,7 +7873,7 @@ test "resolveAllocatorCall: overrides the allocator for one call inside a cycle 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try second(count - 1) with &other\n    with allocator\n    _ = try allocator.allocate(u8, 1)\n    return value + other.used * 10\nfn second(count: usize) -> memory::Error!usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7896,7 +7896,7 @@ test "resolveAllocatorCall: allocates from the allocator of with in every functi
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn even(count: usize) -> !usize\n    with allocator\n    _ = try allocator.allocate(u8, 1)\n    if (count == 0) return 0\n    return try odd(count - 1)\nfn odd(count: usize) -> !usize\n    with allocator\n    _ = try allocator.allocate(u8, 2)\n    if (count == 0) return 0\n    return try even(count - 1)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try even(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7919,7 +7919,7 @@ test "resolveAllocatorCall: finds a need late through the back edge of a cycle w
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn first(count: usize) -> !usize\n    if (count == 0) return 0\n    const value = try second(count - 1)\n    with allocator\n    _ = try allocator.allocate(u8, 1)\n    return value + 1\nfn second(count: usize) -> !usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7942,7 +7942,7 @@ test "resolveAllocatorCall: finds a need late through the forward edge of a cycl
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn first(count: usize) -> !usize\n    if (count == 0) return 0\n    const value = try second(count - 1)\n    with allocator\n    _ = try allocator.allocate(u8, 1)\n    return value + 1\nfn second(count: usize) -> !usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try second(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7965,7 +7965,7 @@ test "resolveAllocatorCall: overrides the allocator for one call inside a cycle 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn first(count: usize) -> !usize\n    with allocator\n    _ = try allocator.allocate(u8, 1)\n    if (count == 0) return 0\n    return try second(count)\nfn second(count: usize) -> !usize\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try first(count - 1) with &other\n    return value + other.used * 10\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7988,7 +7988,7 @@ test "resolveAllocatorCall: overrides the allocator for one call inside a cycle 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn first(count: usize) -> !usize\n    if (count == 0) return 0\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try second(count - 1) with &other\n    with allocator\n    _ = try allocator.allocate(u8, 1)\n    return value + other.used * 10\nfn second(count: usize) -> !usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -8011,7 +8011,7 @@ test "resolveAllocatorCall: calls back into a function whose need is found after
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try helper(count - 1) with &other\n    with allocator\n    _ = try allocator.allocate(u8, 1)\n    return value + other.used * 10\nfn helper(count: usize) -> memory::Error!usize\n    with allocator\n    _ = try allocator.allocate(u8, 2)\n    return try first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -8034,7 +8034,7 @@ test "resolveAllocatorCall: calls back into a function whose need is found after
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn first(count: usize) -> !usize\n    if (count == 0) return 0\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try helper(count - 1) with &other\n    with allocator\n    _ = try allocator.allocate(u8, 1)\n    return value + other.used * 10\nfn helper(count: usize) -> !usize\n    with allocator\n    _ = try allocator.allocate(u8, 2)\n    return try first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -8057,7 +8057,7 @@ test "finishNeeds: rejects with on a call inside a cycle that turns out not to n
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    var other: Fixed = undefined\n    other.used = 0\n    return second(count - 1) with &other\nfn second(count: usize) -> memory::Error!usize = first(count)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -8076,7 +8076,7 @@ test "resolveAllocatorCall: gives the call of a known local constant the default
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Allocator\nfn take() -> memory::Error!usize\n    with allocator\n    const items = try allocator.allocate(u8, 1)\n    allocator.free(items)\n    return items.length\nfn main()\n    const size = take() catch 0\n    _ = size" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -8098,7 +8098,7 @@ test "evaluateConstant: stops a top-level constant at the external call of the d
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Allocator\nfn take() -> memory::Error!usize\n    with allocator\n    const items = try allocator.allocate(u8, 1)\n    allocator.free(items)\n    return items.length\nconst USED = take() catch 0\nfn use() -> usize = USED\nfn main() = _ = use()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -8116,7 +8116,7 @@ test "resolveAllocatorCall: overrides the allocator for an inner call with its o
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn take(count: usize) -> memory::Error!usize\n    with allocator\n    const items = try allocator.allocate(u8, count)\n    return items.length\nfn outer() -> memory::Error![2]usize\n    var inner: Fixed = undefined\n    inner.used = 0\n    const one = try take(3) with &inner\n    const two = try take(5)\n    return {one + inner.used, two}\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const both = try outer() with &fixed\n    return both[0] * 100 + both[1] * 10 + fixed.used\nconst USED = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -8142,7 +8142,7 @@ test "resolveAllocatorCall: infers the need of functions that call each other" {
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn even(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    return try odd(count - 1)\nfn odd(count: usize) -> memory::Error!usize\n    with allocator\n    const items = try allocator.allocate(u8, 1)\n    return items.length + try even(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    return try even(3) with &fixed\nconst USED = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -8168,7 +8168,7 @@ test "resolveAllocatorCall: infers the need of an instance of a generic function
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn take(type T) -> memory::Error!usize\n    if T == u8\n        with allocator\n        const items = try allocator.allocate(u8, 2)\n        return items.length\n    return 0\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const one = try take(u8) with &fixed\n    const two = try take(i32)\n    return one + two\nconst USED = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -8194,7 +8194,7 @@ test "resolveAllocatorCall: rejects with on a call that does not need an allocat
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nfn plain() -> usize = 1\nfn main()\n    var heap = memory::Heap::new()\n    _ = plain() with &heap\n    _ = heap.allocate(u8, 1) catch return" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -8213,7 +8213,7 @@ test "expectAllocatorOperand: rejects a with operand that is not a pointer to an
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nfn take() -> memory::Error!usize\n    with allocator\n    const items = try allocator.allocate(u8, 1)\n    return items.length\nfn main -> !void\n    var count: usize = 1\n    count += 1\n    _ = try take() with &count" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -8232,7 +8232,7 @@ test "expectAllocatorOperand: rejects a with operand that is not a pointer" {
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nfn take() -> memory::Error!usize\n    with allocator\n    const items = try allocator.allocate(u8, 1)\n    return items.length\nfn main -> !void\n    const heap = memory::Heap::new()\n    _ = try take() with heap" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -11824,7 +11824,7 @@ test "countTypeDependency: keeps a condition that passes a type argument to a fu
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nfn check(buffer: []Const(u8), count: usize) -> bool\n    if (memory::equal(buffer, \"y\")) return true\n    if (count == mn::size(u8)) return true\n    return false" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -12677,7 +12677,7 @@ test "checkIteratorLoop: rejects a pointer to an element of an iterator" {
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Countdown\n    count: u32\ninstance mn::Iterator(Countdown)\n    fn Element() -> type = return [u32]\n    fn next(iterator: *Countdown) -> ?Element()\n        if (iterator.count == 0) return null\n        iterator.count -= 1\n        return {iterator.count + 1}\nfn total() -> u32\n    var sum: u32 = 0\n    for (*value in Countdown{count = 3}) sum += value.*\n    return sum" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -12696,7 +12696,7 @@ test "checkIteratorLoop: rejects a single name over elements of several values" 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Pairs\n    count: u32\ninstance mn::Iterator(Pairs)\n    fn Element() -> type = return [u32, bool]\n    fn next(_: *Pairs) -> ?Element() = return null\nfn total() -> u32\n    for (value in Pairs{count = 3}) _ = value\n    return 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -12715,7 +12715,7 @@ test "checkIteratorLoop: rejects elements that are not tuples" {
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Numbers\n    count: u32\ninstance mn::Iterator(Numbers)\n    fn Element() -> type = return u32\n    fn next(_: *Numbers) -> ?Element() = return null\nfn total() -> u32\n    for (value in Numbers{count = 3}) _ = value\n    return 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -12734,7 +12734,7 @@ test "checkRange: rejects a range value whose start is known to be after its end
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main()\n    const range = 5..2\n    _ = range" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -16734,7 +16734,7 @@ test "inferDeclaredTypes: frees read-only slices, array pointers and read-only p
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Allocator\nstruct Card\n    value: i64\nfn run() -> memory::Error!void\n    var heap = memory::Heap::new()\n    var arena = memory::Arena(memory::Heap)::new(heap)\n    const owned = try arena.allocate(Card, 4)\n    const read_only: []Const(Card) = owned\n    arena.free(read_only)\n    var fixed: [2]Card = {Card{value = 1}, Card{value = 2}}\n    arena.free(&fixed)\n    const card = try heap.create(Card)\n    const pointer: *Const(Card) = card\n    heap.destroy(pointer)\n    arena.free_all()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -16842,7 +16842,7 @@ test "checkImplicitArgument: rejects an allocator passed by value to a parameter
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn take(_: *memory::Allocator) = noop\nfn run()\n    const heap = memory::Heap::new()\n    take(heap)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -17579,7 +17579,7 @@ test "checkFunctionCall: takes any tuple through mn::Tuple and checks the code t
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn first(values: mn::Tuple) -> i32 = return values[0]\nfn second(type T: mn::Tuple, values: T) -> T[1] = return values[1]\nfn run() -> i32\n    const five: i32 = 5\n    const flag = true\n    const chosen = second([i32, bool], {five, flag})\n    if (chosen) return first({five, flag})\n    return 0\nconst RUN = run()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -17599,7 +17599,7 @@ test "checkFunctionCall: rejects a value that is not a tuple where mn::Tuple is 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn first(values: mn::Tuple) -> i32 = return values[0]\nfn run() -> i32\n    const five: i32 = 5\n    return first(five)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -18935,7 +18935,7 @@ test "checkBinary: compares the elements of slices through mn::memory::equal" {
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn same(one: []Const(u8), two: []u8, length: usize) -> bool = return memory::equal(two[0..length], \"yes\\n\") and memory::equal(one, two)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -18955,7 +18955,7 @@ test "checkFunctionCall: rejects a slice of elements other than bytes passed to 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn same(one: []Const(i32), two: []Const(i32)) -> bool = return memory::equal(one, two)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23180,7 +23180,7 @@ test "integration: accepts each placeholder for the types it fits through the st
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io\nimport mn::io::Writer\nimport mn::io::stdout\n\nfn main -> !void\n    try stdout.println(\"plain\", {})\n    try stdout.print(\"{} {x} {b}\", {-1i8, 2i16, 3i32})\n    try stdout.print(\"{} {x} {b}\", {4i64, 5i128, 6isize})\n    try stdout.print(\"{} {x} {b}\", {7u8, 8u16, 9u32})\n    try stdout.print(\"{} {x} {b}\", {10u64, 11u128, 12usize})\n    try stdout.println(\"{} {s} {{}}\", {true, \"text\"})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23199,7 +23199,7 @@ test "integration: rejects a format with fewer placeholders than values through 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io\nimport mn::io::Writer\nimport mn::io::stdout\n\nfn main -> !void\n    try stdout.println(\"{}\", {1u8, 2u8})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23218,7 +23218,7 @@ test "integration: rejects a format with more placeholders than values through t
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io\nimport mn::io::Writer\nimport mn::io::stdout\n\nfn main -> !void\n    try stdout.println(\"{} {}\", {1u8})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23237,7 +23237,7 @@ test "integration: rejects an unknown placeholder through the standard library" 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io\nimport mn::io::Writer\nimport mn::io::stdout\n\nfn main -> !void\n    try stdout.println(\"{d}\", {1u8})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23256,7 +23256,7 @@ test "integration: rejects a placeholder for text with an integer through the st
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io\nimport mn::io::Writer\nimport mn::io::stdout\n\nfn main -> !void\n    try stdout.println(\"{s}\", {1u8})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23275,7 +23275,7 @@ test "integration: rejects a placeholder for hexadecimal with a bool through the
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io\nimport mn::io::Writer\nimport mn::io::stdout\n\nfn main -> !void\n    try stdout.println(\"{x}\", {true})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23294,7 +23294,7 @@ test "integration: rejects the default placeholder with a byte slice through the
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io\nimport mn::io::Writer\nimport mn::io::stdout\n\nfn main -> !void\n    try stdout.println(\"{}\", {\"text\"})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23313,7 +23313,7 @@ test "integration: rejects a float as a value to format through the standard lib
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io\nimport mn::io::Writer\nimport mn::io::stdout\n\nfn main -> !void\n    const value: f32 = 1.5\n    try stdout.println(\"{}\", {value})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23332,7 +23332,7 @@ test "integration: rejects a struct as a value to format through the standard li
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io\nimport mn::io::Writer\nimport mn::io::stdout\n\nstruct Data\n\nfn main -> !void\n    try stdout.println(\"{}\", {Data{}})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23351,7 +23351,7 @@ test "integration: rejects an opening brace without a closing one through the st
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io\nimport mn::io::Writer\nimport mn::io::stdout\n\nfn main -> !void\n    try stdout.println(\"a{\", {})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23370,7 +23370,7 @@ test "integration: rejects a closing brace without an opening one through the st
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io\nimport mn::io::Writer\nimport mn::io::stdout\n\nfn main -> !void\n    try stdout.println(\"a}b\", {})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23389,7 +23389,7 @@ test "integration: lists files with a generic function that calls itself and kee
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io::Writer\nimport mn::io::stdout\nimport mn::memory\n\nconst root = \".\"\n\nfn main -> !void\n    var heap = memory::Heap::new()\n    var path = try fs::Path::parse(root) with &heap\n    defer path.deinit() with &heap\n    try print_files(&path) with &heap\n\nfn print_files(path: *fs::Path) -> !void\n    var buffer: [fs::maximum_path_length]u8 = undefined\n    const text = try path.text(&buffer)\n\n    const directory = try fs::Directory::open(path.*)\n    defer directory.deinit()\n\n    while try directory.next() as entry\n        match entry.kind\n            case file\n                try stdout.println(\"{s}/{s}\", {text, entry.name})\n            case directory\n                try path.push(entry.name)\n                try print_files(path)\n                path.pop()\n            else noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23408,7 +23408,7 @@ test "integration: formats into a list of bytes that grows as it is written thro
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::io::Writer\nimport mn::memory\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance memory::Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn build() -> memory::Error![10]u8\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    var list = mn::List(u8)::new()\n    try list.print(\"{}-{x}\", {12u8, 255u8}) with &fixed\n    try list.println(\"{s}\", {\"done\"}) with &fixed\n    var result: [10]u8 = undefined\n    for (index in 0..10) result[index] = list.items[index]\n    return result\nconst TEXT = build() catch [10]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23432,7 +23432,7 @@ test "integration: gives out of memory as an error of mn::memory when a list of 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::io::Writer\nimport mn::memory\nstruct Fixed\n    bytes: [4]u8\n    used: usize\ninstance memory::Allocator(Fixed)\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 4) return memory::Error::out_of_memory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*Many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: []Const(T)) = noop\nfn build() -> memory::Error![10]u8\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    var list = mn::List(u8)::new()\n    try list.print(\"{}-{x}\", {12u8, 255u8}) with &fixed\n    try list.println(\"{s}\", {\"done\"}) with &fixed\n    var result: [10]u8 = undefined\n    for (index in 0..10) result[index] = list.items[index]\n    return result\nfn fails() -> bool\n    _ = build() catch return true\n    return false\nconst FAILED = fails()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23456,7 +23456,7 @@ test "integration: gives the published digests of SHA-256 through the standard l
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::hash\nimport mn::io\nstruct Source\n    bytes: []Const(u8)\n    position: usize\n    limit: usize\ninstance io::Reader(*Source)\n    fn read(source: *Source, buffer: []u8) -> io::Error!usize\n        var count = source.bytes.length - source.position\n        if (count > source.limit) count = source.limit\n        if (count > buffer.length) count = buffer.length\n        for (index in 0..count) buffer[index] = source.bytes[source.position + index]\n        source.position += count\n        return count\nfn digest(text: []Const(u8), limit: usize) -> io::Error![32]u8\n    var source = Source{bytes = text, position = 0, limit = limit}\n    return hash::sha256(&source)\nconst EMPTY = digest(\"\", 64) catch [32]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}\nconst SHORT = digest(\"abc\", 64) catch [32]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}\nconst LONG = digest(\"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq\", 64) catch [32]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23490,7 +23490,7 @@ test "integration: gives the digests around the block boundaries of SHA-256 thro
     defer program_directory.cleanup();
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     const lengths = [_]usize{ 55, 56, 63, 64, 65, 119, 120 };
     var text: [120]u8 = undefined;
     for (&text, 0..) |*byte, index| byte.* = 'a' + @as(u8, @intCast(index % 26));
@@ -23523,7 +23523,7 @@ test "integration: gives the same digest for short reads through the standard li
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::hash\nimport mn::io\nstruct Source\n    bytes: []Const(u8)\n    position: usize\n    limit: usize\ninstance io::Reader(*Source)\n    fn read(source: *Source, buffer: []u8) -> io::Error!usize\n        var count = source.bytes.length - source.position\n        if (count > source.limit) count = source.limit\n        if (count > buffer.length) count = buffer.length\n        for (index in 0..count) buffer[index] = source.bytes[source.position + index]\n        source.position += count\n        return count\nfn digest(text: []Const(u8), limit: usize) -> io::Error![32]u8\n    var source = Source{bytes = text, position = 0, limit = limit}\n    return hash::sha256(&source)\nconst WHOLE = digest(\"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq0123456789\", 64) catch [32]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}\nconst SINGLE = digest(\"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq0123456789\", 1) catch [32]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}\nconst SEVEN = digest(\"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq0123456789\", 7) catch [32]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23550,7 +23550,7 @@ test "integration: passes on the error of a read through the standard library" {
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::hash\nimport mn::io\nstruct Failing\n    remaining: usize\ninstance io::Reader(*Failing)\n    fn read(failing: *Failing, buffer: []u8) -> io::Error!usize\n        if (failing.remaining == 0) return io::Error::no_space\n        failing.remaining -= 1\n        buffer[0] = 1\n        return 1\nfn run() -> u8\n    var failing = Failing{remaining = 3}\n    match hash::sha256(&failing)\n        case ([32]u8) return 3\n        case (io::Error::no_space) return 1\n        else return 2\nconst RESULT = run()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23573,7 +23573,7 @@ test "integration: writes each byte of a slice as two hexadecimal digits through
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io\nimport mn::io::Writer\nstruct Capture\n    bytes: [16]u8\n    length: usize\ninstance Writer(*Capture)\n    fn write(capture: *Capture, bytes: []Const(u8)) -> !void\n        for byte in bytes\n            capture.bytes[capture.length] = byte\n            capture.length += 1\nfn run() -> ![7]u8\n    var capture: Capture = undefined\n    capture.length = 0\n    const data: [3]u8 = {0, 10, 255}\n    try capture.print(\"{x}|\", {data[..]})\n    return {capture.bytes[0], capture.bytes[1], capture.bytes[2], capture.bytes[3], capture.bytes[4], capture.bytes[5], capture.bytes[6]}\nconst RESULT = run() catch [7]u8{0, 0, 0, 0, 0, 0, 0}" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23596,7 +23596,7 @@ test "integration: writes nothing for an empty slice in hexadecimal through the 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io\nimport mn::io::Writer\nstruct Capture\n    bytes: [16]u8\n    length: usize\ninstance Writer(*Capture)\n    fn write(capture: *Capture, bytes: []Const(u8)) -> !void\n        for byte in bytes\n            capture.bytes[capture.length] = byte\n            capture.length += 1\nfn run() -> !usize\n    var capture: Capture = undefined\n    capture.length = 0\n    const data: []Const(u8) = \"\"\n    try capture.print(\"{x}\", {data})\n    return capture.length\nconst RESULT = run() catch 99" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -23619,7 +23619,7 @@ test "integration: rejects the placeholder for binary with a byte slice through 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io::Writer\nimport mn::io::stdout\n\nfn main -> !void\n    try stdout.println(\"{b}\", {\"text\"})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};

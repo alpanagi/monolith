@@ -6794,7 +6794,7 @@ test "Generator.generate: builds an executable that uses the standard streams an
     defer output_directory.cleanup();
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io\nimport mn::io::Reader\nimport mn::io::Writer\nimport mn::io::stdin\nimport mn::io::stdout\nimport mn::memory\n\nfn main -> !void\n    try stdout.println(\"hi\", {})\n    var buffer: [64]u8 = undefined\n    const count = try stdin.read(&buffer)\n    try stdout.write(buffer[..count])\n    var heap = memory::Heap::new()\n    var path = try fs::Path::parse(\"cards.toml\") with &heap\n    defer path.deinit() with &heap\n    _ = try measure(path)\n\nfn measure(path: fs::Path) -> io::Error!usize\n    const file = fs::File::open(path, fs::File::Mode::read) catch return 0\n    defer file.deinit()\n    var buffer: [64]u8 = undefined\n    const count = try file.read(&buffer)\n    return count + try file.size()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -6821,7 +6821,7 @@ test "Generator.generate: builds an executable that writes files" {
     defer output_directory.cleanup();
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io::Writer\n\nfn report(writer: Writer, value: u8) -> !void\n    try writer.print(\"value {x}\", {value})\n    try writer.println(\" done {}\", {value})\n\nfn open_for_writing(text: []Const(u8)) -> !fs::File\n    var path = try fs::Path::parse(text)\n    defer path.deinit()\n    return fs::File::open(path, fs::File::Mode::write)\n\nfn main -> !void\n    const created = try open_for_writing(\"created.txt\")\n    defer created.deinit()\n    try created.write(\"exact bytes\")\n    const emptied = try open_for_writing(\"emptied.txt\")\n    defer emptied.deinit()\n    try emptied.write(\"short\")\n    const formatted = try open_for_writing(\"formatted.txt\")\n    defer formatted.deinit()\n    const number: u8 = 7\n    try formatted.print(\"{} and \", {number})\n    try formatted.println(\"{s}\", {\"text\"})\n    try report(formatted, 255)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -6854,7 +6854,7 @@ test "Generator.generate: builds an executable that reads a file it opened to wr
     defer output_directory.cleanup();
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io\nimport mn::io::Reader\nimport mn::io::Writer\nimport mn::io::stdout\n\nfn read_once(reader: io::Reader) -> io::Error!usize\n    var buffer: [16]u8 = undefined\n    return Reader::read(reader, buffer[..])\n\nfn main -> !void\n    var path = try fs::Path::parse(\"written.txt\")\n    defer path.deinit()\n    const file = try fs::File::open(path, fs::File::Mode::write)\n    defer file.deinit()\n    try file.write(\"some bytes\")\n    const count = try read_once(file)\n    try stdout.println(\"{}\", {count})\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -6881,7 +6881,7 @@ test "Generator.generate: builds an executable that reports the errors of openin
     defer output_directory.cleanup();
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io\nimport mn::io::Reader\nimport mn::io::Writer\nimport mn::io::stdout\n\nfn report_open(text: []Const(u8), mode: fs::File::Mode) -> !void\n    var path = try fs::Path::parse(text)\n    defer path.deinit()\n    match fs::File::open(path, mode)\n        case fs::File as file\n            file.deinit()\n            try stdout.println(\"opened\", {})\n        case (fs::Error::is_directory) try stdout.println(\"is_directory\", {})\n        case (fs::Error::not_found) try stdout.println(\"not_found\", {})\n        else try stdout.println(\"other open error\", {})\n\nfn report_write(file: fs::File) -> !void\n    match file.write(\"overwritten\")\n        case (void) try stdout.println(\"written\", {})\n        case (io::Error::other) try stdout.println(\"other\", {})\n        else try stdout.println(\"another write error\", {})\n\nfn main -> !void\n    try report_open(\"missing.txt\", fs::File::Mode::read)\n    try report_open(\"directory\", fs::File::Mode::read)\n    try report_open(\"directory\", fs::File::Mode::write)\n    try report_open(\"missing/created.txt\", fs::File::Mode::write)\n    var path = try fs::Path::parse(\"existing.txt\")\n    defer path.deinit()\n    const file = try fs::File::open(path, fs::File::Mode::read)\n    defer file.deinit()\n    var buffer: [64]u8 = undefined\n    const count = try Reader::read(file, buffer[..])\n    try stdout.println(\"{s}\", {buffer[..count]})\n    try report_write(file)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -6913,7 +6913,7 @@ test "Generator.generate: builds an executable that reads its arguments" {
     defer output_directory.cleanup();
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io::Writer\nimport mn::io::stdout\nimport mn::process\n\nfn show(items: []Const([]Const(u8))) -> !void\n    try stdout.println(\"{}\", {items.length})\n    for item in items\n        try stdout.println(\"[{x}]\", {item})\n\nfn main -> !void\n    try show(process::arguments())\n    for argument in process::arguments()[1..]\n        try stdout.println(\"{s}\", {argument})\n    const one = process::arguments()\n    const two = process::arguments()\n    try stdout.println(\"{}\", {&one[0] == &two[0]})\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -6947,7 +6947,7 @@ test "Generator.generate: builds an executable whose library reads the arguments
     defer output_directory.cleanup();
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "library.mn", .data = "import mn::process\n\nfn count() -> usize = process::arguments().length\n\nfn last() -> []Const(u8)\n    const items = process::arguments()\n    return items[items.length - 1]\n\nfn main\n    noop\n" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import library\nimport mn::io::Writer\nimport mn::io::stdout\n\nfn main\n    const argc = library::count()\n    const argv = library::last()\n    const arguments = argc\n    match stdout.println(\"{} {s}\", {arguments, argv})\n        case (void) noop\n        else noop\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
@@ -6975,7 +6975,7 @@ test "Generator.generate: builds an executable that opens the file its argument 
     defer output_directory.cleanup();
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io::Reader\nimport mn::io::Writer\nimport mn::io::stdout\nimport mn::process\n\nfn main -> !void\n    var path = try fs::Path::parse(process::arguments()[1])\n    defer path.deinit()\n    const file = try fs::File::open(path, fs::File::Mode::read)\n    defer file.deinit()\n    var buffer: [64]u8 = undefined\n    const count = try Reader::read(file, buffer[..])\n    try stdout.println(\"{s}\", {buffer[..count]})\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7004,7 +7004,7 @@ test "Generator.generate: builds an executable that lists a directory" {
     defer output_directory.cleanup();
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io\nimport mn::io::Writer\nimport mn::io::stdout\nimport mn::memory\n\nfn list(directory: fs::Directory, path: *fs::Path) -> (fs::Error || io::Error || memory::Error)!void\n    while try directory.next() as entry\n        try stdout.println(\"{s}\", {entry.name})\n        if entry.kind == fs::Directory::Kind::directory\n            try path.push(entry.name)\n            defer path.pop()\n            const inner = try fs::Directory::open(path.*)\n            defer inner.deinit()\n            try list(inner, path)\n\nfn main -> !void\n    var heap = memory::Heap::new()\n    var path = try fs::Path::parse(\".\") with &heap\n    defer path.deinit() with &heap\n    const directory = try fs::Directory::open(path)\n    defer directory.deinit()\n    try list(directory, &path) with &heap\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7029,7 +7029,7 @@ test "Generator.generate: builds an executable that prints formatted values" {
     defer output_directory.cleanup();
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io\nimport mn::io::Writer\nimport mn::io::stdout\n\nfn main -> !void\n    try stdout.println(\"{} {x} {b} {} {x} {b}\", {-128i8, -2i16, 3i32, -4i64, 255i128, -6isize})\n    try stdout.println(\"{} {x} {b} {} {x} {b}\", {7u8, 255u16, 9u32, 10u64, 11u128, 12usize})\n    try stdout.println(\"{} {s} {{}} {}\", {true, \"text\", false})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7052,7 +7052,7 @@ test "Generator.generate: builds an executable that prints SHA-256 digests in he
     defer output_directory.cleanup();
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::hash\nimport mn::io\nimport mn::io::Writer\nimport mn::io::stdin\nimport mn::io::stdout\n\nstruct Source\n    bytes: []Const(u8)\n    position: usize\n    limit: usize\n\ninstance io::Reader(*Source)\n    fn read(source: *Source, buffer: []u8) -> io::Error!usize\n        var count = source.bytes.length - source.position\n        if (count > source.limit) count = source.limit\n        if (count > buffer.length) count = buffer.length\n        for (index in 0..count) buffer[index] = source.bytes[source.position + index]\n        source.position += count\n        return count\n\nfn show(text: []Const(u8), limit: usize) -> !void\n    var source = Source{bytes = text, position = 0, limit = limit}\n    const digest = try hash::sha256(&source)\n    try stdout.println(\"{x}\", {digest[..]})\n\nfn main -> !void\n    const text = \"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnop\"\n    const lengths: [8]usize = {3, 55, 56, 63, 64, 65, 119, 120}\n    for length in lengths\n        try show(text[..length], 64)\n    try show(text, 1)\n    const from_stdin = try hash::sha256(stdin)\n    try stdout.println(\"{x}\", {from_stdin[..]})\n    var path = try fs::Path::parse(\"input.txt\")\n    defer path.deinit()\n    const file = try fs::File::open(path, fs::File::Mode::read)\n    defer file.deinit()\n    const from_file = try hash::sha256(file)\n    try stdout.println(\"{x}\", {from_file[..]})\n    const bytes: [3]u8 = {0, 10, 255}\n    try stdout.println(\"{x}\", {bytes[..]})\n    const nothing: []Const(u8) = \"\"\n    try stdout.println(\"[{x}]\", {nothing})\n    try stdout.println(\"{x}\", {text[..40]})\n    const integer: u8 = 255\n    try stdout.println(\"{x} {b}\", {integer, integer})\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7092,7 +7092,7 @@ test "Generator.generate: builds an executable that hashes input larger than its
     defer output_directory.cleanup();
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::fs\nimport mn::hash\nimport mn::io\nimport mn::io::Writer\nimport mn::io::stdout\n\nstruct Source\n    bytes: []Const(u8)\n    position: usize\n    limit: usize\n    reads: usize\n\ninstance io::Reader(*Source)\n    fn read(source: *Source, buffer: []u8) -> io::Error!usize\n        source.reads += 1\n        var count = source.bytes.length - source.position\n        if (count > source.limit) count = source.limit\n        if (count > buffer.length) count = buffer.length\n        for (index in 0..count) buffer[index] = source.bytes[source.position + index]\n        source.position += count\n        return count\n\nfn show(text: []Const(u8), limit: usize) -> !void\n    var source = Source{bytes = text, position = 0, limit = limit, reads = 0}\n    const digest = try hash::sha256(&source)\n    try stdout.println(\"{x} {}\", {digest[..], source.reads})\n\nfn main -> !void\n    var large: [200000]u8 = undefined\n    for index in 0..large.length\n        large[index] = mn::truncate(u8, index % 251)\n    const sizes: [6]usize = {65535, 65536, 65537, 65599, 65600, 200000}\n    for size in sizes\n        try show(large[..size], 200000)\n        try show(large[..size], 1)\n        try show(large[..size], 1000)\n    var path = try fs::Path::parse(\"large.bin\")\n    defer path.deinit()\n    const file = try fs::File::open(path, fs::File::Mode::read)\n    defer file.deinit()\n    const from_file = try hash::sha256(file)\n    try stdout.println(\"{x}\", {from_file[..]})\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7141,7 +7141,7 @@ test "Generator.generate: builds an executable that formats into a list of bytes
     defer output_directory.cleanup();
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::io::Writer\nimport mn::io::stdout\nimport mn::memory\n\nfn main -> !void\n    var heap = memory::Heap::new()\n    var child = mn::List(u8)::new()\n    defer child.deinit() with &heap\n    try child.print(\"{s}/{s}\", {\"parent\", \"name\"}) with &heap\n    try stdout.println(\"{s} has {} cards\", {child.items, 3u32})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7163,7 +7163,7 @@ test "Generator.generate: builds an executable that allocates through the defaul
     defer output_directory.cleanup();
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Allocator\nfn take(count: usize) -> memory::Error!usize\n    with allocator\n    const items = try allocator.allocate(u8, count)\n    allocator.free(items)\n    return items.length\nfn middle(count: usize) -> memory::Error!usize = take(count)\nfn through() -> memory::Error!usize\n    with allocator\n    _ = allocator\n    const pointer = &middle\n    return pointer(1)\nfn main -> !void\n    var arena = memory::Arena(memory::Heap)::new(memory::Heap::new())\n    _ = try middle(1)\n    _ = try middle(2) with &arena\n    _ = try through() with &arena\n    with allocator\n    const bytes = try memory::allocate(u8, 3)\n    allocator.free(bytes)\n    arena.free_all()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -7185,7 +7185,7 @@ test "Generator.generate: builds an executable that walks a directory with a pat
     defer output_directory.cleanup();
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io\nimport mn::io::Writer\nimport mn::io::stdout\nimport mn::memory\n\nfn walk(directory: fs::Directory, path: *fs::Path) -> (fs::Error || io::Error || memory::Error)!void\n    while try directory.next() as entry\n        try path.push(entry.name)\n        defer path.pop()\n        var buffer: [fs::maximum_path_length]u8 = undefined\n        const text = try path.text(&buffer)\n        try stdout.println(\"{s}\", {text})\n        if entry.kind == fs::Directory::Kind::directory\n            const inner = try fs::Directory::open(path.*)\n            defer inner.deinit()\n            try walk(inner, path)\n\nfn main -> !void\n    var heap = memory::Heap::new()\n    var path = try fs::Path::parse(\".\") with &heap\n    defer path.deinit() with &heap\n    const directory = try fs::Directory::open(path)\n    defer directory.deinit()\n    try walk(directory, &path) with &heap\n    var buffer: [fs::maximum_path_length]u8 = undefined\n    const text = try path.text(&buffer)\n    try stdout.println(\"{s}\", {text})\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -8003,7 +8003,7 @@ test "generateStruct: keeps a nested type apart from a top-level type named like
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Directory_Entry\n    size: u32\nstruct Directory\n    count: u32\n    struct Entry\n        name: u8\n        fn new(name: u8) -> Self = Self{name = name}\n    fn first(self: Self) -> Entry\n        _ = self\n        return Entry::new(1)\nfn Directory_Entry_new(size: u32) -> Directory_Entry = Directory_Entry{size = size}\nfn main()\n    const one = Directory_Entry_new(1)\n    const two = Directory{count = 2}.first()\n    _ = one\n    _ = two" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -11187,7 +11187,7 @@ test "generateEntryPoint: gives main no parameters in a program that does not lo
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main\n    noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -11212,7 +11212,7 @@ test "generateEntryPoint: saves the arguments before a main without a result cal
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::process\n\nfn main\n    const count = process::arguments().length\n    if (count == 0) return" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -11237,7 +11237,7 @@ test "generateEntryPoint: saves the arguments before a main with a result calls 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::process\n\nerror Failure\n    bad\n\nfn main -> Failure!void\n    if (process::arguments().length == 0) return Failure::bad" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -12456,7 +12456,7 @@ test "generateUnrolled: writes the block of a loop over a tuple once for each el
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn total(values: mn::Tuple) -> usize\n    var sum: usize = 0\n    for value in values\n        if (sum > 100) break\n        if (sum == 7) continue\n        sum += mn::convert(usize, value)\n    return sum\nfn run(small: u8, large: u64) -> usize = return total({small, large})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -12796,7 +12796,7 @@ test "generateFunction: compares slices through mn::memory::equal" {
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn same(buffer: []Const(u8), length: usize) -> bool = return memory::equal(buffer[0..length], \"yes\\n\")\nfn arrays(one: [3]u8, two: [3]u8) -> bool = return memory::equal(&one, &two)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -12841,7 +12841,7 @@ test "generateIteration: copies the iterator and calls next until it gives null"
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Countdown\n    count: u32\ninstance mn::Iterator(Countdown)\n    fn Element() -> type = return [u32]\n    fn next(iterator: *Countdown) -> ?Element()\n        if (iterator.count == 0) return null\n        iterator.count -= 1\n        return {iterator.count + 1}\nfn total(start: u32) -> u32\n    var sum: u32 = 0\n    for (value in Countdown{count = start}) sum += value\n    return sum\nfn indexes(count: usize) -> usize\n    var sum: usize = 0\n    const range = 2..count\n    for (index) in range\n        if (index == 4) continue\n        sum += index\n    else sum += 1\n    return sum" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -12877,7 +12877,7 @@ test "generateIteration: zips a slice or a read-only slice and a range into one 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::Zip\nfn sum(cards: []u32) -> u32\n    var total: u32 = 0\n    for (card, index) in Zip::zip({cards, 0..})\n        total += card * mn::convert(u32, index)\n    return total\nfn constant(cards: []Const(u32)) -> u32\n    var total: u32 = 0\n    for (card, index) in Zip::zip({cards, 0..})\n        total += card * mn::convert(u32, index)\n    return total" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -16717,7 +16717,7 @@ test "generateFunction: allocates through mn::memory with Heap, Arena and List" 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Card\n    value: i64\n    wide: u128\nfn run() -> memory::Error!i64\n    var heap = memory::Heap::new()\n    const cards = try heap.allocate(Card, 4)\n    cards[0] = Card{value = 1, wide = 2}\n    const card = try heap.create(Card)\n    card.* = cards[0]\n    var arena = memory::Arena(memory::Heap)::new(heap)\n    const bytes = try arena.allocate(u8, 100)\n    const more = try arena.allocate(Card, 300)\n    var list = mn::List(i64)::new()\n    for (index in 0..20) try list.append(mn::convert(i64, index)) with &heap\n    var arena_list = mn::List(Card)::new()\n    try arena_list.append(card.*) with &arena\n    const total = list.items[19] + mn::convert(i64, bytes.length) + arena_list.items[0].value\n    list.deinit() with &heap\n    arena_list.deinit() with &arena\n    arena.free(more)\n    heap.free(cards)\n    heap.destroy(card)\n    arena.free_all()\n    return total\nfn main()\n    _ = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -16796,7 +16796,7 @@ test "generateFunction: generates mn::random with its generator, range and entro
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::random\nimport mn::random::Generator\nfn roll(generator: *random::Xoshiro256) -> usize = return generator.range(1..7)\nfn main()\n    var generator = random::Xoshiro256::new(random::entropy())\n    _ = roll(&generator)\n    _ = Generator::next(&generator)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -16859,7 +16859,7 @@ test "generateFunction: gives functions that call each other the error sets infe
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error FileError\n    missing\nfn first(n: u8) -> !u8\n    if (n == 0) return 0\n    const value = try second(n - 1)\n    if (value == 7) return FileError::missing\n    return value\nfn second(n: u8) -> !u8 = try first(n)\nfn main -> !void\n    _ = try first(3)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -16889,7 +16889,7 @@ test "generateFunction: generates a generic function that calls itself with an i
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\ntypeclass Sized(type T)\n    fn size(value: T) -> usize\nstruct Data\ninstance Sized(Data)\n    fn size(_: Data) -> usize = 4\nerror Failure\n    empty\nconst LENGTH: usize = 8\nfn count(value: Sized, depth: usize) -> !usize\n    var buffer: [LENGTH]u8 = undefined\n    buffer[0] = 1\n    if (depth == 0) return Failure::empty\n    return try count(value, depth - 1) + Sized::size(value) + mn::convert(usize, buffer[0])\nfn main -> !void\n    _ = try count(Data{}, 2)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -17142,7 +17142,7 @@ test "generateFunctionCall: calls a copy of a typeclass function for each set of
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Sized(type T)\n    fn length(value: T) -> usize\n    fn size(value: T, comptime count: usize) -> usize = count * Sized::length(value)\nstruct Data\n    length: usize\ninstance Sized(Data)\n    fn length(value: Data) -> usize = value.length\nfn main()\n    const data = Data{length = 3}\n    _ = data.size(2)\n    _ = data.size(4)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -17167,7 +17167,7 @@ test "generateFunctionCall: passes a pointer to the allocator only to the functi
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Allocator\nfn plain(value: usize) -> usize = value + 1\nfn take(count: usize) -> memory::Error!usize\n    with allocator\n    const items = try allocator.allocate(u8, plain(count))\n    allocator.free(items)\n    return items.length\nfn middle(count: usize) -> memory::Error!usize = take(count)\nfn main -> !void\n    var heap = memory::Heap::new()\n    var arena = memory::Arena(memory::Heap)::new(heap)\n    _ = try middle(1) with &heap\n    _ = try middle(2) with &arena\n    _ = plain(3)\n    arena.free_all()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -17197,7 +17197,7 @@ test "generateFunctionCall: calls the default instance without an allocator and 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Allocator\nfn take(count: usize) -> memory::Error!usize\n    with allocator\n    const items = try allocator.allocate(u8, count)\n    allocator.free(items)\n    return items.length\nfn middle(count: usize) -> memory::Error!usize = take(count)\nfn through() -> memory::Error!usize\n    with allocator\n    _ = allocator\n    const pointer = &middle\n    return pointer(1)\nfn main -> !void\n    var arena = memory::Arena(memory::Heap)::new(memory::Heap::new())\n    _ = try middle(1)\n    _ = try middle(2) with &arena\n    _ = try through() with &arena\n    with allocator\n    const bytes = try memory::allocate(u8, 3)\n    allocator.free(bytes)\n    arena.free_all()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -17247,7 +17247,7 @@ test "generateFunctionCall: keeps the default and the given instances of a cycle
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Allocator\nfn even(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    return try odd(count - 1)\nfn odd(count: usize) -> memory::Error!usize\n    with allocator\n    const items = try allocator.allocate(u8, 1)\n    allocator.free(items)\n    return try even(count)\nfn main -> !void\n    var arena = memory::Arena(memory::Heap)::new(memory::Heap::new())\n    _ = try even(2)\n    _ = try even(3) with &arena\n    arena.free_all()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -17297,7 +17297,7 @@ test "generateFunctionCall: keeps the default and the given instances of a cycle
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Allocator\nfn even(count: usize) -> !usize\n    if (count == 0) return 0\n    return try odd(count - 1)\nfn odd(count: usize) -> !usize\n    with allocator\n    const items = try allocator.allocate(u8, 1)\n    allocator.free(items)\n    return try even(count)\nfn main -> !void\n    var arena = memory::Arena(memory::Heap)::new(memory::Heap::new())\n    _ = try even(2)\n    _ = try even(3) with &arena\n    arena.free_all()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -17347,7 +17347,7 @@ test "generateFunctionCall: calls the default instance from a known local consta
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Allocator\nfn take() -> memory::Error!usize\n    with allocator\n    const items = try allocator.allocate(u8, 1)\n    allocator.free(items)\n    return items.length\nfn main()\n    const size = take() catch 0\n    _ = size" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -19100,7 +19100,7 @@ test "integration: checks a run-time condition that calls a function with a type
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "cards.mn", .data = "struct Card\n    question: []Const(u8)\n    answer:   []Const(u8)\n\nconst cards: [_]Card = {\n    { question = \"Question 1\", answer = \"Answer 1\" },\n    { question = \"Question 2\", answer = \"Answer 2\" },\n}\n" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io\nimport mn::io::Reader\nimport mn::io::Writer\nimport mn::io::stdin\nimport mn::io::stdout\nimport mn::memory\nimport mn::text\n\nimport cards::cards\n\n\nfn main() -> io::Error!void\n    var input_buffer: [4096]u8 = undefined\n    var byte_count: usize = 0\n    var card_index: usize = 0\n\n    while card_index < cards.length\n        try stdout.println(\"{s}\", {cards[card_index].question})\n        byte_count = try stdin.read(&input_buffer)\n        if (byte_count == 0) break\n\n        try stdout.println(\"{s}\", {cards[card_index].answer})\n        byte_count = try stdin.read(&input_buffer)\n        if (byte_count == 0) break\n\n        if memory::equal(text::strip(input_buffer[..byte_count]), \"y\")\n           card_index += 1\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
@@ -19128,7 +19128,7 @@ test "integration: generates the standard streams and a file read through the li
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io\nimport mn::io::Reader\nimport mn::io::Writer\nimport mn::io::stdin\nimport mn::io::stdout\nimport mn::memory\n\nfn main -> !void\n    try stdout.println(\"hi\", {})\n    var buffer: [64]u8 = undefined\n    const count = try stdin.read(&buffer)\n    try stdout.write(buffer[..count])\n    var heap = memory::Heap::new()\n    var path = try fs::Path::parse(\"cards.toml\") with &heap\n    defer path.deinit() with &heap\n    _ = try measure(path)\n\nfn measure(path: fs::Path) -> io::Error!usize\n    const file = fs::File::open(path, fs::File::Mode::read) catch return 0\n    defer file.deinit()\n    var buffer: [64]u8 = undefined\n    const count = try file.read(&buffer)\n    return count + try file.size()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -19179,7 +19179,7 @@ test "integration: generates a recursive listing of a directory through the libr
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io\nimport mn::io::Writer\nimport mn::io::stdout\nimport mn::memory\n\nfn list(directory: fs::Directory, path: *fs::Path) -> (fs::Error || io::Error || memory::Error)!void\n    while try directory.next() as entry\n        try stdout.println(\"{s}\", {entry.name})\n        if entry.kind == fs::Directory::Kind::directory\n            try path.push(entry.name)\n            defer path.pop()\n            const inner = try fs::Directory::open(path.*)\n            defer inner.deinit()\n            try list(inner, path)\n\nfn main -> !void\n    var heap = memory::Heap::new()\n    var path = try fs::Path::parse(\".\") with &heap\n    defer path.deinit() with &heap\n    const directory = try fs::Directory::open(path)\n    defer directory.deinit()\n    try list(directory, &path) with &heap\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -19250,7 +19250,7 @@ test "integration: generates a recursive walk of a directory that keeps a path" 
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io\nimport mn::io::Writer\nimport mn::io::stdout\nimport mn::memory\n\nfn walk(directory: fs::Directory, path: *fs::Path) -> (fs::Error || io::Error || memory::Error)!void\n    while try directory.next() as entry\n        try path.push(entry.name)\n        defer path.pop()\n        var buffer: [fs::maximum_path_length]u8 = undefined\n        const text = try path.text(&buffer)\n        try stdout.println(\"{s}\", {text})\n        if entry.kind == fs::Directory::Kind::directory\n            const inner = try fs::Directory::open(path.*)\n            defer inner.deinit()\n            try walk(inner, path)\n\nfn main -> !void\n    var heap = memory::Heap::new()\n    var path = try fs::Path::parse(\".\") with &heap\n    defer path.deinit() with &heap\n    const directory = try fs::Directory::open(path)\n    defer directory.deinit()\n    try walk(directory, &path) with &heap\n    var buffer: [fs::maximum_path_length]u8 = undefined\n    const text = try path.text(&buffer)\n    try stdout.println(\"{s}\", {text})\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -19321,7 +19321,7 @@ test "integration: prints each type with each placeholder through the standard l
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::io\nimport mn::io::Writer\nimport mn::io::stdout\n\nfn main -> !void\n    try stdout.println(\"{} {x} {b} {} {x} {b}\", {-128i8, -2i16, 3i32, -4i64, 255i128, -6isize})\n    try stdout.println(\"{} {x} {b} {} {x} {b}\", {7u8, 255u16, 9u32, 10u64, 11u128, 12usize})\n    try stdout.println(\"{} {s} {{}} {}\", {true, \"text\", false})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -19371,7 +19371,7 @@ test "integration: formats into a list of bytes and to the standard output throu
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::io::Writer\nimport mn::io::stdout\nimport mn::memory\n\nfn main -> !void\n    var heap = memory::Heap::new()\n    var child = mn::List(u8)::new()\n    defer child.deinit() with &heap\n    try child.print(\"{s}/{s}\", {\"parent\", \"name\"}) with &heap\n    try stdout.println(\"{s} has {} cards\", {child.items, 3u32})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -19431,7 +19431,7 @@ test "integration: gives a generic function that writes the allocator only for t
         arena.allocator(),
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
-    var loader = @import("monolith").Loader.init(program_path, ".");
+    var loader = @import("monolith").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::io\nimport mn::io::Writer\nimport mn::io::stdout\nimport mn::memory\n\nfn report(writer: Writer, count: u32) -> !void\n    try writer.print(\"{} cards\", {count})\n\nfn main -> !void\n    var heap = memory::Heap::new()\n    var text = mn::List(u8)::new()\n    defer text.deinit() with &heap\n    try report(&text, 3) with &heap\n    try report(stdout, 4)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
