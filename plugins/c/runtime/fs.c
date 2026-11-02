@@ -39,20 +39,21 @@ static int32_t mn_runtime_fs_error_code(int number) {
     }
 }
 
-static int mn_runtime_fs_open_at(int base, mn_slice_u8 name, int flags) {
+static int mn_runtime_fs_open_at(int base, mn_slice_u8 name, int flags, mode_t creation_mode) {
     if (memchr(name.items, 0, name.length - 1) != NULL) {
         errno = ENOENT;
         return -1;
     }
     int descriptor;
     do {
-        descriptor = openat(base, (char const *)name.items, flags | O_CLOEXEC);
+        descriptor = openat(base, (char const *)name.items, flags | O_CLOEXEC, creation_mode);
     } while (descriptor < 0 && errno == EINTR);
     return descriptor;
 }
 
-int32_t mn_runtime_fs_open(mn_slice_u8 name) {
-    int descriptor = mn_runtime_fs_open_at(AT_FDCWD, name, O_RDONLY);
+int32_t mn_runtime_fs_open(mn_slice_u8 name, int32_t mode) {
+    int flags = mode == 1 ? O_RDWR | O_CREAT | O_TRUNC : O_RDONLY;
+    int descriptor = mn_runtime_fs_open_at(AT_FDCWD, name, flags, 0666);
     if (descriptor < 0) return mn_runtime_fs_error_code(errno);
     struct stat status;
     if (fstat(descriptor, &status) != 0) {
@@ -78,7 +79,7 @@ void mn_runtime_fs_close(int32_t descriptor) {
 }
 
 void *mn_runtime_fs_open_directory(mn_slice_u8 name, int32_t *code) {
-    int descriptor = mn_runtime_fs_open_at(AT_FDCWD, name, O_RDONLY | O_DIRECTORY);
+    int descriptor = mn_runtime_fs_open_at(AT_FDCWD, name, O_RDONLY | O_DIRECTORY, 0);
     if (descriptor < 0) {
         *code = mn_runtime_fs_error_code(errno);
         return NULL;

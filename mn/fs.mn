@@ -1,7 +1,6 @@
 import mn
 import mn::io
 import mn::memory
-import mn::memory::Allocator
 
 external fn mn_runtime_fs_close(descriptor: i32)
 
@@ -9,7 +8,7 @@ external fn mn_runtime_fs_close_directory(handle: *void)
 
 external fn mn_runtime_fs_next_entry(handle: *void, entry: *Directory::RawEntry) -> i32
 
-external fn mn_runtime_fs_open(name: []Const(u8)) -> i32
+external fn mn_runtime_fs_open(name: []Const(u8), mode: i32) -> i32
 
 external fn mn_runtime_fs_open_directory(name: []Const(u8), code: *i32) -> ?*void
 
@@ -30,11 +29,11 @@ error Error
 struct File
     descriptor: i32
 
-    fn open(path: Path) -> Error!File
+    fn open(path: Path, mode: Mode) -> Error!File
         var name: [maximum_path_length]u8 = undefined
         const text = try path.text(name[..maximum_path_length - 1])
         name[text.length] = 0
-        const descriptor = mn_runtime_fs_open(name[..text.length + 1])
+        const descriptor = mn_runtime_fs_open(name[..text.length + 1], find_mode_code(mode))
         if (descriptor < 0) return find_error(descriptor)
         return File{descriptor = descriptor}
 
@@ -43,7 +42,15 @@ struct File
         if (byte_count < 0) return io::find_error(byte_count)
         return mn::convert(usize, byte_count)
 
-    fn close(self: Self) = mn_runtime_fs_close(self.descriptor)
+    fn deinit(self: Self) = mn_runtime_fs_close(self.descriptor)
+
+    enum Mode
+        read
+        write
+
+fn find_mode_code(mode: File::Mode) -> i32 = match mode
+    case (File::Mode::read) 0
+    case (File::Mode::write) 1
 
 fn find_error(code: i32) -> Error = match code
     case (-1) Error::is_directory
@@ -55,6 +62,9 @@ fn find_error(code: i32) -> Error = match code
 
 instance io::Reader(File)
     fn read(file: File, buffer: []u8) -> io::Error!usize = io::read_descriptor(file.descriptor, buffer)
+
+instance io::Writer(File)
+    fn write(file: File, bytes: []Const(u8)) -> !void = io::write_descriptor(file.descriptor, bytes)
 
 struct Directory
     handle: *void
@@ -74,7 +84,7 @@ struct Directory
         if (status == 0) return null
         return Entry{name = entry.name[0..entry.length], kind = find_kind(entry.kind)}
 
-    fn close(self: Self) = mn_runtime_fs_close_directory(self.handle)
+    fn deinit(self: Self) = mn_runtime_fs_close_directory(self.handle)
 
     external struct RawEntry
         name: *Many(Const(u8))
@@ -105,7 +115,7 @@ struct Path
 
     fn parse(text: []Const(u8)) -> memory::Error!Path
         var path = Path::new()
-        errdefer path.free()
+        errdefer path.deinit()
         path.absolute = text.length > 0 and text[0] == separator
         var start: usize = 0
         for index in 0..text.length + 1
@@ -115,16 +125,14 @@ struct Path
         return path
 
     fn push(self: *Self, name: []Const(u8)) -> memory::Error!void
-        with allocator
-        const part = try allocator.allocate(u8, name.length)
-        errdefer allocator.free(part)
+        const part = try memory::allocate(u8, name.length)
+        errdefer memory::free(part)
         for (index in 0..name.length) part[index] = name[index]
         try self.parts.append(part)
 
     fn pop(self: *Self)
-        with allocator
         const part = self.parts.pop() orelse return
-        allocator.free(part)
+        memory::free(part)
 
     fn text(self: Self, buffer: []u8) -> Error![]u8
         const parts = self.parts.items
@@ -144,8 +152,7 @@ struct Path
             position += part.length
         return buffer[..position]
 
-    fn free(self: *Self)
-        with allocator
+    fn deinit(self: *Self)
         for part in self.parts.items
-            allocator.free(part)
-        self.parts.free()
+            memory::free(part)
+        self.parts.deinit()

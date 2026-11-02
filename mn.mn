@@ -1,5 +1,4 @@
 import mn::memory
-import mn::memory::Allocator
 import mn::reflection
 
 typeclass Tuple(type T)
@@ -81,17 +80,16 @@ fn List(type T) -> type
         fn new() -> Self = Self{items = {}, capacity = 0}
 
         fn append(self: *Self, value: T) -> memory::Error!void
-            with allocator
             const length = self.items.length
             if length == self.capacity
                 var capacity: usize = 8
                 if (self.capacity > 0) capacity = self.capacity * 2
-                if self.capacity > 0 and allocator.resize(self.items.pointer[0..self.capacity], capacity)
+                if self.capacity > 0 and memory::resize(self.items.pointer[0..self.capacity], capacity)
                     self.capacity = capacity
                 else
-                    const items = try allocator.allocate(T, capacity)
+                    const items = try memory::allocate(T, capacity)
                     for (index in 0..length) items[index] = self.items[index]
-                    if (self.capacity > 0) allocator.free(self.items.pointer[0..self.capacity])
+                    if (self.capacity > 0) memory::free(self.items.pointer[0..self.capacity])
                     self.items = items[0..length]
                     self.capacity = capacity
             self.items = self.items.pointer[0..length + 1]
@@ -104,8 +102,7 @@ fn List(type T) -> type
             self.items = self.items[0..length - 1]
             return value
 
-        fn free(self: *Self)
-            with allocator
-            if (self.capacity > 0) allocator.free(self.items.pointer[0..self.capacity])
+        fn deinit(self: *Self)
+            if (self.capacity > 0) memory::free(self.items.pointer[0..self.capacity])
             self.items = self.items[0..0]
             self.capacity = 0

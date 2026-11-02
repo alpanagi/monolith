@@ -19,6 +19,26 @@ typeclass Allocator(type A)
     fn(type T) destroy(allocator: *A, pointer: *Const(T))
         Allocator::free(allocator, mn::cast(*Many(Const(T)), pointer)[0..1])
 
+fn allocate(type T, count: usize) -> Error![]T
+    with allocator
+    return allocator.allocate(T, count)
+
+fn(type T) resize(items: []T, count: usize) -> bool
+    with allocator
+    return allocator.resize(items, count)
+
+fn(type T) free(items: []Const(T))
+    with allocator
+    allocator.free(items)
+
+fn create(type T) -> Error!*T
+    with allocator
+    return allocator.create(T)
+
+fn(type T) destroy(pointer: *Const(T))
+    with allocator
+    allocator.destroy(pointer)
+
 struct Heap
     fn new() -> Self = Self{}
 

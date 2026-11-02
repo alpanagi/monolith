@@ -67,8 +67,12 @@ fn write_value(writer: Writer, type T, comptime specifier: u8, value: T) -> !voi
         else
             try Writer::write(writer, "false")
     else if T == []u8 or T == []Const(u8)
-        if (specifier != 's') mn::comptime::error("a byte slice is formatted only with {s}")
-        try Writer::write(writer, value)
+        if specifier == 'x'
+            try write_hexadecimal(writer, value)
+        else if specifier == 's'
+            try Writer::write(writer, value)
+        else
+            mn::comptime::error("a byte slice is formatted only with {s} or {x}")
     else if T == i8 or T == i16 or T == i32 or T == i64 or T == i128 or T == isize
         if (specifier == 's') mn::comptime::error("an integer is formatted only with {}, {x} or {b}")
         try write_integer(writer, T, true, find_base(specifier), value)
@@ -77,6 +81,18 @@ fn write_value(writer: Writer, type T, comptime specifier: u8, value: T) -> !voi
         try write_integer(writer, T, false, find_base(specifier), value)
     else
         mn::comptime::error("only integers, bools and byte slices can be formatted")
+
+fn write_hexadecimal(writer: Writer, bytes: []Const(u8)) -> !void
+    var buffer: [64]u8 = undefined
+    var position: usize = 0
+    for byte in bytes
+        buffer[position] = find_digit(byte >> 4)
+        buffer[position + 1] = find_digit(byte & 15)
+        position += 2
+        if position == buffer.length
+            try Writer::write(writer, &buffer)
+            position = 0
+    if (position > 0) try Writer::write(writer, buffer[..position])
 
 fn find_base(specifier: u8) -> u8 = match specifier
     case ('x') 16

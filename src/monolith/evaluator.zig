@@ -960,7 +960,11 @@ pub const Evaluator = struct {
         if (self.depth >= depth_limit) return self.fail(location, error.CallDepth);
         self.depth += 1;
         errdefer self.depth -= 1;
-        if (self.preparer) |preparer| try preparer.prepare(preparer.context, function);
+        const preparer = self.preparer orelse return;
+        preparer.prepare(preparer.context, function) catch |prepare_error| {
+            if (prepare_error == error.NeedsAllocator) return self.fail(location, error.AllocationAtCompileTime);
+            return prepare_error;
+        };
     }
 
     fn activate(self: *Evaluator, frame: *Frame) EvaluateError!void {
@@ -1508,6 +1512,7 @@ pub const EvaluateError = AnalyzeError;
 pub const EvaluationError = error{
     OutOfMemory,
     CannotEvaluate,
+    AllocationAtCompileTime,
     IntegerOverflow,
     DivisionByZero,
     IndexOutOfRange,
@@ -1570,6 +1575,7 @@ fn describeError(evaluation_error: EvaluationError) []const u8 {
         error.ReadUndefined => "undefined is read",
         error.ReversedRange => "range starts after its end",
         error.ExternalCall => "external functions cannot run at compile time",
+        error.AllocationAtCompileTime => "this value cannot be computed at compile time because it allocates",
         error.NotErrorSet => "only error sets can be combined",
         error.ExpectedErrorSet => "expected an error set before '!'",
         error.ConversionOutOfRange => "value does not fit the type",
@@ -2415,7 +2421,7 @@ test "List: grows in place or by moving and reports running out of memory at com
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Buffer\n    bytes: []u8\n    used: usize\n    last: usize\n    resizes: usize\n    frees: usize\ninstance Allocator(Buffer)\n    fn allocate(buffer: *Buffer, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (buffer.used + size > buffer.bytes.length) return memory::Error::out_of_memory\n        buffer.last = buffer.used\n        buffer.used += size\n        return mn::cast(*Many(T), buffer.bytes[buffer.last..buffer.used].pointer)[0..count]\n    fn(type T) resize(buffer: *Buffer, items: []T, count: usize) -> bool\n        const size = mn::size(T) * count\n        if (items.length * mn::size(T) != buffer.used - buffer.last or buffer.last + size > buffer.bytes.length) return false\n        buffer.used = buffer.last + size\n        buffer.resizes += 1\n        return true\n    fn(type T) free(buffer: *Buffer, _: []Const(T)) = buffer.frees += 1\nfn grow() -> memory::Error![6]usize\n    var storage: [256]u8 = undefined\n    var buffer = Buffer{bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0}\n    var list = mn::List(u8)::new()\n    for (index in 0..20) try list.append(mn::truncate(u8, index)) with &buffer\n    const in_place = buffer.resizes\n    _ = try buffer.allocate(u8, 4)\n    for (index in 20..40) try list.append(mn::truncate(u8, index)) with &buffer\n    var sum: usize = 0\n    for (item in list.items) sum += mn::convert(usize, item)\n    const length = list.items.length\n    list.free() with &buffer\n    return {in_place, buffer.frees, length, sum, list.items.length, list.capacity}\nfn fill(list: *mn::List(u8), buffer: *Buffer, count: usize) -> memory::Error!u8\n    for (_ in 0..count) try list.append(3) with buffer\n    return 0\nfn exhaust() -> u8\n    var storage: [8]u8 = undefined\n    var buffer = Buffer{bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0}\n    var list = mn::List(u8)::new()\n    const filled = fill(&list, &buffer, 8) catch return 1\n    const more = fill(&list, &buffer, 1) catch return 2\n    return filled + more\nconst GROW = grow() catch {0, 0, 0, 0, 0, 0}\nconst EXHAUST = exhaust()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Buffer\n    bytes: []u8\n    used: usize\n    last: usize\n    resizes: usize\n    frees: usize\ninstance Allocator(Buffer)\n    fn allocate(buffer: *Buffer, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (buffer.used + size > buffer.bytes.length) return memory::Error::out_of_memory\n        buffer.last = buffer.used\n        buffer.used += size\n        return mn::cast(*Many(T), buffer.bytes[buffer.last..buffer.used].pointer)[0..count]\n    fn(type T) resize(buffer: *Buffer, items: []T, count: usize) -> bool\n        const size = mn::size(T) * count\n        if (items.length * mn::size(T) != buffer.used - buffer.last or buffer.last + size > buffer.bytes.length) return false\n        buffer.used = buffer.last + size\n        buffer.resizes += 1\n        return true\n    fn(type T) free(buffer: *Buffer, _: []Const(T)) = buffer.frees += 1\nfn grow() -> memory::Error![6]usize\n    var storage: [256]u8 = undefined\n    var buffer = Buffer{bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0}\n    var list = mn::List(u8)::new()\n    for (index in 0..20) try list.append(mn::truncate(u8, index)) with &buffer\n    const in_place = buffer.resizes\n    _ = try buffer.allocate(u8, 4)\n    for (index in 20..40) try list.append(mn::truncate(u8, index)) with &buffer\n    var sum: usize = 0\n    for (item in list.items) sum += mn::convert(usize, item)\n    const length = list.items.length\n    list.deinit() with &buffer\n    return {in_place, buffer.frees, length, sum, list.items.length, list.capacity}\nfn fill(list: *mn::List(u8), buffer: *Buffer, count: usize) -> memory::Error!u8\n    for (_ in 0..count) try list.append(3) with buffer\n    return 0\nfn exhaust() -> u8\n    var storage: [8]u8 = undefined\n    var buffer = Buffer{bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0}\n    var list = mn::List(u8)::new()\n    const filled = fill(&list, &buffer, 8) catch return 1\n    const more = fill(&list, &buffer, 1) catch return 2\n    return filled + more\nconst GROW = grow() catch {0, 0, 0, 0, 0, 0}\nconst EXHAUST = exhaust()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);

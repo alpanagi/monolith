@@ -48,6 +48,7 @@ pub const FunctionDefinition = struct {
     pristine: ?*const FunctionDefinition = null,
     instantiated: bool = false,
     allocator: ?*const types.Type = null,
+    default_allocator: bool = false,
     need: Need = .unknown,
     dropped_names: []const []const u8 = &.{},
     lenient: bool = false,
@@ -141,6 +142,7 @@ pub const ConstantDeclaration = struct {
     bound: bool = false,
     measured: bool = false,
     with: bool = false,
+    called_early: bool = false,
 };
 
 pub const TupleDeclaration = struct {

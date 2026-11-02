@@ -507,8 +507,9 @@
 - `with allocator` is a statement that binds the allocator the call was given to a name, valid from that line on as any local constant. It has the allocator's own type, e.g. `allocator.allocate(Card, 10)`. Nothing about it appears in the signature.
 - A function needs an allocator if its body has a `with` statement, or calls a function that needs one without its own `with`. This is worked out for each instance, through recursion, and a block dropped by a condition known at compile time does not count.
 - A function that needs an allocator gets its own instance for each allocator type, and allocator calls are direct. Other functions are not affected.
-- A call that needs an allocator without `with`, outside a function that needs one, is a compile-time error, as are `main` needing one, `with` on a call that does not need one, and a `with` operand that is not a pointer to an allocator.
-- `&name` of a function that needs an allocator is a compile-time error.
+- A call that needs an allocator without `with`, outside a function that needs one, and `main` use the default allocator, `mn::memory::Heap`. A function used with the default allocator gets its own instance, with no value passed for the allocator.
+- `with` on a call that does not need an allocator is a compile-time error, as is a `with` operand that is not a pointer to an allocator.
+- `&name` of a function that needs an allocator points to its instance with the default allocator, so a call through it ignores any surrounding `with`.
 
 ## Compile-Time Evaluation
 
