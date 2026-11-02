@@ -22,7 +22,7 @@
 - Identifiers are case-sensitive. By convention only types and type constructors start with a capital letter.
 - The single character `_` is reserved and cannot be used as an identifier by the user.
 - The following identifier names are reserved and cannot be used as identifiers by the user:
-    `and`, `any`, `as`, `break`, `case`, `catch`, `comptime`, `const`, `Const`, `continue`, `defer`, `else`, `enum`, `errdefer`, `error`, `external`, `false`, `fn`, `for`, `if`, `import`, `in`, `inline`, `instance`, `Many`, `match`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `true`, `try`, `typeclass`, `undefined`, `var`, `void`, `while`
+    `and`, `any`, `as`, `break`, `case`, `catch`, `comptime`, `const`, `Const`, `continue`, `defer`, `else`, `enum`, `errdefer`, `error`, `external`, `false`, `fn`, `for`, `if`, `import`, `in`, `inline`, `instance`, `Many`, `match`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `true`, `try`, `typeclass`, `undefined`, `var`, `void`, `while`, `with`
 - A reserved name can be the name of a function, struct, enum or error set, and a name after `::`, e.g. `fn match(pattern: []Const(u8)) -> bool` called as `parser::match(pattern)`. Elsewhere it is reached through a path.
 
 ## Built-In Types
@@ -92,7 +92,8 @@
 
 - A struct is a type with named fields. It is declared with `struct`, its name, and its fields in an indented block, each with a name and a type, e.g. `struct Point` followed by the fields `x: i32` and `y: i32`.
 - A struct without fields has no block, e.g. `struct Marker`.
-- Named structs are declared at the top level of a module.
+- Named structs are declared at the top level of a module or in the block of a struct or an enum, including a struct without a name, to any depth. Inside the block and the blocks within it, a nested type is named by its short name, and elsewhere by its path through the types around it, e.g. `Directory::Entry` or `fs::Directory::Entry::new()`. In a nested type's block, `Self` is the nested type. A nested type in a struct without a name can use the parameters of the function that gives it, and each instance gets its own nested type.
+- Within one block, the names of fields, cases, functions and nested types are unique.
 - Field names must be unique within a struct.
 - A field can have a default value after `=`, e.g. `count: u32 = 0`. The default must be known at compile time.
 - Two structs with the same fields are different types.
@@ -117,7 +118,7 @@
 - Case names must be unique within an enum.
 - `Enum::case` gives a case without a value, e.g. `Token::end`. `Enum::case(value)` gives a case with its value, e.g. `Token::number(42)`.
 - An enum has at least one case.
-- Enums are declared at the top level of a module. An enum's block can also declare functions, as a struct's can. A function cannot have the name of a case.
+- Enums are declared where structs are (see Structs). An enum's block can also declare functions, as a struct's can. A function cannot have the name of a case.
 - Enums are values. Assigning or passing an enum copies its case and its value.
 - An enum's case cannot carry a value of the enum's own type, directly or through structs, other enums, arrays or tuples. A pointer to its own type is allowed, e.g. `node: *Tree`.
 
@@ -447,11 +448,11 @@
 
 - An error set is declared with `error`, its name, and its cases in an indented block, e.g. `error ParseError` followed by `unexpected: [usize, usize]` and `missing_end`. Its cases are written, compared and matched like an enum's, e.g. `ParseError::missing_end`.
 - An error set without cases has no block, e.g. `error Never`. A result with it cannot hold an error.
-- Error sets are declared at the top level of a module.
+- Error sets are declared where structs are (see Structs), and their own blocks hold only cases.
 - `One || Two` is an error set with the cases of both. Each case keeps the set that declares it, e.g. `ParseError::missing_end` is a case of `ParseError || FileError`. A value of an error set converts implicitly to an error set combined from it.
 - `E!T` is a result: either a value of type `T`, or an error of the set `E`, e.g. `ParseError!Token`. `E!void` is a result without a value.
 - `!T` as the return type of a function with a body leaves out the error set, which the compiler infers: the combination of the sets of every error the body can return, through `try`, `return` of a case or `return` of a result, e.g. `fn load(path: []Const(u8)) -> !usize`. A body that returns no error gives a set without cases. A function with `type`, `comptime` or `any` parameters or declared types gets a set for each instance, and `&name` gives a pointer whose type has the set written out.
-- An inferred set is allowed only there, not in the functions of a typeclass or an instance, in external functions or in any other type. A function whose inferred set depends on itself, directly or through other functions, is a compile-time error, so its set must be written.
+- A typeclass's function can leave it out too, e.g. `fn write(writer: W, bytes: []Const(u8)) -> !void`: each instance writes `!T` and gets its own set, and generic code gets the set of the instance it calls. An inferred set is allowed only there, not in external functions or in any other type. A call to a function whose set is being inferred together with the caller's, because they call each other directly or through other functions, adds no error, so their sets are the combination of the sets of every other error their bodies can return.
 - A value of type `T` and a case of `E` convert implicitly to `E!T`, e.g. `return token` and `return ParseError::missing_end`.
 - A result converts implicitly to a result of the same value type whose error set contains its own, e.g. `ParseError!Token` to `(ParseError || FileError)!Token`.
 - `try result` gives the result's value, or returns its error from the function. The function's own result must be able to hold that error, e.g. through `ParseError || FileError`.
@@ -467,7 +468,7 @@
 - `mn::math::add_wrapping(a, b)`, `mn::math::subtract_wrapping(a, b)` and `mn::math::multiply_wrapping(a, b)` take two integers of the same type and give a result of that type that wraps around on overflow instead of being illegal behavior, e.g. `math::add_wrapping(value, 1)` is 0 for a `u8` `value` of 255.
 - `mn::comptime::error(message)` stops compilation with the message wherever the code containing it is checked, e.g. in the block a condition chooses at compile time. Like `return`, it ends its block, so a function returning a value needs no `return` after it. The message is a `[]Const(u8)` known at compile time. The error shows the location of the call and each call that led to it.
 - `mn::reflection` holds the built-in functions that inspect and build types. `mn::reflection::length(T)` gives a tuple type's number of elements as a `usize`. `mn::reflection::join(A, B)` gives the tuple type with the elements of `A` followed by those of `B`, e.g. `mn::reflection::join([Card], [usize])` is `[Card, usize]`.
-- `import path` makes the last name of the path available in the module. The path names a directory, a module or a declaration in a module, e.g. `import mn::text` allows `text::strip(input)` and `import mn::io::stdout` allows `stdout`.
+- `import path` makes the last name of the path available in the module. The path names a directory, a module, a declaration in a module or a type nested in one, e.g. `import mn::text` allows `text::strip(input)`, `import mn::io::stdout` allows `stdout` and `import mn::fs::Directory::Entry` allows `Entry`.
 - `import path as name` makes it available as `name` instead, e.g. `import mn::io::stdout as out`.
 - An import that would make a reserved name available is a compile-time error, e.g. `import mn::comptime`.
 - A path that starts with `::` names a top-level declaration of the current module, e.g. `::match(pattern)`.
@@ -481,8 +482,8 @@
 - A parameter is a type, e.g. `type T`, or a type constructor written with the types it takes, e.g. `type F(type)`.
 - A parameter can require instances of other typeclasses, e.g. `typeclass Ord(type T: Eq)`. Every instance of `Ord(T)` then needs an instance of `Eq(T)`, and `Ord`'s functions can use `Eq`'s.
 - A typeclass's function without a body only declares its signature. With a body, the body is its default implementation.
-- A default implementation can use only the functions of its typeclass and of the typeclasses its parameters require.
-- A typeclass's function can take its own `type` parameters, e.g. `fn map(type A, type B, value: F(A), function: *fn(A) -> B) -> F(B)`.
+- A default implementation can call the functions of its typeclass, of the typeclasses its parameters require, and functions that do not depend on the typeclass's parameters, e.g. a function of its module.
+- A typeclass's function can take its own `type` and `comptime` parameters and parameters whose type is a typeclass, e.g. `fn map(type A, type B, value: F(A), function: *fn(A) -> B) -> F(B)` or `fn print(writer: W, comptime format: []Const(u8), values: mn::Tuple) -> !void`. Its default implementation and an instance's function get their own instance for each different set of arguments to them, as any function does (see Compile-Time Evaluation).
 - An instance is declared with `instance`, the typeclass with its arguments, and its functions in an indented block, e.g. `instance Show(Card)`.
 - An instance can cover every instantiation of a type through its own parameters, e.g. `instance(type A: Show) Show(List(A))`.
 - An instance defines each function of the typeclass with the typeclass's signature, with the arguments in place of the parameters. A function with a default implementation can be left out, and the default implementation is used.
@@ -493,11 +494,21 @@
 - A typeclass's function is called through the typeclass, e.g. `Show::show(card, output)`, with the instance chosen by the types of the arguments. If more than one instance fits, the call is a compile-time error.
 - A typeclass with its arguments names one instance, e.g. `Default(Card)::value()`. A function whose arguments do not decide the instance is called this way.
 - A typeclass's function whose first parameter's type is a parameter of the typeclass, or a pointer to one, can also be called as a method, e.g. `card.show(output)` (see Structs).
+- When no function fits the type of a method call's receiver and a typeclass's function fits a pointer to it, the call takes the receiver's address, e.g. `text.print(format, values)` for a `List(u8)` named `text` with an instance of `Writer` for `*List(u8)`.
 - A function in a struct's block shadows a typeclass's function with the same name. A method that a type gets from two typeclasses cannot be called as `value.name()`.
 - A parameter whose type is a typeclass with one parameter takes a value of any type with an instance, e.g. `fn report(value: Show)` called as `report(card)`. Each different type gets its own instance of the function.
 - A parameter whose type is a pointer to such a typeclass, `*Class` or `*Const(Class)`, takes a pointer to a value of any type with an instance, e.g. `fn allocate(allocator: *Allocator, type T, count: usize)` called as `allocate(&heap, Card, 10)`. Each different type gets its own instance of the function.
 - A `type` parameter can require instances, e.g. `fn parse(type T: Parse, text: []Const(u8)) -> T`.
 - A function with such parameters is checked once, before any instance, and can use them only through the functions of the typeclasses they require.
+
+## Allocators
+
+- A call followed by `with` and a pointer to a value whose type has an instance of `mn::memory::Allocator` gives that allocator to the call and everything beneath it, e.g. `try load(path) with &heap`. A `with` on an inner call overrides it for that call only.
+- `with allocator` is a statement that binds the allocator the call was given to a name, valid from that line on as any local constant. It has the allocator's own type, e.g. `allocator.allocate(Card, 10)`. Nothing about it appears in the signature.
+- A function needs an allocator if its body has a `with` statement, or calls a function that needs one without its own `with`. This is worked out for each instance, through recursion, and a block dropped by a condition known at compile time does not count.
+- A function that needs an allocator gets its own instance for each allocator type, and allocator calls are direct. Other functions are not affected.
+- A call that needs an allocator without `with`, outside a function that needs one, is a compile-time error, as are `main` needing one, `with` on a call that does not need one, and a `with` operand that is not a pointer to an allocator.
+- `&name` of a function that needs an allocator is a compile-time error.
 
 ## Compile-Time Evaluation
 

@@ -464,59 +464,60 @@ pub fn substitute(
     registry: *Registry,
     value_type: Type,
     arguments: []const Argument,
+    scope: Scope,
 ) std.mem.Allocator.Error!Type {
     return switch (value_type) {
         .variable => |variable| {
-            if (variable.scope != .typeclass or variable.index >= arguments.len) return value_type;
+            if (variable.scope != scope or variable.index >= arguments.len) return value_type;
             const argument = arguments[variable.index];
             return if (argument == .type) argument.type else value_type;
         },
         .number, .boolean, .void, .type, .@"struct", .@"enum" => value_type,
         .application => |application| {
             var constructor = application.constructor;
-            if (constructor == .variable and constructor.variable.scope == .typeclass and constructor.variable.index < arguments.len) {
+            if (constructor == .variable and constructor.variable.scope == scope and constructor.variable.index < arguments.len) {
                 const argument = arguments[constructor.variable.index];
                 if (argument == .constructor) constructor = argument.constructor;
             }
             const substituted = try allocator.alloc(Type, application.arguments.len);
             for (application.arguments, substituted) |argument, *result| {
-                result.* = try substitute(allocator, registry, argument, arguments);
+                result.* = try substitute(allocator, registry, argument, arguments, scope);
             }
             return .{ .application = try registry.addApplication(allocator, constructor, substituted) };
         },
         .pointer => |pointer| .{ .pointer = try registry.addPointer(allocator, .{
-            .target = try substitute(allocator, registry, pointer.target, arguments),
+            .target = try substitute(allocator, registry, pointer.target, arguments, scope),
             .many = pointer.many,
             .constant = pointer.constant,
         }) },
         .slice => |slice| .{ .slice = try registry.addSlice(
             allocator,
-            try substitute(allocator, registry, slice.element, arguments),
+            try substitute(allocator, registry, slice.element, arguments, scope),
             slice.constant,
         ) },
         .array => |array| .{ .array = try registry.addArray(
             allocator,
             array.length,
-            try substitute(allocator, registry, array.element, arguments),
+            try substitute(allocator, registry, array.element, arguments, scope),
         ) },
         .optional => |optional| .{ .optional = try registry.addOptional(
             allocator,
-            try substitute(allocator, registry, optional.child, arguments),
+            try substitute(allocator, registry, optional.child, arguments, scope),
         ) },
         .result => |result| .{ .result = try registry.addResult(
             allocator,
             result.error_set,
-            try substitute(allocator, registry, result.value, arguments),
+            try substitute(allocator, registry, result.value, arguments, scope),
         ) },
         .tuple => |tuple| {
             const elements = try allocator.alloc(Type, tuple.elements.len);
-            for (tuple.elements, elements) |element, *result| result.* = try substitute(allocator, registry, element, arguments);
+            for (tuple.elements, elements) |element, *result| result.* = try substitute(allocator, registry, element, arguments, scope);
             return .{ .tuple = try registry.addTuple(allocator, elements) };
         },
         .function => |function| {
             const parameters = try allocator.alloc(Type, function.parameters.len);
-            for (function.parameters, parameters) |parameter, *result| result.* = try substitute(allocator, registry, parameter, arguments);
-            const return_type = try substitute(allocator, registry, function.return_type, arguments);
+            for (function.parameters, parameters) |parameter, *result| result.* = try substitute(allocator, registry, parameter, arguments, scope);
+            const return_type = try substitute(allocator, registry, function.return_type, arguments, scope);
             return .{ .function = try registry.addFunction(allocator, parameters, return_type) };
         },
     };

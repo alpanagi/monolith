@@ -1,15 +1,28 @@
 import mn
 import mn::io
+import mn::memory
+import mn::memory::Allocator
 
 external fn mn_runtime_fs_close(descriptor: i32)
 
-external fn mn_runtime_fs_open(path: []Const(u8)) -> i32
+external fn mn_runtime_fs_close_directory(handle: *void)
+
+external fn mn_runtime_fs_next_entry(handle: *void, entry: *Directory::RawEntry) -> i32
+
+external fn mn_runtime_fs_open(name: []Const(u8)) -> i32
+
+external fn mn_runtime_fs_open_directory(name: []Const(u8), code: *i32) -> ?*void
 
 external fn mn_runtime_fs_size(descriptor: i32) -> isize
+
+const maximum_path_length: usize = 4096
+
+const separator: u8 = '/'
 
 error Error
     is_directory
     name_too_long
+    not_directory
     not_found
     permission_denied
     other
@@ -17,8 +30,11 @@ error Error
 struct File
     descriptor: i32
 
-    fn open(path: []Const(u8)) -> Error!File
-        const descriptor = mn_runtime_fs_open(path)
+    fn open(path: Path) -> Error!File
+        var name: [maximum_path_length]u8 = undefined
+        const text = try path.text(name[..maximum_path_length - 1])
+        name[text.length] = 0
+        const descriptor = mn_runtime_fs_open(name[..text.length + 1])
         if (descriptor < 0) return find_error(descriptor)
         return File{descriptor = descriptor}
 
@@ -32,9 +48,104 @@ struct File
 fn find_error(code: i32) -> Error = match code
     case (-1) Error::is_directory
     case (-2) Error::name_too_long
-    case (-3) Error::not_found
-    case (-4) Error::permission_denied
+    case (-3) Error::not_directory
+    case (-4) Error::not_found
+    case (-5) Error::permission_denied
     else Error::other
 
 instance io::Reader(File)
     fn read(file: File, buffer: []u8) -> io::Error!usize = io::read_descriptor(file.descriptor, buffer)
+
+struct Directory
+    handle: *void
+
+    fn open(path: Path) -> Error!Directory
+        var name: [maximum_path_length]u8 = undefined
+        const text = try path.text(name[..maximum_path_length - 1])
+        name[text.length] = 0
+        var code: i32 = 0
+        const handle = mn_runtime_fs_open_directory(name[..text.length + 1], &code) orelse return find_error(code)
+        return Directory{handle = handle}
+
+    fn next(self: Self) -> io::Error!?Entry
+        var entry: RawEntry = undefined
+        const status = mn_runtime_fs_next_entry(self.handle, &entry)
+        if (status < 0) return io::find_error(mn::convert(isize, status))
+        if (status == 0) return null
+        return Entry{name = entry.name[0..entry.length], kind = find_kind(entry.kind)}
+
+    fn close(self: Self) = mn_runtime_fs_close_directory(self.handle)
+
+    external struct RawEntry
+        name: *Many(Const(u8))
+        length: usize
+        kind: i32
+
+    struct Entry
+        name: []Const(u8)
+        kind: Kind
+
+    enum Kind
+        file
+        directory
+        symbolic_link
+        other
+
+fn find_kind(code: i32) -> Directory::Kind = match code
+    case (0) Directory::Kind::file
+    case (1) Directory::Kind::directory
+    case (2) Directory::Kind::symbolic_link
+    else Directory::Kind::other
+
+struct Path
+    parts: mn::List([]u8)
+    absolute: bool
+
+    fn new() -> Self = Self{parts = mn::List([]u8)::new(), absolute = false}
+
+    fn parse(text: []Const(u8)) -> memory::Error!Path
+        var path = Path::new()
+        errdefer path.free()
+        path.absolute = text.length > 0 and text[0] == separator
+        var start: usize = 0
+        for index in 0..text.length + 1
+            if index == text.length or text[index] == separator
+                if (index > start) try path.push(text[start..index])
+                start = index + 1
+        return path
+
+    fn push(self: *Self, name: []Const(u8)) -> memory::Error!void
+        with allocator
+        const part = try allocator.allocate(u8, name.length)
+        errdefer allocator.free(part)
+        for (index in 0..name.length) part[index] = name[index]
+        try self.parts.append(part)
+
+    fn pop(self: *Self)
+        with allocator
+        const part = self.parts.pop() orelse return
+        allocator.free(part)
+
+    fn text(self: Self, buffer: []u8) -> Error![]u8
+        const parts = self.parts.items
+        if parts.length == 0
+            if (buffer.length == 0) return Error::name_too_long
+            buffer[0] = if (self.absolute) separator else '.'
+            return buffer[..1]
+        var position: usize = 0
+        for index in 0..parts.length
+            if self.absolute or index > 0
+                if (position == buffer.length) return Error::name_too_long
+                buffer[position] = separator
+                position += 1
+            const part = parts[index]
+            if (part.length > buffer.length - position) return Error::name_too_long
+            for (offset in 0..part.length) buffer[position + offset] = part[offset]
+            position += part.length
+        return buffer[..position]
+
+    fn free(self: *Self)
+        with allocator
+        for part in self.parts.items
+            allocator.free(part)
+        self.parts.free()

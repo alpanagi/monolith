@@ -87,10 +87,10 @@ pub const Parser = struct {
             if (try self.parseConstantDeclaration(allocator, offset, 0)) |constant| {
                 break :kind .{ .constant_declaration = constant };
             }
-            if (try self.parseStructDefinition(allocator, offset)) |definition| {
+            if (try self.parseStructDefinition(allocator, offset, self.topSink(), self.declarations.items.len)) |definition| {
                 break :kind .{ .struct_definition = definition };
             }
-            if (try self.parseEnumDefinition(allocator, offset)) |definition| {
+            if (try self.parseEnumDefinition(allocator, offset, self.topSink(), self.declarations.items.len)) |definition| {
                 break :kind .{ .enum_definition = definition };
             }
             if (try self.parseTypeclassDefinition(allocator, offset)) |definition| {
@@ -478,6 +478,8 @@ pub const Parser = struct {
         if (self.match(offset, .keyword_noop) != null) {
             return .{ .kind = .noop, .location = location };
         }
+        if (self.isTypeDeclaration(offset.*)) return self.fail(offset.*, error.MisplacedTypeDeclaration);
+        if (self.match(offset, .keyword_with) != null) return try self.parseWithStatement(offset, location);
         const value_depth: ?usize = if (owner) depth else null;
         if (try self.parseReturn(allocator, offset, value_depth)) |statement| return statement;
         const else_depth: ?usize = if (owner) depth else null;
@@ -1083,12 +1085,19 @@ pub const Parser = struct {
         return written_type;
     }
 
+    fn topSink(self: *Parser) Sink {
+        return .{ .list = &self.methods, .base = self.declarations.items.len + 1 };
+    }
+
     fn parseStructDefinition(
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
+        sink: Sink,
+        own: usize,
     ) ParseError!?ast.StructDefinition {
         var position = offset.*;
+        const outer = self.findLineIndentation(position);
         const external = self.match(&position, .keyword_external) != null;
         _ = self.match(&position, .keyword_struct) orelse return null;
         const name_location = self.tokens[position].location;
@@ -1097,7 +1106,7 @@ pub const Parser = struct {
         if (try self.opensHeaderBlock(position)) {
             try self.expectHeaderEnd(position);
             const receiver = try buildReceiverExpression(allocator, name, name_location);
-            fields = try self.parseMembers(allocator, &position, receiver, 0, &self.methods);
+            fields = try self.parseMembers(allocator, &position, receiver, outer, sink, own, null);
         }
 
         offset.* = position;
@@ -1108,8 +1117,11 @@ pub const Parser = struct {
         self: *Parser,
         allocator: std.mem.Allocator,
         offset: *usize,
+        sink: Sink,
+        own: usize,
     ) ParseError!?ast.EnumDefinition {
         var position = offset.*;
+        const outer = self.findLineIndentation(position);
         const kind: types.EnumKind = switch (self.tokens[position].kind) {
             .keyword_enum => .enumeration,
             .keyword_error => .error_set,
@@ -1122,18 +1134,20 @@ pub const Parser = struct {
         if (try self.opensHeaderBlock(position)) {
             try self.expectHeaderEnd(position);
             const receiver = try buildReceiverExpression(allocator, name, name_location);
-            const depth = try self.expectBlock(position, 0);
-            while (try self.matchBlockLine(&position, depth, 0)) {
+            const depth = try self.expectBlock(position, outer);
+            while (try self.matchBlockLine(&position, depth, outer)) {
                 const location = self.tokens[position].location;
                 if (kind == .error_set) {
+                    if (self.isTypeDeclaration(position)) return self.fail(position, error.MisplacedTypeDeclaration);
                     try cases.append(allocator, try self.parseCase(allocator, &position, error.ExpectedErrorCase));
                     continue;
                 }
+                if (try self.parseNestedType(allocator, &position, sink, own)) continue;
                 if (try self.parseFunctionDefinition(allocator, &position, receiver, depth)) |parsed| {
                     var function = parsed;
                     function.signature.self_parameter = findSelfParameter(function.signature, "Self");
                     const method: ast.DeclarationKind = .{ .function_definition = function };
-                    try self.methods.append(allocator, .{ .kind = method, .location = location });
+                    try sink.list.append(allocator, .{ .kind = method, .location = location, .owner = own });
                     continue;
                 }
                 try cases.append(allocator, try self.parseCase(allocator, &position, error.ExpectedCase));
@@ -1169,19 +1183,27 @@ pub const Parser = struct {
         offset: *usize,
         receiver: ast.Expression,
         outer: usize,
-        functions: *std.ArrayList(ast.Declaration),
+        sink: Sink,
+        owner: ?usize,
+        functions: ?*std.ArrayList(ast.Declaration),
     ) ParseError![]ast.Field {
         var position = offset.*;
         const depth = try self.expectBlock(position, outer);
         var fields: std.ArrayList(ast.Field) = .empty;
         while (try self.matchBlockLine(&position, depth, outer)) {
             const location = self.tokens[position].location;
+            if (try self.parseNestedType(allocator, &position, sink, owner)) continue;
             const method = try self.parseFunctionDefinition(allocator, &position, receiver, depth);
             if (method) |parsed| {
                 var function = parsed;
                 function.signature.self_parameter = findSelfParameter(function.signature, "Self");
                 const kind: ast.DeclarationKind = .{ .function_definition = function };
-                try functions.append(allocator, .{ .kind = kind, .location = location });
+                const declaration: ast.Declaration = .{ .kind = kind, .location = location, .owner = owner };
+                if (functions) |list| {
+                    try list.append(allocator, declaration);
+                } else {
+                    try sink.list.append(allocator, declaration);
+                }
                 continue;
             }
             const field = (try self.parseField(allocator, &position)) orelse {
@@ -1192,6 +1214,35 @@ pub const Parser = struct {
 
         offset.* = position;
         return fields.items;
+    }
+
+    fn parseNestedType(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        sink: Sink,
+        owner: ?usize,
+    ) ParseError!bool {
+        if (!self.isTypeDeclaration(offset.*)) return false;
+        const location = self.tokens[offset.*].location;
+        const slot = sink.list.items.len;
+        try sink.list.append(allocator, undefined);
+        const own = sink.base + slot;
+        const kind: ast.DeclarationKind = if (try self.parseStructDefinition(allocator, offset, sink, own)) |definition|
+            .{ .struct_definition = definition }
+        else
+            .{ .enum_definition = (try self.parseEnumDefinition(allocator, offset, sink, own)).? };
+        sink.list.items[slot] = .{ .kind = kind, .location = location, .owner = owner };
+        return true;
+    }
+
+    fn isTypeDeclaration(self: *const Parser, offset: usize) bool {
+        return switch (self.tokens[offset].kind) {
+            .keyword_struct => self.tokens[offset + 1].kind == .identifier,
+            .keyword_enum, .keyword_error => self.tokens[offset + 1].kind == .identifier,
+            .keyword_external => self.tokens[offset + 1].kind == .keyword_struct,
+            else => false,
+        };
     }
 
     fn parseField(
@@ -1270,27 +1321,7 @@ pub const Parser = struct {
         var functions: std.ArrayList(ast.FunctionSignature) = .empty;
         var defaults: std.ArrayList(?ast.Default) = .empty;
         if (try self.opensHeaderBlock(position)) {
-            try self.expectHeaderEnd(position);
-            const depth = try self.expectBlock(position, 0);
-            while (try self.matchBlockLine(&position, depth, 0)) {
-                const start = position;
-                const inlined = self.match(&position, .keyword_inline) != null;
-                const parsed = try self.parseFunctionSignature(allocator, &position, null);
-                var signature = parsed orelse {
-                    return self.fail(position, error.ExpectedFunctionKeyword);
-                };
-                signature.self_parameter = findTypeclassSelfParameter(signature, parameters.items);
-                signature.@"inline" = inlined;
-                try functions.append(allocator, signature);
-                const body = (try self.parseFunctionBody(allocator, &position, depth)) orelse {
-                    if (inlined) return self.fail(start, error.InlineSignature);
-                    try defaults.append(allocator, null);
-                    continue;
-                };
-                const definition: ast.FunctionDefinition = .{ .signature = signature, .body = body };
-                const template = try ast.cloneFunctionDefinition(allocator, definition);
-                try defaults.append(allocator, .{ .body = body, .template = template });
-            }
+            try self.parseTypeclassFunctions(allocator, &position, parameters.items, &functions, &defaults);
         }
 
         offset.* = position;
@@ -1300,6 +1331,42 @@ pub const Parser = struct {
             .functions = functions.items,
             .defaults = defaults.items,
         };
+    }
+
+    fn parseTypeclassFunctions(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        parameters: []const ast.TypeclassParameter,
+        functions: *std.ArrayList(ast.FunctionSignature),
+        defaults: *std.ArrayList(?ast.Default),
+    ) ParseError!void {
+        var position = offset.*;
+        try self.expectHeaderEnd(position);
+        const outer = self.findLineIndentation(position);
+        const depth = try self.expectBlock(position, outer);
+        while (try self.matchBlockLine(&position, depth, outer)) {
+            const start = position;
+            if (self.isTypeDeclaration(position)) return self.fail(position, error.MisplacedTypeDeclaration);
+            const inlined = self.match(&position, .keyword_inline) != null;
+            const parsed = try self.parseFunctionSignature(allocator, &position, null);
+            var signature = parsed orelse {
+                return self.fail(position, error.ExpectedFunctionKeyword);
+            };
+            signature.self_parameter = findTypeclassSelfParameter(signature, parameters);
+            signature.@"inline" = inlined;
+            try functions.append(allocator, signature);
+            const body = (try self.parseFunctionBody(allocator, &position, depth)) orelse {
+                if (inlined) return self.fail(start, error.InlineSignature);
+                try defaults.append(allocator, null);
+                continue;
+            };
+            const definition: ast.FunctionDefinition = .{ .signature = signature, .body = body };
+            const template = try ast.cloneFunctionDefinition(allocator, definition);
+            try defaults.append(allocator, .{ .body = body, .template = template });
+        }
+
+        offset.* = position;
     }
 
     fn parseTypeclassParameter(
@@ -1365,6 +1432,7 @@ pub const Parser = struct {
             const depth = try self.expectBlock(position, 0);
             while (try self.matchBlockLine(&position, depth, 0)) {
                 const location = self.tokens[position].location;
+                if (self.isTypeDeclaration(position)) return self.fail(position, error.MisplacedTypeDeclaration);
                 const definition = try self.parseFunctionDefinition(allocator, &position, null, depth);
                 var function = definition orelse {
                     return self.fail(position, error.ExpectedFunctionKeyword);
@@ -1726,7 +1794,7 @@ pub const Parser = struct {
                 const literal_type = try allocator.create(ast.Expression);
                 literal_type.* = expression;
                 expression = try self.parseCompositeLiteral(allocator, &position, literal_type);
-            } else if (expression.kind == .call and self.match(&position, .double_colon) != null) {
+            } else if ((expression.kind == .call or expression.kind == .member) and self.match(&position, .double_colon) != null) {
                 expression = try self.parseMemberCall(allocator, &position, expression);
             } else if (self.match(&position, .dot) != null) {
                 expression = try self.parseMember(allocator, &position, expression);
@@ -1734,9 +1802,33 @@ pub const Parser = struct {
                 expression = subscript;
             } else break;
         }
+        try self.parseWithValue(allocator, &position, &expression);
 
         offset.* = position;
         return expression;
+    }
+
+    fn parseWithValue(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        expression: *ast.Expression,
+    ) ParseError!void {
+        if (expression.kind != .call and expression.kind != .method_call) return;
+        if (self.match(offset, .keyword_with) == null) return;
+        const value = try allocator.create(ast.Expression);
+        value.* = (try self.parsePrefix(allocator, offset)) orelse return self.fail(offset.*, error.ExpectedExpression);
+        switch (expression.kind) {
+            .call => |*call| call.with_value = value,
+            .method_call => |*call| call.with_value = value,
+            else => unreachable,
+        }
+    }
+
+    fn parseWithStatement(self: *Parser, offset: *usize, location: token.Location) ParseError!ast.Statement {
+        const name = try self.expectName(offset);
+        const value: ast.Expression = .{ .kind = .{ .identifier = .{ .name = ast.allocator_parameter } }, .location = location };
+        return .{ .kind = .{ .constant_declaration = .{ .name = name, .value = value, .with = true } }, .location = location };
     }
 
     fn parseOperand(
@@ -1776,10 +1868,11 @@ pub const Parser = struct {
         try self.expectHeaderEnd(position);
         const receiver: ast.Expression = .{ .kind = .{ .identifier = .{ .name = "Self" } }, .location = keyword.location };
         var functions: std.ArrayList(ast.Declaration) = .empty;
+        var nested: std.ArrayList(ast.Declaration) = .empty;
         const outer = self.findLineIndentation(offset.*);
-        const fields = try self.parseMembers(allocator, &position, receiver, outer, &functions);
+        const fields = try self.parseMembers(allocator, &position, receiver, outer, .{ .list = &nested, .base = 0 }, null, &functions);
         const struct_type = try allocator.create(ast.StructType);
-        struct_type.* = .{ .fields = fields, .functions = functions.items };
+        struct_type.* = .{ .fields = fields, .functions = functions.items, .types = nested.items };
 
         offset.* = position;
         return .{ .kind = .{ .struct_type = struct_type }, .location = keyword.location };
@@ -2302,6 +2395,7 @@ pub const ParseError = error{
     MisplacedMany,
     MisplacedBranching,
     NestedSameLineIf,
+    MisplacedTypeDeclaration,
     HeaderColon,
     ConstOutsideMany,
     ExpectedEquals,
@@ -2331,6 +2425,11 @@ pub const ParseError = error{
     RangeOperand,
     DiscardedValueName,
     ExpectedDeferredStatement,
+};
+
+const Sink = struct {
+    list: *std.ArrayList(ast.Declaration),
+    base: usize,
 };
 
 const OperatorToken = struct {
@@ -2466,6 +2565,7 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.MisplacedConst => "Const(T) is allowed only as what *, *Many or [] points to, e.g. *Const(T) or []Const(T)",
         error.MisplacedMany => "Many(T) is allowed only right after *, e.g. *Many(T)",
         error.HeaderColon => "a block has no ':' before it; write the header alone with the block indented below, e.g. `if count > limit`, or one statement on the same line, e.g. `if (count > limit) trim(list)`, `else 20` or `fn one -> u8 = 1`",
+        error.MisplacedTypeDeclaration => "a struct, enum or error set can be declared only at the top level of a module or in the block of a struct or an enum",
         error.NestedSameLineIf => "an if with its block on the same line cannot be in the same-line block of another if, an else or a loop; write else if, or put the inner if in parentheses",
         error.MisplacedBranching => "a match, or an if whose blocks are not all on one line, used as a value must end its statement: after = in a declaration or assignment, after return, as the last line of a function body, or as a branch's value",
         error.ConstOutsideMany => "write *Many(Const(T)) instead of *Const(Many(T))",
@@ -5117,6 +5217,80 @@ test "parseEnumDefinition: rejects a reserved word as the name of a case" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, parser.failure.?.location.?);
 }
 
+test "isTypeDeclaration: rejects a struct declared in an error set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("error Failure\n    bad\n    struct Local\n        value: u8");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedTypeDeclaration, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, parser.failure.?.location.?);
+}
+
+test "isTypeDeclaration: rejects a struct declared in an instance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Show(type T)\n    fn show(value: T)\ninstance Show(u8)\n    struct Local\n        value: u8");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedTypeDeclaration, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 5 }, parser.failure.?.location.?);
+}
+
+test "isTypeDeclaration: rejects an enum declared in a typeclass" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Show(type T)\n    enum Kind\n        first");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedTypeDeclaration, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, parser.failure.?.location.?);
+}
+
+test "isTypeDeclaration: rejects a struct declared in a function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    struct Local\n        value: u8");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedTypeDeclaration, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, parser.failure.?.location.?);
+}
+
+test "parseNestedType: keeps the nested types of a struct without a name with that struct" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn List(type T) -> type\n    return struct\n        items: []T\n        struct Node\n            value: T\n        enum Kind\n            first");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const struct_type = module.declarations[0].kind.function_definition.body[0].kind.@"return".?.kind.struct_type;
+    try std.testing.expectEqual(2, struct_type.types.len);
+    try std.testing.expectEqual(null, struct_type.types[0].owner);
+    try std.testing.expectEqualStrings("Kind", struct_type.types[1].kind.enum_definition.name);
+}
+
+test "parseNestedType: flattens nested types after their owner with the owner's position" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("struct Directory\n    struct Entry\n        name: u8\n        fn new() -> Self = Self{name = 1}\n    size: u8");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    try std.testing.expectEqual(3, module.declarations.len);
+    try std.testing.expectEqual(1, module.declarations[0].kind.struct_definition.fields.len);
+    try std.testing.expectEqual(0, module.declarations[1].owner.?);
+    try std.testing.expectEqualStrings("Entry", module.declarations[1].kind.struct_definition.name);
+    try std.testing.expectEqual(1, module.declarations[2].owner.?);
+    try std.testing.expectEqualStrings("new", module.declarations[2].kind.function_definition.signature.name);
+}
+
 test "parseStructDefinition: parses a struct without fields" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5815,6 +5989,33 @@ test "parseAnd: binds a prefix operator tighter than and" {
     try std.testing.expectEqual(ast.BinaryOperator.@"and", value.kind.binary.operator);
     try std.testing.expectEqual(ast.UnaryOperator.not, value.kind.binary.left.kind.unary.operator);
     try std.testing.expectEqualStrings("b", value.kind.binary.right.kind.identifier.name);
+}
+
+test "parseWithValue: gives a call and a method call the operand of with" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn f() = g(1) with &a\nfn h() = c.d() with b");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const first = module.declarations[0].kind.function_definition.body[0].kind.call.kind.call;
+    try std.testing.expectEqualStrings("a", first.with_value.?.kind.address_of.kind.identifier.name);
+    const second = module.declarations[1].kind.function_definition.body[0].kind.call.kind.method_call;
+    try std.testing.expectEqualStrings("b", second.with_value.?.kind.identifier.name);
+}
+
+test "parseWithStatement: binds the allocator to a name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn f()\n    with allocator\n    _ = allocator");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const constant = module.declarations[0].kind.function_definition.body[0].kind.constant_declaration;
+    try std.testing.expect(constant.with);
+    try std.testing.expectEqualStrings("allocator", constant.name);
 }
 
 test "parseComparison: binds bitwise operators tighter than a comparison" {

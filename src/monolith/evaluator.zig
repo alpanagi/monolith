@@ -175,7 +175,7 @@ pub const Evaluator = struct {
             },
             .field_access => |access| self.isKnownWith(access.value.*, calls),
             .call => |call| {
-                if (!calls) return false;
+                if (!calls or call.with_value != null) return false;
                 const callee_resolution = switch (call.callee) {
                     inline else => |name| name.resolution,
                 };
@@ -183,7 +183,7 @@ pub const Evaluator = struct {
                 if (resolution != .function and !self.isKnownResolution(resolution, calls)) return false;
                 return self.areKnown(call.arguments, calls);
             },
-            .method_call => |call| calls and self.isKnownWith(call.receiver.*, calls) and self.areKnown(call.arguments, calls),
+            .method_call => |call| calls and call.with_value == null and self.isKnownWith(call.receiver.*, calls) and self.areKnown(call.arguments, calls),
             .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type, .struct_type => true,
             .undefined, .jump, .branching => false,
         };
@@ -2381,6 +2381,30 @@ test "Default: is Xoshiro256" {
     try std.testing.expectEqual(Value{ .integer = 1546998764402558742 }, declarations[4].kind.constant_declaration.known.?.*);
 }
 
+test "Allocator: creates through the allocate of an instance that takes the element type and length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Counting\n    storage: [16]u8\n    used: usize\n    allocations: usize\n    frees: usize\ninstance Allocator(Counting)\n    fn allocate(counting: *Counting, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (counting.used + size > 16) return memory::Error::out_of_memory\n        const start = counting.used\n        counting.used += size\n        counting.allocations += 1\n        return mn::cast(*Many(T), counting.storage[start..counting.used].pointer)[0..count]\n    fn(type T) resize(_: *Counting, items: []T, count: usize) -> bool = count <= items.length\n    fn(type T) free(counting: *Counting, _: []Const(T)) = counting.frees += 1\nfn run() -> memory::Error![4]usize\n    var counting: Counting = undefined\n    counting.used = 0\n    counting.allocations = 0\n    counting.frees = 0\n    const value = try counting.create(u8)\n    value.* = 7\n    const stored = mn::convert(usize, counting.storage[0])\n    const items = try counting.allocate(u8, 4)\n    const grown = counting.resize(items, 8)\n    counting.free(items)\n    return {stored, counting.allocations, counting.frees, if (grown) 1 else 0}\nconst RESULT = run() catch [4]usize{0, 0, 0, 0}\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    var found: ?Value = null;
+    for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind == .constant_declaration) found = declaration.kind.constant_declaration.known.?.*;
+    }
+    const expected = [_]i129{ 7, 2, 1, 0 };
+    for (expected, found.?.aggregate) |value, one| try std.testing.expectEqual(Value{ .integer = value }, one);
+}
+
 test "List: grows in place or by moving and reports running out of memory at compile time" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2391,7 +2415,7 @@ test "List: grows in place or by moving and reports running out of memory at com
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Buffer\n    bytes: []u8\n    used: usize\n    last: usize\n    resizes: usize\n    frees: usize\ninstance Allocator(Buffer)\n    fn allocate(buffer: *Buffer, size: usize, _: usize) -> memory::Error![]u8\n        if (buffer.used + size > buffer.bytes.length) return memory::Error::out_of_memory\n        buffer.last = buffer.used\n        buffer.used += size\n        return buffer.bytes[buffer.last..buffer.used]\n    fn resize(buffer: *Buffer, bytes: []u8, _: usize, size: usize) -> bool\n        if (bytes.length != buffer.used - buffer.last or buffer.last + size > buffer.bytes.length) return false\n        buffer.used = buffer.last + size\n        buffer.resizes += 1\n        return true\n    fn free(buffer: *Buffer, _: []u8, _: usize) = buffer.frees += 1\nfn grow() -> memory::Error![6]usize\n    var storage: [256]u8 = undefined\n    var buffer = Buffer{bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0}\n    var list = mn::List(u8)::new()\n    for (index in 0..20) try list.append(&buffer, mn::truncate(u8, index))\n    const in_place = buffer.resizes\n    _ = try memory::allocate(&buffer, u8, 4)\n    for (index in 20..40) try list.append(&buffer, mn::truncate(u8, index))\n    var sum: usize = 0\n    for (item in list.items) sum += mn::convert(usize, item)\n    const length = list.items.length\n    list.free(&buffer)\n    return {in_place, buffer.frees, length, sum, list.items.length, list.capacity}\nfn fill(list: *mn::List(u8), buffer: *Buffer, count: usize) -> memory::Error!u8\n    for (_ in 0..count) try list.append(buffer, 3)\n    return 0\nfn exhaust() -> u8\n    var storage: [8]u8 = undefined\n    var buffer = Buffer{bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0}\n    var list = mn::List(u8)::new()\n    const filled = fill(&list, &buffer, 8) catch return 1\n    const more = fill(&list, &buffer, 1) catch return 2\n    return filled + more\nconst GROW = grow() catch {0, 0, 0, 0, 0, 0}\nconst EXHAUST = exhaust()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Buffer\n    bytes: []u8\n    used: usize\n    last: usize\n    resizes: usize\n    frees: usize\ninstance Allocator(Buffer)\n    fn allocate(buffer: *Buffer, type T, count: usize) -> memory::Error![]T\n        const size = mn::size(T) * count\n        if (buffer.used + size > buffer.bytes.length) return memory::Error::out_of_memory\n        buffer.last = buffer.used\n        buffer.used += size\n        return mn::cast(*Many(T), buffer.bytes[buffer.last..buffer.used].pointer)[0..count]\n    fn(type T) resize(buffer: *Buffer, items: []T, count: usize) -> bool\n        const size = mn::size(T) * count\n        if (items.length * mn::size(T) != buffer.used - buffer.last or buffer.last + size > buffer.bytes.length) return false\n        buffer.used = buffer.last + size\n        buffer.resizes += 1\n        return true\n    fn(type T) free(buffer: *Buffer, _: []Const(T)) = buffer.frees += 1\nfn grow() -> memory::Error![6]usize\n    var storage: [256]u8 = undefined\n    var buffer = Buffer{bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0}\n    var list = mn::List(u8)::new()\n    for (index in 0..20) try list.append(mn::truncate(u8, index)) with &buffer\n    const in_place = buffer.resizes\n    _ = try buffer.allocate(u8, 4)\n    for (index in 20..40) try list.append(mn::truncate(u8, index)) with &buffer\n    var sum: usize = 0\n    for (item in list.items) sum += mn::convert(usize, item)\n    const length = list.items.length\n    list.free() with &buffer\n    return {in_place, buffer.frees, length, sum, list.items.length, list.capacity}\nfn fill(list: *mn::List(u8), buffer: *Buffer, count: usize) -> memory::Error!u8\n    for (_ in 0..count) try list.append(3) with buffer\n    return 0\nfn exhaust() -> u8\n    var storage: [8]u8 = undefined\n    var buffer = Buffer{bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0}\n    var list = mn::List(u8)::new()\n    const filled = fill(&list, &buffer, 8) catch return 1\n    const more = fill(&list, &buffer, 1) catch return 2\n    return filled + more\nconst GROW = grow() catch {0, 0, 0, 0, 0, 0}\nconst EXHAUST = exhaust()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);

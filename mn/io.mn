@@ -18,10 +18,92 @@ typeclass Reader(type R)
     fn read(reader: R, buffer: []u8) -> Error!usize
 
 typeclass Writer(type W)
-    fn write(writer: W, bytes: []Const(u8)) -> Error!void
-    fn println(writer: W, text: []Const(u8), _: []) -> Error!void
-        try Writer::write(writer, text)
+    fn write(writer: W, bytes: []Const(u8)) -> !void
+    fn print(writer: W, comptime format: []Const(u8), values: mn::Tuple) -> !void = write_format(writer, format, 0, find_brace(format, 0), 0, values)
+    fn println(writer: W, comptime format: []Const(u8), values: mn::Tuple) -> !void
+        try Writer::print(writer, format, values)
         try Writer::write(writer, "\n")
+
+fn(type Values: mn::Tuple) write_format(writer: Writer, comptime format: []Const(u8), comptime position: usize, comptime brace: usize, comptime index: usize, values: Values) -> !void
+    if (brace > position) try Writer::write(writer, format[position..brace])
+    if brace == format.length
+        if (index < mn::reflection::length(Values)) mn::comptime::error("format has fewer placeholders than values")
+    else if brace + 1 < format.length and format[brace + 1] == format[brace]
+        try Writer::write(writer, format[brace..brace + 1])
+        try write_format(writer, format, brace + 2, find_brace(format, brace + 2), index, values)
+    else if format[brace] == '}'
+        mn::comptime::error("format has a } without a {, write }} for a brace")
+    else if find_close(format, brace) == format.length
+        mn::comptime::error("format has a { without a }, write {{ for a brace")
+    else if find_specifier(format, brace) == '?'
+        mn::comptime::error("format has an unknown placeholder, use {}, {x}, {b} or {s}")
+    else if index == mn::reflection::length(Values)
+        mn::comptime::error("format has more placeholders than values")
+    else
+        try write_value(writer, Values[index], find_specifier(format, brace), values[index])
+        try write_format(writer, format, find_close(format, brace) + 1, find_brace(format, find_close(format, brace) + 1), index + 1, values)
+
+fn find_brace(format: []Const(u8), start: usize) -> usize
+    for index in start..format.length
+        if (format[index] == '{' or format[index] == '}') return index
+    return format.length
+
+fn find_close(format: []Const(u8), brace: usize) -> usize
+    for index in brace + 1..format.length
+        if (format[index] == '}') return index
+    return format.length
+
+fn find_specifier(format: []Const(u8), brace: usize) -> u8
+    const text = format[brace + 1..find_close(format, brace)]
+    if (text.length == 0) return 'd'
+    if (text.length == 1 and (text[0] == 'x' or text[0] == 'b' or text[0] == 's')) return text[0]
+    return '?'
+
+fn write_value(writer: Writer, type T, comptime specifier: u8, value: T) -> !void
+    if T == bool
+        if (specifier != 'd') mn::comptime::error("a bool is formatted only with {}")
+        if value
+            try Writer::write(writer, "true")
+        else
+            try Writer::write(writer, "false")
+    else if T == []u8 or T == []Const(u8)
+        if (specifier != 's') mn::comptime::error("a byte slice is formatted only with {s}")
+        try Writer::write(writer, value)
+    else if T == i8 or T == i16 or T == i32 or T == i64 or T == i128 or T == isize
+        if (specifier == 's') mn::comptime::error("an integer is formatted only with {}, {x} or {b}")
+        try write_integer(writer, T, true, find_base(specifier), value)
+    else if T == u8 or T == u16 or T == u32 or T == u64 or T == u128 or T == usize
+        if (specifier == 's') mn::comptime::error("an integer is formatted only with {}, {x} or {b}")
+        try write_integer(writer, T, false, find_base(specifier), value)
+    else
+        mn::comptime::error("only integers, bools and byte slices can be formatted")
+
+fn find_base(specifier: u8) -> u8 = match specifier
+    case ('x') 16
+    case ('b') 2
+    else 10
+
+fn write_integer(writer: Writer, type T, comptime signed: bool, comptime base: u8, value: T) -> !void
+    var buffer: [129]u8 = undefined
+    var position = buffer.length
+    var rest = value
+    if signed
+        if (value > 0) rest = 0 - value
+    const radix = mn::convert(T, base)
+    while true
+        position -= 1
+        buffer[position] = find_digit(mn::convert(u8, if (signed) 0 - rest % radix else rest % radix))
+        rest /= radix
+        if (rest == 0) break
+    if signed
+        if value < 0
+            position -= 1
+            buffer[position] = '-'
+    try Writer::write(writer, buffer[position..])
+
+fn find_digit(digit: u8) -> u8
+    if (digit < 10) return '0' + digit
+    return 'a' + digit - 10
 
 struct Stdin
 
@@ -43,8 +125,13 @@ fn find_error(code: isize) -> Error = match code
 struct Stdout
 
 instance Writer(Stdout)
-    fn write(_: Stdout, bytes: []Const(u8)) -> Error!void = write_descriptor(1, bytes)
+    fn write(_: Stdout, bytes: []Const(u8)) -> !void = write_descriptor(1, bytes)
 
 fn write_descriptor(descriptor: i32, bytes: []Const(u8)) -> Error!void
     const code = mn_runtime_io_write(descriptor, bytes)
     if (code < 0) return find_error(code)
+
+instance Writer(*mn::List(u8))
+    fn write(list: *mn::List(u8), bytes: []Const(u8)) -> !void
+        for byte in bytes
+            try list.append(byte)

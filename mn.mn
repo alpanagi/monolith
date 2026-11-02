@@ -80,24 +80,32 @@ fn List(type T) -> type
 
         fn new() -> Self = Self{items = {}, capacity = 0}
 
-        fn append(self: *Self, allocator: *memory::Allocator, value: T) -> memory::Error!void
+        fn append(self: *Self, value: T) -> memory::Error!void
+            with allocator
             const length = self.items.length
             if length == self.capacity
                 var capacity: usize = 8
                 if (self.capacity > 0) capacity = self.capacity * 2
-                const bytes = ::cast(*Many(u8), self.items.pointer)[0..self.capacity * ::size(T)]
-                if self.capacity > 0 and Allocator::resize(allocator, bytes, ::alignment(T), capacity * ::size(T))
+                if self.capacity > 0 and allocator.resize(self.items.pointer[0..self.capacity], capacity)
                     self.capacity = capacity
                 else
-                    const items = try memory::allocate(allocator, T, capacity)
+                    const items = try allocator.allocate(T, capacity)
                     for (index in 0..length) items[index] = self.items[index]
-                    if (self.capacity > 0) memory::free(allocator, self.items.pointer[0..self.capacity])
+                    if (self.capacity > 0) allocator.free(self.items.pointer[0..self.capacity])
                     self.items = items[0..length]
                     self.capacity = capacity
             self.items = self.items.pointer[0..length + 1]
             self.items[length] = value
 
-        fn free(self: *Self, allocator: *memory::Allocator)
-            if (self.capacity > 0) memory::free(allocator, self.items.pointer[0..self.capacity])
+        fn pop(self: *Self) -> ?T
+            const length = self.items.length
+            if (length == 0) return null
+            const value = self.items[length - 1]
+            self.items = self.items[0..length - 1]
+            return value
+
+        fn free(self: *Self)
+            with allocator
+            if (self.capacity > 0) allocator.free(self.items.pointer[0..self.capacity])
             self.items = self.items[0..0]
             self.capacity = 0

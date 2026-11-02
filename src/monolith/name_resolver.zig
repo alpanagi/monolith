@@ -39,6 +39,7 @@ pub const NameResolver = struct {
     type_checker: ?*TypeChecker = null,
     pending: std.ArrayList(PendingMethod) = .empty,
     resolved_branchings: std.AutoHashMapUnmanaged(*const ast.Statement, void) = .empty,
+    nested_types: std.ArrayList(NestedType) = .empty,
     preparing: bool = false,
     failure: ?Failure = null,
 
@@ -65,61 +66,83 @@ pub const NameResolver = struct {
     }
 
     fn resolveModule(self: *NameResolver) ResolveError!void {
-        const module = self.loader.modules.items[self.module_index];
-        for (module.declarations, 0..) |declaration, index| {
-            if (isMethod(declaration)) {
-                if (declaration.kind.function_definition.signature.typeclass == null) {
-                    try self.resolveFunction(self.module_index, index);
-                }
-                continue;
-            }
-            switch (declaration.kind) {
-                .instance_declaration => {
-                    try self.resolveInstance(index);
-                    continue;
-                },
-                .function_definition,
-                .function_declaration,
-                .constant_declaration,
-                .struct_definition,
-                .enum_definition,
-                .typeclass_definition,
-                .import,
-                => {},
-            }
-            const name = extractName(declaration);
-            const location = declaration.location;
-            if (findDeclaration(module, name) != index) {
-                return self.fail(location, switch (declaration.kind) {
-                    .function_definition, .function_declaration => error.DuplicateFunction,
-                    .constant_declaration => error.DuplicateConstant,
-                    .struct_definition => error.DuplicateStruct,
-                    .enum_definition => error.DuplicateEnum,
-                    .typeclass_definition => error.DuplicateTypeclass,
-                    .import => error.DuplicateImport,
-                    .instance_declaration => unreachable,
-                });
-            }
-            if (isReservedDeclarationName(module.path, declaration.kind, name)) return self.fail(location, error.ReservedName);
-            if (declaration.kind == .import and isKeywordName(name)) return self.fail(location, error.ReservedImport);
-            if (declaration.kind != .import and try self.hasMember(module.path, name)) {
-                return self.fail(location, error.NamedLikeModule);
-            }
-            switch (declaration.kind) {
-                .function_definition => try self.resolveFunction(self.module_index, index),
-                .function_declaration => try self.resolveExternalSignature(self.module_index, index),
-                .typeclass_definition => {
-                    const module_index = self.module_index;
-                    try self.resolveTypeclass(.{ .module = module_index, .declaration = index });
-                },
+        var index: usize = 0;
+        while (index < self.loader.modules.items[self.module_index].declarations.len) : (index += 1) {
+            switch (try self.prepareModuleDeclaration(index)) {
+                .skip => {},
+                .function => try self.resolveFunction(self.module_index, index),
+                .external => try self.resolveExternalSignature(self.module_index, index),
+                .typeclass => try self.resolveTypeclass(.{ .module = self.module_index, .declaration = index }),
                 .import => _ = try self.resolveImport(self.module_index, index),
-                .constant_declaration => |constant| {
-                    if (constant.type == null and ast.isAlias(constant)) continue;
-                    _ = try self.resolveConstant(self.module_index, index);
-                },
-                .enum_definition => _ = try self.resolveEnum(self.module_index, index),
-                .struct_definition, .instance_declaration => {},
+                .constant => _ = try self.resolveConstant(self.module_index, index),
+                .enumeration => _ = try self.resolveEnum(self.module_index, index),
+                .instance => try self.resolveInstance(index),
             }
+        }
+    }
+
+    fn prepareModuleDeclaration(self: *NameResolver, index: usize) ResolveError!ModuleStep {
+        const module = self.loader.modules.items[self.module_index];
+        const declaration = module.declarations[index];
+        if (isMethod(declaration)) {
+            if (declaration.kind.function_definition.signature.typeclass == null) return .function;
+            return .skip;
+        }
+        if (declaration.owner) |owner| {
+            try self.expectUniqueMember(module, owner, index);
+            if (declaration.kind == .enum_definition) return .enumeration;
+            return .skip;
+        }
+        if (declaration.kind == .instance_declaration) return .instance;
+        const name = extractName(declaration);
+        const location = declaration.location;
+        if (findDeclaration(module, name) != index) {
+            return self.fail(location, switch (declaration.kind) {
+                .function_definition, .function_declaration => error.DuplicateFunction,
+                .constant_declaration => error.DuplicateConstant,
+                .struct_definition => error.DuplicateStruct,
+                .enum_definition => error.DuplicateEnum,
+                .typeclass_definition => error.DuplicateTypeclass,
+                .import => error.DuplicateImport,
+                .instance_declaration => unreachable,
+            });
+        }
+        if (isReservedDeclarationName(module.path, declaration.kind, name)) return self.fail(location, error.ReservedName);
+        if (declaration.kind == .import and isKeywordName(name)) return self.fail(location, error.ReservedImport);
+        if (declaration.kind != .import and try self.hasMember(module.path, name)) {
+            return self.fail(location, error.NamedLikeModule);
+        }
+        return switch (declaration.kind) {
+            .function_definition => .function,
+            .function_declaration => .external,
+            .typeclass_definition => .typeclass,
+            .import => .import,
+            .constant_declaration => |constant| if (constant.type == null and ast.isAlias(constant)) .skip else .constant,
+            .enum_definition => .enumeration,
+            .struct_definition, .instance_declaration => .skip,
+        };
+    }
+
+    fn expectUniqueMember(self: *NameResolver, module: ast.Module, owner: usize, index: usize) NameError!void {
+        const declaration = module.declarations[index];
+        const name = extractName(declaration);
+        const clash = switch (module.declarations[owner].kind) {
+            .struct_definition => |definition| findFieldDeclaration(definition.fields, name) != null,
+            .enum_definition => |definition| findCaseDeclaration(definition.cases, name) != null,
+            .function_definition,
+            .function_declaration,
+            .constant_declaration,
+            .typeclass_definition,
+            .instance_declaration,
+            .import,
+            => false,
+        };
+        if (clash) return self.fail(declaration.location, error.DuplicateMember);
+        for (module.declarations, 0..) |other, other_index| {
+            if (other_index == index or other.owner != owner) continue;
+            if (!std.mem.eql(u8, extractName(other), name)) continue;
+            if (other_index > index and !isMethod(other)) continue;
+            return self.fail(declaration.location, error.DuplicateMember);
         }
     }
 
@@ -153,10 +176,13 @@ pub const NameResolver = struct {
             if (findSignature(functions[0..function_index], signature.name) != null) {
                 return self.fail(declaration.location, error.DuplicateFunction);
             }
-            if (signature.inferred_error_set) |location| return self.fail(location, error.MisplacedInferredErrorSet);
+            self.bindings = typeclass_bindings;
+            try self.resolveConstraints(signature);
+            if (definition.defaults[function_index]) |*default| try self.resolveConstraints(&default.template.signature);
             self.bindings = try self.addOwnTypeBindings(typeclass_bindings, signature.*);
             self.signature_typeclass = typeclass;
             defer self.signature_typeclass = null;
+            try self.denoteImplicitParameters(signature);
             try self.resolveFunctionTypes(signature);
         }
         self.bindings = typeclass_bindings;
@@ -183,8 +209,7 @@ pub const NameResolver = struct {
                     const variable: types.Variable = .{ .scope = .function, .index = index };
                     try bindings.append(allocator, .{ .name = parameter.name, .target = .{ .type = .{ .variable = variable } } });
                 },
-                .compile_time => return self.fail(parameter.location, error.CompileTimeTypeclassParameter),
-                .implicit, .any => {},
+                .compile_time, .implicit, .any => {},
             }
         }
         for (signature.declared, 0..) |declared, position| {
@@ -230,52 +255,59 @@ pub const NameResolver = struct {
     }
 
     fn addDefaults(self: *NameResolver) ResolveError!void {
-        const allocator = self.arena.allocator();
         var module_index: usize = 0;
         while (module_index < self.loader.modules.items.len) : (module_index += 1) {
             self.module_index = module_index;
-            const original = self.loader.modules.items[module_index].declarations;
-            for (original) |*declaration| {
+            for (self.loader.modules.items[module_index].declarations) |*declaration| {
                 if (declaration.kind != .instance_declaration) continue;
                 const instance_declaration = &declaration.kind.instance_declaration;
                 instance_declaration.resolved = try self.expectTypeclass(&instance_declaration.typeclass);
             }
-            var declarations: std.ArrayList(ast.Declaration) = .empty;
-            try declarations.appendSlice(allocator, original);
-            for (original, 0..) |declaration, index| {
-                if (declaration.kind != .instance_declaration) continue;
-                const instance_declaration = declaration.kind.instance_declaration;
-                const typeclass = instance_declaration.resolved.?;
-                const required = self.loader.modules.items[typeclass.module].declarations[typeclass.declaration];
-                const definition = required.kind.typeclass_definition;
-                const first = index + 1;
-                const written = original[first .. first + instance_declaration.functions];
-                const reference: ast.InstanceReference = .{ .module = module_index, .declaration = index };
-                const pattern = instance_declaration.parameters.len > 0;
-                for (declarations.items[first .. first + instance_declaration.functions]) |*function| {
-                    const written_function = &function.kind.function_definition;
-                    written_function.instance = reference;
-                    written_function.pattern = pattern;
-                    const expected = findSignature(definition.functions, written_function.signature.name) orelse continue;
-                    written_function.signature.self_parameter = expected.self_parameter;
-                }
-                var defaults: std.ArrayList(usize) = .empty;
-                for (definition.functions, definition.defaults) |signature, default| {
-                    const template = (default orelse continue).template;
-                    if (findDefinition(written, signature.name) != null) continue;
-                    var function = try ast.cloneFunctionDefinition(allocator, template);
-                    function.signature.typeclass = instance_declaration.typeclass;
-                    function.default_of = typeclass;
-                    function.instance = reference;
-                    function.pattern = pattern;
-                    try defaults.append(allocator, declarations.items.len);
-                    const kind: ast.DeclarationKind = .{ .function_definition = function };
-                    try declarations.append(allocator, .{ .kind = kind, .location = declaration.location });
-                }
-                declarations.items[index].kind.instance_declaration.defaults = defaults.items;
-            }
-            self.loader.modules.items[module_index].declarations = declarations.items;
+            try self.appendDefaults(module_index);
         }
+    }
+
+    fn appendDefaults(self: *NameResolver, module_index: usize) ResolveError!void {
+        const allocator = self.arena.allocator();
+        const original = self.loader.modules.items[module_index].declarations;
+        var declarations: std.ArrayList(ast.Declaration) = .empty;
+        try declarations.appendSlice(allocator, original);
+        for (original, 0..) |declaration, index| {
+            if (declaration.kind != .instance_declaration) continue;
+            const instance_declaration = declaration.kind.instance_declaration;
+            if (instance_declaration.defaults.len > 0) continue;
+            const first = index + 1;
+            const written = original[first .. first + instance_declaration.functions];
+            const reference: ast.InstanceReference = .{ .module = module_index, .declaration = index };
+            const pattern = instance_declaration.parameters.len > 0;
+            for (declarations.items[first .. first + instance_declaration.functions]) |*function| {
+                function.kind.function_definition.instance = reference;
+                function.kind.function_definition.pattern = pattern;
+            }
+            const typeclass = instance_declaration.resolved orelse continue;
+            const required = self.loader.modules.items[typeclass.module].declarations[typeclass.declaration];
+            const definition = required.kind.typeclass_definition;
+            for (declarations.items[first .. first + instance_declaration.functions]) |*function| {
+                const written_function = &function.kind.function_definition;
+                const expected = findSignature(definition.functions, written_function.signature.name) orelse continue;
+                written_function.signature.self_parameter = expected.self_parameter;
+            }
+            var defaults: std.ArrayList(usize) = .empty;
+            for (definition.functions, definition.defaults) |signature, default| {
+                const template = (default orelse continue).template;
+                if (findDefinition(written, signature.name) != null) continue;
+                var function = try ast.cloneFunctionDefinition(allocator, template);
+                function.signature.typeclass = instance_declaration.typeclass;
+                function.default_of = typeclass;
+                function.instance = reference;
+                function.pattern = pattern;
+                try defaults.append(allocator, declarations.items.len);
+                const kind: ast.DeclarationKind = .{ .function_definition = function };
+                try declarations.append(allocator, .{ .kind = kind, .location = declaration.location });
+            }
+            declarations.items[index].kind.instance_declaration.defaults = defaults.items;
+        }
+        self.loader.modules.items[module_index].declarations = declarations.items;
     }
 
     fn resolveInstanceArguments(self: *NameResolver, module_index: usize, index: usize) ResolveError!void {
@@ -493,6 +525,7 @@ pub const NameResolver = struct {
         defer self.bindings = caller_bindings;
         self.module_index = module_index;
         self.bindings = try self.addOwnTypeBindings(definition.bindings, signature);
+        try self.denoteImplicitParameters(&signature);
         try self.resolveFunctionTypes(&signature);
         return signature;
     }
@@ -585,10 +618,8 @@ pub const NameResolver = struct {
             .running => return self.failIn(module_index, declaration.location, error.DependencyLoop),
             .pending => {},
         }
+        try self.keepPristine(definition);
         signature.progress = .running;
-        if (signature.typeclass != null) {
-            if (signature.inferred_error_set) |location| return self.failIn(module_index, location, error.MisplacedInferredErrorSet);
-        }
         const caller_module_index = self.module_index;
         const caller_self_type = self.self_type;
         const caller_self_name = self.self_name;
@@ -619,6 +650,7 @@ pub const NameResolver = struct {
             if (!isStandardLibrary(module.path) and hasReservedPrefix(signature.name)) {
                 return self.fail(declaration.location, error.ReservedName);
             }
+            if (declaration.owner) |owner| self.self_type = (try self.resolveDeclaration(module_index, owner)).type;
             try self.resolveNamesInExpression(.{}, receiver);
             const receiver_type = try self.expectType(receiver);
             self.self_type = receiver_type;
@@ -706,6 +738,14 @@ pub const NameResolver = struct {
         }
     }
 
+    fn denoteImplicitParameters(self: *NameResolver, signature: *ast.FunctionSignature) ResolveError!void {
+        for (signature.parameters, 0..) |*parameter, index| {
+            if (parameter.kind != .implicit) continue;
+            const variable: types.Type = .{ .variable = .{ .scope = .function, .index = index } };
+            parameter.type.denoted = try self.buildImplicitType(parameter.*, variable);
+        }
+    }
+
     fn expectOneParameterTypeclass(self: *NameResolver, expression: *ast.Expression) ResolveError!ast.Resolution.Typeclass {
         const typeclass = try self.expectTypeclass(expression);
         const declaration = self.loader.modules.items[typeclass.module].declarations[typeclass.declaration];
@@ -723,7 +763,12 @@ pub const NameResolver = struct {
         }
         try self.resolveNamesInExpression(scope, member.owner);
         const receiver = try self.expectType(member.owner);
-        const function = ast.findOwnMethod(self.loader.modules.items, receiver, member.name) orelse {
+        return self.resolveMemberOfType(location, receiver, member.name);
+    }
+
+    fn resolveMemberOfType(self: *NameResolver, location: token.Location, receiver: types.Type, name: []const u8) ResolveError!?ast.Resolution {
+        if (try self.findNestedType(receiver, name)) |nested| return .{ .type = nested };
+        const function = ast.findOwnMethod(self.loader.modules.items, receiver, name) orelse {
             return self.fail(location, error.UnknownMethod);
         };
         return .{ .function = function };
@@ -1193,9 +1238,10 @@ pub const NameResolver = struct {
         instance.instance = original.instance;
         instance.instance_arguments = original.instance_arguments;
         instance.pattern = pattern;
+        instance.instantiated = true;
         const index = module.declarations.len + module.instances.items.len;
         const created = try allocator.create(ast.Declaration);
-        created.* = .{ .kind = .{ .function_definition = instance }, .location = declaration.location };
+        created.* = .{ .kind = .{ .function_definition = instance }, .location = declaration.location, .owner = declaration.owner };
         try module.instances.append(allocator, created);
         return .{ .module = template.module, .declaration = index };
     }
@@ -1211,7 +1257,7 @@ pub const NameResolver = struct {
         copy.template = function;
         copy.instance = template.instance;
         copy.instance_arguments = template.instance_arguments;
-        return self.addCheckCopy(function.module, copy, declaration.location);
+        return self.addCheckCopy(function.module, copy, declaration.location, declaration.owner);
     }
 
     fn createDefaultCheckCopyForChecker(
@@ -1234,7 +1280,7 @@ pub const NameResolver = struct {
             argument.* = if (parameter.arity == 0) .{ .type = .{ .variable = variable } } else .{ .constructor = .{ .variable = variable } };
         }
         copy.instance_arguments = arguments;
-        return self.addCheckCopy(typeclass.module, copy, declaration.location);
+        return self.addCheckCopy(typeclass.module, copy, declaration.location, null);
     }
 
     fn buildCheckCopy(
@@ -1342,12 +1388,13 @@ pub const NameResolver = struct {
         module_index: usize,
         copy: ast.FunctionDefinition,
         location: token.Location,
+        owner: ?usize,
     ) ResolveError!ast.Resolution.Function {
         const allocator = self.arena.allocator();
         const module = &self.loader.modules.items[module_index];
         const index = module.declarations.len + module.instances.items.len;
         const created = try allocator.create(ast.Declaration);
-        created.* = .{ .kind = .{ .function_definition = copy }, .location = location };
+        created.* = .{ .kind = .{ .function_definition = copy }, .location = location, .owner = owner };
         try module.instances.append(allocator, created);
         const pending_start = self.pending.items.len;
         try self.resolveFunctionBody(module_index, index);
@@ -1396,6 +1443,8 @@ pub const NameResolver = struct {
             .beginStruct = beginStructForChecker,
             .finishStruct = finishStructForChecker,
             .expandTupleLoop = expandTupleLoopForChecker,
+            .instantiateAllocator = instantiateAllocatorForChecker,
+            .addAllocatorParameter = addAllocatorParameterForChecker,
         };
     }
 
@@ -1642,10 +1691,136 @@ pub const NameResolver = struct {
         self.self_type = value_type;
         self.self_name = "Self";
         self.typeclass = null;
-        self.bindings = bindings;
+        try self.createNestedTypes(struct_type, value_type, bindings);
         const fields = try cloneFields(allocator, struct_type.fields);
         try self.resolveFields(fields, @constCast(value_type.@"struct".fields));
         try self.completeStruct(struct_type, value_type, location);
+    }
+
+    fn createNestedTypes(
+        self: *NameResolver,
+        struct_type: *const ast.StructType,
+        owner: types.Type,
+        bindings: []const ast.Binding,
+    ) ResolveError!void {
+        self.bindings = bindings;
+        const templates = struct_type.types;
+        if (templates.len == 0) return;
+        try self.expectUniqueNestedTemplates(struct_type);
+        const allocator = self.arena.allocator();
+        const values = try allocator.alloc(?types.Type, templates.len);
+        for (templates, values) |template, *value| {
+            const outer = if (template.owner) |index| values[index].? else owner;
+            const name = try std.mem.concat(allocator, u8, &.{ extractTypeName(outer), "::", extractName(template) });
+            value.* = switch (template.kind) {
+                .struct_definition => |definition| .{ .@"struct" = .{
+                    .module = struct_type.module,
+                    .name = name,
+                    .external = definition.external,
+                    .fields = try reserveFields(allocator, definition.fields),
+                } },
+                .enum_definition => |definition| try self.reserveNestedEnum(struct_type.module, name, definition),
+                .function_definition, .function_declaration, .constant_declaration, .typeclass_definition, .instance_declaration, .import => null,
+            };
+            const nested = value.* orelse continue;
+            try self.nested_types.append(allocator, .{ .owner = outer, .name = extractName(template), .value = nested });
+        }
+        for (templates, values, 0..) |template, value, index| {
+            const nested = value orelse continue;
+            self.bindings = try bindSelf(allocator, try bindNestedTypes(allocator, bindings, templates, values, index), nested);
+            self.self_type = nested;
+            switch (template.kind) {
+                .struct_definition => |definition| {
+                    const fields = try cloneFields(allocator, definition.fields);
+                    try self.resolveFields(fields, @constCast(nested.@"struct".fields));
+                    try self.expectNotContained(nested.@"struct", template.location);
+                    try self.types.add(allocator, nested);
+                },
+                .enum_definition => |definition| try self.completeNestedEnum(definition, @constCast(nested.@"enum"), template.location),
+                .function_definition, .function_declaration, .constant_declaration, .typeclass_definition, .instance_declaration, .import => unreachable,
+            }
+            try self.addNestedFunctions(struct_type.module, templates, index);
+        }
+        self.bindings = try bindNestedTypes(allocator, bindings, templates, values, null);
+        self.self_type = owner;
+    }
+
+    fn expectUniqueNestedTemplates(self: *NameResolver, struct_type: *const ast.StructType) NameError!void {
+        const templates = struct_type.types;
+        for (templates, 0..) |template, index| {
+            if (template.kind == .function_definition) continue;
+            const name = extractName(template);
+            const clash = if (template.owner) |owner| switch (templates[owner].kind) {
+                .struct_definition => |definition| findFieldDeclaration(definition.fields, name) != null,
+                .enum_definition => |definition| findCaseDeclaration(definition.cases, name) != null,
+                .function_definition, .function_declaration, .constant_declaration, .typeclass_definition, .instance_declaration, .import => false,
+            } else findFieldDeclaration(struct_type.fields, name) != null or findFunctionDeclaration(struct_type.functions, name) != null;
+            if (clash) return self.fail(template.location, error.DuplicateMember);
+            for (templates, 0..) |other, other_index| {
+                if (other_index == index or other.owner != template.owner) continue;
+                if (other_index > index and other.kind != .function_definition) continue;
+                if (std.mem.eql(u8, extractName(other), name)) return self.fail(template.location, error.DuplicateMember);
+            }
+        }
+    }
+
+    fn reserveNestedEnum(self: *NameResolver, module_index: usize, name: []const u8, definition: ast.EnumDefinition) ResolveError!types.Type {
+        const allocator = self.arena.allocator();
+        const enumeration = try allocator.create(types.Enum);
+        const parts = try allocator.alloc(*const types.Enum, 1);
+        parts[0] = enumeration;
+        enumeration.* = .{
+            .module = module_index,
+            .path = self.loader.modules.items[module_index].path,
+            .name = name,
+            .kind = definition.kind,
+            .cases = try allocator.alloc(types.Case, definition.cases.len),
+            .parts = parts,
+        };
+        return .{ .@"enum" = enumeration };
+    }
+
+    fn completeNestedEnum(
+        self: *NameResolver,
+        definition: ast.EnumDefinition,
+        enumeration: *types.Enum,
+        location: token.Location,
+    ) ResolveError!void {
+        const allocator = self.arena.allocator();
+        if (definition.kind == .enumeration and definition.cases.len == 0) return self.fail(location, error.EmptyEnum);
+        const cases = @constCast(enumeration.cases);
+        const first_tag = if (definition.kind == .error_set) self.types.tags else 0;
+        for (definition.cases, cases, 0..) |case, *resolved, position| {
+            for (definition.cases[0..position]) |earlier| {
+                if (std.mem.eql(u8, earlier.name, case.name)) return self.fail(case.location, error.DuplicateCase);
+            }
+            resolved.* = .{ .name = case.name, .type = null, .declaring = enumeration, .tag = first_tag + position, .location = case.location };
+        }
+        if (definition.kind == .error_set) self.types.tags += cases.len;
+        for (definition.cases, cases) |case, *resolved| {
+            const original = case.type orelse continue;
+            var written = try ast.cloneExpression(allocator, original);
+            try self.resolveNamesInExpression(.{}, &written);
+            resolved.type = try self.expectRuntimeType(&written);
+            if (types.containsEnum(resolved.type.?, enumeration)) return self.fail(case.location, error.EnumContainsItself);
+        }
+        try self.types.add(allocator, .{ .@"enum" = enumeration });
+    }
+
+    fn addNestedFunctions(self: *NameResolver, module_index: usize, templates: []const ast.Declaration, owner: usize) ResolveError!void {
+        const allocator = self.arena.allocator();
+        const module = &self.loader.modules.items[module_index];
+        for (templates) |declaration| {
+            if (declaration.owner != owner or declaration.kind != .function_definition) continue;
+            var function = try ast.cloneFunctionDefinition(allocator, declaration.kind.function_definition);
+            function.bindings = self.bindings;
+            const index = module.declarations.len + module.instances.items.len;
+            const created = try allocator.create(ast.Declaration);
+            created.* = .{ .kind = .{ .function_definition = function }, .location = declaration.location };
+            try module.instances.append(allocator, created);
+            try self.resolveFunctionSignature(module_index, index);
+            try self.type_checker.?.created.append(allocator, .{ .module = module_index, .declaration = index });
+        }
     }
 
     fn completeStruct(
@@ -1726,6 +1901,7 @@ pub const NameResolver = struct {
             if (!discarded and findTypedName(signature.parameters, parameter.name) != index) {
                 return self.fail(parameter.location, error.DuplicateParameter);
             }
+            if (parameter.hidden) continue;
             if (parameter.kind == .any) {
                 parameter.type.denoted = .{ .variable = .{ .scope = .function, .index = index } };
                 continue;
@@ -1921,7 +2097,7 @@ pub const NameResolver = struct {
         };
         try self.resolveNamesInBlock(block, function.body);
         for (parameters, parameter_uses) |parameter, use| {
-            if (ast.isDiscardedName(parameter.name) or self.isDroppedName(parameter.name)) continue;
+            if (ast.isDiscardedName(parameter.name) or self.isDroppedName(parameter.name) or parameter.hidden) continue;
             try self.expectUsed(use, parameter.location, error.UnusedParameter);
         }
     }
@@ -2310,6 +2486,10 @@ pub const NameResolver = struct {
             return self.fail(statement.location, error.ReservedName);
         }
         const value = &constant.value;
+        if (constant.with) {
+            if (findTypedName(scope.parameters, ast.allocator_parameter) != null) try self.resolveNamesInExpression(scope, value);
+            return .{ .local = statement };
+        }
         if (constant.type) |*written| {
             try self.resolveWrittenType(scope, written, value.*);
         } else if (try self.findAlias(scope, value)) |target| {
@@ -2320,7 +2500,7 @@ pub const NameResolver = struct {
         const modules = self.loader.modules.items;
         if (!self.type_checker.?.isKnown(modules, value.*)) return .{ .local = statement };
         const type_checker = try self.prepareChecker();
-        type_checker.checkKnownConstant(modules, self.module_index, constant) catch |type_error| {
+        _ = type_checker.checkKnownConstant(modules, self.module_index, constant) catch |type_error| {
             self.adoptCheckerFailure(type_checker);
             return type_error;
         };
@@ -2539,6 +2719,7 @@ pub const NameResolver = struct {
                     try self.resolveNamesInExpression(scope, &argument.value);
                     recordModifiedVariable(scope, argument.value);
                 }
+                if (call.with_value) |value| try self.resolveNamesInExpression(scope, value);
             },
             .method_call => |*call| {
                 try self.resolveNamesInExpression(scope, call.receiver);
@@ -2547,6 +2728,7 @@ pub const NameResolver = struct {
                     try self.resolveNamesInExpression(scope, &argument.value);
                     recordModifiedVariable(scope, argument.value);
                 }
+                if (call.with_value) |value| try self.resolveNamesInExpression(scope, value);
             },
             .negation => |operand| try self.resolveNamesInExpression(scope, operand),
             .binary => |binary| {
@@ -2965,12 +3147,49 @@ pub const NameResolver = struct {
             if (std.mem.eql(u8, name, self.self_name)) return .{ .type = self_type };
         }
         if (std.mem.eql(u8, name, "Self")) return self.fail(location, error.UnknownName);
-        const module = self.loader.modules.items[self.module_index];
-        if (findBareDeclaration(module, name)) |index| {
+        if (self.findScopedDeclaration(name)) |index| {
             return self.resolveDeclaration(self.module_index, index);
         }
         if (types.findBuiltInType(name)) |built_in_type| return .{ .type = built_in_type };
         return self.fail(location, error.UnknownName);
+    }
+
+    fn findScopedDeclaration(self: *const NameResolver, name: []const u8) ?usize {
+        const module = self.loader.modules.items[self.module_index];
+        var owner = if (self.self_type) |self_type| findTypeDeclaration(module, self_type) else null;
+        while (owner) |index| {
+            if (findNestedDeclaration(module, index, name)) |nested| return nested;
+            owner = module.declarations[index].owner;
+        }
+        return findBareDeclaration(module, name);
+    }
+
+    fn findNestedType(self: *NameResolver, owner: types.Type, name: []const u8) ResolveError!?types.Type {
+        for (self.nested_types.items) |nested| {
+            if (std.meta.eql(nested.owner, owner) and std.mem.eql(u8, nested.name, name)) return nested.value;
+        }
+        const module_index = switch (owner) {
+            .@"struct" => |struct_type| struct_type.module,
+            .@"enum" => |enumeration| enumeration.module,
+            else => return null,
+        };
+        const module = self.loader.modules.items[module_index];
+        const owner_index = findTypeDeclaration(module, owner) orelse return null;
+        const index = findNestedDeclaration(module, owner_index, name) orelse return null;
+        const target = try self.resolveDeclaration(module_index, index);
+        return target.type;
+    }
+
+    fn findNestedOwner(self: *NameResolver, location: token.Location, owner: Target, path: ast.Path) ResolveError!?Target {
+        var current = owner;
+        for (path) |name| {
+            if (current != .type) return null;
+            const nested = (try self.findNestedType(current.type, name)) orelse {
+                return self.fail(location, error.UnknownName);
+            };
+            current = .{ .type = nested };
+        }
+        return current;
     }
 
     fn resolvePath(
@@ -2982,10 +3201,7 @@ pub const NameResolver = struct {
         const last = path[path.len - 1];
         if (try self.findPathOwner(scope, location, path[0 .. path.len - 1])) |owner| {
             return switch (owner) {
-                .type => |receiver| {
-                    if (findCase(receiver, last)) |case| return .{ .case = case };
-                    return .{ .method = .{ .receiver = receiver, .name = last } };
-                },
+                .type => |receiver| self.resolveTypeMember(receiver, last),
                 .typeclass => |typeclass| {
                     const declaration = self.loader.modules.items[typeclass.module].declarations[typeclass.declaration];
                     const functions = declaration.kind.typeclass_definition.functions;
@@ -3004,43 +3220,170 @@ pub const NameResolver = struct {
         return self.resolveMember(location, namespace, last);
     }
 
+    fn resolveTypeMember(self: *NameResolver, receiver: types.Type, name: []const u8) ResolveError!Target {
+        if (try self.findNestedType(receiver, name)) |nested| return .{ .type = nested };
+        if (findCase(receiver, name)) |case| return .{ .case = case };
+        return .{ .method = .{ .receiver = receiver, .name = name } };
+    }
+
     fn findPathOwner(
         self: *NameResolver,
         scope: Scope,
         location: token.Location,
         prefix: ast.Path,
     ) ResolveError!?Target {
-        const last = prefix[prefix.len - 1];
-        if (prefix.len > 1) {
-            var namespace = try self.resolveFirstNamespace(scope, location, prefix[0]);
-            for (prefix[1 .. prefix.len - 1]) |name| {
-                namespace = try self.resolveMemberNamespace(location, namespace, name);
-            }
-            const module_index = namespace.module orelse return null;
-            const index = findMember(self.loader.modules.items[module_index], last) orelse return null;
-            return self.findOwner(module_index, index);
+        if (prefix.len > 1) return self.findLongPathOwner(scope, location, prefix);
+        return self.findShortPathOwner(scope, location, prefix[0]);
+    }
+
+    fn findLongPathOwner(
+        self: *NameResolver,
+        scope: Scope,
+        location: token.Location,
+        prefix: ast.Path,
+    ) ResolveError!?Target {
+        if (try self.findShortPathOwner(scope, location, prefix[0])) |first| return self.findNestedOwner(location, first, prefix[1..]);
+        var namespace = try self.resolveFirstNamespace(scope, location, prefix[0]);
+        for (prefix[1 .. prefix.len - 1], 1..) |name, position| {
+            if (try self.findModuleType(namespace, name)) |owner| return self.findNestedOwner(location, owner, prefix[position + 1 ..]);
+            namespace = try self.resolveMemberNamespace(location, namespace, name);
         }
+        const module_index = namespace.module orelse return null;
+        const index = findMember(self.loader.modules.items[module_index], prefix[prefix.len - 1]) orelse return null;
+        return self.findOwner(module_index, index);
+    }
+
+    fn findShortPathOwner(
+        self: *NameResolver,
+        scope: Scope,
+        location: token.Location,
+        last: []const u8,
+    ) ResolveError!?Target {
         if (findLocal(scope.locals, last)) |local| {
+            if (local.target == .local) return self.findLocalConstantOwner(local);
             if (local.target != .type and local.target != .typeclass) return null;
             local.use.used = true;
             return local.target;
         }
         if (findTypedName(scope.parameters, last) != null) return null;
         if (std.mem.eql(u8, last, "Self")) return try self.resolveName(location, last);
-        const module = self.loader.modules.items[self.module_index];
-        const index = findBareDeclaration(module, last) orelse {
+        if (findBinding(self.bindings, last)) |binding| {
+            if (binding.target == .type) return .{ .type = binding.target.type };
+        }
+        const index = self.findScopedDeclaration(last) orelse {
             const built_in_type = types.findBuiltInType(last) orelse return null;
             return .{ .type = built_in_type };
         };
         return self.findOwner(self.module_index, index);
     }
 
+    fn findModuleType(self: *NameResolver, namespace: Namespace, name: []const u8) ResolveError!?Target {
+        const module_index = namespace.module orelse return null;
+        const index = findMember(self.loader.modules.items[module_index], name) orelse return null;
+        const target = try self.findOwner(module_index, index) orelse return null;
+        if (target != .type) return null;
+        return target;
+    }
+
     fn findOwner(self: *NameResolver, module_index: usize, index: usize) ResolveError!?Target {
         const target = try self.resolveDeclaration(module_index, index);
         return switch (target) {
             .type, .typeclass => target,
-            .function, .namespace, .constant, .local, .element, .method, .typeclass_method, .case, .constructor, .builtin => null,
+            .constant => |constant| self.findConstantOwner(constant),
+            .function, .namespace, .local, .element, .method, .typeclass_method, .case, .constructor, .builtin => null,
         };
+    }
+
+    fn keepPristine(self: *NameResolver, definition: *ast.FunctionDefinition) ResolveError!void {
+        if (definition.instantiated or ast.isGeneric(definition.signature) or definition.pattern or definition.check_only or definition.allocator != null) return;
+        const allocator = self.arena.allocator();
+        const pristine = try allocator.create(ast.FunctionDefinition);
+        pristine.* = try self.copyFunction(definition.*);
+        definition.pristine = pristine;
+    }
+
+    fn copyFunction(self: *NameResolver, definition: ast.FunctionDefinition) ResolveError!ast.FunctionDefinition {
+        var copy = try ast.cloneFunctionDefinition(self.arena.allocator(), definition);
+        for (definition.signature.parameters, copy.signature.parameters) |parameter, *cloned| cloned.type.denoted = parameter.type.denoted;
+        copy.template = definition.template;
+        copy.bindings = definition.bindings;
+        copy.instance = definition.instance;
+        copy.instance_arguments = definition.instance_arguments;
+        copy.constraints = definition.constraints;
+        return copy;
+    }
+
+    fn instantiateAllocatorForChecker(
+        context: *anyopaque,
+        function: ast.Resolution.Function,
+        allocator_type: types.Type,
+        number: usize,
+    ) AnalyzeError!ast.Resolution.Function {
+        const self: *NameResolver = @ptrCast(@alignCast(context));
+        const allocator = self.arena.allocator();
+        const module = &self.loader.modules.items[function.module];
+        const declaration = ast.findDeclaration(module.*, function.declaration).*;
+        var copy = try self.copyFunction(declaration.kind.function_definition.pristine.?.*);
+        copy.signature.name = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ copy.signature.name, number });
+        const index = module.declarations.len + module.instances.items.len;
+        const created = try allocator.create(ast.Declaration);
+        created.* = .{ .kind = .{ .function_definition = copy }, .location = declaration.location, .owner = declaration.owner };
+        try module.instances.append(allocator, created);
+        const result: ast.Resolution.Function = .{ .module = function.module, .declaration = index };
+        try addAllocatorParameterForChecker(self, result, allocator_type);
+        return result;
+    }
+
+    fn addAllocatorParameterForChecker(
+        context: *anyopaque,
+        function: ast.Resolution.Function,
+        allocator_type: types.Type,
+    ) AnalyzeError!void {
+        const self: *NameResolver = @ptrCast(@alignCast(context));
+        const allocator = self.arena.allocator();
+        const declaration = ast.findDeclaration(self.loader.modules.items[function.module], function.declaration);
+        const definition = &declaration.kind.function_definition;
+        const given = try allocator.create(types.Type);
+        given.* = allocator_type;
+        definition.allocator = given;
+        definition.need = .no;
+        const parameters = try allocator.alloc(ast.TypedName, definition.signature.parameters.len + 1);
+        @memcpy(parameters[0 .. parameters.len - 1], definition.signature.parameters);
+        const written: ast.Expression = .{ .kind = .{ .identifier = .{ .name = ast.allocator_parameter } }, .location = declaration.location, .denoted = allocator_type };
+        parameters[parameters.len - 1] = .{ .name = ast.allocator_parameter, .type = written, .location = declaration.location, .hidden = true };
+        definition.signature.parameters = parameters;
+    }
+
+    fn findConstantOwner(self: *NameResolver, constant: ast.Resolution.Constant) ResolveError!?Target {
+        const declaration = &self.loader.modules.items[constant.module].declarations[constant.declaration];
+        const caller_module_index = self.module_index;
+        defer self.module_index = caller_module_index;
+        self.module_index = constant.module;
+        const value_type = try self.findKnownType(&declaration.kind.constant_declaration) orelse return null;
+        return .{ .type = value_type };
+    }
+
+    fn findLocalConstantOwner(self: *NameResolver, local: *Local) ResolveError!?Target {
+        const statement = local.statement;
+        if (statement.kind != .constant_declaration) return null;
+        const value_type = try self.findKnownType(&statement.kind.constant_declaration) orelse return null;
+        local.use.used = true;
+        return .{ .type = value_type };
+    }
+
+    fn findKnownType(self: *NameResolver, constant: *ast.ConstantDeclaration) ResolveError!?types.Type {
+        const value = &constant.value;
+        if (value.denoted) |denoted| return denoted;
+        if (self.type_checker == null) return null;
+        const modules = self.loader.modules.items;
+        if (!self.type_checker.?.isKnown(modules, value.*)) return null;
+        const type_checker = try self.prepareChecker();
+        const value_type = type_checker.checkKnownConstant(modules, self.module_index, constant) catch |type_error| {
+            self.adoptCheckerFailure(type_checker);
+            return type_error;
+        };
+        if (value_type != .type) return null;
+        return try self.expectType(value);
     }
 
     fn resolveFirstNamespace(
@@ -3167,7 +3510,10 @@ pub const NameResolver = struct {
             return self.fail(location, error.ModuleNotFound);
         };
         if (path.len == 1) return .{ .namespace = namespace };
-        for (path[1 .. path.len - 1]) |name| {
+        for (path[1 .. path.len - 1], 1..) |name, position| {
+            if (try self.findModuleType(namespace, name)) |owner| {
+                return (try self.findNestedOwner(location, owner, path[position + 1 ..])).?;
+            }
             namespace = try self.resolveMemberNamespace(location, namespace, name);
         }
         const target = try self.resolveMember(location, namespace, path[path.len - 1]);
@@ -3316,7 +3662,7 @@ pub const NameResolver = struct {
             .module = module_index,
             .path = self.loader.modules.items[module_index].path,
             .position = index,
-            .name = definition.name,
+            .name = try self.buildNestedName(module_index, index),
             .kind = definition.kind,
             .cases = cases,
             .parts = parts,
@@ -3376,7 +3722,7 @@ pub const NameResolver = struct {
         const resolved = try reserveFields(self.arena.allocator(), definition.fields);
         const struct_type: types.Struct = .{
             .module = module_index,
-            .name = definition.name,
+            .name = try self.buildNestedName(module_index, index),
             .external = definition.external,
             .fields = resolved,
         };
@@ -3389,6 +3735,14 @@ pub const NameResolver = struct {
         try self.expectNotContained(struct_type, declaration.location);
         try self.types.add(self.arena.allocator(), value_type);
         return value_type;
+    }
+
+    fn buildNestedName(self: *NameResolver, module_index: usize, index: usize) std.mem.Allocator.Error![]const u8 {
+        const declarations = self.loader.modules.items[module_index].declarations;
+        const declaration = declarations[index];
+        const owner = declaration.owner orelse return extractName(declaration);
+        const outer = try self.buildNestedName(module_index, owner);
+        return std.mem.concat(self.arena.allocator(), u8, &.{ outer, "::", extractName(declaration) });
     }
 
     fn expectExternalFields(self: *NameResolver, fields: []const ast.Field) NameError!void {
@@ -3478,6 +3832,7 @@ pub const NameError = error{
     DuplicateStruct,
     DuplicateParameter,
     DuplicateField,
+    DuplicateMember,
     ReservedName,
     UnknownName,
     NotAFunction,
@@ -3511,7 +3866,6 @@ pub const NameError = error{
     TypeclassUsedAsValue,
     NotInTypeclass,
     MismatchedTypeclassFunction,
-    CompileTimeTypeclassParameter,
     MissingRequiredInstance,
     TypeclassArgumentCount,
     NoInstance,
@@ -3587,6 +3941,12 @@ const Scope = struct {
     }
 };
 
+const NestedType = struct {
+    owner: types.Type,
+    name: []const u8,
+    value: types.Type,
+};
+
 const Local = struct {
     name: []const u8,
     target: Target,
@@ -3599,6 +3959,17 @@ const Local = struct {
 const Loop = struct {
     statement: *const ast.Statement,
     label_used: bool = false,
+};
+
+const ModuleStep = enum {
+    skip,
+    function,
+    external,
+    typeclass,
+    import,
+    constant,
+    enumeration,
+    instance,
 };
 
 const Target = union(enum) {
@@ -3657,6 +4028,7 @@ fn describeError(name_error: NameError) []const u8 {
         error.DuplicateStruct => "struct is already defined",
         error.DuplicateParameter => "parameter is already defined",
         error.DuplicateField => "field is already defined",
+        error.DuplicateMember => "the block already has a field, case, function or type with this name",
         error.ReservedName => "name is reserved",
         error.UnknownName => "unknown name",
         error.NotAFunction => "name is not a function",
@@ -3690,7 +4062,6 @@ fn describeError(name_error: NameError) []const u8 {
         error.TypeclassUsedAsValue => "a typeclass cannot be used here",
         error.NotInTypeclass => "function is not in the typeclass",
         error.MismatchedTypeclassFunction => "function does not match the typeclass",
-        error.CompileTimeTypeclassParameter => "typeclass functions cannot take comptime parameters",
         error.MissingRequiredInstance => "type has no instance of a typeclass that the typeclass requires",
         error.TypeclassArgumentCount => "wrong number of typeclass arguments",
         error.NoInstance => "type has no instance of the typeclass",
@@ -3861,8 +4232,35 @@ fn isStandardLibrary(path: ast.Path) bool {
 fn findDeclaration(module: ast.Module, name: []const u8) ?usize {
     for (module.declarations, 0..) |declaration, index| {
         if (isMethod(declaration)) continue;
+        if (declaration.owner != null) continue;
         if (declaration.kind == .instance_declaration) continue;
         if (std.mem.eql(u8, extractName(declaration), name)) return index;
+    }
+    return null;
+}
+
+fn findNestedDeclaration(module: ast.Module, owner: usize, name: []const u8) ?usize {
+    for (module.declarations, 0..) |declaration, index| {
+        if (declaration.owner != owner or isMethod(declaration)) continue;
+        if (std.mem.eql(u8, extractName(declaration), name)) return index;
+    }
+    return null;
+}
+
+fn findTypeDeclaration(module: ast.Module, value_type: types.Type) ?usize {
+    for (module.declarations, 0..) |declaration, index| {
+        const value = switch (declaration.kind) {
+            .struct_definition => |definition| definition.value,
+            .enum_definition => |definition| definition.value,
+            .function_definition,
+            .function_declaration,
+            .constant_declaration,
+            .typeclass_definition,
+            .instance_declaration,
+            .import,
+            => continue,
+        } orelse continue;
+        if (std.meta.eql(value, value_type)) return index;
     }
     return null;
 }
@@ -4025,9 +4423,13 @@ fn isDependentExpression(names: Names, expression: ast.Expression, in_type: bool
                 .path_expression => |path_expression| if (isDependentName(names, path_expression.path[0], false)) return true,
                 .member => |member| if (isDependentExpression(names, member.owner.*, true)) return true,
             }
+            if (call.with_value) |value| {
+                if (isDependentExpression(names, value.*, true)) return true;
+            }
             return areDependentArguments(names, call.arguments, true);
         },
         .method_call => |call| isDependentExpression(names, call.receiver.*, in_type) or
+            (if (call.with_value) |value| isDependentExpression(names, value.*, true) else false) or
             areDependentArguments(names, call.arguments, true),
         .negation, .address_of, .dereference, .unwrap, .@"try" => |operand| isDependentExpression(names, operand.*, in_type),
         .range => |range| isDependentExpression(names, range.start, in_type) or
@@ -4169,10 +4571,12 @@ fn collectExpressionNames(
                 .member => |member| try collectExpressionNames(allocator, names, member.owner.*),
             }
             for (call.arguments) |argument| try collectExpressionNames(allocator, names, argument.value);
+            if (call.with_value) |value| try collectExpressionNames(allocator, names, value.*);
         },
         .method_call => |call| {
             try collectExpressionNames(allocator, names, call.receiver.*);
             for (call.arguments) |argument| try collectExpressionNames(allocator, names, argument.value);
+            if (call.with_value) |value| try collectExpressionNames(allocator, names, value.*);
         },
         .negation, .address_of, .dereference, .unwrap, .@"try" => |operand| try collectExpressionNames(allocator, names, operand.*),
         .range => |range| {
@@ -4331,6 +4735,42 @@ fn reserveFields(allocator: std.mem.Allocator, fields: []const ast.Field) std.me
     return reserved;
 }
 
+fn bindNestedTypes(
+    allocator: std.mem.Allocator,
+    bindings: []const ast.Binding,
+    templates: []const ast.Declaration,
+    values: []const ?types.Type,
+    scope: ?usize,
+) std.mem.Allocator.Error![]const ast.Binding {
+    var chain: std.ArrayList(?usize) = .empty;
+    var current = scope;
+    while (current) |index| {
+        try chain.append(allocator, index);
+        current = templates[index].owner;
+    }
+    try chain.append(allocator, null);
+    var bound: std.ArrayList(ast.Binding) = .empty;
+    try bound.appendSlice(allocator, bindings);
+    var level = chain.items.len;
+    while (level > 0) {
+        level -= 1;
+        for (templates, values) |template, value| {
+            const nested = value orelse continue;
+            if (template.owner != chain.items[level]) continue;
+            try bound.append(allocator, .{ .name = extractName(template), .target = .{ .type = nested } });
+        }
+    }
+    return bound.items;
+}
+
+fn extractTypeName(value_type: types.Type) []const u8 {
+    return switch (value_type) {
+        .@"struct" => |struct_type| struct_type.name,
+        .@"enum" => |enumeration| enumeration.name,
+        else => unreachable,
+    };
+}
+
 fn bindSelf(allocator: std.mem.Allocator, bindings: []const ast.Binding, value_type: types.Type) std.mem.Allocator.Error![]ast.Binding {
     const bound = try allocator.alloc(ast.Binding, bindings.len + 1);
     @memcpy(bound[0..bindings.len], bindings);
@@ -4401,7 +4841,10 @@ fn matchesSignature(
         if (!types.matchType(expected_type, parameter_type, .typeclass, assigned, true)) return false;
     }
     const return_type = ast.extractType(signature.return_type);
-    return types.matchType(ast.extractType(expected.return_type), return_type, .typeclass, assigned, true);
+    const expected_return = ast.extractType(expected.return_type);
+    if ((signature.inferred_error_set != null) != (expected.inferred_error_set != null)) return false;
+    if (expected.inferred_error_set != null) return types.matchType(expected_return.result.value, return_type.result.value, .typeclass, assigned, true);
+    return types.matchType(expected_return, return_type, .typeclass, assigned, true);
 }
 
 fn isBuiltInTypeName(name: []const u8) bool {
@@ -4436,6 +4879,20 @@ fn recordReadVariable(scope: Scope, expression: ast.Expression) void {
     if (resolution != .local) return;
     const local = findLocal(scope.locals, identifier.name) orelse return;
     if (local.statement == resolution.local) local.use.used = true;
+}
+
+fn findFunctionDeclaration(functions: []const ast.Declaration, name: []const u8) ?usize {
+    for (functions, 0..) |function, index| {
+        if (std.mem.eql(u8, extractName(function), name)) return index;
+    }
+    return null;
+}
+
+fn findCaseDeclaration(cases: []const ast.EnumCase, name: []const u8) ?usize {
+    for (cases, 0..) |case, index| {
+        if (std.mem.eql(u8, case.name, name)) return index;
+    }
+    return null;
 }
 
 fn findFieldDeclaration(fields: []const ast.Field, name: []const u8) ?usize {
@@ -4918,7 +5375,7 @@ test "resolveTypeclass: rejects Self in a typeclass" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 20 }, analyzer.failure.?.location.?);
 }
 
-test "resolveTypeclass: rejects a comptime parameter of a typeclass function" {
+test "resolveTypeclass: gives an instance function a copy for each set of compile-time arguments" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -4928,13 +5385,91 @@ test "resolveTypeclass: rejects a comptime parameter of a typeclass function" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Sized(type T)\n    fn size(comptime count: usize, value: T) -> usize" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Sized(type T)\n    fn size(value: T, comptime count: usize) -> usize\nstruct Data\n    length: usize\ninstance Sized(Data)\n    fn size(value: Data, comptime count: usize) -> usize = count * value.length\nconst ONE = Sized::size(Data{length = 3}, 2)\nconst TWO = Data{length = 3}.size(4)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(Value{ .integer = 6 }, loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 12 }, loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*);
+}
+
+test "resolveTypeclass: gives a default implementation a copy for each set of compile-time arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Sized(type T)\n    fn length(value: T) -> usize\n    fn size(value: T, comptime count: usize) -> usize = count * Sized::length(value)\nstruct Data\n    length: usize\ninstance Sized(Data)\n    fn length(value: Data) -> usize = value.length\nconst ONE = Sized::size(Data{length = 3}, 2)\nconst TWO = Data{length = 3}.size(4)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(Value{ .integer = 6 }, loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = 12 }, loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*);
+}
+
+test "resolveTypeclass: rejects an instance function that leaves out the comptime of a parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Sized(type T)\n    fn size(value: T, comptime count: usize) -> usize\nstruct Data\n    length: usize\ninstance Sized(Data)\n    fn size(value: Data, count: usize) -> usize = count * value.length" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
-    try std.testing.expectError(error.CompileTimeTypeclassParameter, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 22 }, analyzer.failure.?.location.?);
+    try std.testing.expectError(error.MismatchedTypeclassFunction, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 5 }, analyzer.failure.?.location.?);
+}
+
+test "resolveTypeclass: lets a default implementation call a function of its module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn twice(value: usize) -> usize = value * 2\ntypeclass Sized(type T)\n    fn length(value: T) -> usize\n    fn size(value: T) -> usize = twice(Sized::length(value))\nstruct Data\n    length: usize\ninstance Sized(Data)\n    fn length(value: Data) -> usize = value.length\nconst ONE = Data{length = 3}.size()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(Value{ .integer = 6 }, loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*);
+}
+
+test "resolveTypeclass: takes a value of any type with an instance in a typeclass function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, ".");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\ntypeclass Sized(type T)\n    fn length(value: T) -> usize\n    fn size(value: T, values: mn::Tuple) -> usize = Sized::length(value) + values[0]\nstruct Data\n    length: usize\ninstance Sized(Data)\n    fn length(value: Data) -> usize = value.length\nconst ONE = Data{length = 3}.size([usize]{4})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(Value{ .integer = 7 }, loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*);
 }
 
 test "resolveTypeclass: resolves a typeclass of a module that is resolved later" {
@@ -5044,6 +5579,82 @@ test "addDefaults: lets a length call typeclass methods given by a default and b
 
     const parameters = loader.modules.items[0].declarations[0].kind.function_definition.signature.parameters;
     try std.testing.expectEqual(8, ast.extractType(parameters[0].type).array.length);
+}
+
+test "matchesSignature: infers the error set of a typeclass function in each instance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error One\n    first\nerror Two\n    second\ntypeclass Source(type S)\n    fn read(source: S) -> !u8\n    fn twice(source: S) -> !u8\n        const value = try Source::read(source)\n        return value * 2\nstruct Left\nstruct Right\ninstance Source(Left)\n    fn read(_: Left) -> !u8 = One::first\ninstance Source(Right)\n    fn read(_: Right) -> !u8 = Two::second\nfn report(source: Source) -> !u8 = source.twice()\nfn left() -> One!u8 = report(Left{})\nfn right() -> Two!u8 = report(Right{})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(null, analyzer.failure);
+}
+
+test "matchesSignature: rejects a call whose instance gives an error the caller cannot hold" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error One\n    first\nerror Two\n    second\ntypeclass Source(type S)\n    fn read(source: S) -> !u8\n    fn twice(source: S) -> !u8\n        const value = try Source::read(source)\n        return value * 2\nstruct Left\nstruct Right\ninstance Source(Left)\n    fn read(_: Left) -> !u8 = One::first\ninstance Source(Right)\n    fn read(_: Right) -> !u8 = Two::second\nfn report(source: Source) -> !u8 = source.twice()\nfn left() -> One!u8 = report(Right{})" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 17, .column = 23 }, analyzer.failure.?.location.?);
+}
+
+test "matchesSignature: rejects an instance that writes the error set a typeclass function infers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error One\n    first\ntypeclass Source(type S)\n    fn read(source: S) -> !u8\nstruct Left\ninstance Source(Left)\n    fn read(_: Left) -> One!u8 = One::first" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MismatchedTypeclassFunction, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 7, .column = 5 }, analyzer.failure.?.location.?);
+}
+
+test "matchesSignature: rejects an instance that infers the error set a typeclass function writes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error One\n    first\ntypeclass Source(type S)\n    fn read(source: S) -> One!u8\nstruct Left\ninstance Source(Left)\n    fn read(_: Left) -> !u8 = One::first" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MismatchedTypeclassFunction, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 7, .column = 5 }, analyzer.failure.?.location.?);
 }
 
 test "resolveInstance: accepts an instance of a typeclass for a struct that a call gives" {
@@ -5594,44 +6205,6 @@ test "resolveExternalSignature: rejects an inferred error set in an external fun
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, analyzer.failure.?.location.?);
 }
 
-test "resolveFunctionSignature: rejects an inferred error set in an instance function" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ShowError\n    failed\ntypeclass Show(type T)\n    fn show(value: T) -> ShowError!void\nstruct Card\ninstance Show(Card)\n    fn show(value: Card) -> !void = noop" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.MisplacedInferredErrorSet, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 7, .column = 29 }, analyzer.failure.?.location.?);
-}
-
-test "resolveTypeclass: rejects an inferred error set in a typeclass function" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T)\n    fn show(value: T) -> !void" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.MisplacedInferredErrorSet, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 26 }, analyzer.failure.?.location.?);
-}
-
 test "resolveFunctionTypes: rejects an inferred error set in the type of a field" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5739,7 +6312,7 @@ test "resolveFunctionSignature: resolves Self in a method of mn::fs reached afte
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, ".");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io\nimport mn::io::Reader\n\nfn measure(path: []Const(u8)) -> io::Error!usize\n    const file = fs::File::open(path) catch return 0\n    defer file.close()\n    var buffer: [64]u8 = undefined\n    const count = try file.read(&buffer)\n    return count + try file.size()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::fs\nimport mn::io\nimport mn::io::Reader\n\nfn measure(path: fs::Path) -> io::Error!usize\n    const file = fs::File::open(path) catch return 0\n    defer file.close()\n    var buffer: [64]u8 = undefined\n    const count = try file.read(&buffer)\n    return count + try file.size()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11015,6 +11588,264 @@ test "resolveName: rejects a module that is not imported" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, name_resolver.failure.?.location.?);
 }
 
+test "resolveInstanceArguments: declares an instance for a nested type through its path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T)\n    fn show(value: T) -> u8\nstruct Outer\n    struct Inner\n        x: u8\ninstance Show(Outer::Inner)\n    fn show(value: Outer::Inner) -> u8 = value.x\nfn main()\n    const shown = Show::show(Outer::Inner{x = 1})\n    _ = shown" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    const body = for (declarations) |declaration| {
+        if (declaration.kind == .function_definition and std.mem.eql(u8, declaration.kind.function_definition.signature.name, "main")) break declaration.kind.function_definition.body;
+    } else unreachable;
+    try std.testing.expectEqual(types.Type{ .number = .u8 }, body[0].kind.constant_declaration.value.type.?);
+}
+
+test "resolveImport: imports a nested type by its path, also under another name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Shape\n    struct Point\n        x: u8" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes::Shape::Point\nimport shapes::Shape::Point as Spot\nfn main()\n    const one = Point{x = 1}\n    const two = Spot{x = 2}\n    _ = one\n    _ = two" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    const body = for (declarations) |declaration| {
+        if (declaration.kind == .function_definition and std.mem.eql(u8, declaration.kind.function_definition.signature.name, "main")) break declaration.kind.function_definition.body;
+    } else unreachable;
+    try std.testing.expectEqualStrings("Shape::Point", body[1].kind.constant_declaration.value.type.?.@"struct".name);
+}
+
+test "findScopedDeclaration: keeps a nested type out of the module's top-level names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Outer\n    struct Inner\n        value: u8\nfn main()\n    const inner = Inner{value = 1}\n    _ = inner" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownName, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 19 }, analyzer.failure.?.location.?);
+}
+
+test "expectUniqueMember: rejects two nested types with one name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Outer\n    value: u8\n    struct Inner\n        value: u8\n    enum Inner\n        first" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.DuplicateMember, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 5 }, analyzer.failure.?.location.?);
+}
+
+test "expectUniqueMember: rejects a nested type named like a case" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Outer\n    first\n    struct first\n        value: u8" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.DuplicateMember, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, analyzer.failure.?.location.?);
+}
+
+test "expectUniqueMember: rejects a nested type named like a function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Outer\n    value: u8\n    fn Inner() = noop\n    struct Inner\n        value: u8" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.DuplicateMember, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 5 }, analyzer.failure.?.location.?);
+}
+
+test "expectUniqueMember: rejects a nested type named like a field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Outer\n    Inner: u8\n    struct Inner\n        value: u8" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.DuplicateMember, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, analyzer.failure.?.location.?);
+}
+
+test "createNestedTypes: gives each instance of a type function its own nested type with the parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Stack(type T) -> type\n    return struct\n        top: ?*Node\n        struct Node\n            value: T\n            next: ?*Node\n            fn new(value: T) -> Self = Self{value = value, next = null}\nfn main()\n    const one = Stack(u8)::Node::new(1)\n    const two = Stack(u16)::Node::new(2)\n    _ = one\n    _ = two" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    const body = for (declarations) |declaration| {
+        if (declaration.kind == .function_definition and std.mem.eql(u8, declaration.kind.function_definition.signature.name, "main")) break declaration.kind.function_definition.body;
+    } else unreachable;
+    const one = body[0].kind.constant_declaration.value.type.?.@"struct";
+    const two = body[1].kind.constant_declaration.value.type.?.@"struct";
+    try std.testing.expectEqual(types.Type{ .number = .u8 }, one.fields[0].type);
+    try std.testing.expectEqual(types.Type{ .number = .u16 }, two.fields[0].type);
+    try std.testing.expect(!std.mem.eql(u8, one.name, two.name));
+}
+
+test "findScopedDeclaration: makes Self the nested type in its block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Outer\n    value: u16\n    struct Inner\n        value: u8\n        fn copy(self: Self) -> Self = self\nfn main()\n    const inner = Outer::Inner{value = 1}\n    const copied = inner.copy()\n    _ = copied" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    const body = for (declarations) |declaration| {
+        if (declaration.kind == .function_definition and std.mem.eql(u8, declaration.kind.function_definition.signature.name, "main")) break declaration.kind.function_definition.body;
+    } else unreachable;
+    try std.testing.expectEqualStrings("Outer::Inner", body[1].kind.constant_declaration.value.type.?.@"struct".name);
+}
+
+test "findNestedOwner: resolves a type nested several levels deep through its path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Outer\n    struct Middle\n        struct Inner\n            value: u8\nfn main()\n    const inner = Outer::Middle::Inner{value = 1}\n    _ = inner" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    const body = for (declarations) |declaration| {
+        if (declaration.kind == .function_definition and std.mem.eql(u8, declaration.kind.function_definition.signature.name, "main")) break declaration.kind.function_definition.body;
+    } else unreachable;
+    try std.testing.expectEqualStrings("Outer::Middle::Inner", body[0].kind.constant_declaration.value.type.?.@"struct".name);
+}
+
+test "findScopedDeclaration: resolves nested types by their short names inside the block and by paths outside" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Directory\n    entries: u32\n    struct Entry\n        name: u8\n        kind: Kind\n        fn new(name: u8) -> Self = Self{name = name, kind = Kind::file}\n    enum Kind\n        file\n        directory\n    fn first(self: Self) -> Entry = Entry::new(mn::convert(u8, self.entries))\nfn main()\n    const entry = Directory::Entry::new(2)\n    const kind: Directory::Kind = Directory::Kind::directory\n    _ = entry\n    _ = kind" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    const body = for (declarations) |declaration| {
+        if (declaration.kind == .function_definition and std.mem.eql(u8, declaration.kind.function_definition.signature.name, "main")) break declaration.kind.function_definition.body;
+    } else unreachable;
+    try std.testing.expectEqualStrings("Directory::Entry", body[0].kind.constant_declaration.value.type.?.@"struct".name);
+    try std.testing.expectEqualStrings("Directory::Kind", ast.extractType(body[1].kind.constant_declaration.type.?).@"enum".name);
+}
+
+test "expectUniqueNestedTemplates: rejects a nested type named like a field of a struct without a name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Stack(type T) -> type\n    return struct\n        Node: T\n        struct Node\n            value: T\nfn main()\n    var stack: Stack(u8) = undefined\n    stack.Node = 1\n    _ = stack" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.DuplicateMember, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 9 }, analyzer.failure.?.location.?);
+}
+
 test "resolvePath: resolves a case through its enum" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -11202,6 +12033,133 @@ test "findPathOwner: prefers a declaration over a built-in type" {
     const body = loader.modules.items[0].declarations[2].kind.function_definition.body;
     const callee = body[0].kind.discard.kind.call.callee.path_expression;
     try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 1 } }, callee.resolution.?);
+}
+
+test "findConstantOwner: calls a function through a constant that holds a type built by a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Box(type T) -> type\n    return struct\n        value: T\n        fn new(value: T) -> Self = Self{value = value}\nconst Bytes = Box(u8)\nfn main()\n    const one = Bytes::new(1)\n    const two = Box(u8)::new(2)\n    _ = one\n    _ = two" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[2].kind.function_definition.body;
+    const one = body[0].kind.constant_declaration.value.kind.call.callee.path_expression.resolution.?;
+    const two = body[1].kind.constant_declaration.value.kind.call.callee.member.resolution.?;
+    try std.testing.expectEqual(two, one);
+}
+
+test "findConstantOwner: resolves a type nested in a constant that holds a type built by a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Stack(type T) -> type\n    return struct\n        top: ?*Node\n        struct Node\n            value: T\n            fn new(value: T) -> Self = Self{value = value}\nconst Bytes = Stack(u8)\nfn main()\n    const one = Bytes::Node::new(1)\n    const two = Stack(u8)::Node::new(2)\n    _ = one\n    _ = two" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[2].kind.function_definition.body;
+    const one = body[0].kind.constant_declaration.value.kind.call.callee.path_expression.resolution.?;
+    const two = body[1].kind.constant_declaration.value.kind.call.callee.member.resolution.?;
+    try std.testing.expectEqual(two, one);
+}
+
+test "findConstantOwner: calls a function through a constant of another module that holds a type built by a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn Box(type T) -> type\n    return struct\n        value: T\n        fn new(value: T) -> Self = Self{value = value}\nconst Bytes = Box(u8)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils\nfn main()\n    const one = utils::Bytes::new(1)\n    const two = utils::Box(u8)::new(2)\n    _ = one\n    _ = two" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
+    const one = body[0].kind.constant_declaration.value.kind.call.callee.path_expression.resolution.?;
+    const two = body[1].kind.constant_declaration.value.kind.call.callee.member.resolution.?;
+    try std.testing.expectEqual(two, one);
+}
+
+test "findConstantOwner: rejects members of a constant that holds a value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> i32 = 1\nconst ONE = one()\nfn main() = _ = ONE::new()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NoMembers, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 17 }, analyzer.failure.?.location.?);
+}
+
+test "findLocalConstantOwner: calls a function through a local constant that holds a type built by a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Box(type T) -> type\n    return struct\n        value: T\n        fn new(value: T) -> Self = Self{value = value}\nfn main()\n    const Bytes = Box(u8)\n    const one = Bytes::new(1)\n    const two = Box(u8)::new(2)\n    _ = one\n    _ = two" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
+    const one = body[1].kind.constant_declaration.value.kind.call.callee.path_expression.resolution.?;
+    const two = body[2].kind.constant_declaration.value.kind.call.callee.member.resolution.?;
+    try std.testing.expectEqual(two, one);
+}
+
+test "findLocalConstantOwner: rejects members of a local constant that holds a value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> i32 = 1\nfn main()\n    const value = one()\n    _ = value::new()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NoMembers, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 9 }, analyzer.failure.?.location.?);
 }
 
 test "resolveFirstNamespace: resolves a path that starts with the separator to a declaration of the module" {

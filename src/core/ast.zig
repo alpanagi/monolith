@@ -20,6 +20,7 @@ pub const Module = struct {
 pub const Declaration = struct {
     kind: DeclarationKind,
     location: token.Location,
+    owner: ?usize = null,
 };
 
 pub const DeclarationKind = union(enum) {
@@ -44,11 +45,24 @@ pub const FunctionDefinition = struct {
     pattern: bool = false,
     constraints: []const Constraint = &.{},
     check_only: bool = false,
+    pristine: ?*const FunctionDefinition = null,
+    instantiated: bool = false,
+    allocator: ?*const types.Type = null,
+    need: Need = .unknown,
     dropped_names: []const []const u8 = &.{},
     lenient: bool = false,
     body_progress: Progress = .pending,
     check_progress: Progress = .pending,
 };
+
+pub const Need = enum {
+    unknown,
+    running,
+    no,
+    yes,
+};
+
+pub const allocator_parameter = "mn_allocator";
 
 pub const Binding = struct {
     name: []const u8,
@@ -126,6 +140,7 @@ pub const ConstantDeclaration = struct {
     evaluating: bool = false,
     bound: bool = false,
     measured: bool = false,
+    with: bool = false,
 };
 
 pub const TupleDeclaration = struct {
@@ -376,6 +391,7 @@ pub const Call = struct {
     arguments: []Argument,
     typeclass_arguments: []const types.Argument = &.{},
     @"inline": bool = false,
+    with_value: ?*Expression = null,
 };
 
 pub const Name = union(enum) {
@@ -408,6 +424,7 @@ pub const MethodCall = struct {
     name: []const u8,
     name_location: token.Location,
     arguments: []Argument,
+    with_value: ?*Expression = null,
 };
 
 pub const Resolution = union(enum) {
@@ -579,6 +596,7 @@ pub const FieldAccess = struct {
 pub const StructType = struct {
     fields: []Field,
     functions: []Declaration,
+    types: []Declaration = &.{},
     module: usize = 0,
     bindings: []const Binding = &.{},
     prefix: []const u8 = "",
@@ -592,6 +610,7 @@ pub const TypedName = struct {
     requirement: ?Expression = null,
     constraint: ?Resolution.Typeclass = null,
     measured: bool = false,
+    hidden: bool = false,
 };
 
 pub const ParameterKind = enum {
@@ -1190,6 +1209,7 @@ pub fn isDiscardedName(name: []const u8) bool {
 }
 
 pub fn isAlias(constant: ConstantDeclaration) bool {
+    if (constant.with) return false;
     return switch (constant.value.kind) {
         inline .identifier, .path_expression => |name| name.resolution == null,
         .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type => {
@@ -1260,22 +1280,8 @@ pub fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std
             .owner = try cloneExpressionPointer(allocator, member.owner),
             .name = member.name,
         } },
-        .call => |call| .{ .call = .{
-            .callee = switch (call.callee) {
-                .identifier, .path_expression => call.callee,
-                .member => |member| .{ .member = .{
-                    .owner = try cloneExpressionPointer(allocator, member.owner),
-                    .name = member.name,
-                } },
-            },
-            .arguments = try cloneArguments(allocator, call.arguments),
-        } },
-        .method_call => |call| .{ .method_call = .{
-            .receiver = try cloneExpressionPointer(allocator, call.receiver),
-            .name = call.name,
-            .name_location = call.name_location,
-            .arguments = try cloneArguments(allocator, call.arguments),
-        } },
+        .call => |*call| .{ .call = try cloneCall(allocator, call) },
+        .method_call => |*call| .{ .method_call = try cloneMethodCall(allocator, call) },
         .negation => |operand| .{ .negation = try cloneExpressionPointer(allocator, operand) },
         .binary => |binary| .{ .binary = .{
             .operator = binary.operator,
@@ -1335,7 +1341,7 @@ pub fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std
         .range => |range| .{ .range = try cloneRange(allocator, range) },
         .struct_type => |struct_type| kind: {
             const cloned = try allocator.create(StructType);
-            cloned.* = .{ .fields = struct_type.fields, .functions = struct_type.functions };
+            cloned.* = .{ .fields = struct_type.fields, .functions = struct_type.functions, .types = struct_type.types };
             break :kind .{ .struct_type = cloned };
         },
         .jump => |statement| .{ .jump = try cloneNestedStatement(allocator, statement) },
@@ -1351,6 +1357,35 @@ pub fn cloneField(allocator: std.mem.Allocator, field: Field) std.mem.Allocator.
         .default = try cloneOptionalExpression(allocator, field.default),
         .location = field.location,
     };
+}
+
+fn cloneCall(allocator: std.mem.Allocator, call: *const Call) std.mem.Allocator.Error!Call {
+    return .{
+        .callee = switch (call.callee) {
+            .identifier, .path_expression => call.callee,
+            .member => |member| .{ .member = .{
+                .owner = try cloneExpressionPointer(allocator, member.owner),
+                .name = member.name,
+            } },
+        },
+        .arguments = try cloneArguments(allocator, call.arguments),
+        .with_value = try cloneWithValue(allocator, call.with_value),
+    };
+}
+
+fn cloneMethodCall(allocator: std.mem.Allocator, call: *const MethodCall) std.mem.Allocator.Error!MethodCall {
+    return .{
+        .receiver = try cloneExpressionPointer(allocator, call.receiver),
+        .name = call.name,
+        .name_location = call.name_location,
+        .arguments = try cloneArguments(allocator, call.arguments),
+        .with_value = try cloneWithValue(allocator, call.with_value),
+    };
+}
+
+fn cloneWithValue(allocator: std.mem.Allocator, value: ?*Expression) std.mem.Allocator.Error!?*Expression {
+    const present = value orelse return null;
+    return try cloneExpressionPointer(allocator, present);
 }
 
 fn cloneFunctionSignature(
@@ -1409,6 +1444,7 @@ fn cloneStatement(allocator: std.mem.Allocator, statement: Statement) std.mem.Al
             .name = constant.name,
             .type = try cloneOptionalExpression(allocator, constant.type),
             .value = try cloneExpression(allocator, constant.value),
+            .with = constant.with,
         } },
         .tuple_declaration => |declaration| .{ .tuple_declaration = .{
             .names = try allocator.dupe(ElementName, declaration.names),
