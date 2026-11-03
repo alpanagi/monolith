@@ -484,3 +484,22 @@ test "loadModule: records the file it cannot read" {
     const expected = try std.fmt.allocPrint(arena.allocator(), "cannot read '{s}': FileNotFound", .{file});
     try std.testing.expectEqualStrings(expected, loader.failure.?.message);
 }
+
+test "loadMainModule: rejects an import path that starts with module when the directory exists" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.createDirPath(io, "module");
+    try program_directory.dir.writeFile(io, .{ .sub_path = "module/thing.mn", .data = "const VALUE: i32 = 1" });
+    try program_directory.dir.writeFile(io, .{ .sub_path = "main.mn", .data = "const VALUE: i32 = 1\nimport module::thing" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = Loader.init(program_path, program_path);
+
+    try std.testing.expectError(error.ReservedImport, loader.loadMainModule(&arena, io, "main"));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, loader.failure.?.location.?);
+}

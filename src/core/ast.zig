@@ -5,6 +5,8 @@ const types = @import("types.zig");
 const Value = @import("value.zig").Value;
 
 pub const module_root = "";
+pub const case_without_enum_message = "a leading :: names a case or a function of the expected type, and no enum or struct is expected here; use module:: for a declaration of this module, and the name of its error set for an error";
+pub const case_without_known_enum_message = "a leading :: names a case or a function of the expected type, and that type is not known from the surrounding code; use module:: for a declaration of this module";
 
 pub const Program = struct {
     modules: []Module,
@@ -73,6 +75,7 @@ pub const Binding = struct {
         type: types.Type,
         constant: Resolution.Constant,
         constructor: types.Constructor,
+        length: types.Variable,
     };
 };
 
@@ -216,6 +219,7 @@ pub const InstanceDeclaration = struct {
 
 pub const InstanceParameter = struct {
     name: []const u8,
+    is_length: bool = false,
     requirement: ?Expression = null,
     resolved_requirement: ?Resolution.Typeclass = null,
     location: token.Location,
@@ -337,7 +341,7 @@ pub const Sequence = union(enum) {
 pub const Range = struct {
     start: Expression,
     end: ?Expression = null,
-    length: ?u64 = null,
+    known_end: ?u64 = null,
     type: ?types.Type = null,
 };
 
@@ -371,6 +375,8 @@ pub const ExpressionKind = union(enum) {
     address_of: *Expression,
     array_type: ArrayType,
     composite_literal: CompositeLiteral,
+    case_literal: CaseLiteral,
+    inferred_type: InferredType,
     slice_type: SliceType,
     index: Index,
     slice: Slice,
@@ -386,6 +392,18 @@ pub const ExpressionKind = union(enum) {
     struct_type: *StructType,
     jump: *Statement,
     branching: *Statement,
+};
+
+pub const CaseLiteral = struct {
+    name: []const u8,
+    arguments: []Argument = &.{},
+    called: bool = false,
+    with_value: ?*Expression = null,
+    expected: ?types.Type = null,
+};
+
+pub const InferredType = struct {
+    expected: ?types.Type = null,
 };
 
 pub const Call = struct {
@@ -975,6 +993,10 @@ pub fn collectJumps(
         .composite_literal => |literal| {
             for (literal.elements) |*element| try collectJumps(allocator, jumps, &element.value);
         },
+        .case_literal => |literal| {
+            for (literal.arguments) |*argument| try collectJumps(allocator, jumps, &argument.value);
+        },
+        .inferred_type => {},
         .binary => |binary| {
             try collectJumps(allocator, jumps, binary.left);
             try collectJumps(allocator, jumps, binary.right);
@@ -1039,6 +1061,10 @@ pub fn collectBranchings(
         .composite_literal => |literal| {
             for (literal.elements) |*element| try collectBranchings(allocator, branchings, &element.value);
         },
+        .case_literal => |literal| {
+            for (literal.arguments) |*argument| try collectBranchings(allocator, branchings, &argument.value);
+        },
+        .inferred_type => {},
         .binary => |binary| {
             try collectBranchings(allocator, branchings, binary.left);
             try collectBranchings(allocator, branchings, binary.right);
@@ -1303,6 +1329,14 @@ pub fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std
         .composite_literal => |literal| .{ .composite_literal = .{
             .type = try cloneOptionalExpressionPointer(allocator, literal.type),
             .elements = try cloneArguments(allocator, literal.elements),
+        } },
+        .inferred_type => |inferred| .{ .inferred_type = inferred },
+        .case_literal => |literal| .{ .case_literal = .{
+            .name = literal.name,
+            .arguments = try cloneArguments(allocator, literal.arguments),
+            .called = literal.called,
+            .with_value = try cloneWithValue(allocator, literal.with_value),
+            .expected = literal.expected,
         } },
         .slice_type => |slice_type| .{ .slice_type = .{
             .constant = slice_type.constant,

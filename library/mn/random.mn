@@ -6,8 +6,11 @@ external fn mn_runtime_random_entropy() -> u64
 const Default = Xoshiro256
 const entropy = mn_runtime_random_entropy
 
+
 typeclass Generator(type G)
     fn next(generator: *G) -> u64
+
+
     fn range(generator: *G, range: mn::Range) -> usize
         const count = mn::convert(u64, range.end.? - range.start)
         const threshold = math::subtract_wrapping(0, count) % count
@@ -15,12 +18,14 @@ typeclass Generator(type G)
             const bits = Generator::next(generator)
             if (bits >= threshold) return range.start + mn::convert(usize, bits % count)
 
+
 struct Xoshiro256
     state: [4]u64
 
     fn new(seed: u64) -> Xoshiro256
         var mixer = seed
         return Xoshiro256{state = {splitmix64(&mixer), splitmix64(&mixer), splitmix64(&mixer), splitmix64(&mixer)}}
+
 
 instance Generator(Xoshiro256)
     fn next(generator: *Xoshiro256) -> u64
@@ -35,6 +40,7 @@ instance Generator(Xoshiro256)
         state[2] ^= shifted
         state[3] = (state[3] << 45) | (state[3] >> 19)
         return result
+
 
 fn splitmix64(state: *u64) -> u64
     state.* = math::add_wrapping(state.*, 0x9e3779b97f4a7c15)

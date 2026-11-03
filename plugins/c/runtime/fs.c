@@ -4,11 +4,15 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "monolith.h"
+
+static_assert(PATH_MAX <= 4096, "the buffer of mn::fs::Path::absolute holds 4096 bytes");
 
 typedef struct mn_slice_u8 {
     uint8_t *items;
@@ -66,6 +70,13 @@ int32_t mn_runtime_fs_open(mn_slice_u8 name, int32_t mode) {
         return mn_runtime_fs_error_code(EISDIR);
     }
     return descriptor;
+}
+
+int32_t mn_runtime_fs_absolute(mn_slice_u8 name, mn_slice_u8 buffer) {
+    if (memchr(name.items, 0, name.length - 1) != NULL) return mn_runtime_fs_error_code(ENOENT);
+    char const *resolved = realpath((char const *)name.items, (char *)buffer.items);
+    if (resolved == NULL) return mn_runtime_fs_error_code(errno);
+    return (int32_t)strlen(resolved);
 }
 
 ptrdiff_t mn_runtime_fs_size(int32_t descriptor) {

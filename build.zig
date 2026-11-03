@@ -54,9 +54,10 @@ pub fn build(b: *std.Build) void {
     });
 
     const test_step = b.step("test", "Run tests");
+    const input_marker = addInputMarker(b);
     for ([_]*std.Build.Module{ core, monolith }) |module| {
         const tests = b.addTest(.{ .root_module = module });
-        test_step.dependOn(&b.addRunArtifact(tests).step);
+        addTestRun(b, test_step, tests, input_marker);
     }
 
     const c_plugin_tests = b.addTest(.{
@@ -70,5 +71,23 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    test_step.dependOn(&b.addRunArtifact(c_plugin_tests).step);
+    addTestRun(b, test_step, c_plugin_tests, input_marker);
+}
+
+fn addInputMarker(b: *std.Build) std.Build.LazyPath {
+    const inputs = b.addWriteFiles();
+    _ = inputs.addCopyDirectory(b.path("library"), "library", .{});
+    _ = inputs.addCopyDirectory(b.path("plugins/c"), "plugins/c", .{});
+    return inputs.add("marker", "");
+}
+
+fn addTestRun(
+    b: *std.Build,
+    test_step: *std.Build.Step,
+    tests: *std.Build.Step.Compile,
+    input_marker: std.Build.LazyPath,
+) void {
+    const run = b.addRunArtifact(tests);
+    run.addFileInput(input_marker);
+    test_step.dependOn(&run.step);
 }

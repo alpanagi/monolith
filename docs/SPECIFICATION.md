@@ -24,6 +24,7 @@
 - The following identifier names are reserved and cannot be used as identifiers by the user:
     `and`, `any`, `as`, `break`, `case`, `catch`, `comptime`, `const`, `Const`, `continue`, `defer`, `else`, `enum`, `errdefer`, `error`, `external`, `false`, `fn`, `for`, `if`, `import`, `in`, `inline`, `instance`, `Many`, `match`, `noop`, `null`, `or`, `orelse`, `return`, `Self`, `struct`, `true`, `try`, `typeclass`, `undefined`, `var`, `void`, `while`, `with`
 - A reserved name can be the name of a function, struct, enum or error set, and a name after `::`, e.g. `fn match(pattern: []Const(u8)) -> bool` called as `parser::match(pattern)`. Elsewhere it is reached through a path.
+- `module` is reserved only as the first name of a path, before `::`. A local variable, a parameter or a declaration can be named `module`, e.g. `fn load(module: Module)`, and `module.field` reads its field.
 
 ## Built-In Types
 
@@ -105,6 +106,7 @@
 - `value.field` gives a field of a struct.
 - A struct's block can also declare functions, e.g. `fn area(self: Self) -> i32 = self.side`. In the block, `Self` is the struct's type.
 - A function in a struct's block is reached through the struct's name and `::`, e.g. `Square::new()`.
+- A leading `::` also names a function in the block of the expected enum or struct whose return type is that type, or an optional or a result of it, e.g. `Inventory{cards = ::new(), seen = ::new()}`, `const list: List(u8) = ::new()`, `const path: fs::Path = try ::parse("cards")` or `mode == ::make()`. It is the same call as `Type::name(...)`, including with `with`, and the type is worked out through `try`, `catch` and `orelse`. A method, a function that returns another type or a name the type does not have is a compile-time error.
 - A function whose first parameter's type is written `Self`, `*Self` or `*Const(Self)` is a method. `value.name(arguments)` calls it with `value` as the first argument, e.g. `square.area()`.
 - When the first parameter is a pointer, the call takes the value's address automatically, e.g. `counter.increment()` passes `&counter`. It is allowed only where `&` is allowed, and `*Self` needs a pointer that can modify the value (see Pointer Operations).
 - A method can also be called on a pointer to the value, which is dereferenced automatically, one level only, e.g. `pointer.area()`. If the pointer's own type has a method with the same name, that method is called.
@@ -117,6 +119,8 @@
 - A case can carry a value of the type written after `:`. A case without a type carries no value.
 - Case names must be unique within an enum.
 - `Enum::case` gives a case without a value, e.g. `Token::end`. `Enum::case(value)` gives a case with its value, e.g. `Token::number(42)`.
+- The enum can be left out when it is known from the surrounding code, written with a leading `::`, e.g. `const mode: Mode = ::write`, `open(path, ::read)`, `mode == ::write` or `::number(42)`. An optional or a result of an enum takes it too, e.g. `const mode: ?Mode = ::write`. The name is looked up in the expected type, even where a local variable has the same name.
+- A leading `::` where the type is not known is a compile-time error, e.g. `const mode = ::read`. So is one where the type is not an enum or a struct, and an error is not written this way, e.g. `return ::out_of_memory`.
 - An enum has at least one case.
 - Enums are declared where structs are (see Structs). An enum's block can also declare functions, as a struct's can. A function cannot have the name of a case.
 - Enums are values. Assigning or passing an enum copies its case and its value.
@@ -295,7 +299,8 @@
 ### Indexing
 
 - `a[i]` gives the element at index `i` of an array, slice, `*Many(T)` or tuple. The index is a `usize`.
-- An index outside the length of an array or slice is illegal behavior. An index known at compile time outside an array's length is a compile-time error.
+- An index outside the length of an array or slice is illegal behavior. An index known at compile time outside an array's length is a compile-time error, and so is any index into an array of length 0.
+- An index that is the variable of a loop over a range is a compile-time error when the range's end is known at compile time and greater than the length of the array or of the array behind a pointer, e.g. `value[index]` on a `[3]u8` in `for index in 0..5`. Only the variable itself counts, e.g. `value[index + 1]` is not checked. Slices are not checked.
 - A tuple's index must be known at compile time.
 - Indexing a pointer to an array dereferences it automatically.
 
@@ -366,7 +371,7 @@
 - It runs on every way out of the block: reaching its end, `return`, `break`, `continue`, and an error returned through `try`.
 - Deferred statements run in reverse order of their `defer`.
 - A deferred statement's expressions are evaluated when it runs, not when `defer` is reached. With `return value`, the value is evaluated before the deferred statements run.
-- `errdefer` works like `defer`, but runs only when the function returns an error after the `errdefer` was reached.
+- `errdefer` works like `defer`, but runs only when the block ends because the function returns an error.
 - A deferred statement cannot use `try`.
 
 ### If
@@ -391,6 +396,7 @@
 
 - `for name in sequence` runs its block once for each element of the sequence, in order, with `name` holding the element. On one line it is written `for (name in sequence) statement`, e.g. `for (card in cards) total += card.value`. A sequence is an array, a slice, a pointer to an array, a range, an iterator or a tuple.
 - `start..end` is a range of the `usize` values from `start` up to, but not including, `end`, e.g. `for index in 0..count`. `start..` is a range without an end. A start after the end is illegal behavior.
+- A `for` over a range whose bounds are both known at compile time and equal, or with the start after the end, is a compile-time error, e.g. `for index in 0..0`, or `for index in 0..N` for an instance where `N` is 0. A bound known only at run time can make a loop run zero times.
 - A range is also a value of the type `mn::Range`, which is an iterator over its values, e.g. as an argument.
 - An iterator is a value whose type has an instance of `mn`'s typeclass `Iterator(I)`. Its `Element() -> type` gives the type of the elements, and its `next(iterator: *I) -> ?Element()` gives the elements until it returns `null`, e.g. `Iterator(Countdown)::Element()`. The loop calls `next` on its own copy of the iterator.
 - An iterator's elements are tuples. A single name without parentheses takes apart a one-element tuple, e.g. `for count in countdown` over an iterator whose `Element()` is `[u32]` gives each `u32`. A single name over elements with more than one value is a compile-time error.
@@ -436,6 +442,8 @@
 - A parameter named `_` has no name, and the body cannot refer to it.
 - An unused parameter is a compile-time error.
 - Arguments are given in the order of the parameters.
+- The argument of a `type` parameter can be written `_` when the type is known from the surrounding code, e.g. `const size: u8 = make(_)` for `fn make(type T) -> T`. The type is worked out from the function's return type and what the surrounding code expects, through `try`, `catch` and `orelse`, e.g. `const text: []u8 = try path.to(_)`.
+- `_` where the type is not known is a compile-time error, e.g. `const text = try path.to(_)`. So is `_` as the argument of any other parameter.
 - `&name` gives a pointer to a function, e.g. to pass it as an argument. A pointer to a function is called like a function.
 - `external fn` declares a function defined outside the program, without a body, e.g. `external fn write(text: []Const(u8))`.
 - A struct in an external function's parameters or return type, directly or through pointers or arrays, must be an external struct.
@@ -470,8 +478,9 @@
 - `mn::reflection` holds the built-in functions that inspect and build types. `mn::reflection::length(T)` gives a tuple type's number of elements as a `usize`. `mn::reflection::join(A, B)` gives the tuple type with the elements of `A` followed by those of `B`, e.g. `mn::reflection::join([Card], [usize])` is `[Card, usize]`.
 - `import path` makes the last name of the path available in the module. The path names a directory, a module, a declaration in a module or a type nested in one, e.g. `import mn::text` allows `text::strip(input)`, `import mn::io::stdout` allows `stdout` and `import mn::fs::Directory::Entry` allows `Entry`.
 - `import path as name` makes it available as `name` instead, e.g. `import mn::io::stdout as out`.
-- An import that would make a reserved name available is a compile-time error, e.g. `import mn::comptime`.
-- A path that starts with `::` names a top-level declaration of the current module, e.g. `::match(pattern)`.
+- An import that would make a reserved name available is a compile-time error, e.g. `import mn::comptime` or `import shapes::module`.
+- An import path that starts with `module::` is a compile-time error, since `module::` names only the current module, e.g. `import module::thing`. A directory named `module` has to be renamed. A file named `module.mn` can be imported under another name, e.g. `import module as shape`.
+- A path that starts with `module::` names a top-level declaration of the current module, e.g. `module::match(pattern)`, even where a local variable named `module` is in scope.
 - `import` is written at the top level of a module. The name it makes available cannot be the same as another import or top-level declaration of the module.
 - Other modules can use every top-level declaration of a module.
 - A module can be next to a directory with the same name, e.g. `shapes.mn` and `shapes/`. A declaration in the module with the same name as a module or directory in the directory is a compile-time error, e.g. `circle` in `shapes.mn` and `shapes/circle.mn`.
@@ -484,14 +493,17 @@
 - A typeclass's function without a body only declares its signature. With a body, the body is its default implementation.
 - A default implementation can call the functions of its typeclass, of the typeclasses its parameters require, and functions that do not depend on the typeclass's parameters, e.g. a function of its module.
 - A typeclass's function can take its own `type` and `comptime` parameters and parameters whose type is a typeclass, e.g. `fn map(type A, type B, value: F(A), function: *fn(A) -> B) -> F(B)` or `fn print(writer: W, comptime format: []Const(u8), values: mn::Tuple) -> !void`. Its default implementation and an instance's function get their own instance for each different set of arguments to them, as any function does (see Compile-Time Evaluation).
+- A function's `type` parameter with the same name as a parameter of the typeclass is that parameter, e.g. `U` in `fn to(value: T, type U) -> !U` of `typeclass To(type T, type U)`. Its argument takes part in choosing the instance, e.g. `path.to([]u8)` calls `instance To(Path, []u8)`. An instance repeats the line, with `U` fixed by its header. A `type` parameter with a different name is the function's own, e.g. `allocate(allocator: *A, type T, count: usize)` is one function for every `T`.
 - An instance is declared with `instance`, the typeclass with its arguments, and its functions in an indented block, e.g. `instance Show(Card)`.
 - An instance can cover every instantiation of a type through its own parameters, e.g. `instance(type A: Show) Show(List(A))`.
+- An instance can cover every length of an array with a parameter written `comptime N: usize`, e.g. `instance(type A: Show, comptime N: usize) Show([N]A)` covers `[16]u8` and `[2][3]u8`. In the instance's signatures it is written alone as a length. In its functions it is a value known at compile time, e.g. `if N <= 8` or `for index in 0..N`. Each length gets its own instance of the functions, which are checked when they are used.
+- A parameter of an instance that its arguments do not decide makes a call to it a compile-time error.
 - An instance defines each function of the typeclass with the typeclass's signature, with the arguments in place of the parameters. A function with a default implementation can be left out, and the default implementation is used.
 - An instance can only define the typeclass's functions.
 - Two instances of a typeclass cannot cover the same arguments, e.g. `instance Show(List(u8))` next to `instance(type A: Show) Show(List(A))`.
 - Instances are declared at the top level of a module.
 - A typeclass's functions can be called only in modules that declare or import the typeclass, e.g. `import shapes::Shape`.
-- A typeclass's function is called through the typeclass, e.g. `Show::show(card, output)`, with the instance chosen by the types of the arguments. If more than one instance fits, the call is a compile-time error.
+- A typeclass's function is called through the typeclass, e.g. `Show::show(card, output)`, with the instance chosen by the types of the arguments and by a type argument for a parameter of the typeclass. If no instance or more than one instance fits, the call is a compile-time error.
 - A typeclass with its arguments names one instance, e.g. `Default(Card)::value()`. A function whose arguments do not decide the instance is called this way.
 - A typeclass's function whose first parameter's type is a parameter of the typeclass, or a pointer to one, can also be called as a method, e.g. `card.show(output)` (see Structs).
 - When no function fits the type of a method call's receiver and a typeclass's function fits a pointer to it, the call takes the receiver's address, e.g. `text.print(format, values)` for a `List(u8)` named `text` with an instance of `Writer` for `*List(u8)`.

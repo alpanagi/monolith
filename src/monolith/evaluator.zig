@@ -164,6 +164,8 @@ pub const Evaluator = struct {
             .unary => |unary| self.isKnownWith(unary.operand.*, calls),
             .binary => |binary| self.isKnownWith(binary.left.*, calls) and self.isKnownWith(binary.right.*, calls),
             .composite_literal => |literal| self.areKnown(literal.elements, calls),
+            .case_literal => |literal| literal.with_value == null and self.areKnown(literal.arguments, calls),
+            .inferred_type => false,
             .index => |indexing| self.isKnownWith(indexing.value.*, calls) and self.isKnownWith(indexing.index.*, calls),
             .slice => |slice| {
                 if (!self.isKnownWith(slice.value.*, calls)) return false;
@@ -209,7 +211,7 @@ pub const Evaluator = struct {
     }
 
     fn evaluateExpression(self: *Evaluator, expression: *const ast.Expression) EvaluateError!Value {
-        if (findFunctionCall(expression)) |call| return self.evaluateCall(expression.location, call);
+        if (self.findFunctionCall(expression)) |call| return self.evaluateCall(expression.location, call);
         if (findStructType(expression)) |struct_type| return self.evaluateStructType(expression.location, struct_type);
         return self.evaluateOtherExpression(expression);
     }
@@ -228,6 +230,8 @@ pub const Evaluator = struct {
             .unary => |unary| self.evaluateUnary(expression.*, unary),
             .binary => |binary| self.evaluateBinary(expression.*, binary),
             .composite_literal => |literal| self.evaluateCompositeLiteral(expression.*, literal),
+            .case_literal => unreachable,
+            .inferred_type => unreachable,
             .index => self.evaluateIndex(expression.*),
             .field_access => self.evaluateFieldAccess(expression),
             .dereference => self.readPlace(location, try self.findPlace(expression.*)),
@@ -401,6 +405,8 @@ pub const Evaluator = struct {
             .address_of,
             .array_type,
             .composite_literal,
+            .case_literal,
+            .inferred_type,
             .slice_type,
             .slice,
             .pointer_type,
@@ -510,6 +516,7 @@ pub const Evaluator = struct {
     fn evaluateCallExpression(self: *Evaluator, location: token.Location, call: *const ast.Call) EvaluateError!Value {
         const resolution = ast.extractResolution(call.callee);
         if (resolution == .builtin) return self.evaluateBuiltin(location, call.*, resolution.builtin);
+        if (resolution == .function) return self.copyElements(location, call);
         const case = &resolution.case.enumeration.cases[resolution.case.index];
         const cell = try self.arena.allocator().create(Value);
         cell.* = try self.copy(try self.evaluateConverted(&call.arguments[0].value, case.type.?));
@@ -895,6 +902,44 @@ pub const Evaluator = struct {
         defer self.module_index = caller_module_index;
         const flow = try (self.executeBlock(frame.definition.body) catch |execute_error| self.recoverReturnedError(execute_error));
         return self.finishCall(cached, flow);
+    }
+
+    fn findFunctionCall(self: *const Evaluator, expression: *const ast.Expression) ?*const ast.Call {
+        if (expression.kind != .call) return null;
+        const call = &expression.kind.call;
+        return switch (ast.extractResolution(call.callee)) {
+            .builtin, .case => null,
+            else => if (self.isMemoryCopy(call)) null else call,
+        };
+    }
+
+    fn isMemoryCopy(self: *const Evaluator, call: *const ast.Call) bool {
+        const resolution = ast.extractResolution(call.callee);
+        if (resolution != .function) return false;
+        const function = resolution.function;
+        const declaration = ast.findDeclaration(self.program.modules[function.module], function.declaration);
+        if (declaration.kind != .function_declaration) return false;
+        return std.mem.eql(u8, declaration.kind.function_declaration.name, "mn_runtime_memory_copy");
+    }
+
+    fn copyElements(self: *Evaluator, location: token.Location, call: *const ast.Call) EvaluateError!Value {
+        const destination = try self.evaluateExpression(&call.arguments[0].value);
+        const source = try self.evaluateExpression(&call.arguments[1].value);
+        const size = try self.expectIndex(location, try self.evaluateExpression(&call.arguments[2].value));
+        if (size == 0) return .void;
+        if (destination != .many or source != .many) return self.fail(location, error.CannotEvaluate);
+        const element_size = types.findLayout(findPointedType(destination).?).size;
+        const count: usize = @intCast(@divExact(size, @as(i129, @intCast(element_size))));
+        const elements = try self.arena.allocator().alloc(Value, count);
+        for (elements, 0..) |*element, position| {
+            const place = try self.extendPlace(source.many.array, @as(usize, @intCast(source.many.index)) + position);
+            element.* = try self.copy(try self.readPlace(location, place));
+        }
+        for (elements, 0..) |element, position| {
+            const place = try self.extendPlace(destination.many.array, @as(usize, @intCast(destination.many.index)) + position);
+            self.locate(place).* = element;
+        }
+        return .void;
     }
 
     fn prepareFrame(self: *Evaluator, frame: *Frame, location: token.Location, call: *const ast.Call) EvaluateError!void {
@@ -1693,16 +1738,6 @@ fn findPartType(container: types.Type, position: usize) ?types.Type {
         .array => |array| array.element,
         .@"struct" => |struct_type| struct_type.fields[position].type,
         .tuple => |tuple| tuple.elements[position],
-        else => null,
-    };
-}
-
-fn findFunctionCall(expression: *const ast.Expression) ?*const ast.Call {
-    return switch (expression.kind) {
-        .call => |*call| switch (ast.extractResolution(call.callee)) {
-            .builtin, .case => null,
-            else => call,
-        },
         else => null,
     };
 }

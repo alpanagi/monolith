@@ -2,21 +2,18 @@ import mn
 import mn::io
 import mn::memory
 
+external fn mn_runtime_fs_absolute(name: []Const(u8), buffer: []u8) -> i32
+
 external fn mn_runtime_fs_close(descriptor: i32)
-
 external fn mn_runtime_fs_close_directory(handle: *void)
-
 external fn mn_runtime_fs_next_entry(handle: *void, entry: *Directory::RawEntry) -> i32
-
 external fn mn_runtime_fs_open(name: []Const(u8), mode: i32) -> i32
-
 external fn mn_runtime_fs_open_directory(name: []Const(u8), code: *i32) -> ?*void
-
 external fn mn_runtime_fs_size(descriptor: i32) -> isize
 
 const maximum_path_length: usize = 4096
-
 const separator: u8 = '/'
+
 
 error Error
     is_directory
@@ -26,21 +23,24 @@ error Error
     permission_denied
     other
 
+
 struct File
     descriptor: i32
 
     fn open(path: Path, mode: Mode) -> Error!File
         var name: [maximum_path_length]u8 = undefined
-        const text = try path.text(name[..maximum_path_length - 1])
+        const text = try build_text(path, name[..maximum_path_length - 1])
         name[text.length] = 0
         const descriptor = mn_runtime_fs_open(name[..text.length + 1], find_mode_code(mode))
         if (descriptor < 0) return find_error(descriptor)
         return File{descriptor = descriptor}
 
+
     fn size(self: Self) -> io::Error!usize
         const byte_count = mn_runtime_fs_size(self.descriptor)
         if (byte_count < 0) return io::find_error(byte_count)
         return mn::convert(usize, byte_count)
+
 
     fn deinit(self: Self) = mn_runtime_fs_close(self.descriptor)
 
@@ -48,9 +48,43 @@ struct File
         read
         write
 
+
+fn build_text(path: Path, buffer: []u8) -> Error![]u8
+    const length = find_text_length(path)
+    if (length > buffer.length) return Error::name_too_long
+    fill_text(path, buffer[..length])
+    return buffer[..length]
+
+
+fn find_text_length(path: Path) -> usize
+    const parts = path.parts.items
+    if (parts.length == 0) return 1
+    var length: usize = if (path.is_absolute) 1 else 0
+    for index in 0..parts.length
+        if (index > 0) length += 1
+        length += parts[index].length
+    return length
+
+
+fn fill_text(path: Path, buffer: []u8)
+    const parts = path.parts.items
+    if parts.length == 0
+        buffer[0] = if (path.is_absolute) separator else '.'
+        return
+    var position: usize = 0
+    for index in 0..parts.length
+        if path.is_absolute or index > 0
+            buffer[position] = separator
+            position += 1
+        const part = parts[index]
+        memory::copy(buffer[position..position + part.length], part)
+        position += part.length
+
+
 fn find_mode_code(mode: File::Mode) -> i32 = match mode
     case (File::Mode::read) 0
     case (File::Mode::write) 1
+
 
 fn find_error(code: i32) -> Error = match code
     case (-1) Error::is_directory
@@ -60,22 +94,26 @@ fn find_error(code: i32) -> Error = match code
     case (-5) Error::permission_denied
     else Error::other
 
+
 instance io::Reader(File)
     fn read(file: File, buffer: []u8) -> io::Error!usize = io::read_descriptor(file.descriptor, buffer)
 
+
 instance io::Writer(File)
     fn write(file: File, bytes: []Const(u8)) -> !void = io::write_descriptor(file.descriptor, bytes)
+
 
 struct Directory
     handle: *void
 
     fn open(path: Path) -> Error!Directory
         var name: [maximum_path_length]u8 = undefined
-        const text = try path.text(name[..maximum_path_length - 1])
+        const text = try build_text(path, name[..maximum_path_length - 1])
         name[text.length] = 0
         var code: i32 = 0
         const handle = mn_runtime_fs_open_directory(name[..text.length + 1], &code) orelse return find_error(code)
         return Directory{handle = handle}
+
 
     fn next(self: Self) -> io::Error!?Entry
         var entry: RawEntry = undefined
@@ -83,6 +121,7 @@ struct Directory
         if (status < 0) return io::find_error(mn::convert(isize, status))
         if (status == 0) return null
         return Entry{name = entry.name[0..entry.length], kind = find_kind(entry.kind)}
+
 
     fn deinit(self: Self) = mn_runtime_fs_close_directory(self.handle)
 
@@ -101,22 +140,25 @@ struct Directory
         symbolic_link
         other
 
+
 fn find_kind(code: i32) -> Directory::Kind = match code
     case (0) Directory::Kind::file
     case (1) Directory::Kind::directory
     case (2) Directory::Kind::symbolic_link
     else Directory::Kind::other
 
+
 struct Path
     parts: mn::List([]u8)
-    absolute: bool
+    is_absolute: bool
 
-    fn new() -> Self = Self{parts = mn::List([]u8)::new(), absolute = false}
+    fn new() -> Self = Self{parts = mn::List([]u8)::new(), is_absolute = false}
+
 
     fn parse(text: []Const(u8)) -> memory::Error!Path
         var path = Path::new()
         errdefer path.deinit()
-        path.absolute = text.length > 0 and text[0] == separator
+        path.is_absolute = text.length > 0 and text[0] == separator
         var start: usize = 0
         for index in 0..text.length + 1
             if index == text.length or text[index] == separator
@@ -124,35 +166,37 @@ struct Path
                 start = index + 1
         return path
 
+
     fn push(self: *Self, name: []Const(u8)) -> memory::Error!void
         const part = try memory::allocate(u8, name.length)
         errdefer memory::free(part)
-        for (index in 0..name.length) part[index] = name[index]
+        memory::copy(part, name)
         try self.parts.append(part)
+
 
     fn pop(self: *Self)
         const part = self.parts.pop() orelse return
         memory::free(part)
 
-    fn text(self: Self, buffer: []u8) -> Error![]u8
-        const parts = self.parts.items
-        if parts.length == 0
-            if (buffer.length == 0) return Error::name_too_long
-            buffer[0] = if (self.absolute) separator else '.'
-            return buffer[..1]
-        var position: usize = 0
-        for index in 0..parts.length
-            if self.absolute or index > 0
-                if (position == buffer.length) return Error::name_too_long
-                buffer[position] = separator
-                position += 1
-            const part = parts[index]
-            if (part.length > buffer.length - position) return Error::name_too_long
-            for (offset in 0..part.length) buffer[position + offset] = part[offset]
-            position += part.length
-        return buffer[..position]
+
+    fn absolute(self: Self) -> (Error || memory::Error)!Path
+        var name: [maximum_path_length]u8 = undefined
+        const text = try build_text(self, name[..maximum_path_length - 1])
+        name[text.length] = 0
+        var resolved: [maximum_path_length]u8 = undefined
+        const length = mn_runtime_fs_absolute(name[..text.length + 1], &resolved)
+        if (length < 0) return find_error(length)
+        return try Path::parse(resolved[..mn::convert(usize, length)])
+
 
     fn deinit(self: *Self)
         for part in self.parts.items
             memory::free(part)
         self.parts.deinit()
+
+
+instance mn::To(Path, []u8)
+    fn to(path: Path, type U) -> !U
+        const text = try memory::allocate(u8, find_text_length(path))
+        fill_text(path, text)
+        return text

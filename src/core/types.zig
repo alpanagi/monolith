@@ -89,6 +89,7 @@ pub const Array = struct {
     length: u64,
     element: Type,
     variables: bool = false,
+    length_variable: ?Variable = null,
 };
 
 pub const Slice = struct {
@@ -150,9 +151,12 @@ pub const Constructor = union(enum) {
     typeclass_function: ast.Resolution.TypeclassFunction,
 };
 
+const placeholder_length: u64 = 1;
+
 pub const Argument = union(enum) {
     type: Type,
     constructor: Constructor,
+    length: u64,
 };
 
 pub const Registry = struct {
@@ -183,10 +187,25 @@ pub const Registry = struct {
         element: Type,
     ) std.mem.Allocator.Error!*const Array {
         for (self.arrays.items) |array| {
-            if (array.length == length and std.meta.eql(array.element, element)) return array;
+            if (array.length_variable == null and array.length == length and std.meta.eql(array.element, element)) return array;
         }
         const array = try allocator.create(Array);
         array.* = .{ .length = length, .element = element, .variables = hasVariables(element) };
+        try self.arrays.append(allocator, array);
+        return array;
+    }
+
+    pub fn addLengthVariableArray(
+        self: *Registry,
+        allocator: std.mem.Allocator,
+        variable: Variable,
+        element: Type,
+    ) std.mem.Allocator.Error!*const Array {
+        for (self.arrays.items) |array| {
+            if (std.meta.eql(array.length_variable, variable) and std.meta.eql(array.element, element)) return array;
+        }
+        const array = try allocator.create(Array);
+        array.* = .{ .length = placeholder_length, .element = element, .variables = true, .length_variable = variable };
         try self.arrays.append(allocator, array);
         return array;
     }
@@ -367,7 +386,7 @@ pub fn containsVariable(value_type: Type, scope: Scope) bool {
         .number, .boolean, .void, .type, .@"struct", .@"enum" => false,
         .pointer => |pointer| containsVariable(pointer.target, scope),
         .slice => |slice| containsVariable(slice.element, scope),
-        .array => |array| containsVariable(array.element, scope),
+        .array => |array| (array.length_variable != null and array.length_variable.?.scope == scope) or containsVariable(array.element, scope),
         .optional => |optional| containsVariable(optional.child, scope),
         .result => |result| containsVariable(result.value, scope),
         .tuple => |tuple| {
@@ -388,6 +407,7 @@ pub fn containsVariable(value_type: Type, scope: Scope) bool {
 pub fn matchArgument(pattern: Argument, concrete: Argument, scope: Scope, assigned: []?Argument) bool {
     return switch (pattern) {
         .type => |pattern_type| concrete == .type and matchType(pattern_type, concrete.type, scope, assigned, true),
+        .length => false,
         .constructor => |constructor| concrete == .constructor and matchConstructor(constructor, concrete.constructor, scope, assigned),
     };
 }
@@ -431,7 +451,8 @@ pub fn matchType(pattern: Type, concrete: Type, scope: Scope, assigned: []?Argum
             return matchType(slice.element, concrete.slice.element, scope, assigned, exact);
         },
         .array => |array| {
-            if (concrete != .array or concrete.array.length != array.length) return false;
+            if (concrete != .array) return false;
+            if (!matchLength(array, concrete.array, scope, assigned, exact)) return false;
             return matchType(array.element, concrete.array.element, scope, assigned, exact);
         },
         .optional => |optional| {
@@ -457,6 +478,19 @@ pub fn matchType(pattern: Type, concrete: Type, scope: Scope, assigned: []?Argum
             return matchType(function.return_type, concrete.function.return_type, scope, assigned, exact);
         },
     }
+}
+
+fn matchLength(pattern: *const Array, concrete: *const Array, scope: Scope, assigned: []?Argument, exact: bool) bool {
+    const variable = pattern.length_variable orelse {
+        return concrete.length_variable == null and concrete.length == pattern.length;
+    };
+    if (variable.scope != scope) return !exact or std.meta.eql(pattern.length_variable, concrete.length_variable);
+    if (concrete.length_variable != null) return false;
+    const earlier = assigned[variable.index] orelse {
+        assigned[variable.index] = .{ .length = concrete.length };
+        return true;
+    };
+    return earlier == .length and earlier.length == concrete.length;
 }
 
 pub fn substitute(
@@ -495,11 +529,14 @@ pub fn substitute(
             try substitute(allocator, registry, slice.element, arguments, scope),
             slice.constant,
         ) },
-        .array => |array| .{ .array = try registry.addArray(
-            allocator,
-            array.length,
-            try substitute(allocator, registry, array.element, arguments, scope),
-        ) },
+        .array => |array| {
+            const element = try substitute(allocator, registry, array.element, arguments, scope);
+            const variable = array.length_variable orelse {
+                return .{ .array = try registry.addArray(allocator, array.length, element) };
+            };
+            if (variable.scope != scope) return .{ .array = try registry.addLengthVariableArray(allocator, variable, element) };
+            return .{ .array = try registry.addArray(allocator, arguments[variable.index].length, element) };
+        },
         .optional => |optional| .{ .optional = try registry.addOptional(
             allocator,
             try substitute(allocator, registry, optional.child, arguments, scope),
@@ -534,6 +571,7 @@ pub fn unifyArguments(one: []const Argument, two: []const Argument, sides: Sides
             .constructor => |constructor| {
                 if (two_argument != .constructor or !std.meta.eql(constructor, two_argument.constructor)) return false;
             },
+            .length => unreachable,
         }
     }
     return true;
@@ -735,7 +773,7 @@ fn unifyType(one: Unified, two: Unified, sides: Sides) bool {
         },
         .array => |array| {
             const other = right.type;
-            if (other != .array or other.array.length != array.length) return false;
+            if (other != .array or !unifyLength(array, left.side, other.array, right.side, sides)) return false;
             return unifyParts(array.element, left.side, other.array.element, right.side, sides);
         },
         .optional => |optional| {
@@ -763,6 +801,31 @@ fn unifyType(one: Unified, two: Unified, sides: Sides) bool {
             return unifyParts(function.return_type, left.side, other.function.return_type, right.side, sides);
         },
     }
+}
+
+fn unifyLength(one: *const Array, one_side: Side, two: *const Array, two_side: Side, sides: Sides) bool {
+    const left = followLength(.{ .type = .{ .array = one }, .side = one_side }, sides);
+    const right = followLength(.{ .type = .{ .array = two }, .side = two_side }, sides);
+    const left_variable = left.type.array.length_variable;
+    const right_variable = right.type.array.length_variable;
+    if (left_variable) |variable| {
+        if (left.side == right.side and std.meta.eql(left_variable, right_variable)) return true;
+        sides.find(left.side)[variable.index] = right;
+        return true;
+    }
+    if (right_variable) |variable| {
+        sides.find(right.side)[variable.index] = left;
+        return true;
+    }
+    return left.type.array.length == right.type.array.length;
+}
+
+fn followLength(term: Unified, sides: Sides) Unified {
+    var current = term;
+    while (current.type.array.length_variable) |variable| {
+        current = sides.find(current.side)[variable.index] orelse return current;
+    }
+    return current;
 }
 
 fn unifyParts(one: Type, one_side: Side, two: Type, two_side: Side, sides: Sides) bool {
