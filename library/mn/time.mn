@@ -1,0 +1,40 @@
+import mn::codec::Decode
+import mn::codec::Decoder
+import mn::codec::Encode
+import mn::codec::Encoder
+
+private external fn mn_runtime_time_wall_clock(seconds: *i64, nanoseconds: *u32)
+private external fn mn_runtime_time_monotonic_clock() -> i64
+
+
+struct WallTime
+    seconds: i64
+    nanoseconds: u32
+
+
+instance Encode(WallTime)
+
+    fn encode(wall_time: *const(Self), encoder: *Encoder) -> !void
+        try encoder.i64(wall_time.seconds)
+        try encoder.u32(wall_time.nanoseconds)
+
+
+instance Decode(WallTime)
+
+    fn decode(decoder: *Decoder) -> own !Self
+        const seconds = try decoder.i64()
+        const nanoseconds = try decoder.u32()
+        return { seconds = seconds, nanoseconds = nanoseconds }
+
+
+struct MonotonicTime
+    nanoseconds: i64
+
+
+fn wall_clock() -> WallTime
+    var reading: WallTime = { seconds = 0, nanoseconds = 0 }
+    mn_runtime_time_wall_clock(&reading.seconds, &reading.nanoseconds)
+    return reading
+
+
+fn monotonic_clock() -> MonotonicTime = { nanoseconds = mn_runtime_time_monotonic_clock() }

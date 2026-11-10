@@ -1,0 +1,27 @@
+import mn::memory
+
+
+typeclass Reader(type R)
+
+    fn read(reader: *R, buffer: []u8) -> !usize
+
+
+typeclass Writer(type W)
+
+    fn write(writer: *W, bytes: []const(u8)) -> !void
+
+
+struct Bytes
+    private remaining: []const(u8)
+
+    fn init(bytes: []const(u8)) -> Self = { remaining = bytes }
+
+
+instance Reader(Bytes)
+
+    fn read(source: *Self, buffer: []u8) -> !usize
+        var count = source.remaining.length
+        if (buffer.length < count) count = buffer.length
+        memory::copy(buffer[..count], source.remaining[..count])
+        source.remaining = source.remaining[count..]
+        return count

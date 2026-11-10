@@ -41,7 +41,7 @@ pub const Analyzer = struct {
             self.recordFailure(self.name_resolver.failure orelse self.type_checker.failure);
             return resolve_error;
         };
-        const program: ast.Program = .{ .modules = self.loader.modules.items, .types = self.type_checker.program.types };
+        var program: ast.Program = .{ .modules = self.loader.modules.items, .types = self.type_checker.program.types };
         self.type_checker.program = program;
         self.type_checker.failure = null;
         self.type_checker.check() catch |type_error| {
@@ -49,11 +49,16 @@ pub const Analyzer = struct {
             return type_error;
         };
         try self.appendInstances();
+        program.skipped_defers = self.type_checker.skipped_defers.items;
         return program;
     }
 
     pub fn collectCallTrace(self: *const Analyzer, allocator: std.mem.Allocator, failure: Failure) std.mem.Allocator.Error![]const CallNote {
         var notes: std.ArrayList(CallNote) = .empty;
+        if (self.type_checker.trace.len > 0) {
+            for (self.type_checker.trace) |call| try notes.append(allocator, .{ .module = call.module, .location = call.location });
+            return notes.items;
+        }
         var function = failure.function;
         while (function) |current| {
             const call = self.type_checker.findCreatingCall(current) orelse break;

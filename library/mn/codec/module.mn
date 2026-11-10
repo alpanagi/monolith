@@ -1,0 +1,310 @@
+import mn::memory
+import mn::memory::Deinit
+
+
+error Error
+    Malformed
+
+
+typeclass Encode(type T)
+
+    fn encode(value: *const(T), encoder: *Encoder) -> !void
+
+
+typeclass Encoder(type E)
+
+    fn i8(self: *E, value: i8) -> !void
+    fn i16(self: *E, value: i16) -> !void
+    fn i32(self: *E, value: i32) -> !void
+    fn i64(self: *E, value: i64) -> !void
+    fn i128(self: *E, value: i128) -> !void
+    fn isize(self: *E, value: isize) -> !void
+    fn u8(self: *E, value: u8) -> !void
+    fn u16(self: *E, value: u16) -> !void
+    fn u32(self: *E, value: u32) -> !void
+    fn u64(self: *E, value: u64) -> !void
+    fn u128(self: *E, value: u128) -> !void
+    fn usize(self: *E, value: usize) -> !void
+    fn f16(self: *E, value: f16) -> !void
+    fn f32(self: *E, value: f32) -> !void
+    fn f64(self: *E, value: f64) -> !void
+    fn f128(self: *E, value: f128) -> !void
+    fn bool(self: *E, value: bool) -> !void
+    fn bytes(self: *E, value: []const(u8)) -> !void
+    fn absent(self: *E) -> !void
+    fn present(self: *E) -> !void
+    fn sequence(self: *E, count: usize) -> !void
+    fn map(self: *E, count: usize) -> !void
+    fn structure(self: *E, count: usize) -> !void
+    fn field(self: *E, name: []const(u8)) -> !void
+    fn tuple(self: *E, count: usize) -> !void
+    fn variant(self: *E, name: []const(u8), number: usize) -> !void
+    fn(type T: Encode) encode(self: *E, value: *const(T)) -> !void
+
+
+typeclass Decode(type T)
+
+    fn decode(decoder: *Decoder) -> own !T
+
+
+typeclass Decoder(type D)
+
+    fn i8(self: *D) -> !i8
+    fn i16(self: *D) -> !i16
+    fn i32(self: *D) -> !i32
+    fn i64(self: *D) -> !i64
+    fn i128(self: *D) -> !i128
+    fn isize(self: *D) -> !isize
+    fn u8(self: *D) -> !u8
+    fn u16(self: *D) -> !u16
+    fn u32(self: *D) -> !u32
+    fn u64(self: *D) -> !u64
+    fn u128(self: *D) -> !u128
+    fn usize(self: *D) -> !usize
+    fn f16(self: *D) -> !f16
+    fn f32(self: *D) -> !f32
+    fn f64(self: *D) -> !f64
+    fn f128(self: *D) -> !f128
+    fn bool(self: *D) -> !bool
+    fn bytes(self: *D) -> own ![]u8
+    fn is_present(self: *D) -> !bool
+    fn sequence(self: *D) -> !usize
+    fn map(self: *D) -> !usize
+    fn structure(self: *D, count: usize) -> !void
+    fn field(self: *D, name: []const(u8)) -> !void
+    fn tuple(self: *D, count: usize) -> !void
+    fn variant(self: *D, names: []const([]const(u8))) -> !usize
+    fn decode(self: *D, type T: Decode) -> own !T
+
+
+instance Encode(i8)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.i8(value.*)
+
+
+instance Decode(i8)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.i8()
+
+
+instance Encode(i16)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.i16(value.*)
+
+
+instance Decode(i16)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.i16()
+
+
+instance Encode(i32)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.i32(value.*)
+
+
+instance Decode(i32)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.i32()
+
+
+instance Encode(i64)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.i64(value.*)
+
+
+instance Decode(i64)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.i64()
+
+
+instance Encode(i128)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.i128(value.*)
+
+
+instance Decode(i128)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.i128()
+
+
+instance Encode(isize)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.isize(value.*)
+
+
+instance Decode(isize)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.isize()
+
+
+instance Encode(u8)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.u8(value.*)
+
+
+instance Decode(u8)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.u8()
+
+
+instance Encode(u16)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.u16(value.*)
+
+
+instance Decode(u16)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.u16()
+
+
+instance Encode(u32)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.u32(value.*)
+
+
+instance Decode(u32)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.u32()
+
+
+instance Encode(u64)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.u64(value.*)
+
+
+instance Decode(u64)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.u64()
+
+
+instance Encode(u128)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.u128(value.*)
+
+
+instance Decode(u128)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.u128()
+
+
+instance Encode(usize)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.usize(value.*)
+
+
+instance Decode(usize)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.usize()
+
+
+instance Encode(f16)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.f16(value.*)
+
+
+instance Decode(f16)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.f16()
+
+
+instance Encode(f32)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.f32(value.*)
+
+
+instance Decode(f32)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.f32()
+
+
+instance Encode(f64)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.f64(value.*)
+
+
+instance Decode(f64)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.f64()
+
+
+instance Encode(f128)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.f128(value.*)
+
+
+instance Decode(f128)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.f128()
+
+
+instance Encode(bool)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.bool(value.*)
+
+
+instance Decode(bool)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.bool()
+
+
+instance Encode([]const(u8))
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.bytes(value.*)
+
+
+instance Encode([]u8)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void = encoder.bytes(value.*)
+
+
+instance Decode([]u8)
+
+    fn decode(decoder: *Decoder) -> own !Self = decoder.bytes()
+
+
+instance(type A: Encode) Encode(?A)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void
+        if value.* as *inner
+            try encoder.present()
+            try encoder.encode(inner)
+        else
+            try encoder.absent()
+
+
+instance(type A: Decode) Decode(?A)
+
+    fn decode(decoder: *Decoder) -> own !Self
+        if (!try decoder.is_present()) return null
+        const own inner = try decoder.decode(A)
+        return inner
+
+
+instance(type A: Encode, comptime N: usize) Encode([N]A)
+
+    fn encode(value: *const(Self), encoder: *Encoder) -> !void
+        try encoder.sequence(N)
+        if N > 0
+            for *element in value
+                try encoder.encode(element)
+
+
+instance(type A: Decode and Deinit, comptime N: usize) Decode([N]A)
+
+    fn decode(decoder: *Decoder) -> own !Self
+        if (try decoder.sequence() != N) return Error::Malformed
+        var own elements: Self = undefined
+        if N > 0
+            var count: usize = 0
+            errdefer drain_elements(A, N, &elements, count)
+            while count < N
+                const own element = try decoder.decode(A)
+                elements[count] = own element
+                count += 1
+        return elements
+
+
+private fn drain_elements(type A, comptime N: usize, elements: *[N]A, count: usize)
+    for index in 0..count
+        var own element = memory::move(&elements[index])
+        element.deinit(own)

@@ -1,0 +1,92 @@
+import mn::memory
+
+
+typeclass Equal(type T)
+
+    fn equal(one: *const(T), two: *const(T)) -> bool
+
+
+instance Equal(i8)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+
+
+instance Equal(i16)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+
+
+instance Equal(i32)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+
+
+instance Equal(i64)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+
+
+instance Equal(i128)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+
+
+instance Equal(isize)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+
+
+instance Equal(u8)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+
+
+instance Equal(u16)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+
+
+instance Equal(u32)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+
+
+instance Equal(u64)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+
+
+instance Equal(u128)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+
+
+instance Equal(usize)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+
+
+instance Equal(bool)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+
+
+instance Equal([]const(u8))
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = memory::equal(one.*, two.*)
+
+
+instance Equal([]u8)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = memory::equal(one.*, two.*)
+
+
+instance(type A: Equal, comptime N: usize) Equal([N]A)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool
+        if N == 0
+            return true
+        else
+            for index in 0..N
+                if (!Equal::equal(&one.*[index], &two.*[index])) return false
+            return true

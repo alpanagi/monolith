@@ -1,12 +1,12 @@
 import mn
-import mn::io
-import mn::io::Reader
+import mn::compare::Equal
 import mn::math
 import mn::memory
+import mn::stream::Reader
 
 const block_size: usize = 64
 const buffer_size: usize = 65536
-const initial_state: [8]u32 = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19}
+const initial_state: [8]u32 = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 }
 
 
 const round_constants: [64]u32 = {
@@ -21,7 +21,110 @@ const round_constants: [64]u32 = {
 }
 
 
-fn sha256(reader: io::Reader) -> io::Error![32]u8
+typeclass Hash(type T: Equal)
+
+    fn hash(value: *const(T)) -> u64
+
+
+instance Hash(i8)
+
+    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::truncate(u64, value.*))
+
+
+instance Hash(i16)
+
+    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::truncate(u64, value.*))
+
+
+instance Hash(i32)
+
+    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::truncate(u64, value.*))
+
+
+instance Hash(i64)
+
+    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::truncate(u64, value.*))
+
+
+instance Hash(i128)
+
+    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::truncate(u64, value.*)) ^ splitmix64(mn::truncate(u64, value.* >> 64))
+
+
+instance Hash(isize)
+
+    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::truncate(u64, value.*))
+
+
+instance Hash(u8)
+
+    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::convert(u64, value.*))
+
+
+instance Hash(u16)
+
+    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::convert(u64, value.*))
+
+
+instance Hash(u32)
+
+    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::convert(u64, value.*))
+
+
+instance Hash(u64)
+
+    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::convert(u64, value.*))
+
+
+instance Hash(u128)
+
+    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::truncate(u64, value.*)) ^ splitmix64(mn::truncate(u64, value.* >> 64))
+
+
+instance Hash(usize)
+
+    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::convert(u64, value.*))
+
+
+instance Hash(bool)
+
+    fn hash(value: *const(Self)) -> u64 = splitmix64(if (value.*) 1 else 0)
+
+
+instance Hash([]const(u8))
+
+    fn hash(value: *const(Self)) -> u64 = splitmix64(fnv1a64(value.*))
+
+
+instance Hash([]u8)
+
+    fn hash(value: *const(Self)) -> u64 = splitmix64(fnv1a64(value.*))
+
+
+instance(type A: Hash, comptime N: usize) Hash([N]A)
+
+    fn hash(value: *const(Self)) -> u64
+        var state: u64 = 0
+        for *element in value.*
+            state = splitmix64(state ^ Hash::hash(element))
+        return state
+
+
+fn splitmix64(number: u64) -> u64
+    var value = math::add_wrapping(number, 0x9e3779b97f4a7c15)
+    value = math::multiply_wrapping(value ^ (value >> 30), 0xbf58476d1ce4e5b9)
+    value = math::multiply_wrapping(value ^ (value >> 27), 0x94d049bb133111eb)
+    return value ^ (value >> 31)
+
+
+fn fnv1a64(bytes: []const(u8)) -> u64
+    var state: u64 = 0xcbf29ce484222325
+    for byte in bytes
+        state = math::multiply_wrapping(state ^ mn::convert(u64, byte), 0x100000001b3)
+    return state
+
+
+fn sha256(reader: *Reader) -> ![32]u8
     var state = initial_state
     var buffer: [buffer_size]u8 = undefined
     var filled: usize = 0
@@ -53,7 +156,7 @@ fn sha256(reader: io::Reader) -> io::Error![32]u8
     return digest
 
 
-fn compress(state: *[8]u32, block: []Const(u8))
+fn compress(state: *[8]u32, block: []const(u8))
     var schedule: [64]u32 = undefined
     for index in 0..16
         const start = index * 4

@@ -1,0 +1,8 @@
+typeclass To(type T, type U)
+
+    fn to(value: T, type U) -> !U
+
+
+typeclass ToOwned(type T, type U)
+
+    fn to_owned(own value: *T) -> own !U

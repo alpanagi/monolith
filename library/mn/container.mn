@@ -1,0 +1,432 @@
+import mn
+import mn::codec
+import mn::codec::Decode
+import mn::codec::Decoder
+import mn::codec::Encode
+import mn::codec::Encoder
+import mn::compare::Equal
+import mn::convert::ToOwned
+import mn::hash::Hash
+import mn::iterator::Zip
+import mn::iterator::Zipped
+import mn::memory
+import mn::memory::Clone
+import mn::memory::Deinit
+import mn::stream
+
+
+fn ArrayList(type T) -> type
+    return struct
+        private own storage: []T
+        private count: usize
+
+        fn init() -> own Self = { storage = {}, count = 0 }
+
+
+        fn length(self: *const(Self)) -> usize = self.count
+
+
+        fn items(self: *const(Self)) -> []T = self.storage[0..self.count]
+
+
+        fn append(self: *Self, own value: T) -> memory::Error!void
+            if self.count == self.storage.length
+                var capacity: usize = 8
+                if (self.storage.length > 0) capacity = self.storage.length * 2
+                if self.storage.length > 0 and memory::resize(self.storage, capacity)
+                    memory::refit(&self.storage, capacity)
+                else
+                    const own storage = try memory::allocate(T, capacity)
+                    memory::copy(storage[..self.count], self.storage[..self.count])
+                    if self.storage.length > 0
+                        memory::free(memory::replace(&self.storage, own storage))
+                    else
+                        self.storage = own storage
+            self.storage[self.count] = own value
+            self.count += 1
+
+
+        fn pop(self: *Self) -> own ?T
+            if (self.count == 0) return null
+            self.count -= 1
+            const own value = memory::move(&self.storage[self.count])
+            return value
+
+
+instance(type E) Deinit(ArrayList(E))
+
+    fn deinit(own list: *Self) = memory::free(own list.storage)
+
+
+instance(type E) ToOwned(ArrayList(E), []E)
+
+    fn to_owned(own list: *Self) -> own ![]E
+        const length = list.count
+        if length == 0
+            memory::free(own list.storage)
+            return {}
+        if (length < list.storage.length) try shrink(E, &list.storage, length)
+        return list.storage
+
+
+instance stream::Writer(ArrayList(u8))
+
+    fn write(list: *Self, bytes: []const(u8)) -> !void
+        for byte in bytes
+            try list.append(byte)
+
+
+instance(type A: Encode) Encode(ArrayList(A))
+
+    fn encode(list: *const(Self), encoder: *Encoder) -> !void
+        try encoder.sequence(list.count)
+        for *element in list.items()
+            try encoder.encode(element)
+
+
+instance(type A: Decode and Deinit) Decode(ArrayList(A))
+
+    fn decode(decoder: *Decoder) -> own !Self
+        const count = try decoder.sequence()
+        var own list = Self::init()
+        errdefer drain_list(A, own &list)
+        for _ in 0..count
+            const own element = try decoder.decode(A)
+            errdefer element.deinit(own)
+            try list.append(own element)
+        return list
+
+
+private fn drain_list(type A, own list: *ArrayList(A))
+    while list.pop() as own element
+        element.deinit(own)
+    list.deinit(own)
+
+
+fn HashMap(type K: Hash and Clone, type V) -> type
+    return struct
+        private own key_storage: []K
+        private own value_storage: []V
+        private own table: []usize
+        private count: usize
+
+        fn init() -> own Self = { key_storage = {}, value_storage = {}, table = {}, count = 0 }
+
+
+        fn length(self: *const(Self)) -> usize = self.count
+
+
+        fn put(self: *Self, key: *const(K), own value: V) -> own memory::Error!?V
+            if find_table_slot(self.table, self.key_storage, key) as slot
+                return memory::replace(&self.value_storage[self.table[slot] - 1], own value)
+            if (self.count == self.key_storage.length) try self.grow()
+            const own stored = try Clone::clone(key)
+            self.key_storage[self.count] = own stored
+            self.value_storage[self.count] = own value
+            self.count += 1
+            place_in_table(self.table, self.key_storage, self.count - 1)
+            return null
+
+
+        fn get_or_put(self: *Self, key: *const(K)) -> memory::Error!Slot
+            if find_table_slot(self.table, self.key_storage, key) as table_slot
+                const position = self.table[table_slot] - 1
+                return { key = &self.key_storage[position], value = &self.value_storage[position], found = true }
+            if (self.count == self.key_storage.length) try self.grow()
+            const position = self.count
+            place_key_in_table(self.table, key, position)
+            self.count += 1
+            return { key = &self.key_storage[position], value = &self.value_storage[position], found = false }
+
+
+        fn get(self: *const(Self), key: *const(K)) -> ?*const(V)
+            const slot = find_table_slot(self.table, self.key_storage, key) orelse return null
+            return &self.value_storage[self.table[slot] - 1]
+
+
+        fn contains(self: *const(Self), key: *const(K)) -> bool = find_table_slot(self.table, self.key_storage, key) != null
+
+
+        fn remove(self: *Self, key: *const(K)) -> own ?[K, V]
+            const slot = find_table_slot(self.table, self.key_storage, key) orelse return null
+            const position = self.table[slot] - 1
+            const own removed: [K, V] = { memory::move(&self.key_storage[position]), memory::move(&self.value_storage[position]) }
+            remove_table_slot(self.table, self.key_storage, slot)
+            const last = self.count - 1
+            if position != last
+                self.table[find_position_table_slot(self.table, self.key_storage, last)] = position + 1
+                const own last_key = memory::move(&self.key_storage[last])
+                self.key_storage[position] = own last_key
+                const own last_value = memory::move(&self.value_storage[last])
+                self.value_storage[position] = own last_value
+            self.count = last
+            return removed
+
+
+        fn pop(self: *Self) -> own ?[K, V]
+            if (self.count == 0) return null
+            const last = self.count - 1
+            const slot = find_position_table_slot(self.table, self.key_storage, last)
+            const own removed: [K, V] = { memory::move(&self.key_storage[last]), memory::move(&self.value_storage[last]) }
+            remove_table_slot(self.table, self.key_storage, slot)
+            self.count = last
+            return removed
+
+
+        fn keys(self: *const(Self)) -> []const(K) = self.key_storage[0..self.count]
+
+        fn values(self: *const(Self)) -> []V = self.value_storage[0..self.count]
+
+        fn iterator(self: *const(Self)) -> Zipped([[]const(K), []V]) = Zip::zip({ self.keys(), self.values() })
+
+
+        fn clear(self: *Self)
+            for (index in 0..self.table.length) self.table[index] = 0
+            self.count = 0
+
+
+        fn grow(self: *Self) -> memory::Error!void
+            var table_length: usize = 8
+            if (self.table.length > 0) table_length = self.table.length * 2
+            const capacity = table_length / 4 * 3
+            const own key_storage = try memory::allocate(K, capacity)
+            errdefer memory::free(own key_storage)
+            const own value_storage = try memory::allocate(V, capacity)
+            errdefer memory::free(own value_storage)
+            const own table = try memory::allocate(usize, table_length)
+            memory::copy(key_storage[..self.count], self.keys())
+            memory::copy(value_storage[..self.count], self.values())
+            fill_table(table, key_storage[..self.count])
+            if self.table.length > 0
+                memory::free(memory::replace(&self.key_storage, own key_storage))
+                memory::free(memory::replace(&self.value_storage, own value_storage))
+                memory::free(memory::replace(&self.table, own table))
+            else
+                self.key_storage = own key_storage
+                self.value_storage = own value_storage
+                self.table = own table
+
+        struct Slot
+            key: *K
+            value: *V
+            found: bool
+
+
+instance(type K: Hash and Clone, type V) Deinit(HashMap(K, V))
+
+    fn deinit(own map: *Self)
+        memory::free(own map.key_storage)
+        memory::free(own map.value_storage)
+        memory::free(own map.table)
+
+
+instance(type K: Hash and Clone and Encode, type V: Encode) Encode(HashMap(K, V))
+
+    fn encode(map: *const(Self), encoder: *Encoder) -> !void
+        try encoder.map(map.count)
+        for { *key, *value } in map.iterator()
+            try encoder.encode(key)
+            try encoder.encode(value)
+
+
+instance(type K: Hash and Clone and Decode and Deinit, type V: Decode and Deinit) Decode(HashMap(K, V))
+
+    fn decode(decoder: *Decoder) -> own !Self
+        const count = try decoder.map()
+        var own map = Self::init()
+        errdefer drain_map(K, V, own &map)
+        for _ in 0..count
+            const own key = try decoder.decode(K)
+            errdefer key.deinit(own)
+            const own value = try decoder.decode(V)
+            errdefer value.deinit(own)
+            const slot = try map.get_or_put(&key)
+            if (slot.found) return codec::Error::Malformed
+            slot.key.* = own key
+            slot.value.* = own value
+        return map
+
+
+private fn drain_map(type K, type V, own map: *HashMap(K, V))
+    while map.pop() as own { key, value }
+        key.deinit(own)
+        value.deinit(own)
+    map.deinit(own)
+
+
+fn HashSet(type T: Hash) -> type
+    return struct
+        private own value_storage: []T
+        private own table: []usize
+        private count: usize
+
+        fn init() -> own Self = { value_storage = {}, table = {}, count = 0 }
+
+
+        fn length(self: *const(Self)) -> usize = self.count
+
+
+        fn insert(self: *Self, own value: T) -> own memory::Error!?T
+            if (self.contains(&value)) return value
+            if (self.count == self.value_storage.length) try self.grow()
+            self.value_storage[self.count] = own value
+            self.count += 1
+            place_in_table(self.table, self.value_storage, self.count - 1)
+            return null
+
+
+        fn contains(self: *const(Self), value: *const(T)) -> bool = find_table_slot(self.table, self.value_storage, value) != null
+
+
+        fn remove(self: *Self, value: *const(T)) -> own ?T
+            const slot = find_table_slot(self.table, self.value_storage, value) orelse return null
+            const position = self.table[slot] - 1
+            const own removed = memory::move(&self.value_storage[position])
+            remove_table_slot(self.table, self.value_storage, slot)
+            const last = self.count - 1
+            if position != last
+                self.table[find_position_table_slot(self.table, self.value_storage, last)] = position + 1
+                const own last_value = memory::move(&self.value_storage[last])
+                self.value_storage[position] = own last_value
+            self.count = last
+            return removed
+
+
+        fn pop(self: *Self) -> own ?T
+            if (self.count == 0) return null
+            const last = self.count - 1
+            const slot = find_position_table_slot(self.table, self.value_storage, last)
+            const own removed = memory::move(&self.value_storage[last])
+            remove_table_slot(self.table, self.value_storage, slot)
+            self.count = last
+            return removed
+
+
+        fn values(self: *const(Self)) -> []const(T) = self.value_storage[0..self.count]
+
+
+        fn clear(self: *Self)
+            for (index in 0..self.table.length) self.table[index] = 0
+            self.count = 0
+
+
+        fn grow(self: *Self) -> memory::Error!void
+            var table_length: usize = 8
+            if (self.table.length > 0) table_length = self.table.length * 2
+            const capacity = table_length / 4 * 3
+            const own value_storage = try memory::allocate(T, capacity)
+            errdefer memory::free(own value_storage)
+            const own table = try memory::allocate(usize, table_length)
+            memory::copy(value_storage[..self.count], self.values())
+            fill_table(table, value_storage[..self.count])
+            if self.table.length > 0
+                memory::free(memory::replace(&self.value_storage, own value_storage))
+                memory::free(memory::replace(&self.table, own table))
+            else
+                self.value_storage = own value_storage
+                self.table = own table
+
+
+instance(type T: Hash) Deinit(HashSet(T))
+
+    fn deinit(own set: *Self)
+        memory::free(own set.value_storage)
+        memory::free(own set.table)
+
+
+instance(type T: Hash) ToOwned(HashSet(T), []T)
+
+    fn to_owned(own set: *Self) -> own ![]T
+        const length = set.count
+        if length == 0
+            memory::free(own set.table)
+            memory::free(own set.value_storage)
+            return {}
+        try shrink(T, &set.value_storage, length)
+        memory::free(own set.table)
+        return set.value_storage
+
+
+instance(type T: Hash and Encode) Encode(HashSet(T))
+
+    fn encode(set: *const(Self), encoder: *Encoder) -> !void
+        try encoder.sequence(set.count)
+        for *value in set.values()
+            try encoder.encode(value)
+
+
+instance(type T: Hash and Decode and Deinit) Decode(HashSet(T))
+
+    fn decode(decoder: *Decoder) -> own !Self
+        const count = try decoder.sequence()
+        var own set = Self::init()
+        errdefer drain_set(T, own &set)
+        for _ in 0..count
+            const own value = try decoder.decode(T)
+            errdefer value.deinit(own)
+            const own refused = try set.insert(own value)
+            if refused as own other
+                other.deinit(own)
+                return codec::Error::Malformed
+        return set
+
+
+private fn drain_set(type T, own set: *HashSet(T))
+    while set.pop() as own value
+        value.deinit(own)
+    set.deinit(own)
+
+
+private fn shrink(type T, storage: *[]T, length: usize) -> memory::Error!void
+    if memory::resize(storage.*, length)
+        memory::refit(storage, length)
+        return
+    const own exact = try memory::allocate(T, length)
+    memory::copy(exact, storage.*[..length])
+    memory::free(memory::replace(storage, own exact))
+
+
+private fn(type K: Hash) find_table_slot(table: []const(usize), keys: []const(K), key: *const(K)) -> ?usize
+    if (table.length == 0) return null
+    const mask = table.length - 1
+    var slot = mn::truncate(usize, Hash::hash(key)) & mask
+    while table[slot] != 0
+        if (Equal::equal(&keys[table[slot] - 1], key)) return slot
+        slot = (slot + 1) & mask
+    return null
+
+
+private fn(type K: Hash) find_position_table_slot(table: []const(usize), keys: []const(K), position: usize) -> usize
+    const mask = table.length - 1
+    var slot = mn::truncate(usize, Hash::hash(&keys[position])) & mask
+    while (table[slot] != position + 1) slot = (slot + 1) & mask
+    return slot
+
+
+private fn(type K: Hash) remove_table_slot(table: []usize, keys: []const(K), slot: usize)
+    const capacity = table.length
+    const mask = capacity - 1
+    var hole = slot
+    var next = (hole + 1) & mask
+    while table[next] != 0
+        const home = mn::truncate(usize, Hash::hash(&keys[table[next] - 1])) & mask
+        if ((next + capacity - home) & mask) >= ((next + capacity - hole) & mask)
+            table[hole] = table[next]
+            hole = next
+        next = (next + 1) & mask
+    table[hole] = 0
+
+
+private fn(type K: Hash) fill_table(table: []usize, keys: []const(K))
+    for (index in 0..table.length) table[index] = 0
+    for (position in 0..keys.length) place_in_table(table, keys, position)
+
+
+private fn(type K: Hash) place_in_table(table: []usize, keys: []const(K), position: usize) = place_key_in_table(table, &keys[position], position)
+
+
+private fn(type K: Hash) place_key_in_table(table: []usize, key: *const(K), position: usize)
+    const mask = table.length - 1
+    var slot = mn::truncate(usize, Hash::hash(key)) & mask
+    while (table[slot] != 0) slot = (slot + 1) & mask
+    table[slot] = position + 1

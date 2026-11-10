@@ -1,33 +1,34 @@
 import mn
 
-external fn mn_runtime_memory_allocate(size: usize, alignment: usize) -> ?*Many(u8)
-external fn mn_runtime_memory_copy(destination: *void, source: *Const(void), size: usize)
+private external fn mn_runtime_memory_allocate(size: usize, alignment: usize) -> ?*many(u8)
+private external fn mn_runtime_memory_copy(destination: *void, source: *const(void), size: usize)
 
-external fn mn_runtime_memory_free(pointer: *Many(u8))
+private external fn mn_runtime_memory_free(pointer: *many(u8))
 
 const arena_block_size: usize = 4096
 
 
 error Error
-    out_of_memory
+    OutOfMemory
 
 
 typeclass Allocator(type A)
-    fn allocate(allocator: *A, type T, count: usize) -> Error![]T
+
+    fn allocate(allocator: *A, type T, count: usize) -> own Error![]T
     fn(type T) resize(allocator: *A, items: []T, count: usize) -> bool
-    fn(type T) free(allocator: *A, items: []Const(T))
+    fn(type T) free(allocator: *A, own items: []const(T))
 
 
-    fn create(allocator: *A, type T) -> Error!*T
-        const items = try Allocator::allocate(allocator, T, 1)
+    fn create(allocator: *A, type T) -> own Error!*T
+        const own items = try Allocator::allocate(allocator, T, 1)
         return &items[0]
 
 
-    fn(type T) destroy(allocator: *A, pointer: *Const(T))
-        Allocator::free(allocator, mn::cast(*Many(Const(T)), pointer)[0..1])
+    fn(type T) destroy(allocator: *A, own pointer: *const(T))
+        Allocator::free(allocator, mn::cast(*many(const(T)), pointer)[0..1])
 
 
-fn allocate(type T, count: usize) -> Error![]T
+fn allocate(type T, count: usize) -> own Error![]T
     with allocator
     return allocator.allocate(T, count)
 
@@ -37,64 +38,76 @@ fn(type T) resize(items: []T, count: usize) -> bool
     return allocator.resize(items, count)
 
 
-fn(type T) free(items: []Const(T))
+fn(type T) free(own items: []const(T))
     with allocator
-    allocator.free(items)
+    allocator.free(own items)
 
 
-fn create(type T) -> Error!*T
+fn create(type T) -> own Error!*T
     with allocator
     return allocator.create(T)
 
 
-fn(type T) destroy(pointer: *Const(T))
+fn(type T) destroy(own pointer: *const(T))
     with allocator
-    allocator.destroy(pointer)
+    allocator.destroy(own pointer)
 
 
 struct Heap
-    fn new() -> Self = Self{}
+
+    fn init() -> Self = {}
 
 
 instance Allocator(Heap)
-    fn allocate(_: *Heap, type T, count: usize) -> Error![]T
-        const pointer = mn_runtime_memory_allocate(mn::size(T) * count, mn::alignment(T)) orelse return Error::out_of_memory
-        return mn::cast(*Many(T), pointer)[0..count]
+
+    fn allocate(_: *Self, type T, count: usize) -> own Error![]T
+        if (count == 0) return {}
+        if mn::size(T) == 0
+            const empty: []T = {}
+            return empty.pointer[0..count]
+        const pointer = mn_runtime_memory_allocate(mn::size(T) * count, mn::alignment(T)) orelse return Error::OutOfMemory
+        return mn::cast(*many(T), pointer)[0..count]
 
 
-    fn(type T) resize(_: *Heap, items: []T, count: usize) -> bool = count <= items.length
+    fn(type T) resize(_: *Self, items: []T, count: usize) -> bool = count <= items.length
 
-    fn(type T) free(_: *Heap, items: []Const(T)) = mn_runtime_memory_free(mn::cast(*Many(u8), items.pointer))
+    fn(type T) free(_: *Self, own items: []const(T))
+        if (items.length == 0) return
+        mn_runtime_memory_free(mn::cast(*many(u8), items.pointer))
+
+
+struct None
 
 
 fn Arena(type P: Allocator) -> type
     return struct
-        parent: P
-        block: ?*Many(u8)
+        private parent: P
+        private own block: ?*many(u8)
         used: usize
         capacity: usize
         last: usize
 
-        fn new(parent: P) -> Self = Self{parent = parent, block = null, used = 0, capacity = 0, last = 0}
+        fn init(parent: P) -> own Self = { parent = parent, block = null, used = 0, capacity = 0, last = 0 }
 
 
         fn free_all(self: *Self)
             while self.block as block
                 const header = mn::cast(*ArenaBlock, block)
                 self.block = header.previous
-                self.parent.free(mn::cast(*Many(ArenaBlock), block)[0..header.size / mn::size(ArenaBlock)])
+                self.parent.free(mn::cast(*many(ArenaBlock), block)[0..header.size / mn::size(ArenaBlock)])
             self.used = 0
             self.capacity = 0
             self.last = 0
 
 
 struct ArenaBlock
-    previous: ?*Many(u8)
+    previous: ?*many(u8)
     size: usize
 
 
 instance(type P: Allocator) Allocator(Arena(P))
-    fn allocate(arena: *Arena(P), type T, count: usize) -> Error![]T
+
+    fn allocate(arena: *Self, type T, count: usize) -> own Error![]T
         const size = mn::size(T) * count
         const alignment = mn::alignment(T)
         if arena.block as block
@@ -103,43 +116,118 @@ instance(type P: Allocator) Allocator(Arena(P))
             if offset + size <= arena.capacity
                 arena.last = offset
                 arena.used = offset + size
-                return mn::cast(*Many(T), start)[0..count]
+                return mn::cast(*many(T), start)[0..count]
         const header_size = mn::size(ArenaBlock)
         var capacity = header_size + size + alignment
         if (capacity < arena_block_size) capacity = arena_block_size
-        const blocks = try arena.parent.allocate(ArenaBlock, (capacity + header_size - 1) / header_size)
+        const own blocks = try arena.parent.allocate(ArenaBlock, (capacity + header_size - 1) / header_size)
         capacity = blocks.length * header_size
-        const bytes = mn::cast(*Many(u8), blocks.pointer)
-        blocks[0] = ArenaBlock{previous = arena.block, size = capacity}
+        const bytes = mn::cast(*many(u8), blocks.pointer)
+        blocks[0] = { previous = arena.block, size = capacity }
         const start = mn::align(bytes + header_size, alignment)
         const offset = mn::convert(usize, start - bytes)
         arena.block = bytes
         arena.capacity = capacity
         arena.last = offset
         arena.used = offset + size
-        return mn::cast(*Many(T), start)[0..count]
+        return mn::cast(*many(T), start)[0..count]
 
 
-    fn(type T) resize(arena: *Arena(P), items: []T, count: usize) -> bool
+    fn(type T) resize(arena: *Self, items: []T, count: usize) -> bool
         if (count <= items.length) return true
         const block = arena.block orelse return false
         const size = mn::size(T) * count
-        if (mn::cast(*Many(u8), items.pointer) != block + arena.last or arena.last + size > arena.capacity) return false
+        if (mn::cast(*many(u8), items.pointer) != block + arena.last or arena.last + size > arena.capacity) return false
         arena.used = arena.last + size
         return true
 
 
-    fn(type T) free(_: *Arena(P), _: []Const(T)) = noop
+    fn(type T) free(_: *Self, own _: []const(T)) = noop
 
 
-fn(type T) copy(destination: []T, source: []Const(T))
+instance(type P: Allocator) Deinit(Arena(P))
+
+    fn deinit(own arena: *Self) = arena.free_all()
+
+
+fn(type T) copy(destination: []T, source: []const(T))
     const target = destination[..source.length]
     const origin = source[..destination.length]
-    mn_runtime_memory_copy(mn::cast(*void, target.pointer), mn::cast(*Const(void), origin.pointer), mn::size(T) * target.length)
+    mn_runtime_memory_copy(mn::cast(*void, target.pointer), mn::cast(*const(void), origin.pointer), mn::size(T) * target.length)
 
 
-fn equal(one: []Const(u8), two: []Const(u8)) -> bool
+fn(type T) refit(target: *[]T, count: usize)
+    target.* = target.*.pointer[0..count]
+
+
+fn(type T) swap(one: *T, two: *T)
+    var spare: [1]T = undefined
+    copy(spare[..], mn::cast(*many(const(T)), one)[0..1])
+    copy(mn::cast(*many(T), one)[0..1], mn::cast(*many(const(T)), two)[0..1])
+    copy(mn::cast(*many(T), two)[0..1], spare[..])
+
+
+fn(type T) replace(target: *T, own value: T) -> own T
+    var own spare: T = undefined
+    copy(mn::cast(*many(T), &spare)[0..1], mn::cast(*many(const(T)), target)[0..1])
+    copy(mn::cast(*many(T), target)[0..1], mn::cast(*many(const(T)), &value)[0..1])
+    return spare
+
+
+fn(type T) take(target: *?T) -> own ?T
+    var own spare: ?T = undefined
+    copy(mn::cast(*many(?T), &spare)[0..1], mn::cast(*many(const(?T)), target)[0..1])
+    target.* = null
+    return spare
+
+
+fn(type T) move(source: *T) -> own T
+    var own spare: T = undefined
+    copy(mn::cast(*many(T), &spare)[0..1], mn::cast(*many(const(T)), source)[0..1])
+    return spare
+
+
+inline fn(type T) forget(own _: T) = noop
+
+
+fn equal(one: []const(u8), two: []const(u8)) -> bool
     if (one.length != two.length) return false
     for index in 0..one.length
         if (one[index] != two[index]) return false
     return true
+
+
+typeclass Deinit(type T)
+
+    fn deinit(own value: *T)
+
+
+instance(type T) Deinit(T)
+
+    inline fn deinit(own _: *Self) = noop
+
+
+typeclass Clone(type T)
+
+    fn clone(value: *const(T)) -> own Error!T
+
+
+instance(type T) Clone(T)
+
+    inline fn clone(value: *const(Self)) -> own Error!Self = value.*
+
+
+instance Clone([]const(u8))
+
+    fn clone(value: *const(Self)) -> own Error!Self
+        const own bytes = try allocate(u8, value.*.length)
+        copy(bytes, value.*)
+        return bytes
+
+
+instance Clone([]u8)
+
+    fn clone(value: *const(Self)) -> own Error!Self
+        const own bytes = try allocate(u8, value.*.length)
+        copy(bytes, value.*)
+        return bytes

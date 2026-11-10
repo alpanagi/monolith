@@ -45,6 +45,7 @@ pub const Struct = struct {
     module: usize,
     name: []const u8,
     external: bool = false,
+    @"inline": bool = false,
     fields: []const Field,
     origin: ?*Origin = null,
 };
@@ -80,6 +81,8 @@ pub const Origin = struct {
 pub const Field = struct {
     name: []const u8,
     type: Type,
+    own: bool = false,
+    private: bool = false,
     default: ?*ast.Expression = null,
     default_value: ?*?Value = null,
     location: token.Location,
@@ -310,6 +313,14 @@ pub const Registry = struct {
         one: *const Enum,
         two: *const Enum,
     ) std.mem.Allocator.Error!*const Enum {
+        if (!hasWholeParts(one) or !hasWholeParts(two)) {
+            var selected: std.ArrayList(Case) = .empty;
+            try selected.appendSlice(allocator, one.cases);
+            for (two.cases) |case| {
+                if (!containsCase(one, case)) try selected.append(allocator, case);
+            }
+            return self.addErrorCases(allocator, selected.items);
+        }
         var parts: std.ArrayList(*const Enum) = .empty;
         for ([_]*const Enum{ one, two }) |side| {
             for (side.parts) |part| {
@@ -318,26 +329,59 @@ pub const Registry = struct {
         }
         if (parts.items.len == 1) return parts.items[0];
         std.mem.sort(*const Enum, parts.items, {}, isDeclaredBefore);
+        var cases: std.ArrayList(Case) = .empty;
+        for (parts.items) |part| try cases.appendSlice(allocator, part.cases);
+        return self.addSelection(allocator, parts.items, cases.items);
+    }
+
+    pub fn addErrorCases(
+        self: *Registry,
+        allocator: std.mem.Allocator,
+        selected: []const Case,
+    ) std.mem.Allocator.Error!*const Enum {
+        var parts: std.ArrayList(*const Enum) = .empty;
+        for (selected) |case| {
+            if (std.mem.findScalar(*const Enum, parts.items, case.declaring) == null) try parts.append(allocator, case.declaring);
+        }
+        if (parts.items.len == 1 and parts.items[0].cases.len == selected.len) return parts.items[0];
+        std.mem.sort(*const Enum, parts.items, {}, isDeclaredBefore);
+        var cases: std.ArrayList(Case) = .empty;
+        for (parts.items) |part| {
+            for (part.cases) |case| {
+                const chosen = for (selected) |candidate| {
+                    if (candidate.tag == case.tag) break true;
+                } else false;
+                if (chosen) try cases.append(allocator, case);
+            }
+        }
+        return self.addSelection(allocator, parts.items, cases.items);
+    }
+
+    fn addSelection(
+        self: *Registry,
+        allocator: std.mem.Allocator,
+        parts: []const *const Enum,
+        cases: []const Case,
+    ) std.mem.Allocator.Error!*const Enum {
         for (self.combined.items) |combined| {
-            if (combined.parts.len != parts.items.len) continue;
-            const same = for (parts.items) |part| {
+            if (combined.parts.len != parts.len or combined.cases.len != cases.len) continue;
+            const same_parts = for (parts) |part| {
                 if (std.mem.findScalar(*const Enum, combined.parts, part) == null) break false;
             } else true;
-            if (same) return combined;
+            const same_cases = for (cases) |case| {
+                if (!containsCase(combined, case)) break false;
+            } else true;
+            if (same_parts and same_cases) return combined;
         }
-        var cases: std.ArrayList(Case) = .empty;
         var names: std.ArrayList([]const u8) = .empty;
-        for (parts.items) |part| {
-            try cases.appendSlice(allocator, part.cases);
-            try names.append(allocator, part.name);
-        }
+        for (parts) |part| try names.append(allocator, part.name);
         const combined = try allocator.create(Enum);
         combined.* = .{
-            .module = parts.items[0].module,
+            .module = parts[0].module,
             .name = try std.mem.join(allocator, "_or_", names.items),
             .kind = .error_set,
-            .cases = cases.items,
-            .parts = parts.items,
+            .cases = cases,
+            .parts = parts,
         };
         try self.combined.append(allocator, combined);
         return combined;
@@ -404,12 +448,23 @@ pub fn containsVariable(value_type: Type, scope: Scope) bool {
     };
 }
 
-pub fn matchArgument(pattern: Argument, concrete: Argument, scope: Scope, assigned: []?Argument) bool {
+pub fn matchArgument(pattern: Argument, concrete: Argument, scope: Scope, assigned: []?Argument, reads_only: bool) bool {
     return switch (pattern) {
-        .type => |pattern_type| concrete == .type and matchType(pattern_type, concrete.type, scope, assigned, true),
-        .length => false,
+        .type => |pattern_type| concrete == .type and (matchReadOnly(pattern_type, concrete.type, scope, assigned, reads_only) orelse matchType(pattern_type, concrete.type, scope, assigned, true)),
         .constructor => |constructor| concrete == .constructor and matchConstructor(constructor, concrete.constructor, scope, assigned),
+        .length => false,
     };
+}
+
+fn matchReadOnly(pattern: Type, concrete: Type, scope: Scope, assigned: []?Argument, reads_only: bool) ?bool {
+    if (!reads_only) return null;
+    if (pattern == .slice and pattern.slice.constant and concrete == .slice and !concrete.slice.constant) {
+        return matchType(pattern.slice.element, concrete.slice.element, scope, assigned, true);
+    }
+    if (pattern == .pointer and pattern.pointer.constant and concrete == .pointer and !concrete.pointer.constant and pattern.pointer.many == concrete.pointer.many) {
+        return matchType(pattern.pointer.target, concrete.pointer.target, scope, assigned, true);
+    }
+    return null;
 }
 
 pub fn matchType(pattern: Type, concrete: Type, scope: Scope, assigned: []?Argument, exact: bool) bool {
@@ -560,6 +615,126 @@ pub fn substitute(
     };
 }
 
+pub fn renameScope(
+    allocator: std.mem.Allocator,
+    registry: *Registry,
+    value_type: Type,
+    from: Scope,
+    to: Scope,
+) std.mem.Allocator.Error!Type {
+    return switch (value_type) {
+        .variable => |variable| {
+            if (variable.scope != from) return value_type;
+            return .{ .variable = .{ .scope = to, .index = variable.index } };
+        },
+        .number, .boolean, .void, .type, .@"struct", .@"enum" => value_type,
+        .application => |application| {
+            var constructor = application.constructor;
+            if (constructor == .variable and constructor.variable.scope == from) {
+                constructor = .{ .variable = .{ .scope = to, .index = constructor.variable.index } };
+            }
+            const renamed = try allocator.alloc(Type, application.arguments.len);
+            for (application.arguments, renamed) |argument, *result| {
+                result.* = try renameScope(allocator, registry, argument, from, to);
+            }
+            return .{ .application = try registry.addApplication(allocator, constructor, renamed) };
+        },
+        .pointer => |pointer| .{ .pointer = try registry.addPointer(allocator, .{
+            .target = try renameScope(allocator, registry, pointer.target, from, to),
+            .many = pointer.many,
+            .constant = pointer.constant,
+        }) },
+        .slice => |slice| .{ .slice = try registry.addSlice(
+            allocator,
+            try renameScope(allocator, registry, slice.element, from, to),
+            slice.constant,
+        ) },
+        .array => |array| {
+            const element = try renameScope(allocator, registry, array.element, from, to);
+            const variable = array.length_variable orelse {
+                return .{ .array = try registry.addArray(allocator, array.length, element) };
+            };
+            const scope = if (variable.scope == from) to else variable.scope;
+            return .{ .array = try registry.addLengthVariableArray(allocator, .{ .scope = scope, .index = variable.index }, element) };
+        },
+        .optional => |optional| .{ .optional = try registry.addOptional(
+            allocator,
+            try renameScope(allocator, registry, optional.child, from, to),
+        ) },
+        .result => |result| .{ .result = try registry.addResult(
+            allocator,
+            result.error_set,
+            try renameScope(allocator, registry, result.value, from, to),
+        ) },
+        .tuple => |tuple| {
+            const elements = try allocator.alloc(Type, tuple.elements.len);
+            for (tuple.elements, elements) |element, *result| result.* = try renameScope(allocator, registry, element, from, to);
+            return .{ .tuple = try registry.addTuple(allocator, elements) };
+        },
+        .function => |function| {
+            const parameters = try allocator.alloc(Type, function.parameters.len);
+            for (function.parameters, parameters) |parameter, *result| result.* = try renameScope(allocator, registry, parameter, from, to);
+            const return_type = try renameScope(allocator, registry, function.return_type, from, to);
+            return .{ .function = try registry.addFunction(allocator, parameters, return_type) };
+        },
+    };
+}
+
+pub fn canOwn(value_type: Type) bool {
+    return switch (value_type) {
+        .pointer, .slice, .variable, .application => true,
+        .@"struct" => |struct_type| if (struct_type.@"inline") canOwn(struct_type.fields[0].type) else isOwning(value_type),
+        .optional => |optional| canOwn(optional.child),
+        .result => |result| canOwn(result.value),
+        .array => |array| canOwn(array.element),
+        .tuple => |tuple| {
+            for (tuple.elements) |element| {
+                if (canOwn(element)) return true;
+            }
+            return false;
+        },
+        .@"enum" => |enumeration| {
+            for (enumeration.cases) |case| {
+                if (case.type) |payload| {
+                    if (canOwn(payload)) return true;
+                }
+            }
+            return false;
+        },
+        else => isOwning(value_type),
+    };
+}
+
+pub fn isOwning(value_type: Type) bool {
+    return switch (value_type) {
+        .@"struct" => |struct_type| {
+            if (struct_type.@"inline") return isOwning(struct_type.fields[0].type);
+            for (struct_type.fields) |field| {
+                if (field.own or isOwning(field.type)) return true;
+            }
+            return false;
+        },
+        .array => |array| isOwning(array.element),
+        .tuple => |tuple| {
+            for (tuple.elements) |element| {
+                if (isOwning(element)) return true;
+            }
+            return false;
+        },
+        .optional => |optional| isOwning(optional.child),
+        .result => |result| isOwning(result.value),
+        .@"enum" => |enumeration| {
+            for (enumeration.cases) |case| {
+                if (case.type) |payload| {
+                    if (isOwning(payload)) return true;
+                }
+            }
+            return false;
+        },
+        .number, .boolean, .void, .type, .slice, .pointer, .function, .variable, .application => false,
+    };
+}
+
 pub fn unifyArguments(one: []const Argument, two: []const Argument, sides: Sides) bool {
     if (one.len != two.len) return false;
     for (one, two) |one_argument, two_argument| {
@@ -610,10 +785,29 @@ pub fn isResultError(value_type: Type, result: Result) bool {
 }
 
 pub fn isEnumPart(enumeration: *const Enum, combined: *const Enum) bool {
+    if (enumeration.kind == .error_set and combined.kind == .error_set and enumeration.cases.len > 0) {
+        for (enumeration.cases) |case| {
+            if (!containsCase(combined, case)) return false;
+        }
+        return true;
+    }
     for (enumeration.parts) |part| {
         if (std.mem.findScalar(*const Enum, combined.parts, part) == null) return false;
     }
     return true;
+}
+
+pub fn containsCase(enumeration: *const Enum, case: Case) bool {
+    for (enumeration.cases) |candidate| {
+        if (candidate.tag == case.tag) return true;
+    }
+    return false;
+}
+
+pub fn hasWholeParts(enumeration: *const Enum) bool {
+    var count: usize = 0;
+    for (enumeration.parts) |part| count += part.cases.len;
+    return count == enumeration.cases.len;
 }
 
 pub fn containsStruct(value_type: Type, target: Struct) bool {
@@ -1138,6 +1332,37 @@ test "findBuiltInType: finds nothing for other names" {
     try std.testing.expectEqual(null, findBuiltInType("Integer"));
     try std.testing.expectEqual(null, findBuiltInType("char"));
     try std.testing.expectEqual(null, findBuiltInType("string"));
+}
+
+test "canOwn: gives an inline struct the ownership class of its field" {
+    const location: token.Location = .{ .row = 1, .column = 1 };
+    const slice: Slice = .{ .element = .{ .number = .u8 }, .constant = true };
+    const field: Field = .{ .name = "bytes", .type = .{ .slice = &slice }, .location = location };
+    const inlined: Type = .{ .@"struct" = .{ .module = 0, .name = "DataOne", .@"inline" = true, .fields = &.{field} } };
+    const plain: Type = .{ .@"struct" = .{ .module = 0, .name = "DataTwo", .fields = &.{field} } };
+    const outer_field: Field = .{ .name = "data", .type = inlined, .location = location };
+    const nested: Type = .{ .@"struct" = .{ .module = 0, .name = "Type", .@"inline" = true, .fields = &.{outer_field} } };
+    const number_field: Field = .{ .name = "value", .type = .{ .number = .u32 }, .location = location };
+    const number: Type = .{ .@"struct" = .{ .module = 0, .name = "Component", .@"inline" = true, .fields = &.{number_field} } };
+
+    try std.testing.expect(canOwn(inlined));
+    try std.testing.expect(!canOwn(plain));
+    try std.testing.expect(canOwn(nested));
+    try std.testing.expect(!canOwn(number));
+}
+
+test "isOwning: gives an inline struct the ownership class of its field" {
+    const location: token.Location = .{ .row = 1, .column = 1 };
+    const slice: Slice = .{ .element = .{ .number = .u8 }, .constant = true };
+    const owned_field: Field = .{ .name = "bytes", .type = .{ .slice = &slice }, .own = true, .location = location };
+    const owning: Type = .{ .@"struct" = .{ .module = 0, .name = "DataOne", .fields = &.{owned_field} } };
+    const owning_field: Field = .{ .name = "data", .type = owning, .location = location };
+    const inlined_owning: Type = .{ .@"struct" = .{ .module = 0, .name = "Type", .@"inline" = true, .fields = &.{owning_field} } };
+    const view_field: Field = .{ .name = "bytes", .type = .{ .slice = &slice }, .location = location };
+    const inlined_view: Type = .{ .@"struct" = .{ .module = 0, .name = "DataTwo", .@"inline" = true, .fields = &.{view_field} } };
+
+    try std.testing.expect(isOwning(inlined_owning));
+    try std.testing.expect(!isOwning(inlined_view));
 }
 
 test "findNumberType: finds only number types" {

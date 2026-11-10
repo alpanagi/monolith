@@ -1,0 +1,36 @@
+import mn::iterator::Iterable
+import mn::iterator::Iterator
+
+
+struct Range
+    start: usize
+    end: ?usize
+
+
+instance Iterable(Range)
+
+    fn Cursor() -> type = RangeCursor
+    fn iterator(range: Self) -> Cursor() = { position = range.start, end = range.end }
+
+
+struct RangeCursor
+    position: usize
+    end: ?usize
+
+
+instance Iterator(RangeCursor)
+
+    fn Element() -> type = [usize]
+
+
+    fn next(cursor: *Self) -> ?Element()
+        if (cursor.end != null and cursor.position >= cursor.end.?) return null
+        const value = cursor.position
+        cursor.position += 1
+        return { value }
+
+
+instance Iterable(RangeCursor)
+
+    fn Cursor() -> type = Self
+    fn iterator(cursor: Self) -> Cursor() = cursor

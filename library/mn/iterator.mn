@@ -1,0 +1,144 @@
+import mn::reflection
+import mn::reflection::Tuple
+
+
+typeclass Iterator(type I)
+
+    fn Element() -> type
+    fn next(iterator: *I) -> ?Element()
+
+
+typeclass Iterable(type T)
+
+    fn Cursor() -> type
+    fn iterator(value: T) -> Cursor()
+
+
+instance(type T) Iterable([]T)
+
+    fn Cursor() -> type = SliceCursor(T)
+    fn iterator(items: Self) -> Cursor() = { items = items, index = 0 }
+
+
+instance(type T) Iterable([]const(T))
+
+    fn Cursor() -> type = ConstSliceCursor(T)
+    fn iterator(items: Self) -> Cursor() = { items = items, index = 0 }
+
+
+fn SliceCursor(type T) -> type
+    return struct
+        items: []T
+        index: usize
+
+
+instance(type T) Iterator(SliceCursor(T))
+
+    fn Element() -> type = [*T]
+
+
+    fn next(cursor: *Self) -> ?Element()
+        if (cursor.index == cursor.items.length) return null
+        const element = &cursor.items[cursor.index]
+        cursor.index += 1
+        return { element }
+
+
+instance(type T) Iterable(SliceCursor(T))
+
+    fn Cursor() -> type = Self
+    fn iterator(cursor: Self) -> Cursor() = cursor
+
+
+fn ConstSliceCursor(type T) -> type
+    return struct
+        items: []const(T)
+        index: usize
+
+
+instance(type T) Iterator(ConstSliceCursor(T))
+
+    fn Element() -> type = [*const(T)]
+
+
+    fn next(cursor: *Self) -> ?Element()
+        if (cursor.index == cursor.items.length) return null
+        const element = &cursor.items[cursor.index]
+        cursor.index += 1
+        return { element }
+
+
+instance(type T) Iterable(ConstSliceCursor(T))
+
+    fn Cursor() -> type = Self
+    fn iterator(cursor: Self) -> Cursor() = cursor
+
+
+typeclass Zip(type T)
+
+    fn zip(iterables: T) -> Zipped(T)
+
+
+fn Zipped(type T) -> type
+    return struct
+        private cursors: Cursors(T, 0)
+
+
+private fn Cursors(type T, comptime index: usize) -> type
+    if (index == reflection::length(T)) return []
+    else return reflection::join([Iterable(T[index])::Cursor()], Cursors(T, index + 1))
+
+
+instance(type T: Tuple) Zip(T)
+
+    fn zip(iterables: Self) -> Zipped(Self)
+        var zipped: Zipped(Self) = undefined
+        fill_cursors(Self, 0, iterables, &zipped.cursors)
+        return zipped
+
+
+private fn fill_cursors(type T, comptime index: usize, iterables: T, cursors: *Cursors(T, 0))
+    if (index == reflection::length(T)) noop
+    else
+        cursors.*[index] = Iterable::iterator(iterables[index])
+        fill_cursors(T, index + 1, iterables, cursors)
+
+
+instance(type T: Tuple) Iterator(Zipped(T))
+
+    fn Element() -> type = ZippedElement(Cursors(T, 0), 0)
+
+
+    fn next(zipped: *Self) -> ?Element()
+        var element: ZippedElement(Cursors(T, 0), 0) = undefined
+        const filled = fill_zipped(Cursors(T, 0), 0, 0, &zipped.cursors, &element)
+        if (filled) return element
+        return null
+
+
+instance(type T: Tuple) Iterable(Zipped(T))
+
+    fn Cursor() -> type = Self
+    fn iterator(zipped: Self) -> Cursor() = zipped
+
+
+fn ZippedElement(type C, comptime index: usize) -> type
+    if (index == reflection::length(C)) return []
+    else return reflection::join(Iterator(C[index])::Element(), ZippedElement(C, index + 1))
+
+
+private fn fill_zipped(type C, comptime index: usize, comptime offset: usize, cursors: *C, element: *ZippedElement(C, 0)) -> bool
+    if (index == reflection::length(C)) return true
+    else
+        const item = Iterator::next(&cursors.*[index])
+        if (item == null) return false
+        const Item = Iterator(C[index])::Element()
+        copy_elements(Item, ZippedElement(C, 0), offset, 0, item.?, element)
+        return fill_zipped(C, index + 1, offset + reflection::length(Item), cursors, element)
+
+
+private fn copy_elements(type S, type D, comptime offset: usize, comptime position: usize, source: S, destination: *D)
+    if (position == reflection::length(S)) noop
+    else
+        destination.*[offset + position] = source[position]
+        copy_elements(S, D, offset, position + 1, source, destination)

@@ -27,6 +27,7 @@ pub const Value = union(enum) {
         root_type: types.Type,
         path: []const usize,
         text: bool = false,
+        single: bool = false,
     };
 
     pub const Many = struct {

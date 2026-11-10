@@ -1,0 +1,194 @@
+import mn
+import mn::codec
+import mn::codec::Decode
+import mn::codec::Encode
+import mn::memory
+import mn::stream::Reader
+import mn::stream::Writer
+
+
+fn Encoder(type W: Writer) -> type
+    return struct
+        private writer: *W
+
+        fn init(writer: *W) -> Self = { writer = writer }
+
+
+instance(type W: Writer) codec::Encoder(Encoder(W))
+
+    fn i8(self: *Self, value: i8) -> !void = write_unsigned(self.writer, u8, copy_bits(u8, i8, &value))
+    fn i16(self: *Self, value: i16) -> !void = write_unsigned(self.writer, u16, copy_bits(u16, i16, &value))
+    fn i32(self: *Self, value: i32) -> !void = write_unsigned(self.writer, u32, copy_bits(u32, i32, &value))
+    fn i64(self: *Self, value: i64) -> !void = write_unsigned(self.writer, u64, copy_bits(u64, i64, &value))
+    fn i128(self: *Self, value: i128) -> !void = write_unsigned(self.writer, u128, copy_bits(u128, i128, &value))
+    fn isize(self: *Self, value: isize) -> !void = write_unsigned(self.writer, usize, copy_bits(usize, isize, &value))
+    fn u8(self: *Self, value: u8) -> !void = write_unsigned(self.writer, u8, value)
+    fn u16(self: *Self, value: u16) -> !void = write_unsigned(self.writer, u16, value)
+    fn u32(self: *Self, value: u32) -> !void = write_unsigned(self.writer, u32, value)
+    fn u64(self: *Self, value: u64) -> !void = write_unsigned(self.writer, u64, value)
+    fn u128(self: *Self, value: u128) -> !void = write_unsigned(self.writer, u128, value)
+    fn usize(self: *Self, value: usize) -> !void = write_unsigned(self.writer, usize, value)
+    fn f16(self: *Self, value: f16) -> !void = write_unsigned(self.writer, u16, copy_bits(u16, f16, &value))
+    fn f32(self: *Self, value: f32) -> !void = write_unsigned(self.writer, u32, copy_bits(u32, f32, &value))
+    fn f64(self: *Self, value: f64) -> !void = write_unsigned(self.writer, u64, copy_bits(u64, f64, &value))
+    fn f128(self: *Self, value: f128) -> !void = write_unsigned(self.writer, u128, copy_bits(u128, f128, &value))
+    fn bool(self: *Self, value: bool) -> !void = write_unsigned(self.writer, u8, if (value) 1 else 0)
+
+
+    fn bytes(self: *Self, value: []const(u8)) -> !void
+        try write_unsigned(self.writer, usize, value.length)
+        try Writer::write(self.writer, value)
+
+
+    fn absent(self: *Self) -> !void = write_unsigned(self.writer, u8, 0)
+    fn present(self: *Self) -> !void = write_unsigned(self.writer, u8, 1)
+    fn sequence(self: *Self, count: usize) -> !void = write_unsigned(self.writer, usize, count)
+    fn map(self: *Self, count: usize) -> !void = write_unsigned(self.writer, usize, count)
+    fn structure(self: *Self, count: usize) -> !void = write_unsigned(self.writer, usize, count)
+    fn field(_: *Self, _: []const(u8)) -> !void = noop
+    fn tuple(self: *Self, count: usize) -> !void = write_unsigned(self.writer, usize, count)
+    fn variant(self: *Self, _: []const(u8), number: usize) -> !void = write_unsigned(self.writer, usize, number)
+    fn(type T: Encode) encode(self: *Self, value: *const(T)) -> !void = Encode::encode(value, self)
+
+
+fn Decoder(type R: Reader) -> type
+    return struct
+        private reader: *R
+
+        fn init(reader: *R) -> Self = { reader = reader }
+
+
+instance(type R: Reader) codec::Decoder(Decoder(R))
+
+    fn i8(self: *Self) -> !i8
+        const bits = try read_unsigned(self.reader, u8)
+        return copy_bits(i8, u8, &bits)
+
+
+    fn i16(self: *Self) -> !i16
+        const bits = try read_unsigned(self.reader, u16)
+        return copy_bits(i16, u16, &bits)
+
+
+    fn i32(self: *Self) -> !i32
+        const bits = try read_unsigned(self.reader, u32)
+        return copy_bits(i32, u32, &bits)
+
+
+    fn i64(self: *Self) -> !i64
+        const bits = try read_unsigned(self.reader, u64)
+        return copy_bits(i64, u64, &bits)
+
+
+    fn i128(self: *Self) -> !i128
+        const bits = try read_unsigned(self.reader, u128)
+        return copy_bits(i128, u128, &bits)
+
+
+    fn isize(self: *Self) -> !isize
+        const bits = try read_unsigned(self.reader, usize)
+        return copy_bits(isize, usize, &bits)
+
+
+    fn u8(self: *Self) -> !u8 = read_unsigned(self.reader, u8)
+    fn u16(self: *Self) -> !u16 = read_unsigned(self.reader, u16)
+    fn u32(self: *Self) -> !u32 = read_unsigned(self.reader, u32)
+    fn u64(self: *Self) -> !u64 = read_unsigned(self.reader, u64)
+    fn u128(self: *Self) -> !u128 = read_unsigned(self.reader, u128)
+    fn usize(self: *Self) -> !usize = read_unsigned(self.reader, usize)
+
+
+    fn f16(self: *Self) -> !f16
+        const bits = try read_unsigned(self.reader, u16)
+        return copy_bits(f16, u16, &bits)
+
+
+    fn f32(self: *Self) -> !f32
+        const bits = try read_unsigned(self.reader, u32)
+        return copy_bits(f32, u32, &bits)
+
+
+    fn f64(self: *Self) -> !f64
+        const bits = try read_unsigned(self.reader, u64)
+        return copy_bits(f64, u64, &bits)
+
+
+    fn f128(self: *Self) -> !f128
+        const bits = try read_unsigned(self.reader, u128)
+        return copy_bits(f128, u128, &bits)
+
+
+    fn bool(self: *Self) -> !bool = match try read_unsigned(self.reader, u8)
+        case (0) false
+        case (1) true
+        else codec::Error::Malformed
+
+
+    fn bytes(self: *Self) -> own ![]u8
+        const length = try read_unsigned(self.reader, usize)
+        const own bytes = try memory::allocate(u8, length)
+        errdefer memory::free(own bytes)
+        try read_exact(self.reader, bytes)
+        return bytes
+
+
+    fn is_present(self: *Self) -> !bool = match try read_unsigned(self.reader, u8)
+        case (0) false
+        case (1) true
+        else codec::Error::Malformed
+
+
+    fn sequence(self: *Self) -> !usize = read_unsigned(self.reader, usize)
+    fn map(self: *Self) -> !usize = read_unsigned(self.reader, usize)
+
+
+    fn structure(self: *Self, count: usize) -> !void
+        if (try read_unsigned(self.reader, usize) != count) return codec::Error::Malformed
+
+
+    fn field(_: *Self, _: []const(u8)) -> !void = noop
+
+
+    fn tuple(self: *Self, count: usize) -> !void
+        if (try read_unsigned(self.reader, usize) != count) return codec::Error::Malformed
+
+
+    fn variant(self: *Self, names: []const([]const(u8))) -> !usize
+        const number = try read_unsigned(self.reader, usize)
+        if (number >= names.length) return codec::Error::Malformed
+        return number
+
+
+    fn decode(self: *Self, type T: Decode) -> own !T = Decode(T)::decode(self)
+
+
+private fn(type W: Writer) write_unsigned(writer: *W, type U, value: U) -> !void
+    var bytes: [16]u8 = undefined
+    var rest = value
+    for index in 0..mn::size(U)
+        bytes[index] = mn::truncate(u8, rest & 255)
+        rest = rest >> 8
+    try Writer::write(writer, bytes[..mn::size(U)])
+
+
+private fn copy_bits(type T, type F, value: *const(F)) -> T
+    var bits: T = undefined
+    memory::copy(mn::cast(*many(u8), &bits)[0..mn::size(T)], mn::cast(*many(const(u8)), value)[0..mn::size(F)])
+    return bits
+
+
+private fn(type R: Reader) read_unsigned(reader: *R, type U) -> !U
+    var bytes: [16]u8 = undefined
+    try read_exact(reader, bytes[..mn::size(U)])
+    var value: U = 0
+    for index in 0..mn::size(U)
+        value = value | (mn::convert(U, bytes[index]) << (index * 8))
+    return value
+
+
+private fn(type R: Reader) read_exact(reader: *R, buffer: []u8) -> !void
+    var filled: usize = 0
+    while filled < buffer.length
+        const count = try Reader::read(reader, buffer[filled..])
+        if (count == 0) return codec::Error::Malformed
+        filled += count

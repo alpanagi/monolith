@@ -1,17 +1,20 @@
 import mn
+import mn::hash
 import mn::math
+import mn::range::Range
 
-external fn mn_runtime_random_entropy() -> u64
+private external fn mn_runtime_random_entropy() -> u64
 
 const Default = Xoshiro256
 const entropy = mn_runtime_random_entropy
 
 
 typeclass Generator(type G)
+
     fn next(generator: *G) -> u64
 
 
-    fn range(generator: *G, range: mn::Range) -> usize
+    fn range(generator: *G, range: Range) -> usize
         const count = mn::convert(u64, range.end.? - range.start)
         const threshold = math::subtract_wrapping(0, count) % count
         while true
@@ -20,15 +23,16 @@ typeclass Generator(type G)
 
 
 struct Xoshiro256
-    state: [4]u64
+    private state: [4]u64
 
-    fn new(seed: u64) -> Xoshiro256
+    fn init(seed: u64) -> Self
         var mixer = seed
-        return Xoshiro256{state = {splitmix64(&mixer), splitmix64(&mixer), splitmix64(&mixer), splitmix64(&mixer)}}
+        return { state = { draw_seed_word(&mixer), draw_seed_word(&mixer), draw_seed_word(&mixer), draw_seed_word(&mixer) } }
 
 
 instance Generator(Xoshiro256)
-    fn next(generator: *Xoshiro256) -> u64
+
+    fn next(generator: *Self) -> u64
         const state = &generator.state
         const scaled = math::multiply_wrapping(state[1], 5)
         const result = math::multiply_wrapping((scaled << 7) | (scaled >> 57), 9)
@@ -42,8 +46,7 @@ instance Generator(Xoshiro256)
         return result
 
 
-fn splitmix64(state: *u64) -> u64
+private fn draw_seed_word(state: *u64) -> u64
+    const word = hash::splitmix64(state.*)
     state.* = math::add_wrapping(state.*, 0x9e3779b97f4a7c15)
-    const mixed = math::multiply_wrapping(state.* ^ (state.* >> 30), 0xbf58476d1ce4e5b9)
-    const scrambled = math::multiply_wrapping(mixed ^ (mixed >> 27), 0x94d049bb133111eb)
-    return scrambled ^ (scrambled >> 31)
+    return word

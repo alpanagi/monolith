@@ -11,11 +11,19 @@ pub const case_without_known_enum_message = "a leading :: names a case or a func
 pub const Program = struct {
     modules: []Module,
     types: *types.Registry,
+    skipped_defers: []const SkippedDefer = &.{},
+};
+
+pub const SkippedDefer = struct {
+    statement: *const Statement,
+    exit: *const Expression,
 };
 
 pub const Module = struct {
     path: Path = &.{},
     declarations: []Declaration,
+    paths: []const Path = &.{},
+    has_range: bool = false,
     instances: std.ArrayList(*Declaration) = .empty,
 };
 
@@ -23,6 +31,7 @@ pub const Declaration = struct {
     kind: DeclarationKind,
     location: token.Location,
     owner: ?usize = null,
+    private: bool = false,
 };
 
 pub const DeclarationKind = union(enum) {
@@ -50,12 +59,18 @@ pub const FunctionDefinition = struct {
     pristine: ?*const FunctionDefinition = null,
     instantiated: bool = false,
     allocator: ?*const types.Type = null,
-    default_allocator: bool = false,
+    allocator_root: bool = false,
     need: Need = .unknown,
+    need_reason: ?NeedReason = null,
     dropped_names: []const []const u8 = &.{},
     lenient: bool = false,
     body_progress: Progress = .pending,
     check_progress: Progress = .pending,
+};
+
+pub const NeedReason = struct {
+    location: token.Location,
+    callee: ?Resolution.Function = null,
 };
 
 pub const Need = enum {
@@ -66,6 +81,8 @@ pub const Need = enum {
 };
 
 pub const allocator_parameter = "mn_allocator";
+pub const context_local = "mn_context";
+pub const allocator_name = "allocator";
 
 pub const Binding = struct {
     name: []const u8,
@@ -102,6 +119,8 @@ pub const FunctionSignature = struct {
     @"inline": bool = false,
     inferred_error_set: ?token.Location = null,
     error_set: ?*types.Enum = null,
+    return_own: bool = false,
+    private: bool = false,
 };
 
 pub const SelfParameter = enum {
@@ -145,12 +164,19 @@ pub const ConstantDeclaration = struct {
     bound: bool = false,
     measured: bool = false,
     with: bool = false,
+    own: bool = false,
+    moved: bool = false,
+    context: bool = false,
+    context_used: bool = false,
     called_early: bool = false,
 };
 
 pub const TupleDeclaration = struct {
     names: []ElementName,
     value: Expression,
+    variable: bool = false,
+    own: bool = false,
+    moved: bool = false,
 };
 
 pub const ElementName = struct {
@@ -163,6 +189,7 @@ pub const ElementName = struct {
 pub const StructDefinition = struct {
     name: []const u8,
     external: bool = false,
+    @"inline": bool = false,
     fields: []Field,
     value: ?types.Type = null,
 };
@@ -191,8 +218,8 @@ pub const TypeclassDefinition = struct {
 pub const TypeclassParameter = struct {
     name: []const u8,
     arity: usize,
-    requirement: ?Expression = null,
-    resolved_requirement: ?Resolution.Typeclass = null,
+    requirements: []Expression = &.{},
+    resolved_requirements: []Resolution.Typeclass = &.{},
     location: token.Location,
 };
 
@@ -215,13 +242,14 @@ pub const InstanceDeclaration = struct {
     resolved: ?Resolution.Typeclass = null,
     resolved_arguments: []const types.Argument = &.{},
     progress: Progress = .pending,
+    only_reads: bool = false,
 };
 
 pub const InstanceParameter = struct {
     name: []const u8,
     is_length: bool = false,
-    requirement: ?Expression = null,
-    resolved_requirement: ?Resolution.Typeclass = null,
+    requirements: []Expression = &.{},
+    resolved_requirements: []Resolution.Typeclass = &.{},
     location: token.Location,
 };
 
@@ -237,6 +265,8 @@ pub const VariableDeclaration = struct {
     value: Expression,
     deferred_use: ?Use = null,
     measured: bool = false,
+    own: bool = false,
+    moved: bool = false,
 };
 
 pub const Use = struct {
@@ -249,6 +279,7 @@ pub const Assignment = struct {
     target: Expression,
     operator: ?CompoundOperator = null,
     value: Expression,
+    moved: bool = false,
 };
 
 pub const CompoundOperator = struct {
@@ -258,7 +289,11 @@ pub const CompoundOperator = struct {
 
 pub const If = struct {
     condition: Expression,
+    marker: ?token.Location = null,
+    moved: bool = false,
     names: []ElementName = &.{},
+    own: bool = false,
+    tuple: bool = false,
     body: []Statement,
     else_body: ?[]Statement = null,
     known: ?bool = null,
@@ -269,7 +304,11 @@ pub const If = struct {
 pub const While = struct {
     label: ?[]const u8 = null,
     condition: Expression,
+    marker: ?token.Location = null,
+    moved: bool = false,
     names: []ElementName = &.{},
+    own: bool = false,
+    tuple: bool = false,
     body: []Statement,
     else_body: ?[]Statement = null,
 };
@@ -282,11 +321,11 @@ pub const For = struct {
     body: []Statement,
     else_body: ?[]Statement = null,
     iterator: ?Iteration = null,
-    expansion_value: ?*Statement = null,
-    expansions: []const []Statement = &.{},
 };
 
 pub const Iteration = struct {
+    iterator: Resolution.Function,
+    cursor: types.Type,
     next: Resolution.Function,
     element: types.Type,
 };
@@ -298,14 +337,21 @@ pub const Defer = struct {
 
 pub const Match = struct {
     value: Expression,
+    marker: ?token.Location = null,
+    moved: bool = false,
     branches: []Branch,
     names: []ElementName,
     produces: bool = false,
+    gives_void: bool = false,
 };
 
 pub const Branch = struct {
     cases: []BranchCase,
     naming: Naming = .none,
+    own: bool = false,
+    tuple: bool = false,
+    first_name: usize = 0,
+    name_count: usize = 1,
     body: []Statement,
     location: token.Location,
 };
@@ -355,6 +401,8 @@ pub const Expression = struct {
     type: ?types.Type = null,
     denoted: ?types.Type = null,
     location: token.Location,
+    handed: bool = false,
+    implicit: bool = false,
 };
 
 pub const ExpressionKind = union(enum) {
@@ -398,6 +446,7 @@ pub const CaseLiteral = struct {
     name: []const u8,
     arguments: []Argument = &.{},
     called: bool = false,
+    braced: bool = false,
     with_value: ?*Expression = null,
     expected: ?types.Type = null,
 };
@@ -412,12 +461,19 @@ pub const Call = struct {
     typeclass_arguments: []const types.Argument = &.{},
     @"inline": bool = false,
     with_value: ?*Expression = null,
+    braces: Braces = .none,
 };
 
 pub const Name = union(enum) {
     identifier: Identifier,
     path_expression: PathExpression,
     member: Member,
+};
+
+pub const Braces = enum {
+    none,
+    written,
+    gathered,
 };
 
 pub const Identifier = struct {
@@ -445,6 +501,7 @@ pub const MethodCall = struct {
     name_location: token.Location,
     arguments: []Argument,
     with_value: ?*Expression = null,
+    receiver_own: bool = false,
 };
 
 pub const Resolution = union(enum) {
@@ -605,6 +662,8 @@ pub const Argument = struct {
     name: ?[]const u8,
     value: Expression,
     location: token.Location,
+    own: bool = false,
+    receiver: bool = false,
 };
 
 pub const FieldAccess = struct {
@@ -627,11 +686,28 @@ pub const TypedName = struct {
     type: Expression,
     location: token.Location,
     kind: ParameterKind = .run_time,
-    requirement: ?Expression = null,
+    requirements: []Expression = &.{},
+    resolved_requirements: []Resolution.Typeclass = &.{},
     constraint: ?Resolution.Typeclass = null,
+    constraint_arguments: []const types.Argument = &.{},
+    unknown_position: usize = 0,
     measured: bool = false,
     hidden: bool = false,
+    own: bool = false,
+    default: ?*Expression = null,
+    default_constant: ?Resolution.Constant = null,
 };
+
+pub fn fillConstraintArguments(
+    allocator: std.mem.Allocator,
+    parameter: TypedName,
+    value_type: types.Type,
+) std.mem.Allocator.Error![]types.Argument {
+    if (parameter.constraint_arguments.len == 0) return allocator.dupe(types.Argument, &.{.{ .type = value_type }});
+    const arguments = try allocator.dupe(types.Argument, parameter.constraint_arguments);
+    arguments[parameter.unknown_position] = .{ .type = value_type };
+    return arguments;
+}
 
 pub const ParameterKind = enum {
     run_time,
@@ -647,6 +723,8 @@ pub const Field = struct {
     default: ?Expression = null,
     default_value: ?Value = null,
     location: token.Location,
+    own: bool = false,
+    private: bool = false,
 };
 
 pub const Expressions = struct {
@@ -670,12 +748,6 @@ pub const Blocks = struct {
             const branches = self.statement.kind.match.branches;
             if (position >= branches.len) return null;
             return branches[position].body;
-        }
-        if (self.statement.kind == .@"for" and isUnrolled(self.statement.kind.@"for")) {
-            const loop = self.statement.kind.@"for";
-            if (position < loop.expansions.len) return loop.expansions[position];
-            if (position == loop.expansions.len) return loop.else_body orelse &.{};
-            return null;
         }
         const blocks = extractBlocks(self.statement);
         if (position >= blocks.len) return null;
@@ -735,6 +807,77 @@ pub fn isGeneric(signature: FunctionSignature) bool {
     return false;
 }
 
+pub fn isHidden(module: Module, index: usize) bool {
+    var current: ?usize = index;
+    while (current) |position| {
+        const declaration = module.declarations[position];
+        if (isPrivate(declaration)) return true;
+        current = declaration.owner;
+    }
+    return false;
+}
+
+pub fn findTypeDeclaration(module: Module, value_type: types.Type) ?usize {
+    for (module.declarations, 0..) |declaration, index| {
+        const value = switch (declaration.kind) {
+            .struct_definition => |definition| definition.value,
+            .enum_definition => |definition| definition.value,
+            .function_definition,
+            .function_declaration,
+            .constant_declaration,
+            .typeclass_definition,
+            .instance_declaration,
+            .import,
+            => continue,
+        } orelse continue;
+        if (std.meta.eql(value, value_type)) return index;
+    }
+    return null;
+}
+
+pub fn isPrivate(declaration: Declaration) bool {
+    return switch (declaration.kind) {
+        .function_definition => |definition| definition.signature.private,
+        .function_declaration => |signature| signature.private,
+        .constant_declaration, .struct_definition, .enum_definition, .typeclass_definition, .instance_declaration, .import => declaration.private,
+    };
+}
+
+pub fn renderTypeName(allocator: std.mem.Allocator, modules: []const Module, value_type: types.Type) std.mem.Allocator.Error![]const u8 {
+    return switch (value_type) {
+        .number => |number| @tagName(number),
+        .boolean => "bool",
+        .void => "void",
+        .type => "type",
+        .@"struct" => |struct_type| name: {
+            const origin = struct_type.origin orelse break :name struct_type.name;
+            const function = origin.function orelse break :name struct_type.name;
+            const name = extractFunctionSignature(findDeclaration(modules[function.module], function.declaration).*).name;
+            var arguments: std.ArrayList([]const u8) = .empty;
+            for (origin.arguments) |argument| try arguments.append(allocator, try renderTypeName(allocator, modules, argument));
+            break :name std.fmt.allocPrint(allocator, "{s}({s})", .{ name, try std.mem.join(allocator, ", ", arguments.items) });
+        },
+        .@"enum" => |enumeration| enumeration.name,
+        .array => |array| std.fmt.allocPrint(allocator, "[{d}]{s}", .{ array.length, try renderTypeName(allocator, modules, array.element) }),
+        .slice => |slice| renderReadOnly(allocator, "[]", slice.constant, try renderTypeName(allocator, modules, slice.element)),
+        .pointer => |pointer| renderReadOnly(allocator, if (pointer.many) "*many" else "*", pointer.constant, try renderTypeName(allocator, modules, pointer.target)),
+        .optional => |optional| std.fmt.allocPrint(allocator, "?{s}", .{try renderTypeName(allocator, modules, optional.child)}),
+        .result => |result| std.fmt.allocPrint(allocator, "{s}!{s}", .{ result.error_set.name, try renderTypeName(allocator, modules, result.value) }),
+        .tuple => |tuple| name: {
+            var elements: std.ArrayList([]const u8) = .empty;
+            for (tuple.elements) |element| try elements.append(allocator, try renderTypeName(allocator, modules, element));
+            break :name std.fmt.allocPrint(allocator, "[{s}]", .{try std.mem.join(allocator, ", ", elements.items)});
+        },
+        .function, .variable, .application => "the type",
+    };
+}
+
+fn renderReadOnly(allocator: std.mem.Allocator, prefix: []const u8, constant: bool, target: []const u8) std.mem.Allocator.Error![]const u8 {
+    const inner = if (constant) try std.fmt.allocPrint(allocator, "const({s})", .{target}) else target;
+    if (std.mem.eql(u8, prefix, "*many")) return std.fmt.allocPrint(allocator, "*many({s})", .{inner});
+    return std.mem.concat(allocator, u8, &.{ prefix, inner });
+}
+
 pub fn isMain(signature: FunctionSignature) bool {
     return signature.receiver == null and std.mem.eql(u8, signature.name, "main");
 }
@@ -744,6 +887,52 @@ pub fn findInstance(
     modules: []const Module,
     typeclass: Resolution.Typeclass,
     decided: []const ?types.Argument,
+) std.mem.Allocator.Error!InstanceSearch {
+    const exact = try searchInstance(allocator, modules, typeclass, decided, false);
+    if (exact != .missing) return exact;
+    const relaxed = try searchInstance(allocator, modules, typeclass, decided, true);
+    if (relaxed != .missing) return relaxed;
+    return findNothingOwningInstance(allocator, modules, typeclass, decided);
+}
+
+pub fn isNothingOwningInstance(modules: []const Module, module_index: usize, instance_declaration: InstanceDeclaration) bool {
+    const typeclass = instance_declaration.resolved orelse return false;
+    if (typeclass.module != module_index or !isNothingOwningTypeclass(modules, typeclass)) return false;
+    if (instance_declaration.parameters.len != 1 or instance_declaration.resolved_arguments.len != 1) return false;
+    const argument = instance_declaration.resolved_arguments[0];
+    return argument == .type and argument.type == .variable and argument.type.variable.scope == .instance;
+}
+
+fn isNothingOwningTypeclass(modules: []const Module, typeclass: Resolution.Typeclass) bool {
+    const path: []const []const u8 = &.{ "mn", "memory" };
+    return isLibraryTypeclass(modules, typeclass, path, "Deinit") or isLibraryTypeclass(modules, typeclass, path, "Clone");
+}
+
+fn findNothingOwningInstance(
+    allocator: std.mem.Allocator,
+    modules: []const Module,
+    typeclass: Resolution.Typeclass,
+    decided: []const ?types.Argument,
+) std.mem.Allocator.Error!InstanceSearch {
+    if (!isNothingOwningTypeclass(modules, typeclass) or decided.len != 1) return .missing;
+    const argument = decided[0] orelse return .missing;
+    if (argument != .type or types.canOwn(argument.type)) return .missing;
+    for (modules[typeclass.module].declarations, 0..) |declaration, index| {
+        if (declaration.kind != .instance_declaration) continue;
+        if (!std.meta.eql(declaration.kind.instance_declaration.resolved, typeclass)) continue;
+        if (!isNothingOwningInstance(modules, typeclass.module, declaration.kind.instance_declaration)) continue;
+        const reference: InstanceReference = .{ .module = typeclass.module, .declaration = index };
+        return .{ .found = .{ .reference = reference, .assigned = try allocator.dupe(types.Argument, &.{argument}) } };
+    }
+    return .missing;
+}
+
+fn searchInstance(
+    allocator: std.mem.Allocator,
+    modules: []const Module,
+    typeclass: Resolution.Typeclass,
+    decided: []const ?types.Argument,
+    relaxed: bool,
 ) std.mem.Allocator.Error!InstanceSearch {
     if (isTupleTypeclass(modules, typeclass)) {
         const argument = decided[0] orelse return .undecided;
@@ -759,11 +948,13 @@ pub fn findInstance(
             const instance_declaration = declaration.kind.instance_declaration;
             if (!std.meta.eql(instance_declaration.resolved, typeclass)) continue;
             if (instance_declaration.resolved_arguments.len != decided.len) continue;
+            if (isNothingOwningInstance(modules, module_index, instance_declaration)) continue;
             const assigned = try allocator.alloc(?types.Argument, instance_declaration.parameters.len);
             @memset(assigned, null);
-            const fits = for (instance_declaration.resolved_arguments, decided) |pattern, optional_argument| {
+            const fits = for (instance_declaration.resolved_arguments, decided, 0..) |pattern, optional_argument, position| {
                 const argument = optional_argument orelse continue;
-                if (!types.matchArgument(pattern, argument, .instance, assigned)) break false;
+                const reads_only = relaxed and !isTargetParameter(modules, typeclass, position);
+                if (!types.matchArgument(pattern, argument, .instance, assigned, reads_only)) break false;
             } else true;
             if (!fits) continue;
             if (!try satisfiesRequirements(allocator, modules, instance_declaration, assigned)) continue;
@@ -783,11 +974,32 @@ pub fn findInstance(
     return .{ .found = .{ .reference = reference, .assigned = assigned } };
 }
 
+fn isTargetParameter(modules: []const Module, typeclass: Resolution.Typeclass, position: usize) bool {
+    const definition = modules[typeclass.module].declarations[typeclass.declaration].kind.typeclass_definition;
+    for (definition.functions) |signature| {
+        for (signature.parameters) |parameter| {
+            if (parameter.kind == .type and std.mem.eql(u8, parameter.name, definition.parameters[position].name)) return true;
+        }
+    }
+    return false;
+}
+
 pub fn isTupleTypeclass(modules: []const Module, typeclass: Resolution.Typeclass) bool {
+    return isLibraryTypeclass(modules, typeclass, &.{ "mn", "reflection" }, "Tuple");
+}
+
+pub fn isElementTypeclass(modules: []const Module, typeclass: Resolution.Typeclass) bool {
+    return isTupleTypeclass(modules, typeclass) or isLibraryTypeclass(modules, typeclass, &.{ "mn", "iterator" }, "Iterable");
+}
+
+pub fn isLibraryTypeclass(modules: []const Module, typeclass: Resolution.Typeclass, path: []const []const u8, name: []const u8) bool {
     const module = modules[typeclass.module];
-    if (module.path.len != 1 or !std.mem.eql(u8, module.path[0], "mn")) return false;
+    if (module.path.len != path.len) return false;
+    for (module.path, path) |segment, expected| {
+        if (!std.mem.eql(u8, segment, expected)) return false;
+    }
     const declaration = module.declarations[typeclass.declaration];
-    return std.mem.eql(u8, declaration.kind.typeclass_definition.name, "Tuple");
+    return std.mem.eql(u8, declaration.kind.typeclass_definition.name, name);
 }
 
 pub const InstanceSearch = union(enum) {
@@ -828,10 +1040,11 @@ fn hasRequiredInstances(
 ) std.mem.Allocator.Error!bool {
     const definition = modules[typeclass.module].declarations[typeclass.declaration].kind.typeclass_definition;
     for (definition.parameters, decided) |parameter, optional_argument| {
-        const requirement = parameter.resolved_requirement orelse continue;
         const argument = optional_argument orelse continue;
         const required: []const ?types.Argument = &.{argument};
-        if (try findInstance(allocator, modules, requirement, required) != .found) return false;
+        for (parameter.resolved_requirements) |requirement| {
+            if (try findInstance(allocator, modules, requirement, required) != .found) return false;
+        }
     }
     return true;
 }
@@ -843,12 +1056,13 @@ fn satisfiesRequirements(
     assigned: []const ?types.Argument,
 ) std.mem.Allocator.Error!bool {
     for (instance_declaration.parameters, assigned) |parameter, optional_argument| {
-        const requirement = parameter.resolved_requirement orelse continue;
         const argument = optional_argument orelse continue;
         const decided: []const ?types.Argument = &.{argument};
-        switch (try findInstance(allocator, modules, requirement, decided)) {
-            .missing, .missing_requirement => return false,
-            .found, .ambiguous, .undecided => {},
+        for (parameter.resolved_requirements) |requirement| {
+            switch (try findInstance(allocator, modules, requirement, decided)) {
+                .missing, .missing_requirement => return false,
+                .found, .ambiguous, .undecided => {},
+            }
         }
     }
     return true;
@@ -1141,12 +1355,6 @@ pub fn isComptimeErrorCall(module: Module, expression: Expression) bool {
     return false;
 }
 
-pub fn isUnrolled(loop: For) bool {
-    if (loop.sequence != .value) return false;
-    const sequence_type = loop.sequence.value.type orelse return false;
-    return sequence_type == .tuple;
-}
-
 pub fn iterateBlocks(statement: Statement) Blocks {
     return .{ .statement = statement };
 }
@@ -1199,6 +1407,12 @@ pub fn extractElementType(sequence: Sequence) types.Type {
     };
 }
 
+pub fn isCopiedElement(iteration: Iteration, name: ElementName, position: usize) bool {
+    if (name.pointer) return false;
+    const element = iteration.element.tuple.elements[position];
+    return element == .pointer and !element.pointer.many;
+}
+
 pub fn extractElementNames(statement: Statement) []ElementName {
     return switch (statement.kind) {
         .@"for" => |loop| loop.names,
@@ -1225,6 +1439,134 @@ pub fn findElementName(element: Resolution.Element) ElementName {
     return extractElementNames(element.statement.*)[element.position];
 }
 
+pub fn isTupleCondition(statement: Statement) bool {
+    return switch (statement.kind) {
+        .@"if" => |conditional| conditional.tuple,
+        .@"while" => |loop| loop.tuple,
+        else => unreachable,
+    };
+}
+
+pub fn extractBranchNames(matching: Match, branch: Branch) []ElementName {
+    return matching.names[branch.first_name..][0..branch.name_count];
+}
+
+pub fn findNameBranch(matching: Match, position: usize) usize {
+    for (matching.branches, 0..) |branch, index| {
+        if (position < branch.first_name + branch.name_count) return index;
+    }
+    unreachable;
+}
+
+pub const Place = struct {
+    root: Resolution,
+    steps: []const PartStep = &.{},
+
+    pub fn extend(self: Place, allocator: std.mem.Allocator, step: PartStep) std.mem.Allocator.Error!Place {
+        const steps = try allocator.alloc(PartStep, self.steps.len + 1);
+        @memcpy(steps[0..self.steps.len], self.steps);
+        steps[self.steps.len] = step;
+        return .{ .root = self.root, .steps = steps };
+    }
+
+    pub fn contains(self: Place, other: Place) bool {
+        if (!std.meta.eql(self.root, other.root)) return false;
+        if (self.steps.len > other.steps.len) return false;
+        for (self.steps, other.steps[0..self.steps.len]) |one, two| {
+            if (!one.eql(two)) return false;
+        }
+        return true;
+    }
+
+    pub fn eql(self: Place, other: Place) bool {
+        return self.steps.len == other.steps.len and self.contains(other);
+    }
+};
+
+pub const PartStep = union(enum) {
+    field: []const u8,
+    element: u64,
+    value,
+
+    pub fn eql(self: PartStep, other: PartStep) bool {
+        return switch (self) {
+            .field => |name| other == .field and std.mem.eql(u8, name, other.field),
+            .element => |position| other == .element and position == other.element,
+            .value => other == .value,
+        };
+    }
+};
+
+pub fn findSyntacticPlace(allocator: std.mem.Allocator, expression: Expression) std.mem.Allocator.Error!?Place {
+    switch (expression.kind) {
+        .identifier => |identifier| {
+            const resolution = identifier.resolution orelse return null;
+            return switch (resolution) {
+                .local, .parameter, .element => .{ .root = resolution },
+                else => null,
+            };
+        },
+        .address_of => |operand| return findSyntacticPlace(allocator, operand.*),
+        .field_access => |access| {
+            const base = try findSyntacticPlace(allocator, access.value.*) orelse return null;
+            return try base.extend(allocator, .{ .field = access.field });
+        },
+        .index => |indexing| {
+            const position = indexing.position orelse return null;
+            const base = try findSyntacticPlace(allocator, indexing.value.*) orelse return null;
+            return try base.extend(allocator, .{ .element = position });
+        },
+        .unwrap => |operand| {
+            const base = try findSyntacticPlace(allocator, operand.*) orelse return null;
+            return try base.extend(allocator, .value);
+        },
+        else => return null,
+    }
+}
+
+pub fn collectStatementMoves(allocator: std.mem.Allocator, statement: *const Statement, moved: *std.ArrayList(*const Expression)) std.mem.Allocator.Error!void {
+    switch (statement.kind) {
+        .discard, .call, .value => |*expression| try collectExpressionMoves(allocator, expression, moved),
+        .assignment => |*assignment| {
+            try collectExpressionMoves(allocator, &assignment.value, moved);
+            if (assignment.moved) try moved.append(allocator, &assignment.value);
+        },
+        else => {},
+    }
+}
+
+fn collectExpressionMoves(allocator: std.mem.Allocator, expression: *const Expression, moved: *std.ArrayList(*const Expression)) std.mem.Allocator.Error!void {
+    const arguments: []const Argument = switch (expression.kind) {
+        .call => |call| call.arguments,
+        .method_call => |call| call.arguments,
+        .composite_literal => |literal| literal.elements,
+        .case_literal => |literal| literal.arguments,
+        .@"try" => |operand| return collectExpressionMoves(allocator, operand, moved),
+        else => return,
+    };
+    for (arguments) |*argument| {
+        try collectExpressionMoves(allocator, &argument.value, moved);
+        if (argument.own) try moved.append(allocator, &argument.value);
+    }
+}
+
+pub fn isOwnElement(element: Resolution.Element) bool {
+    return switch (element.statement.kind) {
+        .@"if" => |conditional| conditional.own,
+        .@"while" => |loop| loop.own,
+        .match => |matching| matching.branches[findNameBranch(matching, element.position)].own,
+        .tuple_declaration => |declaration| declaration.own,
+        else => false,
+    };
+}
+
+pub fn isWritableElement(element: Resolution.Element) bool {
+    return switch (element.statement.kind) {
+        .tuple_declaration => |declaration| declaration.variable or declaration.own,
+        else => isOwnElement(element),
+    };
+}
+
 pub fn hasPointerName(names: []const ElementName) bool {
     for (names) |name| {
         if (name.pointer) return true;
@@ -1237,7 +1579,7 @@ pub fn isDiscardedName(name: []const u8) bool {
 }
 
 pub fn isAlias(constant: ConstantDeclaration) bool {
-    if (constant.with) return false;
+    if (constant.with or constant.context) return false;
     return switch (constant.value.kind) {
         inline .identifier, .path_expression => |name| name.resolution == null,
         .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type => {
@@ -1335,6 +1677,7 @@ pub fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std
             .name = literal.name,
             .arguments = try cloneArguments(allocator, literal.arguments),
             .called = literal.called,
+            .braced = literal.braced,
             .with_value = try cloneWithValue(allocator, literal.with_value),
             .expected = literal.expected,
         } },
@@ -1383,7 +1726,7 @@ pub fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std
         .jump => |statement| .{ .jump = try cloneNestedStatement(allocator, statement) },
         .branching => |statement| .{ .branching = try cloneNestedStatement(allocator, statement) },
     };
-    return .{ .kind = kind, .location = expression.location };
+    return .{ .kind = kind, .location = expression.location, .handed = expression.handed, .implicit = expression.implicit };
 }
 
 pub fn cloneField(allocator: std.mem.Allocator, field: Field) std.mem.Allocator.Error!Field {
@@ -1392,6 +1735,8 @@ pub fn cloneField(allocator: std.mem.Allocator, field: Field) std.mem.Allocator.
         .type = try cloneExpression(allocator, field.type),
         .default = try cloneOptionalExpression(allocator, field.default),
         .location = field.location,
+        .own = field.own,
+        .private = field.private,
     };
 }
 
@@ -1406,6 +1751,7 @@ fn cloneCall(allocator: std.mem.Allocator, call: *const Call) std.mem.Allocator.
         },
         .arguments = try cloneArguments(allocator, call.arguments),
         .with_value = try cloneWithValue(allocator, call.with_value),
+        .braces = call.braces,
     };
 }
 
@@ -1416,6 +1762,7 @@ fn cloneMethodCall(allocator: std.mem.Allocator, call: *const MethodCall) std.me
         .name_location = call.name_location,
         .arguments = try cloneArguments(allocator, call.arguments),
         .with_value = try cloneWithValue(allocator, call.with_value),
+        .receiver_own = call.receiver_own,
     };
 }
 
@@ -1435,8 +1782,14 @@ fn cloneFunctionSignature(
             .type = try cloneExpression(allocator, parameter.type),
             .location = parameter.location,
             .kind = parameter.kind,
-            .requirement = parameter.requirement,
+            .requirements = parameter.requirements,
+            .resolved_requirements = parameter.resolved_requirements,
             .constraint = parameter.constraint,
+            .constraint_arguments = parameter.constraint_arguments,
+            .unknown_position = parameter.unknown_position,
+            .own = parameter.own,
+            .default = parameter.default,
+            .default_constant = parameter.default_constant,
         };
     }
     return .{
@@ -1449,11 +1802,9 @@ fn cloneFunctionSignature(
         .self_parameter = signature.self_parameter,
         .@"inline" = signature.@"inline",
         .inferred_error_set = signature.inferred_error_set,
+        .return_own = signature.return_own,
+        .private = signature.private,
     };
-}
-
-pub fn cloneBlock(allocator: std.mem.Allocator, statements: []const Statement) std.mem.Allocator.Error![]Statement {
-    return cloneStatements(allocator, statements);
 }
 
 fn cloneStatements(allocator: std.mem.Allocator, statements: []const Statement) std.mem.Allocator.Error![]Statement {
@@ -1481,31 +1832,48 @@ fn cloneStatement(allocator: std.mem.Allocator, statement: Statement) std.mem.Al
             .type = try cloneOptionalExpression(allocator, constant.type),
             .value = try cloneExpression(allocator, constant.value),
             .with = constant.with,
+            .own = constant.own,
+            .moved = constant.moved,
+            .context = constant.context,
         } },
         .tuple_declaration => |declaration| .{ .tuple_declaration = .{
             .names = try allocator.dupe(ElementName, declaration.names),
             .value = try cloneExpression(allocator, declaration.value),
+            .variable = declaration.variable,
+            .own = declaration.own,
+            .moved = declaration.moved,
         } },
         .variable_declaration => |variable| .{ .variable_declaration = .{
             .name = variable.name,
             .type = try cloneOptionalExpression(allocator, variable.type),
             .value = try cloneExpression(allocator, variable.value),
+            .own = variable.own,
+            .moved = variable.moved,
         } },
         .assignment => |assignment| .{ .assignment = .{
             .target = try cloneExpression(allocator, assignment.target),
             .operator = assignment.operator,
             .value = try cloneExpression(allocator, assignment.value),
+            .moved = assignment.moved,
         } },
         .@"if" => |conditional| .{ .@"if" = .{
             .condition = try cloneExpression(allocator, conditional.condition),
+            .marker = conditional.marker,
+            .moved = conditional.moved,
             .names = try allocator.dupe(ElementName, conditional.names),
+            .own = conditional.own,
+            .tuple = conditional.tuple,
             .body = try cloneStatements(allocator, conditional.body),
             .else_body = try cloneOptionalStatements(allocator, conditional.else_body),
         } },
         .@"while" => |loop| .{ .@"while" = .{
             .label = loop.label,
             .condition = try cloneExpression(allocator, loop.condition),
+            .marker = loop.marker,
+            .moved = loop.moved,
             .names = try allocator.dupe(ElementName, loop.names),
+            .own = loop.own,
+            .tuple = loop.tuple,
             .body = try cloneStatements(allocator, loop.body),
             .else_body = try cloneOptionalStatements(allocator, loop.else_body),
         } },
@@ -1525,6 +1893,8 @@ fn cloneStatement(allocator: std.mem.Allocator, statement: Statement) std.mem.Al
         } },
         .match => |matching| .{ .match = .{
             .value = try cloneExpression(allocator, matching.value),
+            .marker = matching.marker,
+            .moved = matching.moved,
             .branches = try cloneBranches(allocator, matching.branches),
             .names = try allocator.dupe(ElementName, matching.names),
         } },
@@ -1571,6 +1941,10 @@ fn cloneBranches(allocator: std.mem.Allocator, branches: []const Branch) std.mem
         copy.* = .{
             .cases = cases,
             .naming = branch.naming,
+            .own = branch.own,
+            .tuple = branch.tuple,
+            .first_name = branch.first_name,
+            .name_count = branch.name_count,
             .body = try cloneStatements(allocator, branch.body),
             .location = branch.location,
         };
@@ -1610,6 +1984,8 @@ fn cloneArguments(allocator: std.mem.Allocator, arguments: []const Argument) std
             .name = argument.name,
             .value = try cloneExpression(allocator, argument.value),
             .location = argument.location,
+            .own = argument.own,
+            .receiver = argument.receiver,
         };
     }
     return cloned;
@@ -1715,6 +2091,31 @@ test "extractElementType: finds usize elements in a range" {
     } };
 
     try std.testing.expectEqual(types.Type{ .number = .usize }, extractElementType(sequence));
+}
+
+test "findNameBranch: finds the branch that gives each name when a branch takes a tuple apart" {
+    const location: token.Location = .{ .row = 1, .column = 1 };
+    var names = [_]ElementName{
+        .{ .name = "_", .location = location },
+        .{ .name = "key", .location = location },
+        .{ .name = "value", .location = location },
+        .{ .name = "rest", .location = location },
+    };
+    var branches = [_]Branch{
+        .{ .cases = &.{}, .body = &.{}, .location = location },
+        .{ .cases = &.{}, .tuple = true, .first_name = 1, .name_count = 2, .body = &.{}, .location = location },
+        .{ .cases = &.{}, .first_name = 3, .body = &.{}, .location = location },
+    };
+    const matching: Match = .{
+        .value = .{ .kind = .{ .identifier = .{ .name = "value" } }, .location = location },
+        .branches = &branches,
+        .names = &names,
+    };
+
+    try std.testing.expectEqual(0, findNameBranch(matching, 0));
+    try std.testing.expectEqual(1, findNameBranch(matching, 1));
+    try std.testing.expectEqual(1, findNameBranch(matching, 2));
+    try std.testing.expectEqual(2, findNameBranch(matching, 3));
 }
 
 test "findConstantRoot: finds the constant that stores a field or an element" {

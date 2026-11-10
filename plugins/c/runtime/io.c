@@ -11,18 +11,34 @@ typedef struct mn_slice_u8 {
     size_t length;
 } mn_slice_u8;
 
-static ptrdiff_t mn_runtime_io_error_code(int number) {
+ptrdiff_t mn_runtime_io_error_code(int number) {
     switch (number) {
     case EPIPE:
         return -1;
-    case EIO:
+    case ECONNABORTED:
+    case ECONNRESET:
+    case ENETDOWN:
+    case ENETUNREACH:
+    case ENOTCONN:
+    case ETIMEDOUT:
         return -2;
-    case EISDIR:
+    case EIO:
         return -3;
-    case ENOSPC:
+    case EISDIR:
         return -4;
-    default:
+    case EDQUOT:
+    case EFBIG:
+    case ENOSPC:
         return -5;
+    case EBADF:
+        return -6;
+    case EAGAIN:
+#if EWOULDBLOCK != EAGAIN
+    case EWOULDBLOCK:
+#endif
+        return -7;
+    default:
+        return -8;
     }
 }
 

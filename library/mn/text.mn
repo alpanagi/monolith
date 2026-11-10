@@ -1,4 +1,24 @@
-fn strip(bytes: []Const(u8)) -> []Const(u8)
+import mn
+import mn::container
+import mn::convert::ToOwned
+import mn::memory
+import mn::memory::Deinit
+import mn::reflection
+import mn::reflection::Tuple
+import mn::stream::Writer
+
+
+fn print(writer: *Writer, comptime format: []const(u8), values: Tuple) -> !void = write_format(writer, format, 0, find_brace(format, 0), 0, values)
+
+
+fn format(comptime pattern: []const(u8), values: Tuple) -> own memory::Error![]u8
+    var own list = container::ArrayList(u8)::init()
+    errdefer list.deinit(own)
+    try print(&list, pattern, values)
+    return list.to_owned(own)
+
+
+fn strip(bytes: []const(u8)) -> []const(u8)
     var start: usize = 0
     var end = bytes.length
     while (start < end and is_whitespace(bytes[start])) start += 1
@@ -9,3 +29,109 @@ fn strip(bytes: []Const(u8)) -> []Const(u8)
 fn is_whitespace(byte: u8) -> bool = match byte
     case (' ', '\t', '\n', '\r', 0x0b, 0x0c) true
     else false
+
+
+fn(type Values: Tuple) write_format(writer: *Writer, comptime format: []const(u8), comptime position: usize, comptime brace: usize, comptime index: usize, values: Values) -> !void
+    if (brace > position) try Writer::write(writer, format[position..brace])
+    if brace == format.length
+        if (index < reflection::length(Values)) mn::comptime::error("format has fewer placeholders than values")
+    else if brace + 1 < format.length and format[brace + 1] == format[brace]
+        try Writer::write(writer, format[brace..brace + 1])
+        try write_format(writer, format, brace + 2, find_brace(format, brace + 2), index, values)
+    else if format[brace] == '}'
+        mn::comptime::error("format has a } without a {, write }} for a brace")
+    else if find_close(format, brace) == format.length
+        mn::comptime::error("format has a { without a }, write {{ for a brace")
+    else if find_specifier(format, brace) == '?'
+        mn::comptime::error("format has an unknown placeholder, use {}, {x}, {b} or {s}")
+    else if index == reflection::length(Values)
+        mn::comptime::error("format has more placeholders than values")
+    else
+        try write_value(writer, Values[index], find_specifier(format, brace), values[index])
+        try write_format(writer, format, find_close(format, brace) + 1, find_brace(format, find_close(format, brace) + 1), index + 1, values)
+
+
+fn find_brace(format: []const(u8), start: usize) -> usize
+    for index in start..format.length
+        if (format[index] == '{' or format[index] == '}') return index
+    return format.length
+
+
+fn find_close(format: []const(u8), brace: usize) -> usize
+    for index in brace + 1..format.length
+        if (format[index] == '}') return index
+    return format.length
+
+
+fn find_specifier(format: []const(u8), brace: usize) -> u8
+    const text = format[brace + 1..find_close(format, brace)]
+    if (text.length == 0) return 'd'
+    if (text.length == 1 and (text[0] == 'x' or text[0] == 'b' or text[0] == 's')) return text[0]
+    return '?'
+
+
+fn write_value(writer: *Writer, type T, comptime specifier: u8, value: T) -> !void
+    if T == bool
+        if (specifier != 'd') mn::comptime::error("a bool is formatted only with {}")
+        if value
+            try Writer::write(writer, "true")
+        else
+            try Writer::write(writer, "false")
+    else if T == []u8 or T == []const(u8)
+        if specifier == 'x'
+            try write_hexadecimal(writer, value)
+        else if specifier == 's'
+            try Writer::write(writer, value)
+        else
+            mn::comptime::error("a byte slice is formatted only with {s} or {x}")
+    else if T == i8 or T == i16 or T == i32 or T == i64 or T == i128 or T == isize
+        if (specifier == 's') mn::comptime::error("an integer is formatted only with {}, {x} or {b}")
+        try write_integer(writer, T, true, find_base(specifier), value)
+    else if T == u8 or T == u16 or T == u32 or T == u64 or T == u128 or T == usize
+        if (specifier == 's') mn::comptime::error("an integer is formatted only with {}, {x} or {b}")
+        try write_integer(writer, T, false, find_base(specifier), value)
+    else
+        mn::comptime::error("only integers, bools and byte slices can be formatted")
+
+
+fn write_hexadecimal(writer: *Writer, bytes: []const(u8)) -> !void
+    var buffer: [64]u8 = undefined
+    var position: usize = 0
+    for byte in bytes
+        buffer[position] = find_digit(byte >> 4)
+        buffer[position + 1] = find_digit(byte & 15)
+        position += 2
+        if position == buffer.length
+            try Writer::write(writer, &buffer)
+            position = 0
+    if (position > 0) try Writer::write(writer, buffer[..position])
+
+
+fn find_base(specifier: u8) -> u8 = match specifier
+    case ('x') 16
+    case ('b') 2
+    else 10
+
+
+fn write_integer(writer: *Writer, type T, comptime is_signed: bool, comptime base: u8, value: T) -> !void
+    var buffer: [129]u8 = undefined
+    var position = buffer.length
+    var rest = value
+    if is_signed
+        if (value > 0) rest = 0 - value
+    const radix = mn::convert(T, base)
+    while true
+        position -= 1
+        buffer[position] = find_digit(mn::convert(u8, if (is_signed) 0 - rest % radix else rest % radix))
+        rest /= radix
+        if (rest == 0) break
+    if is_signed
+        if value < 0
+            position -= 1
+            buffer[position] = '-'
+    try Writer::write(writer, buffer[position..])
+
+
+fn find_digit(digit: u8) -> u8
+    if (digit < 10) return '0' + digit
+    return 'a' + digit - 10

@@ -1,0 +1,298 @@
+import mn
+import mn::codec::Decode
+import mn::codec::Decoder
+import mn::codec::Encode
+import mn::codec::Encoder
+import mn::compare::Equal
+import mn::convert::To
+import mn::hash
+import mn::hash::Hash
+import mn::memory
+import mn::memory::Clone
+import mn::memory::Deinit
+import mn::stream
+import mn::stream::Reader
+import mn::stream::Writer
+import mn::time
+
+private external fn mn_runtime_filesystem_absolute(name: []const(u8), buffer: []u8) -> i32
+
+private external fn mn_runtime_filesystem_close(descriptor: i32)
+private external fn mn_runtime_filesystem_close_directory(handle: *void)
+private external fn mn_runtime_filesystem_metadata(name: []const(u8), kind: *i32, size: *usize, seconds: *i64, nanoseconds: *u32) -> i32
+private external fn mn_runtime_filesystem_next_entry(handle: *void, entry: *Directory::RawEntry) -> i32
+private external fn mn_runtime_filesystem_open(name: []const(u8), mode: i32) -> i32
+private external fn mn_runtime_filesystem_open_directory(name: []const(u8), code: *i32) -> ?*void
+private external fn mn_runtime_filesystem_size(descriptor: i32) -> isize
+private external fn mn_runtime_io_read(descriptor: i32, buffer: []u8) -> isize
+private external fn mn_runtime_io_write(descriptor: i32, bytes: []const(u8)) -> isize
+
+const maximum_path_length: usize = 4096
+private const separator: u8 = '/'
+
+
+error Error
+    BrokenPipe
+    DeviceFailure
+    IsDirectory
+    NameTooLong
+    NoSpace
+    NotDirectory
+    NotFound
+    NotOpen
+    PermissionDenied
+    SystemLimit
+    WouldBlock
+    SystemFailure
+
+
+struct File
+    private descriptor: i32
+
+    fn open(path: Path, mode: Mode) -> Error!Self
+        var name: [maximum_path_length]u8 = undefined
+        const descriptor = mn_runtime_filesystem_open(try fill_name(path, &name), find_mode_code(mode))
+        if (descriptor < 0) return find_error(descriptor)
+        return { descriptor = descriptor }
+
+
+    fn size(self: Self) -> Error!usize
+        const byte_count = mn_runtime_filesystem_size(self.descriptor)
+        if (byte_count < 0) return find_descriptor_error(byte_count)
+        return mn::convert(usize, byte_count)
+
+
+    fn deinit(self: Self) = mn_runtime_filesystem_close(self.descriptor)
+
+    enum Mode
+        Read
+        Write
+
+    enum Kind
+        File
+        Directory
+        SymbolicLink
+        Other
+
+
+private fn fill_name(path: Path, buffer: []u8) -> Error![]const(u8)
+    const length = path.bytes.length
+    if (length >= buffer.length) return Error::NameTooLong
+    memory::copy(buffer[..length], path.bytes)
+    buffer[length] = 0
+    return buffer[..length + 1]
+
+
+private fn find_mode_code(mode: File::Mode) -> i32 = match mode
+    case (File::Mode::Read) 0
+    case (File::Mode::Write) 1
+
+
+fn find_error(code: i32) -> Error = match code
+    case (-1) Error::IsDirectory
+    case (-2) Error::NameTooLong
+    case (-3) Error::NoSpace
+    case (-4) Error::NotDirectory
+    case (-5) Error::NotFound
+    case (-6) Error::PermissionDenied
+    case (-7) Error::SystemLimit
+    else Error::SystemFailure
+
+
+fn find_descriptor_error(code: isize) -> Error = match code
+    case (-1) Error::BrokenPipe
+    case (-3) Error::DeviceFailure
+    case (-4) Error::IsDirectory
+    case (-5) Error::NoSpace
+    case (-6) Error::NotOpen
+    case (-7) Error::WouldBlock
+    else Error::SystemFailure
+
+
+instance stream::Reader(File)
+
+    fn read(file: *const(Self), buffer: []u8) -> !usize
+        const count = mn_runtime_io_read(file.descriptor, buffer)
+        if (count < 0) return find_descriptor_error(count)
+        return mn::convert(usize, count)
+
+
+instance stream::Writer(File)
+
+    fn write(file: *const(Self), bytes: []const(u8)) -> !void
+        const code = mn_runtime_io_write(file.descriptor, bytes)
+        if (code < 0) return find_descriptor_error(code)
+
+
+struct Directory
+    private handle: *void
+
+    fn open(path: Path) -> Error!Self
+        var name: [maximum_path_length]u8 = undefined
+        var code: i32 = 0
+        const handle = mn_runtime_filesystem_open_directory(try fill_name(path, &name), &code) orelse return find_error(code)
+        return { handle = handle }
+
+
+    fn next(self: Self) -> Error!?Entry
+        var entry: RawEntry = undefined
+        const status = mn_runtime_filesystem_next_entry(self.handle, &entry)
+        if (status < 0) return find_descriptor_error(mn::convert(isize, status))
+        if (status == 0) return null
+        return { name = entry.name[0..entry.length], kind = find_kind(entry.kind) }
+
+
+    fn deinit(self: Self) = mn_runtime_filesystem_close_directory(self.handle)
+
+    private external struct RawEntry
+        name: *many(const(u8))
+        length: usize
+        kind: i32
+
+    struct Entry
+        name: []const(u8)
+        kind: File::Kind
+
+
+private fn find_kind(code: i32) -> File::Kind = match code
+    case (0) File::Kind::File
+    case (1) File::Kind::Directory
+    case (2) File::Kind::SymbolicLink
+    else File::Kind::Other
+
+
+inline struct Path
+    private bytes: []const(u8)
+
+    fn init() -> own Self = { bytes = {} }
+
+
+    fn is_absolute(self: Self) -> bool = self.bytes.length > 0 and self.bytes[0] == separator
+
+
+    fn join(self: Self, name: []const(u8)) -> own memory::Error!Self
+        const length = self.bytes.length
+        const is_separated = length > 0 and self.bytes[length - 1] != separator
+        const start = if (is_separated) length + 1 else length
+        const total = start + name.length
+        if (start < length or total < start) return memory::Error::OutOfMemory
+        const own bytes = try memory::allocate(u8, total)
+        memory::copy(bytes, self.bytes)
+        if (is_separated) bytes[length] = separator
+        memory::copy(bytes[start..], name)
+        return { bytes = own bytes }
+
+
+    fn parent(self: Self) -> own memory::Error!Self = build_path(self.bytes[..find_parent_length(self.bytes)])
+
+
+    fn absolute(self: Self) -> own (Error || memory::Error)!Self
+        var name: [maximum_path_length]u8 = undefined
+        var resolved: [maximum_path_length]u8 = undefined
+        const length = mn_runtime_filesystem_absolute(try fill_name(self, &name), &resolved)
+        if (length < 0) return find_error(length)
+        return try build_path(resolved[..mn::convert(usize, length)])
+
+
+instance Hash(Path)
+
+    fn hash(path: *const(Self)) -> u64 = hash::splitmix64(hash::fnv1a64(path.bytes))
+
+
+instance Equal(Path)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = Equal::equal(&one.bytes, &two.bytes)
+
+
+instance Clone(Path)
+
+    fn clone(path: *const(Self)) -> own memory::Error!Self = { bytes = try path.bytes.clone() }
+
+
+instance Deinit(Path)
+
+    fn deinit(own path: *Self) = memory::free(own path.bytes)
+
+
+instance To([]const(u8), Path)
+
+    fn to(text: Self, type U) -> own !U = build_path(text)
+
+
+instance To(Path, []u8)
+
+    fn to(path: Self, type U) -> own !U
+        const own text = try memory::allocate(u8, path.bytes.length)
+        memory::copy(text, path.bytes)
+        return text
+
+
+instance Encode(Path)
+
+    fn encode(path: *const(Self), encoder: *Encoder) -> !void = encoder.bytes(path.bytes)
+
+
+instance Decode(Path)
+
+    fn decode(decoder: *Decoder) -> own !Self
+        const own bytes = try decoder.bytes()
+        return { bytes = own bytes }
+
+
+private fn build_path(bytes: []const(u8)) -> own memory::Error!Path
+    const own copied = try memory::allocate(u8, bytes.length)
+    memory::copy(copied, bytes)
+    return { bytes = own copied }
+
+
+private fn find_parent_length(bytes: []const(u8)) -> usize
+    var end = bytes.length
+    while end > 1 and bytes[end - 1] == separator
+        end -= 1
+    while end > 0 and bytes[end - 1] != separator
+        end -= 1
+    while end > 1 and bytes[end - 1] == separator
+        end -= 1
+    return end
+
+
+struct Metadata
+    kind: File::Kind
+    size: usize
+    modified_time: time::WallTime
+
+
+fn metadata(path: Path) -> Error!Metadata
+    var name: [maximum_path_length]u8 = undefined
+    var kind: i32 = 0
+    var size: usize = 0
+    var modified: time::WallTime = { seconds = 0, nanoseconds = 0 }
+    const code = mn_runtime_filesystem_metadata(try fill_name(path, &name), &kind, &size, &modified.seconds, &modified.nanoseconds)
+    if (code < 0) return find_error(code)
+    return { kind = find_kind(kind), size = size, modified_time = modified }
+
+
+fn read(path: Path) -> own ![]u8
+    const file = try File::open(path, File::Mode::Read)
+    defer file.deinit()
+    const size = try file.size()
+    var own bytes = try memory::allocate(u8, size)
+    errdefer memory::free(own bytes)
+    var filled: usize = 0
+    while filled < size
+        const count = try file.read(bytes[filled..])
+        if (count == 0) break
+        filled += count
+    if filled < size
+        if filled == 0
+            memory::free(own bytes)
+            return {}
+        if (!memory::resize(bytes, filled)) return memory::Error::OutOfMemory
+        memory::refit(&bytes, filled)
+    return bytes
+
+
+fn write(path: Path, bytes: []const(u8)) -> !void
+    const file = try File::open(path, File::Mode::Write)
+    defer file.deinit()
+    try file.write(bytes)
