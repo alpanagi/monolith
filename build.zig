@@ -17,8 +17,8 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "core", .module = core }},
     });
 
-    const c_plugin = b.createModule(.{
-        .root_source_file = b.path("plugins/c/generator.zig"),
+    const c_generator = b.createModule(.{
+        .root_source_file = b.path("generators/c/generator.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "core", .module = core }},
@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "core", .module = core },
                 .{ .name = "monolith", .module = monolith },
-                .{ .name = "c", .module = c_plugin },
+                .{ .name = "c", .module = c_generator },
             },
         }),
     });
@@ -46,9 +46,9 @@ pub fn build(b: *std.Build) void {
     });
 
     b.installDirectory(.{
-        .source_dir = b.path("plugins/c/runtime"),
+        .source_dir = b.path("generators/c/runtime"),
         .install_dir = .bin,
-        .install_subdir = "plugins/c/runtime",
+        .install_subdir = "generators/c/runtime",
     });
 
     const test_step = b.step("test", "Run tests");
@@ -58,9 +58,9 @@ pub fn build(b: *std.Build) void {
         addTestRun(b, test_step, tests, input_marker);
     }
 
-    const c_plugin_tests = b.addTest(.{
+    const c_generator_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("plugins/c/generator.zig"),
+            .root_source_file = b.path("generators/c/generator.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -69,13 +69,13 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    addTestRun(b, test_step, c_plugin_tests, input_marker);
+    addTestRun(b, test_step, c_generator_tests, input_marker);
 }
 
 fn addInputMarker(b: *std.Build) std.Build.LazyPath {
     const inputs = b.addWriteFiles();
     _ = inputs.addCopyDirectory(b.path("library"), "library", .{});
-    _ = inputs.addCopyDirectory(b.path("plugins/c"), "plugins/c", .{});
+    _ = inputs.addCopyDirectory(b.path("generators/c"), "generators/c", .{});
     return inputs.add("marker", "");
 }
 

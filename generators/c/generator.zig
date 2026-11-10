@@ -47,13 +47,13 @@ pub const Generator = struct {
         self: *Generator,
         allocator: std.mem.Allocator,
         io: std.Io,
-        plugin_path: []const u8,
+        generator_path: []const u8,
         output_path: []const u8,
     ) GenerateError!void {
         const files = try self.generateFiles(allocator);
 
-        const plugin_directory = try std.Io.Dir.cwd().openDir(io, plugin_path, .{});
-        defer plugin_directory.close(io);
+        const generator_directory = try std.Io.Dir.cwd().openDir(io, generator_path, .{});
+        defer generator_directory.close(io);
         try std.Io.Dir.cwd().deleteTree(io, output_path);
         const output_directory = try std.Io.Dir.cwd().createDirPathOpen(io, output_path, .{});
         defer output_directory.close(io);
@@ -66,10 +66,10 @@ pub const Generator = struct {
             }
             try source_directory.writeFile(io, .{ .sub_path = file.path, .data = file.contents });
         }
-        const runtime_files = try self.collectRuntimeFiles(allocator, io, plugin_directory);
+        const runtime_files = try self.collectRuntimeFiles(allocator, io, generator_directory);
         for (runtime_files) |path| {
             try source_directory.createDirPath(io, std.fs.path.dirname(path).?);
-            try plugin_directory.copyFile(path, source_directory, path, io, .{});
+            try generator_directory.copyFile(path, source_directory, path, io, .{});
         }
         try self.buildExecutable(allocator, io, source_directory, files, runtime_files);
     }
@@ -78,12 +78,12 @@ pub const Generator = struct {
         self: *Generator,
         allocator: std.mem.Allocator,
         io: std.Io,
-        plugin_directory: std.Io.Dir,
+        generator_directory: std.Io.Dir,
     ) GenerateError![]const []const u8 {
         var runtime_files: std.ArrayList([]const u8) = .empty;
         try runtime_files.append(allocator, "runtime/monolith.h");
         for (self.runtime_functions.items) |name| {
-            const path = try findRuntimeFile(allocator, io, plugin_directory, name);
+            const path = try findRuntimeFile(allocator, io, generator_directory, name);
             if (!containsName(runtime_files.items, path)) try runtime_files.append(allocator, path);
         }
         return runtime_files.items;
@@ -6823,7 +6823,7 @@ fn isRuntimeFunction(name: []const u8) bool {
 fn findRuntimeFile(
     allocator: std.mem.Allocator,
     io: std.Io,
-    plugin_directory: std.Io.Dir,
+    generator_directory: std.Io.Dir,
     name: []const u8,
 ) (std.mem.Allocator.Error || std.Io.Dir.AccessError)![]const u8 {
     const parts = name["mn_".len..];
@@ -6831,7 +6831,7 @@ fn findRuntimeFile(
     while (end) |index| : (end = std.mem.findScalarPos(u8, parts, index + 1, '_')) {
         const path = try std.mem.concat(allocator, u8, &.{ parts[0..index], ".c" });
         std.mem.replaceScalar(u8, path, '_', '/');
-        plugin_directory.access(io, path, .{}) catch |access_error| switch (access_error) {
+        generator_directory.access(io, path, .{}) catch |access_error| switch (access_error) {
             error.FileNotFound => continue,
             else => return access_error,
         };
@@ -6899,16 +6899,16 @@ test "Generator.generate: writes the modules and the runtime files they use" {
     defer program_directory.cleanup();
     var compiler_directory = std.testing.tmpDir(.{});
     defer compiler_directory.cleanup();
-    var plugin_directory = std.testing.tmpDir(.{});
-    defer plugin_directory.cleanup();
+    var generator_directory = std.testing.tmpDir(.{});
+    defer generator_directory.cleanup();
     var output_directory = std.testing.tmpDir(.{});
     defer output_directory.cleanup();
     try compiler_directory.dir.createDirPath(std.testing.io, "mn");
     try compiler_directory.dir.writeFile(std.testing.io, .{ .sub_path = "mn/stdout.mn", .data = "external fn mn_runtime_stdout_write(text: []const(u8))\nconst write = mn_runtime_stdout_write" });
-    try plugin_directory.dir.createDirPath(std.testing.io, "runtime");
-    try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/monolith.h", .data = "header" });
-    try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/stdout.c", .data = "stdout" });
-    try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/unused.c", .data = "unused" });
+    try generator_directory.dir.createDirPath(std.testing.io, "runtime");
+    try generator_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/monolith.h", .data = "header" });
+    try generator_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/stdout.c", .data = "stdout" });
+    try generator_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/unused.c", .data = "unused" });
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
     const compiler_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &compiler_directory.sub_path });
@@ -6922,11 +6922,11 @@ test "Generator.generate: writes the modules and the runtime files they use" {
     var type_checker = @import("monolith").TypeChecker.init(&arena, program);
     try type_checker.check();
     var generator = Generator.init(program);
-    const plugin_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &plugin_directory.sub_path });
+    const generator_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &generator_directory.sub_path });
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
     try output_directory.dir.createDirPath(std.testing.io, "build");
     try output_directory.dir.writeFile(std.testing.io, .{ .sub_path = "build/old.txt", .data = "old" });
-    try generator.generate(allocator, std.testing.io, plugin_path, output_path);
+    try generator.generate(allocator, std.testing.io, generator_path, output_path);
 
     try std.testing.expectEqualStrings("header", try output_directory.dir.readFileAlloc(std.testing.io, "build/source/runtime/monolith.h", allocator, .unlimited));
     try std.testing.expectEqualStrings("stdout", try output_directory.dir.readFileAlloc(std.testing.io, "build/source/runtime/stdout.c", allocator, .unlimited));
@@ -6987,7 +6987,7 @@ test "Generator.generate: builds an executable when the main module defines main
     try type_checker.check();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const executable = try output_directory.dir.statFile(std.testing.io, "build/hello", .{});
     try std.testing.expectEqual(.file, executable.kind);
@@ -7010,12 +7010,12 @@ test "Generator.generate: builds an executable that uses the standard streams an
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const executable = try output_directory.dir.statFile(std.testing.io, "build/main", .{});
     try std.testing.expectEqual(.file, executable.kind);
-    const io_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "plugins/c/runtime/io.c", allocator, .unlimited);
-    const filesystem_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "plugins/c/runtime/filesystem.c", allocator, .unlimited);
+    const io_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "generators/c/runtime/io.c", allocator, .unlimited);
+    const filesystem_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "generators/c/runtime/filesystem.c", allocator, .unlimited);
     try std.testing.expectEqualStrings(io_source, try output_directory.dir.readFileAlloc(std.testing.io, "build/source/runtime/io.c", allocator, .unlimited));
     try std.testing.expectEqualStrings(filesystem_source, try output_directory.dir.readFileAlloc(std.testing.io, "build/source/runtime/filesystem.c", allocator, .unlimited));
 }
@@ -7037,7 +7037,7 @@ test "Generator.generate: builds an executable that writes files" {
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7070,7 +7070,7 @@ test "Generator.generate: builds an executable that reads a file it opened to wr
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7097,7 +7097,7 @@ test "Generator.generate: builds an executable that reports the errors of openin
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7129,7 +7129,7 @@ test "Generator.generate: builds an executable that reads its arguments" {
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7163,7 +7163,7 @@ test "Generator.generate: builds an executable that gives no arguments when the 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const source_directory = try output_directory.dir.openDir(std.testing.io, "build/source", .{});
     defer source_directory.close(std.testing.io);
@@ -7203,7 +7203,7 @@ test "Generator.generate: builds an executable that gives its first operating sy
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7239,7 +7239,7 @@ test "Generator.generate: builds an executable that reads its first operating sy
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7266,7 +7266,7 @@ test "Generator.generate: builds an executable that handles one error of a match
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7306,7 +7306,7 @@ test "Generator.generate: builds an executable that names the smallest type of w
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7333,7 +7333,7 @@ test "Generator.generate: builds an executable that converts what is left to lar
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7360,7 +7360,7 @@ test "Generator.generate: builds an executable that handles results without a va
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7387,7 +7387,7 @@ test "Generator.generate: builds an executable that names what is left in each i
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7414,7 +7414,7 @@ test "Generator.generate: builds an executable that names what is left beside a 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7441,7 +7441,7 @@ test "Generator.generate: builds an executable that opens a file or creates it a
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7480,7 +7480,7 @@ test "Generator.generate: builds an executable whose monotonic clock never goes 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7507,11 +7507,11 @@ test "Generator.generate: builds an executable whose clocks agree with reference
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
-    const runtime_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "plugins/c/runtime/time.c", allocator, .unlimited);
+    const runtime_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "generators/c/runtime/time.c", allocator, .unlimited);
     try std.testing.expectEqualStrings(runtime_source, try output_directory.dir.readFileAlloc(std.testing.io, "build/source/runtime/time.c", allocator, .unlimited));
     try build_directory.writeFile(std.testing.io, .{ .sub_path = "reference.c", .data = "#define _POSIX_C_SOURCE 200809L\n\n#include <stdio.h>\n#include <time.h>\n\nint main(void) {\n    struct timespec monotonic;\n    clock_gettime(CLOCK_MONOTONIC, &monotonic);\n    printf(\"%lld %lld\\n\", (long long)time(NULL), (long long)monotonic.tv_sec * 1000000000LL + (long long)monotonic.tv_nsec);\n    return 0;\n}\n" });
     const compiled = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "gcc", "-std=c23", "-w", "reference.c", "-o", "reference" }, .cwd = .{ .dir = build_directory } });
@@ -7632,7 +7632,7 @@ test "Generator.generate: links no clock runtime into a program that does not us
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7661,7 +7661,7 @@ test "Generator.generate: builds an executable that requires a typeclass with on
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7688,7 +7688,7 @@ test "Generator.generate: builds an executable that swaps, replaces, takes and m
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7715,7 +7715,7 @@ test "Generator.generate: builds an executable that turns lists into memory of t
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7742,7 +7742,7 @@ test "Generator.generate: builds an executable that hands receivers to methods w
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7769,7 +7769,7 @@ test "Generator.generate: builds an executable that hands receivers to a method 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7797,7 +7797,7 @@ test "Generator.generate: builds an executable that builds, changes and ends a s
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7824,7 +7824,7 @@ test "Generator.generate: builds an executable that fills an own struct field by
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7851,7 +7851,7 @@ test "Generator.generate: builds an executable that takes values apart into vari
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7878,7 +7878,7 @@ test "Generator.generate: builds an executable that builds cases with their valu
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7905,7 +7905,7 @@ test "Generator.generate: builds an executable that goes over zipped iterators" 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7932,7 +7932,7 @@ test "Generator.generate: builds an executable that formats text through the hea
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7959,7 +7959,7 @@ test "Generator.generate: builds an executable that formats text through a count
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -7986,7 +7986,7 @@ test "Generator.generate: builds an executable that prints without importing Wri
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8013,7 +8013,7 @@ test "Generator.generate: builds an executable that prints through the print met
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8040,7 +8040,7 @@ test "Generator.generate: builds an executable that allocates and frees zero len
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8078,7 +8078,7 @@ test "Generator.generate: builds an executable that gives the allocator of a wit
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8105,7 +8105,7 @@ test "Generator.generate: builds an executable that passes owned values through 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8132,7 +8132,7 @@ test "Generator.generate: builds an executable that keeps owning values in a lis
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8159,7 +8159,7 @@ test "Generator.generate: builds an executable that ends and clones values of ty
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8189,7 +8189,7 @@ test "Generator.generate: builds an executable that forgets owned values without
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8218,7 +8218,7 @@ test "Generator.generate: builds an executable that pops and frees each element 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8245,7 +8245,7 @@ test "Generator.generate: builds an executable that moves parts out of owned val
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8274,7 +8274,7 @@ test "Generator.generate: builds an executable that moves owned values into the 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8301,7 +8301,7 @@ test "Generator.generate: builds an executable that goes over Iterables through 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8328,7 +8328,7 @@ test "Generator.generate: builds an executable that clones a literal key into a 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8355,7 +8355,7 @@ test "Generator.generate: builds an executable that pops and frees lists, maps a
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8382,7 +8382,7 @@ test "Generator.generate: builds an executable that frees through the allocator 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8409,7 +8409,7 @@ test "Generator.generate: builds an executable that takes an allocator type with
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8436,7 +8436,7 @@ test "Generator.generate: builds an executable that reads with allocator the all
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8463,7 +8463,7 @@ test "Generator.generate: builds an executable without a warning that slices poi
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8496,7 +8496,7 @@ test "Generator.generate: builds an executable whose library reads the arguments
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8523,7 +8523,7 @@ test "Generator.generate: builds an executable that opens the file its argument 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8553,7 +8553,7 @@ test "Generator.generate: builds an executable that takes the enum of a case fro
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8583,7 +8583,7 @@ test "Generator.generate: builds an executable that opens files with the mode wr
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8613,7 +8613,7 @@ test "Generator.generate: builds an executable that keeps an inline struct as it
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8640,7 +8640,7 @@ test "Generator.generate: builds an executable that ends inline structs through 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8667,7 +8667,7 @@ test "Generator.generate: builds an executable that gives fields by names standi
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8694,7 +8694,7 @@ test "Generator.generate: builds an executable that joins paths, finds their par
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8721,7 +8721,7 @@ test "Generator.generate: builds an executable that turns a path into text" {
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8753,7 +8753,7 @@ test "Generator.generate: builds an executable that selects an instance by its t
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8780,7 +8780,7 @@ test "Generator.generate: builds an executable that gives a name too long from o
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8807,7 +8807,7 @@ test "Generator.generate: builds an executable that grows a map through many siz
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8837,7 +8837,7 @@ test "Generator.generate: builds an executable that keeps a map equal to a list 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8867,7 +8867,7 @@ test "Generator.generate: builds an executable that keeps colliding keys of a ma
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8897,7 +8897,7 @@ test "Generator.generate: builds an executable that keeps maps of each kind of k
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8935,7 +8935,7 @@ test "Generator.generate: builds an executable that goes over the keys and value
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8965,7 +8965,7 @@ test "Generator.generate: builds an executable that allocates a map from a fixed
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -8995,7 +8995,7 @@ test "Generator.generate: builds an executable that gives the absolute form of a
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9035,7 +9035,7 @@ test "Generator.generate: builds an executable that allocates the absolute form 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9062,7 +9062,7 @@ test "Generator.generate: builds an executable that keeps maps of arrays of each
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9092,7 +9092,7 @@ test "Generator.generate: builds an executable that calls fnv1a64 and splitmix64
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9122,7 +9122,7 @@ test "Generator.generate: builds an executable that hashes slices, numbers, arra
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9159,7 +9159,7 @@ test "Generator.generate: builds an executable that hashes a record by the metho
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9186,7 +9186,7 @@ test "Generator.generate: builds an executable with an instance that takes the l
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9216,7 +9216,7 @@ test "Generator.generate: builds an executable that uses Self in the blocks of i
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9246,7 +9246,7 @@ test "Generator.generate: builds an executable that copies elements" {
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9276,7 +9276,7 @@ test "Generator.generate: builds an executable that runs an errdefer of an inner
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9302,7 +9302,7 @@ test "Generator.generate: builds an executable that copies empty slices and larg
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9328,7 +9328,7 @@ test "Generator.generate: builds an executable that calls functions of the expec
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9357,7 +9357,7 @@ test "Generator.generate: builds an executable that calls a function with a rese
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9383,7 +9383,7 @@ test "Generator.generate: builds an executable with loops that fit their arrays 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9447,7 +9447,7 @@ test "Generator.generate: builds an executable that reports the errors of the sy
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9483,7 +9483,7 @@ test "Generator.generate: builds an executable whose cases line up with each err
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9492,7 +9492,7 @@ test "Generator.generate: builds an executable whose cases line up with each err
 
     try build_directory.writeFile(std.testing.io, .{ .sub_path = "codes.c", .data = "#include \"filesystem.c\"\n#include \"io.c\"\n#include <stdio.h>\n\nint main(void) {\n    printf(\"io EPIPE %d\\n\", (int)mn_runtime_io_error_code(EPIPE));\n    printf(\"io ECONNABORTED %d\\n\", (int)mn_runtime_io_error_code(ECONNABORTED));\n    printf(\"io ECONNRESET %d\\n\", (int)mn_runtime_io_error_code(ECONNRESET));\n    printf(\"io ENETDOWN %d\\n\", (int)mn_runtime_io_error_code(ENETDOWN));\n    printf(\"io ENETUNREACH %d\\n\", (int)mn_runtime_io_error_code(ENETUNREACH));\n    printf(\"io ENOTCONN %d\\n\", (int)mn_runtime_io_error_code(ENOTCONN));\n    printf(\"io ETIMEDOUT %d\\n\", (int)mn_runtime_io_error_code(ETIMEDOUT));\n    printf(\"io EIO %d\\n\", (int)mn_runtime_io_error_code(EIO));\n    printf(\"io EISDIR %d\\n\", (int)mn_runtime_io_error_code(EISDIR));\n    printf(\"io EDQUOT %d\\n\", (int)mn_runtime_io_error_code(EDQUOT));\n    printf(\"io EFBIG %d\\n\", (int)mn_runtime_io_error_code(EFBIG));\n    printf(\"io ENOSPC %d\\n\", (int)mn_runtime_io_error_code(ENOSPC));\n    printf(\"io EBADF %d\\n\", (int)mn_runtime_io_error_code(EBADF));\n    printf(\"io EAGAIN %d\\n\", (int)mn_runtime_io_error_code(EAGAIN));\n    printf(\"io EWOULDBLOCK %d\\n\", (int)mn_runtime_io_error_code(EWOULDBLOCK));\n    printf(\"io EINVAL %d\\n\", (int)mn_runtime_io_error_code(EINVAL));\n    printf(\"io ELOOP %d\\n\", (int)mn_runtime_io_error_code(ELOOP));\n    printf(\"filesystem EISDIR %d\\n\", (int)mn_runtime_filesystem_error_code(EISDIR));\n    printf(\"filesystem ENAMETOOLONG %d\\n\", (int)mn_runtime_filesystem_error_code(ENAMETOOLONG));\n    printf(\"filesystem EDQUOT %d\\n\", (int)mn_runtime_filesystem_error_code(EDQUOT));\n    printf(\"filesystem EFBIG %d\\n\", (int)mn_runtime_filesystem_error_code(EFBIG));\n    printf(\"filesystem ENOSPC %d\\n\", (int)mn_runtime_filesystem_error_code(ENOSPC));\n    printf(\"filesystem EOVERFLOW %d\\n\", (int)mn_runtime_filesystem_error_code(EOVERFLOW));\n    printf(\"filesystem ENOTDIR %d\\n\", (int)mn_runtime_filesystem_error_code(ENOTDIR));\n    printf(\"filesystem ENODEV %d\\n\", (int)mn_runtime_filesystem_error_code(ENODEV));\n    printf(\"filesystem ENOENT %d\\n\", (int)mn_runtime_filesystem_error_code(ENOENT));\n    printf(\"filesystem ENXIO %d\\n\", (int)mn_runtime_filesystem_error_code(ENXIO));\n    printf(\"filesystem EACCES %d\\n\", (int)mn_runtime_filesystem_error_code(EACCES));\n    printf(\"filesystem EPERM %d\\n\", (int)mn_runtime_filesystem_error_code(EPERM));\n    printf(\"filesystem EROFS %d\\n\", (int)mn_runtime_filesystem_error_code(EROFS));\n    printf(\"filesystem ELOOP %d\\n\", (int)mn_runtime_filesystem_error_code(ELOOP));\n    printf(\"filesystem EMFILE %d\\n\", (int)mn_runtime_filesystem_error_code(EMFILE));\n    printf(\"filesystem ENFILE %d\\n\", (int)mn_runtime_filesystem_error_code(ENFILE));\n    printf(\"filesystem ENOMEM %d\\n\", (int)mn_runtime_filesystem_error_code(ENOMEM));\n    printf(\"filesystem EINVAL %d\\n\", (int)mn_runtime_filesystem_error_code(EINVAL));\n    printf(\"filesystem EIO %d\\n\", (int)mn_runtime_filesystem_error_code(EIO));\n    printf(\"file EPIPE %d\\n\", (int)mn_runtime_io_error_code(EPIPE));\n    printf(\"file ECONNABORTED %d\\n\", (int)mn_runtime_io_error_code(ECONNABORTED));\n    printf(\"file ECONNRESET %d\\n\", (int)mn_runtime_io_error_code(ECONNRESET));\n    printf(\"file ENETDOWN %d\\n\", (int)mn_runtime_io_error_code(ENETDOWN));\n    printf(\"file ENETUNREACH %d\\n\", (int)mn_runtime_io_error_code(ENETUNREACH));\n    printf(\"file ENOTCONN %d\\n\", (int)mn_runtime_io_error_code(ENOTCONN));\n    printf(\"file ETIMEDOUT %d\\n\", (int)mn_runtime_io_error_code(ETIMEDOUT));\n    printf(\"file EIO %d\\n\", (int)mn_runtime_io_error_code(EIO));\n    printf(\"file EISDIR %d\\n\", (int)mn_runtime_io_error_code(EISDIR));\n    printf(\"file EDQUOT %d\\n\", (int)mn_runtime_io_error_code(EDQUOT));\n    printf(\"file EFBIG %d\\n\", (int)mn_runtime_io_error_code(EFBIG));\n    printf(\"file ENOSPC %d\\n\", (int)mn_runtime_io_error_code(ENOSPC));\n    printf(\"file EBADF %d\\n\", (int)mn_runtime_io_error_code(EBADF));\n    printf(\"file EAGAIN %d\\n\", (int)mn_runtime_io_error_code(EAGAIN));\n    printf(\"file EWOULDBLOCK %d\\n\", (int)mn_runtime_io_error_code(EWOULDBLOCK));\n    printf(\"file EINVAL %d\\n\", (int)mn_runtime_io_error_code(EINVAL));\n    printf(\"file ELOOP %d\\n\", (int)mn_runtime_io_error_code(ELOOP));\n    return 0;\n}\n" });
     const include_path = try std.process.currentPathAlloc(std.testing.io, allocator);
-    const include = try std.fmt.allocPrint(allocator, "-I{s}/plugins/c/runtime", .{include_path});
+    const include = try std.fmt.allocPrint(allocator, "-I{s}/generators/c/runtime", .{include_path});
     const compiled = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "gcc", "-std=c23", "-w", include, "codes.c", "-o", "codes" }, .cwd = .{ .dir = build_directory } });
     try std.testing.expectEqualStrings("", compiled.stderr);
     const codes = try std.process.run(allocator, std.testing.io, .{ .argv = &.{"./codes"}, .cwd = .{ .dir = build_directory } });
@@ -9534,7 +9534,7 @@ test "Generator.generate: builds an executable that turns text into a path" {
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9564,7 +9564,7 @@ test "Generator.generate: builds an executable that keeps owned writable slices 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9594,7 +9594,7 @@ test "Generator.generate: builds an executable that clones a new path key into a
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9621,7 +9621,7 @@ test "Generator.generate: builds an executable that leaves a map unchanged when 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9648,7 +9648,7 @@ test "Generator.generate: builds an executable that finds nothing in an empty ma
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9675,7 +9675,7 @@ test "Generator.generate: builds an executable that removes the first, middle, l
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9702,7 +9702,7 @@ test "Generator.generate: builds an executable that pops the last entry of a map
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9729,7 +9729,7 @@ test "Generator.generate: builds an executable that clears a map without allocat
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9756,7 +9756,7 @@ test "Generator.generate: builds an executable that keeps maps of zero-sized key
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9783,7 +9783,7 @@ test "Generator.generate: builds an executable that keeps owning keys in a map a
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9810,7 +9810,7 @@ test "Generator.generate: builds an executable that hands an owned key and value
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9837,7 +9837,7 @@ test "Generator.generate: builds an executable that counts keys through get_or_p
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9864,7 +9864,7 @@ test "Generator.generate: builds an executable that keeps values owning memory i
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9891,7 +9891,7 @@ test "Generator.generate: builds an executable that leaves a set unchanged when 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9918,7 +9918,7 @@ test "Generator.generate: builds an executable that empties, clears, deinitializ
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9945,7 +9945,7 @@ test "Generator.generate: builds an executable that pops the last value of a set
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -9972,7 +9972,7 @@ test "Generator.generate: builds an executable that takes a read-only address of
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -10017,7 +10017,7 @@ test "Generator.generate: builds an executable that reads and writes through poi
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -10049,7 +10049,7 @@ test "Generator.generate: builds an executable that reads a byte slice from the 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -10076,7 +10076,7 @@ test "Generator.generate: builds an executable that encodes each number type and
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -10103,7 +10103,7 @@ test "Generator.generate: builds an executable that encodes bytes, optionals, ar
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -10130,7 +10130,7 @@ test "Generator.generate: builds an executable that encodes a struct, a tuple an
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -10157,7 +10157,7 @@ test "Generator.generate: builds an executable that gives malformed for a presen
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -10184,7 +10184,7 @@ test "Generator.generate: builds an executable that ends what a decode built whe
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -10211,7 +10211,7 @@ test "Generator.generate: builds an executable that round-trips an index with a 
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -10238,11 +10238,11 @@ test "Generator.generate: builds an executable that lists a directory" {
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const executable = try output_directory.dir.statFile(std.testing.io, "build/main", .{});
     try std.testing.expectEqual(.file, executable.kind);
-    const filesystem_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "plugins/c/runtime/filesystem.c", allocator, .unlimited);
+    const filesystem_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "generators/c/runtime/filesystem.c", allocator, .unlimited);
     try std.testing.expectEqualStrings(filesystem_source, try output_directory.dir.readFileAlloc(std.testing.io, "build/source/runtime/filesystem.c", allocator, .unlimited));
 }
 
@@ -10263,7 +10263,7 @@ test "Generator.generate: builds an executable that prints formatted values" {
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const executable = try output_directory.dir.statFile(std.testing.io, "build/main", .{});
     try std.testing.expectEqual(.file, executable.kind);
@@ -10286,7 +10286,7 @@ test "Generator.generate: builds an executable that prints SHA-256 digests in he
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     var text: [120]u8 = undefined;
     for (&text, 0..) |*byte, index| byte.* = 'a' + @as(u8, @intCast(index % 26));
@@ -10326,7 +10326,7 @@ test "Generator.generate: builds an executable that hashes input larger than its
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const large = try allocator.alloc(u8, 200000);
     for (large, 0..) |*byte, index| byte.* = @intCast(index % 251);
@@ -10375,7 +10375,7 @@ test "Generator.generate: builds an executable that formats into a list of bytes
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const executable = try output_directory.dir.statFile(std.testing.io, "build/main", .{});
     try std.testing.expectEqual(.file, executable.kind);
@@ -10397,7 +10397,7 @@ test "Generator.generate: builds an executable that allocates through the heap a
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const executable = try output_directory.dir.statFile(std.testing.io, "build/main", .{});
     try std.testing.expectEqual(.file, executable.kind);
@@ -10419,7 +10419,7 @@ test "Generator.generate: builds an executable that walks a directory with a pat
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const executable = try output_directory.dir.statFile(std.testing.io, "build/main", .{});
     try std.testing.expectEqual(.file, executable.kind);
@@ -10442,7 +10442,7 @@ test "Generator.generate: builds an executable that gives the metadata of a file
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -10473,7 +10473,7 @@ test "Generator.generate: builds an executable that gives metadata with a modifi
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -10502,7 +10502,7 @@ test "Generator.generate: builds an executable that reports the errors of metada
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -10532,7 +10532,7 @@ test "Generator.generate: builds an executable that writes a file over longer co
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -10562,7 +10562,7 @@ test "Generator.generate: builds an executable that gives not found from reading
     const program = try analyzer.analyze();
     var generator = Generator.init(program);
     const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
-    try generator.generate(allocator, std.testing.io, "plugins/c", output_path);
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
     const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
     defer build_directory.close(std.testing.io);
@@ -23114,12 +23114,12 @@ test "isRuntimeFunction: recognizes the reserved prefix" {
 test "findRuntimeFile: follows the name as a path to the file" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var plugin_directory = std.testing.tmpDir(.{});
-    defer plugin_directory.cleanup();
-    try plugin_directory.dir.createDirPath(std.testing.io, "runtime");
-    try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/stdout.c", .data = "" });
+    var generator_directory = std.testing.tmpDir(.{});
+    defer generator_directory.cleanup();
+    try generator_directory.dir.createDirPath(std.testing.io, "runtime");
+    try generator_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/stdout.c", .data = "" });
 
-    const path = try findRuntimeFile(arena.allocator(), std.testing.io, plugin_directory.dir, "mn_runtime_stdout_write");
+    const path = try findRuntimeFile(arena.allocator(), std.testing.io, generator_directory.dir, "mn_runtime_stdout_write");
 
     try std.testing.expectEqualStrings("runtime/stdout.c", path);
 }
@@ -23127,12 +23127,12 @@ test "findRuntimeFile: follows the name as a path to the file" {
 test "findRuntimeFile: finds a file in a nested folder" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var plugin_directory = std.testing.tmpDir(.{});
-    defer plugin_directory.cleanup();
-    try plugin_directory.dir.createDirPath(std.testing.io, "runtime/io");
-    try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/io/stdout.c", .data = "" });
+    var generator_directory = std.testing.tmpDir(.{});
+    defer generator_directory.cleanup();
+    try generator_directory.dir.createDirPath(std.testing.io, "runtime/io");
+    try generator_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/io/stdout.c", .data = "" });
 
-    const path = try findRuntimeFile(arena.allocator(), std.testing.io, plugin_directory.dir, "mn_runtime_io_stdout_write");
+    const path = try findRuntimeFile(arena.allocator(), std.testing.io, generator_directory.dir, "mn_runtime_io_stdout_write");
 
     try std.testing.expectEqualStrings("runtime/io/stdout.c", path);
 }
@@ -23140,35 +23140,35 @@ test "findRuntimeFile: finds a file in a nested folder" {
 test "findRuntimeFile: keeps underscores of the function name out of the path" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var plugin_directory = std.testing.tmpDir(.{});
-    defer plugin_directory.cleanup();
-    try plugin_directory.dir.createDirPath(std.testing.io, "runtime");
-    try plugin_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/stdout.c", .data = "" });
+    var generator_directory = std.testing.tmpDir(.{});
+    defer generator_directory.cleanup();
+    try generator_directory.dir.createDirPath(std.testing.io, "runtime");
+    try generator_directory.dir.writeFile(std.testing.io, .{ .sub_path = "runtime/stdout.c", .data = "" });
 
-    const path = try findRuntimeFile(arena.allocator(), std.testing.io, plugin_directory.dir, "mn_runtime_stdout_write_line");
+    const path = try findRuntimeFile(arena.allocator(), std.testing.io, generator_directory.dir, "mn_runtime_stdout_write_line");
 
     try std.testing.expectEqualStrings("runtime/stdout.c", path);
 }
 
-test "findRuntimeFile: finds the runtime file of mn::random::entropy among the plugin's files" {
+test "findRuntimeFile: finds the runtime file of mn::random::entropy among the generator's files" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const plugin_directory = try std.Io.Dir.cwd().openDir(std.testing.io, "plugins/c", .{});
-    defer plugin_directory.close(std.testing.io);
+    const generator_directory = try std.Io.Dir.cwd().openDir(std.testing.io, "generators/c", .{});
+    defer generator_directory.close(std.testing.io);
 
-    const path = try findRuntimeFile(arena.allocator(), std.testing.io, plugin_directory, "mn_runtime_random_entropy");
+    const path = try findRuntimeFile(arena.allocator(), std.testing.io, generator_directory, "mn_runtime_random_entropy");
 
     try std.testing.expectEqualStrings("runtime/random.c", path);
 }
 
-test "findRuntimeFile: finds the runtime files of mn::process and mn::filesystem among the plugin's files" {
+test "findRuntimeFile: finds the runtime files of mn::process and mn::filesystem among the generator's files" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const plugin_directory = try std.Io.Dir.cwd().openDir(std.testing.io, "plugins/c", .{});
-    defer plugin_directory.close(std.testing.io);
+    const generator_directory = try std.Io.Dir.cwd().openDir(std.testing.io, "generators/c", .{});
+    defer generator_directory.close(std.testing.io);
 
-    const io_path = try findRuntimeFile(arena.allocator(), std.testing.io, plugin_directory, "mn_runtime_io_write");
-    const filesystem_path = try findRuntimeFile(arena.allocator(), std.testing.io, plugin_directory, "mn_runtime_filesystem_open");
+    const io_path = try findRuntimeFile(arena.allocator(), std.testing.io, generator_directory, "mn_runtime_io_write");
+    const filesystem_path = try findRuntimeFile(arena.allocator(), std.testing.io, generator_directory, "mn_runtime_filesystem_open");
 
     try std.testing.expectEqualStrings("runtime/io.c", io_path);
     try std.testing.expectEqualStrings("runtime/filesystem.c", filesystem_path);
@@ -23177,10 +23177,10 @@ test "findRuntimeFile: finds the runtime files of mn::process and mn::filesystem
 test "findRuntimeFile: rejects a name that leads to no file" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var plugin_directory = std.testing.tmpDir(.{});
-    defer plugin_directory.cleanup();
+    var generator_directory = std.testing.tmpDir(.{});
+    defer generator_directory.cleanup();
 
-    const result = findRuntimeFile(arena.allocator(), std.testing.io, plugin_directory.dir, "mn_runtime_stdout_write");
+    const result = findRuntimeFile(arena.allocator(), std.testing.io, generator_directory.dir, "mn_runtime_stdout_write");
 
     try std.testing.expectError(error.FileNotFound, result);
 }

@@ -47,9 +47,9 @@ pub fn main(init: std.process.Init) !u8 {
         return report(allocator, io, stderr, &loader, failure, try analyzer.collectCallTrace(allocator, failure));
     };
 
-    const plugin_path = try std.fs.path.join(allocator, &.{ compiler_path, "plugins", "c" });
+    const generator_path = try std.fs.path.join(allocator, &.{ compiler_path, "generators", "c" });
     var generator = c.Generator.init(program);
-    generator.generate(allocator, io, plugin_path, "build") catch |generate_error| {
+    generator.generate(allocator, io, generator_path, "build") catch |generate_error| {
         const failure = generator.failure orelse return generate_error;
         return report(allocator, io, stderr, &loader, failure, &.{});
     };

@@ -9,7 +9,7 @@
         "build.zig.zon",
         "src",
         "std",
-        "plugins",
+        "generators",
         "README.md",
     },
 }
