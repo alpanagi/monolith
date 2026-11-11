@@ -2,6 +2,7 @@ const std = @import("std");
 const token = @import("token.zig");
 const types = @import("types.zig");
 
+const Integer = @import("value.zig").Integer;
 const Value = @import("value.zig").Value;
 
 pub const module_root = "";
@@ -362,8 +363,8 @@ pub const BranchCase = struct {
     range: bool = false,
     kind: CaseKind = .case,
     index: ?usize = null,
-    minimum: i129 = 0,
-    maximum: i129 = 0,
+    minimum: Integer = undefined,
+    maximum: Integer = undefined,
 };
 
 pub const Naming = enum {

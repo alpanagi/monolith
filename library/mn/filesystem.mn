@@ -49,9 +49,9 @@ error Error
 struct File
     private descriptor: i32
 
-    fn open(path: Path, mode: Mode) -> Error!Self
+    fn open(path: Path, options: Options = {}) -> Error!Self
         var name: [maximum_path_length]u8 = undefined
-        const descriptor = mn_runtime_filesystem_open(try fill_name(path, &name), find_mode_code(mode))
+        const descriptor = mn_runtime_filesystem_open(try fill_name(path, &name), find_mode_code(options.mode))
         if (descriptor < 0) return find_error(descriptor)
         return { descriptor = descriptor }
 
@@ -62,7 +62,10 @@ struct File
         return mn::convert(usize, byte_count)
 
 
-    fn deinit(self: Self) = mn_runtime_filesystem_close(self.descriptor)
+    fn close(self: Self) = mn_runtime_filesystem_close(self.descriptor)
+
+    struct Options
+        mode: Mode = ::Read
 
     enum Mode
         Read
@@ -142,7 +145,7 @@ struct Directory
         return { name = entry.name[0..entry.length], kind = find_kind(entry.kind) }
 
 
-    fn deinit(self: Self) = mn_runtime_filesystem_close_directory(self.handle)
+    fn close(self: Self) = mn_runtime_filesystem_close_directory(self.handle)
 
     private external struct RawEntry
         name: *many(const(u8))
@@ -273,8 +276,8 @@ fn metadata(path: Path) -> Error!Metadata
 
 
 fn read(path: Path) -> own ![]u8
-    const file = try File::open(path, File::Mode::Read)
-    defer file.deinit()
+    const file = try File::open(path)
+    defer file.close()
     const size = try file.size()
     var own bytes = try memory::allocate(u8, size)
     errdefer memory::free(own bytes)
@@ -293,6 +296,6 @@ fn read(path: Path) -> own ![]u8
 
 
 fn write(path: Path, bytes: []const(u8)) -> !void
-    const file = try File::open(path, File::Mode::Write)
-    defer file.deinit()
+    const file = try File::open(path, { mode = ::Write })
+    defer file.close()
     try file.write(bytes)

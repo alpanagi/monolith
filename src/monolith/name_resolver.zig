@@ -3227,7 +3227,7 @@ pub const NameResolver = struct {
             }
             return type_error;
         };
-        return @intCast(value.integer);
+        return @intCast(value.integer.unsigned);
     }
 
     fn resolveSliceType(
@@ -3464,7 +3464,7 @@ pub const NameResolver = struct {
         }
         const assigned = try self.arena.allocator().alloc(types.Argument, parameters.len);
         for (assigned, definition.bindings[0..parameters.len]) |*argument, binding| argument.* = switch (binding.target) {
-            .constant => |constant| .{ .length = @intCast(ast.findDeclaration(modules[constant.module], constant.declaration).kind.constant_declaration.known.?.integer) },
+            .constant => |constant| .{ .length = @intCast(ast.findDeclaration(modules[constant.module], constant.declaration).kind.constant_declaration.known.?.integer.unsigned) },
             else => .{ .type = binding.target.type },
         };
         return .{ .function = try self.instantiateInstanceFunction(function, assigned) };
@@ -5346,7 +5346,7 @@ fn addLengthConstant(
         .type = .{ .kind = .undefined, .location = parameter.location },
         .location = parameter.location,
     };
-    const bound: Bound = .{ .type = .{ .number = .usize }, .value = .{ .integer = length } };
+    const bound: Bound = .{ .type = .{ .number = .usize }, .value = .{ .integer = .{ .unsigned = length } } };
     return addBoundConstant(allocator, module, module_index, instance_name, typed_name, bound);
 }
 
@@ -6439,7 +6439,7 @@ test "resolveModule: accepts a declaration named module in the module of a direc
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 3 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 3 } }, found.?);
 }
 
 test "resolveModule: accepts an import named like a module in the directory of its module" {
@@ -6499,8 +6499,8 @@ test "resolveTypeclass: gives an instance function a copy for each set of compil
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     _ = try analyzer.analyze();
 
-    try std.testing.expectEqual(Value{ .integer = 6 }, loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 12 }, loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 6 } }, loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 12 } }, loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*);
 }
 
 test "resolveTypeclass: gives a default implementation a copy for each set of compile-time arguments" {
@@ -6519,8 +6519,8 @@ test "resolveTypeclass: gives a default implementation a copy for each set of co
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     _ = try analyzer.analyze();
 
-    try std.testing.expectEqual(Value{ .integer = 6 }, loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 12 }, loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 6 } }, loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 12 } }, loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*);
 }
 
 test "resolveTypeclass: rejects an instance function that leaves out the comptime of a parameter" {
@@ -6558,7 +6558,7 @@ test "resolveTypeclass: lets a default implementation call a function of its mod
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     _ = try analyzer.analyze();
 
-    try std.testing.expectEqual(Value{ .integer = 6 }, loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 6 } }, loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*);
 }
 
 test "resolveTypeclass: takes a value of any type with an instance in a typeclass function" {
@@ -6577,7 +6577,7 @@ test "resolveTypeclass: takes a value of any type with an instance in a typeclas
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     _ = try analyzer.analyze();
 
-    try std.testing.expectEqual(Value{ .integer = 7 }, loader.modules.items[0].declarations[6].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, loader.modules.items[0].declarations[6].kind.constant_declaration.known.?.*);
 }
 
 test "resolveTypeclass: resolves a typeclass of a module that is resolved later" {
@@ -6782,7 +6782,7 @@ test "resolveInstance: accepts an instance of a typeclass for a struct that a ca
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 3 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 3 } }, known);
 }
 
 test "resolveInstance: rejects a type for a type constructor parameter" {
@@ -7413,7 +7413,7 @@ test "resolveFunctionSignature: resolves Self in a method of mn::filesystem reac
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::filesystem\nimport mn::stream::Reader\n\nfn measure(path: filesystem::Path) -> filesystem::Error!usize\n    const file = filesystem::File::open(path, filesystem::File::Mode::Read) catch return 0\n    defer file.deinit()\n    var buffer: [64]u8 = undefined\n    const count = try file.read(&buffer)\n    return count + try file.size()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::filesystem\nimport mn::stream::Reader\n\nfn measure(path: filesystem::Path) -> filesystem::Error!usize\n    const file = filesystem::File::open(path) catch return 0\n    defer file.close()\n    var buffer: [64]u8 = undefined\n    const count = try file.read(&buffer)\n    return count + try file.size()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -7449,7 +7449,7 @@ test "dropResultLines: lets a generic function whose return type depends on its 
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 7 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, found.?);
 }
 
 test "dropResultLines: lets a generic function whose return type depends on its type parameter give a plain value on one line" {
@@ -7469,8 +7469,8 @@ test "dropResultLines: lets a generic function whose return type depends on its 
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[1].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 1 } }, declarations[2].kind.constant_declaration.known.?.*);
 }
 
 test "dropResultLines: lets the value line of each block of a generic function depend on the instance" {
@@ -7490,8 +7490,8 @@ test "dropResultLines: lets the value line of each block of a generic function d
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[1].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, declarations[2].kind.constant_declaration.known.?.*);
 }
 
 test "dropResultLines: rejects a value on one line of a generic function that returns nothing" {
@@ -7795,7 +7795,7 @@ test "resolveConstraints: takes a typeclass through a module path and an importe
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 9 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 9 } }, known);
 }
 
 test "resolveConstraints: rejects a typeclass with two parameters as the type of a parameter" {
@@ -8092,7 +8092,7 @@ test "resolveInstanceFunction: names an instance of a typeclass with several par
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[7].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 100 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 100 } }, known);
 }
 
 test "resolveInstanceFunction: finds a function that is not a method through a named instance" {
@@ -8197,7 +8197,7 @@ test "resolveParameterTypeForChecker: resolves Self in the type of a comptime pa
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     _ = try analyzer.analyze();
 
-    try std.testing.expectEqual(Value{ .integer = 6 }, loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 6 } }, loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.*);
 }
 
 test "expectUniqueMethod: rejects a function with the name of a case" {
@@ -9025,7 +9025,7 @@ test "addStructFunctions: makes the functions of a struct without a name callabl
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 5 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 5 } }, known);
 }
 
 test "addStructFunctions: rejects a function named like a field" {
@@ -10080,7 +10080,7 @@ test "chooseBlock: resolves only the block that a condition depending on a type 
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 7 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, known);
 }
 
 test "resolveNamedBody: keeps the name of an if inside its block" {
@@ -10884,7 +10884,7 @@ test "resolveLocalConstant: evaluates a top-level constant made by a struct's fu
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     _ = try analyzer.analyze();
 
-    try std.testing.expectEqual(Value{ .integer = 7 }, loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.aggregate[0]);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.aggregate[0]);
 }
 
 test "resolveLocalConstant: reports calling a pointer method on a constant made through a path instead of crashing" {
@@ -12000,7 +12000,7 @@ test "isMeasuredParameter: takes an array length from a parameter whose type dep
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     _ = try analyzer.analyze();
 
-    try std.testing.expectEqual(5, loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.integer);
+    try std.testing.expectEqual(5, loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.integer.unsigned);
 }
 
 test "isMeasuredParameter: rejects a parameter used otherwise in a type" {
@@ -14084,7 +14084,7 @@ test "resolveMember: reaches the built-ins through the current module's path ins
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 16 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 16 } }, known);
 }
 
 test "resolveMember: rejects the built-ins through the current module's path outside mn" {
@@ -14477,7 +14477,7 @@ test "resolveMember: reaches a sibling and its own declarations from the module 
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 5 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 5 } }, found.?);
     var count: usize = 0;
     for (loader.modules.items) |module| {
         if (std.mem.eql(u8, module.path[0], "shapes")) count += 1;
@@ -16001,9 +16001,9 @@ test "resolveNamespace: calls a function with a reserved name through module fro
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     _ = try analyzer.analyze();
 
-    var total: i129 = 0;
+    var total: i128 = 0;
     for (loader.modules.items[0].declarations) |declaration| {
-        if (declaration.kind == .constant_declaration) total += declaration.kind.constant_declaration.known.?.integer;
+        if (declaration.kind == .constant_declaration) total += declaration.kind.constant_declaration.known.?.integer.signed;
     }
     try std.testing.expectEqual(8, total);
 }
@@ -16028,7 +16028,7 @@ test "resolveNamespace: names the current module through module with a local nam
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 7 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 7 } }, found.?);
 }
 
 test "resolveNamespace: keeps a parameter and a local named module with their fields" {
@@ -16051,7 +16051,7 @@ test "resolveNamespace: keeps a parameter and a local named module with their fi
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 7 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 7 } }, found.?);
 }
 
 test "resolveNamespace: reaches a struct named module through module" {
@@ -16074,7 +16074,7 @@ test "resolveNamespace: reaches a struct named module through module" {
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 6 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 6 } }, found.?);
 }
 
 test "checkName: rejects an import that makes the name module available" {
@@ -16196,7 +16196,7 @@ test "dropResultLines: counts a parameter used on a dropped line as used" {
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "VALUE")) {
-            try std.testing.expectEqual(Value{ .integer = 7 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, constant.known.?.*);
             checked += 1;
         }
     }

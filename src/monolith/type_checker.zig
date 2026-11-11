@@ -7,6 +7,7 @@ const types = core.types;
 const AnalyzeError = @import("analyzer.zig").AnalyzeError;
 const Evaluator = @import("evaluator.zig").Evaluator;
 const Failure = core.Failure;
+const Integer = core.Integer;
 const Value = core.Value;
 
 const followPointer = types.followPointer;
@@ -3206,8 +3207,8 @@ pub const TypeChecker = struct {
         matching: *ast.Match,
         number: types.NumberType,
     ) TypeError!void {
-        const minimum = computeIntegerMinimum(number);
-        const maximum: i129 = computeIntegerMaximum(number).?;
+        const minimum = Integer.findMinimum(number);
+        const maximum = Integer.findMaximum(number);
         var covered: std.ArrayList(*const ast.BranchCase) = .empty;
         var has_else = false;
         for (matching.branches) |*branch| {
@@ -3219,7 +3220,7 @@ pub const TypeChecker = struct {
             for (branch.cases) |*case| {
                 try self.boundCase(signature, case, .{ .number = number }, maximum);
                 for (covered.items) |earlier| {
-                    if (case.minimum <= earlier.maximum and earlier.minimum <= case.maximum) {
+                    if (case.minimum.order(earlier.maximum) != .gt and earlier.minimum.order(case.maximum) != .gt) {
                         return self.fail(case.pattern.location, error.DuplicateBranch);
                     }
                 }
@@ -3239,7 +3240,7 @@ pub const TypeChecker = struct {
         signature: ast.FunctionSignature,
         case: *ast.BranchCase,
         value_type: types.Type,
-        maximum: i129,
+        maximum: Integer,
     ) TypeError!void {
         case.kind = .integer;
         case.minimum = try self.evaluateCaseInteger(signature, &case.pattern, value_type);
@@ -3248,8 +3249,12 @@ pub const TypeChecker = struct {
             return;
         }
         case.maximum = maximum;
-        if (case.end) |*end| case.maximum = try self.evaluateCaseInteger(signature, end, value_type) - 1;
-        if (case.maximum < case.minimum) return self.fail(case.pattern.location, error.EmptyRange);
+        if (case.end) |*end| {
+            const limit = try self.evaluateCaseInteger(signature, end, value_type);
+            if (limit.order(case.minimum) != .gt) return self.fail(case.pattern.location, error.EmptyRange);
+            case.maximum = limit.decrement();
+        }
+        if (case.maximum.order(case.minimum) == .lt) return self.fail(case.pattern.location, error.EmptyRange);
     }
 
     fn evaluateCaseInteger(
@@ -3257,7 +3262,7 @@ pub const TypeChecker = struct {
         signature: ast.FunctionSignature,
         expression: *ast.Expression,
         value_type: types.Type,
-    ) TypeError!i129 {
+    ) TypeError!Integer {
         if (isUnknownName(expression.*)) return self.fail(expression.location, error.UnknownCase);
         try self.checkExpression(signature.parameters, expression, value_type);
         if (!self.evaluator.isKnown(expression.*)) return self.fail(expression.location, error.CannotEvaluate);
@@ -3411,10 +3416,10 @@ pub const TypeChecker = struct {
                 const end = &range.end.?;
                 try self.checkExactExpression(parameters, end, bound_type);
                 if (!self.evaluator.isKnownWithoutCalls(end.*)) return null;
-                const last = (try self.evaluateValue(end)).integer;
+                const last = (try self.evaluateValue(end)).integer.unsigned;
                 range.known_end = @intCast(last);
                 if (!self.evaluator.isKnownWithoutCalls(range.start)) return null;
-                const first = (try self.evaluateValue(&range.start)).integer;
+                const first = (try self.evaluateValue(&range.start)).integer.unsigned;
                 if (first > last) return self.fail(range.start.location, error.ReversedRange);
                 if (first == last) return self.fail(range.start.location, error.EmptyRange);
             },
@@ -5024,8 +5029,8 @@ pub const TypeChecker = struct {
         if (range.end) |*end| {
             try self.checkExactExpression(parameters, end, bound_type);
             if (self.evaluator.isKnownWithoutCalls(range.start) and self.evaluator.isKnownWithoutCalls(end.*)) {
-                const first = (try self.evaluateValue(&range.start)).integer;
-                const last = (try self.evaluateValue(end)).integer;
+                const first = (try self.evaluateValue(&range.start)).integer.unsigned;
+                const last = (try self.evaluateValue(end)).integer.unsigned;
                 if (first > last) return self.fail(range.start.location, error.ReversedRange);
             }
         }
@@ -5590,7 +5595,7 @@ pub const TypeChecker = struct {
         if (array.length == 0) return self.fail(index.location, error.IndexOutOfRange);
         try self.expectLoopFits(index, array);
         if (!self.evaluator.isKnownWithoutCalls(index.*)) return array.element;
-        const position = (try self.evaluateValue(index)).integer;
+        const position = (try self.evaluateValue(index)).integer.unsigned;
         if (position >= array.length) return self.fail(index.location, error.IndexOutOfRange);
         expression.kind.index.position = @intCast(position);
         return array.element;
@@ -5618,7 +5623,7 @@ pub const TypeChecker = struct {
     ) TypeError!u64 {
         try self.checkExactExpression(parameters, index, .{ .number = .usize });
         if (!self.evaluator.isKnown(index.*)) return self.fail(index.location, error.UnknownTupleIndex);
-        const position = (try self.evaluateValue(index)).integer;
+        const position = (try self.evaluateValue(index)).integer.unsigned;
         if (position >= tuple.elements.len) return self.fail(index.location, error.IndexOutOfRange);
         return @intCast(position);
     }
@@ -7428,18 +7433,18 @@ fn isUnknownName(expression: ast.Expression) bool {
     return expression.kind == .identifier and expression.kind.identifier.resolution == null;
 }
 
-fn coversRange(cases: []const *const ast.BranchCase, minimum: i129, maximum: i129) bool {
+fn coversRange(cases: []const *const ast.BranchCase, minimum: Integer, maximum: Integer) bool {
     var next = minimum;
-    while (next <= maximum) {
+    while (true) {
         const reaching = findCoveringMaximum(cases, next) orelse return false;
-        next = reaching + 1;
+        if (reaching.order(maximum) != .lt) return true;
+        next = reaching.increment();
     }
-    return true;
 }
 
-fn findCoveringMaximum(cases: []const *const ast.BranchCase, value: i129) ?i129 {
+fn findCoveringMaximum(cases: []const *const ast.BranchCase, value: Integer) ?Integer {
     for (cases) |case| {
-        if (case.minimum <= value and value <= case.maximum) return case.maximum;
+        if (case.minimum.order(value) != .gt and value.order(case.maximum) != .gt) return case.maximum;
     }
     return null;
 }
@@ -7697,18 +7702,6 @@ fn isNamed(expression: ast.Expression, variable: *const ast.Statement) bool {
     if (expression.kind != .identifier) return false;
     const resolution = expression.kind.identifier.resolution orelse return false;
     return resolution == .local and resolution.local == variable;
-}
-
-fn computeIntegerMinimum(number: types.NumberType) i129 {
-    return switch (number) {
-        .i8 => std.math.minInt(i8),
-        .i16 => std.math.minInt(i16),
-        .i32 => std.math.minInt(i32),
-        .i64, .isize => std.math.minInt(i64),
-        .i128 => std.math.minInt(i128),
-        .u8, .u16, .u32, .u64, .u128, .usize => 0,
-        .f16, .f32, .f64, .f128 => unreachable,
-    };
 }
 
 fn computeIntegerMaximum(number: types.NumberType) ?u128 {
@@ -8641,7 +8634,7 @@ test "TypeChecker.check: accepts a read of an array that a loop fills element by
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     _ = try analyzer.analyze();
 
-    try std.testing.expectEqual(Value{ .integer = 4 }, loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 4 } }, loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.*);
 }
 
 test "prepareFunction: rejects a function that its own check calls at compile time" {
@@ -8685,7 +8678,7 @@ test "prepareFunction: checks a function that a top-level constant calls before 
 
     const definition = loader.modules.items[0].declarations[1].kind.function_definition;
     try std.testing.expectEqual(ast.Progress.done, definition.check_progress);
-    try std.testing.expectEqual(Value{ .integer = 9 }, loader.modules.items[0].declarations[0].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 9 } }, loader.modules.items[0].declarations[0].kind.constant_declaration.known.?.*);
 }
 
 test "checkDefault: lets a default use the typeclass that its typeclass requires" {
@@ -10306,7 +10299,7 @@ test "resolveAllocatorCall: gives a call the allocator of with and everything be
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
-        if (std.mem.eql(u8, constant.name, "USED")) try std.testing.expectEqual(Value{ .integer = 4 }, constant.known.?.*);
+        if (std.mem.eql(u8, constant.name, "USED")) try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 4 } }, constant.known.?.*);
         checked += 1;
     }
     try std.testing.expectEqual(1, checked);
@@ -10332,7 +10325,7 @@ test "resolveAllocatorCall: lets the function of an instance need an allocator t
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 37 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 37 } }, found.?);
 }
 
 test "resolveAllocatorCall: rejects with on an instance of a generic function that does not need an allocator" {
@@ -10374,7 +10367,7 @@ test "resolveAllocatorCall: infers the need of a generic function that calls its
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 3 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 3 } }, found.?);
 }
 
 test "resolveAllocatorCall: rejects a chain without with in main with the chain of calls" {
@@ -10460,7 +10453,7 @@ test "resolveAllocatorCall: reaches memory::allocate at the bottom of a chain wi
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 505 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 505 } }, found.?);
 }
 
 test "resolveAllocatorCall: allocates from the allocator of with in every function of a cycle with a written error set" {
@@ -10483,7 +10476,7 @@ test "resolveAllocatorCall: allocates from the allocator of with in every functi
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 6 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 6 } }, found.?);
 }
 
 test "resolveAllocatorCall: finds a need late through the back edge of a cycle with a written error set" {
@@ -10506,7 +10499,7 @@ test "resolveAllocatorCall: finds a need late through the back edge of a cycle w
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 303 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 303 } }, found.?);
 }
 
 test "resolveAllocatorCall: finds a need late through the forward edge of a cycle with a written error set" {
@@ -10529,7 +10522,7 @@ test "resolveAllocatorCall: finds a need late through the forward edge of a cycl
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 303 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 303 } }, found.?);
 }
 
 test "resolveAllocatorCall: overrides the allocator for one call inside a cycle with a written error set" {
@@ -10552,7 +10545,7 @@ test "resolveAllocatorCall: overrides the allocator for one call inside a cycle 
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 2001 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2001 } }, found.?);
 }
 
 test "resolveAllocatorCall: overrides the allocator for one call inside a cycle whose need is found after it with a written error set" {
@@ -10575,7 +10568,7 @@ test "resolveAllocatorCall: overrides the allocator for one call inside a cycle 
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 1001 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 1001 } }, found.?);
 }
 
 test "resolveAllocatorCall: allocates from the allocator of with in every function of a cycle with an inferred error set" {
@@ -10598,7 +10591,7 @@ test "resolveAllocatorCall: allocates from the allocator of with in every functi
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 6 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 6 } }, found.?);
 }
 
 test "resolveAllocatorCall: finds a need late through the back edge of a cycle with an inferred error set" {
@@ -10621,7 +10614,7 @@ test "resolveAllocatorCall: finds a need late through the back edge of a cycle w
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 303 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 303 } }, found.?);
 }
 
 test "resolveAllocatorCall: finds a need late through the forward edge of a cycle with an inferred error set" {
@@ -10644,7 +10637,7 @@ test "resolveAllocatorCall: finds a need late through the forward edge of a cycl
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 303 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 303 } }, found.?);
 }
 
 test "resolveAllocatorCall: overrides the allocator for one call inside a cycle with an inferred error set" {
@@ -10667,7 +10660,7 @@ test "resolveAllocatorCall: overrides the allocator for one call inside a cycle 
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 2001 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2001 } }, found.?);
 }
 
 test "resolveAllocatorCall: overrides the allocator for one call inside a cycle whose need is found after it with an inferred error set" {
@@ -10690,7 +10683,7 @@ test "resolveAllocatorCall: overrides the allocator for one call inside a cycle 
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 1001 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 1001 } }, found.?);
 }
 
 test "resolveAllocatorCall: calls back into a function whose need is found after the call with a written error set" {
@@ -10713,7 +10706,7 @@ test "resolveAllocatorCall: calls back into a function whose need is found after
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 5001 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 5001 } }, found.?);
 }
 
 test "resolveAllocatorCall: calls back into a function whose need is found after the call with an inferred error set" {
@@ -10736,7 +10729,7 @@ test "resolveAllocatorCall: calls back into a function whose need is found after
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 5001 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 5001 } }, found.?);
 }
 
 test "finishNeeds: rejects with on a call inside a cycle that turns out not to need an allocator" {
@@ -10824,7 +10817,7 @@ test "resolveAllocatorCall: overrides the allocator for an inner call with its o
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
-        if (std.mem.eql(u8, constant.name, "USED")) try std.testing.expectEqual(Value{ .integer = 655 }, constant.known.?.*);
+        if (std.mem.eql(u8, constant.name, "USED")) try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 655 } }, constant.known.?.*);
         checked += 1;
     }
     try std.testing.expectEqual(1, checked);
@@ -10850,7 +10843,7 @@ test "resolveAllocatorCall: infers the need of functions that call each other" {
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
-        if (std.mem.eql(u8, constant.name, "USED")) try std.testing.expectEqual(Value{ .integer = 3 }, constant.known.?.*);
+        if (std.mem.eql(u8, constant.name, "USED")) try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 3 } }, constant.known.?.*);
         checked += 1;
     }
     try std.testing.expectEqual(1, checked);
@@ -10876,7 +10869,7 @@ test "resolveAllocatorCall: infers the need of an instance of a generic function
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
-        if (std.mem.eql(u8, constant.name, "USED")) try std.testing.expectEqual(Value{ .integer = 2 }, constant.known.?.*);
+        if (std.mem.eql(u8, constant.name, "USED")) try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, constant.known.?.*);
         checked += 1;
     }
     try std.testing.expectEqual(1, checked);
@@ -15093,12 +15086,12 @@ test "integration: evaluates memory::swap, replace, take and move at compile tim
 
     _ = try analyzer.analyze();
 
-    const expected = [_]struct { []const u8, i129 }{ .{ "SWAPPED", 2143 }, .{ "REPLACED", 56 }, .{ "TAKEN", 7 }, .{ "MOVED", 81 } };
+    const expected = [_]struct { []const u8, u128 }{ .{ "SWAPPED", 2143 }, .{ "REPLACED", 56 }, .{ "TAKEN", 7 }, .{ "MOVED", 81 } };
     for (expected) |entry| {
         const known = for (loader.modules.items[0].declarations) |declaration| {
             if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, entry[0])) break declaration.kind.constant_declaration.known.?.*;
         } else unreachable;
-        try std.testing.expectEqual(Value{ .integer = entry[1] }, known);
+        try std.testing.expectEqual(Value{ .integer = .{ .unsigned = entry[1] } }, known);
     }
 }
 
@@ -15502,8 +15495,8 @@ test "traceStatement: ends a value if whose condition is known at compile time w
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[1].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 2 } }, declarations[2].kind.constant_declaration.known.?.*);
 }
 
 test "traceStatement: reaches the statement after an if that a type condition chooses" {
@@ -18804,7 +18797,7 @@ test "expectDecidedInstance: passes a requirement on to the same known type" {
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 7 }, declarations[8].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, declarations[8].kind.constant_declaration.known.?.*);
 }
 
 test "checkImplicitArgument: rejects a read-only pointer when the instance writes through a known type" {
@@ -20097,11 +20090,11 @@ test "checkIntegerMatch: bounds values and ranges and accepts cases that cover t
     _ = try analyzer.analyze();
 
     const branches = loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.match.branches;
-    try std.testing.expectEqual(1, branches[0].cases[1].maximum);
-    try std.testing.expectEqual(2, branches[1].cases[0].minimum);
-    try std.testing.expectEqual(127, branches[1].cases[0].maximum);
-    try std.testing.expectEqual(128, branches[2].cases[0].minimum);
-    try std.testing.expectEqual(255, branches[2].cases[0].maximum);
+    try std.testing.expectEqual(Integer{ .unsigned = 1 }, branches[0].cases[1].maximum);
+    try std.testing.expectEqual(Integer{ .unsigned = 2 }, branches[1].cases[0].minimum);
+    try std.testing.expectEqual(Integer{ .unsigned = 127 }, branches[1].cases[0].maximum);
+    try std.testing.expectEqual(Integer{ .unsigned = 128 }, branches[2].cases[0].minimum);
+    try std.testing.expectEqual(Integer{ .unsigned = 255 }, branches[2].cases[0].maximum);
 }
 
 test "checkIntegerMatch: names the type of the integer after else" {
@@ -20182,6 +20175,62 @@ test "checkIntegerMatch: rejects an else after cases that cover the type" {
     try std.testing.expectEqual(token.Location{ .row = 5, .column = 9 }, analyzer.failure.?.location.?);
 }
 
+test "checkIntegerMatch: accepts cases that reach the u128 and the i128 maximum" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn unsigned(value: u128) -> u8\n    match value\n        case (0..340282366920938463463374607431768211455) return 1\n        case (340282366920938463463374607431768211455) return 2\nfn signed(value: i128) -> u8\n    match value\n        case (-170141183460469231731687303715884105728..0) return 1\n        case (0..) return 2" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "checkIntegerMatch: rejects a match that leaves out the u128 maximum" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn kind(value: u128) -> u8\n    match value\n        case (0..340282366920938463463374607431768211455) return 1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.MissingCase, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, analyzer.failure.?.location.?);
+}
+
+test "checkIntegerMatch: rejects an else after cases that cover u128" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn kind(value: u128) -> u8\n    match value\n        case (0..) return 1\n        else return 2" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.EmptyElse, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 9 }, analyzer.failure.?.location.?);
+}
+
 test "checkIntegerMatch: rejects a name on an integer case" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -20212,6 +20261,44 @@ test "boundCase: rejects an empty range" {
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn kind(value: u8) -> u8\n    match value\n        case (5..5) return 1\n        else return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.EmptyRange, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 15 }, analyzer.failure.?.location.?);
+}
+
+test "boundCase: rejects a range that ends at the most negative i128" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn kind(value: i128) -> u8\n    match value\n        case (-170141183460469231731687303715884105728..-170141183460469231731687303715884105728) return 1\n        else return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.EmptyRange, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 15 }, analyzer.failure.?.location.?);
+}
+
+test "boundCase: rejects a range that ends at 0 for an unsigned type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn kind(value: u8) -> u8\n    match value\n        case (0..0) return 1\n        else return 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -20256,8 +20343,8 @@ test "chooseBlock: checks only the block that a type comparison chooses" {
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[1].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 2 } }, declarations[2].kind.constant_declaration.known.?.*);
 }
 
 test "countTypeDependency: keeps a condition that passes a type argument to a function a run-time condition" {
@@ -20326,11 +20413,11 @@ test "chooseBlock: evaluates a condition on a type and a run-time value at run t
     const one = for (declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "ONE")) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
-    try std.testing.expectEqual(Value{ .integer = 1 }, one);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, one);
     const zero = for (declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "ZERO")) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
-    try std.testing.expectEqual(Value{ .integer = 0 }, zero);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 0 } }, zero);
 }
 
 test "chooseBlock: checks the else block of a condition that is not known as a whole" {
@@ -20487,11 +20574,11 @@ test "chooseBlock: checks only the block that a condition known as a whole choos
     const one = for (declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "ONE")) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
-    try std.testing.expectEqual(Value{ .integer = 1 }, one);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, one);
     const two = for (declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "TWO")) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
-    try std.testing.expectEqual(Value{ .integer = 2 }, two);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 2 } }, two);
 }
 
 test "chooseBlock: keeps the missing else of a value if whose condition is known to be true" {
@@ -21810,8 +21897,8 @@ test "checkExpression: converts a result to a result whose error set contains it
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[4].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 9 }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 9 } }, declarations[5].kind.constant_declaration.known.?.*);
 }
 
 test "checkExpression: rejects a result whose error set the expected result does not contain" {
@@ -21891,7 +21978,7 @@ test "checkExpression: calls a typeclass function of an instance for an enum" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 1 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, known);
 }
 
 test "checkExpression: rejects a boolean for an integer type" {
@@ -23373,9 +23460,9 @@ test "checkExpression: converts a value to an optional where an optional is expe
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 9 }, declarations[4].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[5].kind.constant_declaration.known.?.optional.?.*);
-    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[6].kind.constant_declaration.known.?.optional.?.optional.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 9 } }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 5 } }, declarations[5].kind.constant_declaration.known.?.optional.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 5 } }, declarations[6].kind.constant_declaration.known.?.optional.?.optional.?.*);
 }
 
 test "checkExpression: rejects a literal where an optional of an optional is expected" {
@@ -23564,9 +23651,9 @@ test "checkExpression: widens a number to a type of the same kind that holds eve
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 200 }, declarations[4].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 200 }, declarations[5].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = -5 }, declarations[6].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 200 } }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 200 } }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = -5 } }, declarations[6].kind.constant_declaration.known.?.*);
     try std.testing.expectEqual(Value{ .float = 0.5 }, declarations[7].kind.constant_declaration.known.?.*);
 }
 
@@ -23900,9 +23987,9 @@ test "fillDefaultArguments: fills the arguments a call leaves out with the defau
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 321 }, declarations[1].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 303 }, declarations[2].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 6 }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 321 } }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 303 } }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 6 } }, declarations[3].kind.constant_declaration.known.?.*);
 }
 
 test "fillDefaultArguments: fills a struct, a tuple and an enum case default typed against its parameter" {
@@ -23922,8 +24009,8 @@ test "fillDefaultArguments: fills a struct, a tuple and an enum case default typ
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 17654 }, declarations[3].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 10003 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 17654 } }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 10003 } }, declarations[4].kind.constant_declaration.known.?.*);
 }
 
 test "fillDefaultArguments: applies a typeclass default to an instance that writes none through the typeclass and the instance" {
@@ -23943,9 +24030,9 @@ test "fillDefaultArguments: applies a typeclass default to an instance that writ
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 6 }, declarations[5].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 6 }, declarations[6].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 10 }, declarations[7].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 6 } }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 6 } }, declarations[6].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 10 } }, declarations[7].kind.constant_declaration.known.?.*);
 }
 
 test "fillDefaultArguments: rejects a call through a pointer that leaves out an argument with a default" {
@@ -24022,7 +24109,7 @@ test "checkInstanceDefaults: accepts an instance default equal to the typeclass'
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 6 }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 6 } }, declarations[5].kind.constant_declaration.known.?.*);
 }
 
 test "checkInstanceDefaults: rejects an instance default other than the typeclass's" {
@@ -24188,7 +24275,7 @@ test "resolveMethodCall: calls a method of a typeclass with several parameters" 
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 1 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 1 } }, known);
 }
 
 test "resolveMethodCall: calls a function of a typeclass of the file" {
@@ -24586,7 +24673,7 @@ test "resolveTypeclassCall: decides the instance by an argument after the first"
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[13].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 6 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 6 } }, known);
 }
 
 test "resolveTypeclassCall: decides the instance through a slice of the parameter" {
@@ -24606,7 +24693,7 @@ test "resolveTypeclassCall: decides the instance through a slice of the paramete
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[14].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 4 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 4 } }, known);
 }
 
 test "resolveTypeclassCall: rejects arguments that decide different instances" {
@@ -24645,7 +24732,7 @@ test "resolveTypeclassCall: picks the only instance that fits the decided parame
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 212 }, known.aggregate[0]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 212 } }, known.aggregate[0]);
 }
 
 test "resolveTypeclassCall: rejects a call that more than one instance fits" {
@@ -24684,7 +24771,7 @@ test "resolveTypeclassCall: matches a type constructor parameter against a struc
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 4 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 4 } }, known);
 }
 
 test "resolveTypeclassCall: calls a function of a generic instance for each binding" {
@@ -24704,9 +24791,9 @@ test "resolveTypeclassCall: calls a function of a generic instance for each bind
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[6].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 6 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 6 } }, known);
     const two = loader.modules.items[0].declarations[7].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 7 }, two);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 7 } }, two);
 }
 
 test "resolveTypeclassCall: calls a default of a generic instance" {
@@ -24726,7 +24813,7 @@ test "resolveTypeclassCall: calls a default of a generic instance" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[6].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 12 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 12 } }, known);
 }
 
 test "resolveTypeclassCall: skips a generic instance whose requirement does not hold" {
@@ -24767,7 +24854,7 @@ test "resolveTypeclassCall: calls a generic instance whose binding has every req
     const known = for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
-    try std.testing.expectEqual(Value{ .integer = 7 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 7 } }, known);
 }
 
 test "resolveTypeclassCall: skips a generic instance whose binding lacks one of several required instances" {
@@ -24867,7 +24954,7 @@ test "resolveTypeclassCall: lets a default use each typeclass that its typeclass
     const known = for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
-    try std.testing.expectEqual(Value{ .integer = 5 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 5 } }, known);
 }
 
 test "resolveTypeclassCall: rejects an instance whose argument lacks one of several instances its typeclass requires" {
@@ -25461,7 +25548,7 @@ test "checkGenericTypeclassCall: keeps the type parameters of a generic caller a
     const known = for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
-    try std.testing.expectEqual(Value{ .integer = 3 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 3 } }, known);
 }
 
 test "instantiateCall: creates an instance for each type of the argument to an any parameter" {
@@ -25545,9 +25632,9 @@ test "instantiateCall: creates an instance for each type given to a parameter of
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[6].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 10 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 10 } }, known);
     const two = loader.modules.items[0].declarations[7].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 2 }, two);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 2 } }, two);
 }
 
 test "instantiateCall: rejects a value of a type without an instance for a parameter of a typeclass type" {
@@ -25586,7 +25673,7 @@ test "instantiateCall: binds a type parameter that requires a typeclass" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 7 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 7 } }, known);
 }
 
 test "instantiateCall: rejects a type without an instance of the required typeclass" {
@@ -25627,7 +25714,7 @@ test "instantiateCall: binds a type parameter that requires several typeclasses 
     const known = for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
-    try std.testing.expectEqual(Value{ .integer = 14 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 14 } }, known);
 }
 
 test "instantiateCall: rejects a type without an instance of one of several required typeclasses" {
@@ -25668,7 +25755,7 @@ test "inferDeclaredTypes: binds a declared type that requires several typeclasse
     const known = for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
-    try std.testing.expectEqual(Value{ .integer = 6 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 6 } }, known);
 }
 
 test "inferDeclaredTypes: rejects a declared type without an instance of one of several required typeclasses" {
@@ -25791,7 +25878,7 @@ test "instantiateCall: evaluates a call to an instance at compile time" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 7 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, known);
 }
 
 test "instantiateCall: takes the type of a compile-time parameter from an earlier type parameter" {
@@ -25811,7 +25898,7 @@ test "instantiateCall: takes the type of a compile-time parameter from an earlie
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 200 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 200 } }, known);
 }
 
 test "instantiateCall: checks a compile-time argument against an earlier type parameter" {
@@ -25888,7 +25975,7 @@ test "instantiateCall: instantiates functions in the block of a struct" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[3].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 9 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 9 } }, known);
 }
 
 test "inferDeclaredTypes: takes each declared type from the argument types" {
@@ -25911,7 +25998,7 @@ test "inferDeclaredTypes: takes each declared type from the argument types" {
     const result = for (declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
-    try std.testing.expectEqual(Value{ .integer = 3 + 30 + 200 + 1000 + 90000 }, result);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 3 + 30 + 200 + 1000 + 90000 } }, result);
     const body = declarations[4].kind.function_definition.body;
     const sizes = body[2].kind.constant_declaration.value.kind.binary.left.kind.binary;
     const from_array = sizes.left.kind.call.callee.identifier.resolution.?.function;
@@ -25996,7 +26083,7 @@ test "inferDeclaredTypes: infers declared types of inline functions and of funct
     const result = for (declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
-    try std.testing.expectEqual(Value{ .integer = 50 + 3 }, result);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 50 + 3 } }, result);
 }
 
 test "inferDeclaredTypes: infers declared types of a typeclass's functions and default implementations" {
@@ -26019,7 +26106,7 @@ test "inferDeclaredTypes: infers declared types of a typeclass's functions and d
     const result = for (declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
-    try std.testing.expectEqual(Value{ .integer = 2 + 100 }, result);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 + 100 } }, result);
 }
 
 test "inferDeclaredTypes: checks a function with declared types even if it is never called" {
@@ -26080,7 +26167,7 @@ test "checkImplicitArgument: takes a pointer to a value of each type with an ins
     const result = for (declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
-    try std.testing.expectEqual(Value{ .integer = 2 + 12 + 300 + 3000 + 120000 }, result);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 + 12 + 300 + 3000 + 120000 } }, result);
     const body = for (declarations) |declaration| {
         if (declaration.kind == .function_definition and std.mem.eql(u8, declaration.kind.function_definition.signature.name, "run")) break declaration.kind.function_definition.body;
     } else unreachable;
@@ -26188,7 +26275,7 @@ test "checkImplicitArgument: takes pointers in a method of a type constructor's 
     const result = for (declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
-    try std.testing.expectEqual(Value{ .integer = 14 + 10 * 100 }, result);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 14 + 10 * 100 } }, result);
 }
 
 test "findInstance: rejects instances that nest without end" {
@@ -26270,9 +26357,9 @@ test "checkBuiltinCall: gives the size and the alignment of types as C lays them
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    const expected = [_]i129{ 4, 8, 4, 16, 8, 16, 6, 2, 0 };
+    const expected = [_]u128{ 4, 8, 4, 16, 8, 16, 6, 2, 0 };
     for (expected, declarations[3..]) |size, declaration| {
-        try std.testing.expectEqual(Value{ .integer = size }, declaration.kind.constant_declaration.known.?.*);
+        try std.testing.expectEqual(Value{ .integer = .{ .unsigned = size } }, declaration.kind.constant_declaration.known.?.*);
     }
 }
 
@@ -26293,11 +26380,11 @@ test "checkBuiltinCall: gives the length of a tuple type and joins tuple types" 
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, declarations[1].kind.constant_declaration.known.?.*);
     const joined = declarations[2].kind.constant_declaration.known.?.type.tuple;
     try std.testing.expectEqual(3, joined.elements.len);
     try std.testing.expectEqual(types.Type.boolean, joined.elements[1]);
-    try std.testing.expectEqual(Value{ .integer = 9 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 9 } }, declarations[4].kind.constant_declaration.known.?.*);
 }
 
 test "checkBuiltinCall: rejects the length of a type that is not a tuple" {
@@ -26812,7 +26899,7 @@ test "checkCaseCall: builds cases at compile time and compares them" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 42 }, known.enumeration.value.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 42 } }, known.enumeration.value.?.*);
     const declarations = loader.modules.items[0].declarations;
     try std.testing.expectEqual(Value{ .boolean = true }, declarations[3].kind.constant_declaration.known.?.*);
     try std.testing.expectEqual(Value{ .boolean = true }, declarations[4].kind.constant_declaration.known.?.*);
@@ -26965,7 +27052,7 @@ test "checkFunctionCall: takes any tuple through mn::reflection::Tuple and check
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 5 } }, declarations[5].kind.constant_declaration.known.?.*);
 }
 
 test "checkFunctionCall: rejects a value that is not a tuple where mn::reflection::Tuple is required" {
@@ -30083,7 +30170,7 @@ test "checkCompositeLiteral: makes a read-only slice from braces with elements k
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 10 + 1400 + 300000 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 10 + 1400 + 300000 } }, declarations[4].kind.constant_declaration.known.?.*);
 }
 
 test "checkCompositeLiteral: rejects braces with elements not known at compile time for a read-only slice" {
@@ -31030,7 +31117,7 @@ test "checkConstruction: gives names standing alone their fields in the default 
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     _ = try analyzer.analyze();
 
-    try std.testing.expectEqual(Value{ .integer = 2 }, loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 2 } }, loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.*);
 }
 
 test "checkConstruction: rejects a name standing alone that is not a field and names the struct and the field" {
@@ -31547,7 +31634,7 @@ test "checkIndex: gives the type of an element of a tuple type" {
 
     const declarations = loader.modules.items[0].declarations;
     try std.testing.expectEqual(types.Type.boolean, declarations[1].kind.constant_declaration.known.?.type);
-    try std.testing.expectEqual(Value{ .integer = 7 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, declarations[4].kind.constant_declaration.known.?.*);
     try std.testing.expectEqual(Value{ .boolean = true }, declarations[5].kind.constant_declaration.known.?.*);
 }
 
@@ -33553,7 +33640,7 @@ test "integration: lists files with a generic function that calls itself and kee
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::convert::To\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::process::stdout\nimport mn::stream::Writer\nimport mn::text\n\nconst root = \".\"\n\nfn main -> !void\n    var heap = memory::Heap::init()\n    var own path = try root.to(filesystem::Path) with &heap\n    defer path.deinit(own) with &heap\n    try print_files(path) with &heap\n\nfn print_files(path: filesystem::Path) -> !void\n    var buffer: [filesystem::maximum_path_length]u8 = undefined\n    const own bytes = try path.to([]u8)\n    defer memory::free(own bytes)\n    for (index in 0..bytes.length) buffer[index] = bytes[index]\n\n    const directory = try filesystem::Directory::open(path)\n    defer directory.deinit()\n\n    while try directory.next() as entry\n        match entry.kind\n            case File\n                try text::print(&stdout, \"{s}/{s}\\n\", { buffer[..bytes.length], entry.name })\n            case Directory\n                const own inner_path = try path.join(entry.name)\n                defer inner_path.deinit(own)\n                try print_files(inner_path)\n            else noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::convert::To\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::process::stdout\nimport mn::stream::Writer\nimport mn::text\n\nconst root = \".\"\n\nfn main -> !void\n    var heap = memory::Heap::init()\n    var own path = try root.to(filesystem::Path) with &heap\n    defer path.deinit(own) with &heap\n    try print_files(path) with &heap\n\nfn print_files(path: filesystem::Path) -> !void\n    var buffer: [filesystem::maximum_path_length]u8 = undefined\n    const own bytes = try path.to([]u8)\n    defer memory::free(own bytes)\n    for (index in 0..bytes.length) buffer[index] = bytes[index]\n\n    const directory = try filesystem::Directory::open(path)\n    defer directory.close()\n\n    while try directory.next() as entry\n        match entry.kind\n            case File\n                try text::print(&stdout, \"{s}/{s}\\n\", { buffer[..bytes.length], entry.name })\n            case Directory\n                const own inner_path = try path.join(entry.name)\n                defer inner_path.deinit(own)\n                try print_files(inner_path)\n            else noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -33583,7 +33670,7 @@ test "integration: formats into a list of bytes that grows as it is written thro
     for (declarations) |declaration| {
         if (declaration.kind == .constant_declaration) found = declaration.kind.constant_declaration.known.?.*;
     }
-    for ("12-ffdone\n", found.?.aggregate) |byte, value| try std.testing.expectEqual(Value{ .integer = byte }, value);
+    for ("12-ffdone\n", found.?.aggregate) |byte, value| try std.testing.expectEqual(Value{ .integer = .{ .unsigned = byte } }, value);
 }
 
 test "integration: gives out of memory as an error of mn::memory when a list of bytes cannot grow through the standard library" {
@@ -33639,7 +33726,7 @@ test "integration: gives the published digests of SHA-256 through the standard l
             if (!std.mem.eql(u8, pair[0], constant.name)) continue;
             var bytes: [32]u8 = undefined;
             _ = try std.fmt.hexToBytes(&bytes, pair[1]);
-            for (bytes, constant.known.?.aggregate) |byte, value| try std.testing.expectEqual(Value{ .integer = byte }, value);
+            for (bytes, constant.known.?.aggregate) |byte, value| try std.testing.expectEqual(Value{ .integer = .{ .unsigned = byte } }, value);
             checked += 1;
         }
     }
@@ -33673,7 +33760,7 @@ test "integration: gives the digests around the block boundaries of SHA-256 thro
         const known = for (loader.modules.items[0].declarations) |declaration| {
             if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, name)) break declaration.kind.constant_declaration.known.?.aggregate;
         } else unreachable;
-        for (expected, known) |byte, value| try std.testing.expectEqual(Value{ .integer = byte }, value);
+        for (expected, known) |byte, value| try std.testing.expectEqual(Value{ .integer = .{ .unsigned = byte } }, value);
     }
 }
 
@@ -33698,7 +33785,7 @@ test "integration: gives the same digest for short reads through the standard li
     var checked: usize = 0;
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind != .constant_declaration or declaration.kind.constant_declaration.known == null) continue;
-        for (expected, declaration.kind.constant_declaration.known.?.aggregate) |byte, value| try std.testing.expectEqual(Value{ .integer = byte }, value);
+        for (expected, declaration.kind.constant_declaration.known.?.aggregate) |byte, value| try std.testing.expectEqual(Value{ .integer = .{ .unsigned = byte } }, value);
         checked += 1;
     }
     try std.testing.expectEqual(3, checked);
@@ -33724,7 +33811,7 @@ test "integration: passes on the error of a read through the standard library" {
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 1 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 1 } }, found.?);
 }
 
 test "integration: writes each byte of a slice as two hexadecimal digits through the standard library" {
@@ -33747,7 +33834,7 @@ test "integration: writes each byte of a slice as two hexadecimal digits through
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    for ("000aff|", found.?.aggregate) |byte, value| try std.testing.expectEqual(Value{ .integer = byte }, value);
+    for ("000aff|", found.?.aggregate) |byte, value| try std.testing.expectEqual(Value{ .integer = .{ .unsigned = byte } }, value);
 }
 
 test "integration: writes nothing for an empty slice in hexadecimal through the standard library" {
@@ -33770,7 +33857,7 @@ test "integration: writes nothing for an empty slice in hexadecimal through the 
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 0 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 0 } }, found.?);
 }
 
 test "integration: rejects the placeholder for binary with a byte slice through the standard library" {
@@ -34251,11 +34338,11 @@ test "resolveCaseLiteral: gives cases that compile-time evaluation reads" {
         if (std.mem.eql(u8, constant.name, "FLIPPED")) try std.testing.expectEqualStrings("Read", known.enumeration.case.name);
         if (std.mem.eql(u8, constant.name, "NUMBER")) {
             try std.testing.expectEqualStrings("Number", known.enumeration.case.name);
-            try std.testing.expectEqual(Value{ .integer = 7 }, known.enumeration.value.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, known.enumeration.value.?.*);
         }
         if (std.mem.eql(u8, constant.name, "OPTIONAL")) try std.testing.expectEqualStrings("Write", known.optional.?.enumeration.case.name);
         if (std.mem.eql(u8, constant.name, "DEFAULT")) try std.testing.expectEqualStrings("Write", known.enumeration.case.name);
-        if (std.mem.eql(u8, constant.name, "CHOSEN")) try std.testing.expectEqual(Value{ .integer = 2 }, known);
+        if (std.mem.eql(u8, constant.name, "CHOSEN")) try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, known);
         checked += 1;
     }
     try std.testing.expectEqual(6, checked);
@@ -34382,11 +34469,11 @@ test "resolveTypeclassCall: selects the instance by the type argument" {
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "ONE")) {
-            try std.testing.expectEqual(Value{ .integer = 7 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "TWO")) {
-            try std.testing.expectEqual(Value{ .integer = 300 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 300 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -34414,11 +34501,11 @@ test "findSelectedMethod: selects the instance of a method by the type argument"
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "ONE")) {
-            try std.testing.expectEqual(Value{ .integer = 7 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "TWO")) {
-            try std.testing.expectEqual(Value{ .integer = 300 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 300 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -34446,11 +34533,11 @@ test "findSelectedMethod: selects the instance through a parameter of any type" 
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "ONE")) {
-            try std.testing.expectEqual(Value{ .integer = 7 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "TWO")) {
-            try std.testing.expectEqual(Value{ .integer = 300 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 300 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -34480,11 +34567,11 @@ test "findSelectedMethod: takes an instance from a second module for its own tar
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "ONE")) {
-            try std.testing.expectEqual(Value{ .integer = 7 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "TWO")) {
-            try std.testing.expectEqual(Value{ .integer = 1007 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 1007 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -34569,11 +34656,11 @@ test "findTypeclassMethod: passes the type argument through as a variable in a d
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "ONE")) {
-            try std.testing.expectEqual(Value{ .integer = 7 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "TWO")) {
-            try std.testing.expectEqual(Value{ .integer = 300 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 300 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -34601,11 +34688,11 @@ test "resolveTypeclassCall: decides an instance from a type argument alone" {
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "ONE")) {
-            try std.testing.expectEqual(Value{ .integer = 1 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 1 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "TWO")) {
-            try std.testing.expectEqual(Value{ .integer = 2 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -34633,11 +34720,11 @@ test "resolveTypeclassCall: keeps one function for every type of a differently n
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "ONE")) {
-            try std.testing.expectEqual(Value{ .integer = 7 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "TWO")) {
-            try std.testing.expectEqual(Value{ .integer = 8 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 8 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -34706,43 +34793,43 @@ test "fillTypeArgument: takes a type from the surrounding code in each position"
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "DECLARED")) {
-            try std.testing.expectEqual(Value{ .integer = 3 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 3 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "WIDE")) {
-            try std.testing.expectEqual(Value{ .integer = 300 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 300 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "PLAIN")) {
-            try std.testing.expectEqual(Value{ .integer = 9 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 9 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "FOUND")) {
-            try std.testing.expectEqual(Value{ .integer = 4 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 4 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "MISSING")) {
-            try std.testing.expectEqual(Value{ .integer = 5 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 5 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "RETURNED")) {
-            try std.testing.expectEqual(Value{ .integer = 1 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 1 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "TRIED")) {
-            try std.testing.expectEqual(Value{ .integer = 300 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 300 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "LINE")) {
-            try std.testing.expectEqual(Value{ .integer = 300 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 300 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "ARGUMENT")) {
-            try std.testing.expectEqual(Value{ .integer = 2 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "BOTH")) {
-            try std.testing.expectEqual(Value{ .integer = 8 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 8 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -34930,7 +35017,7 @@ test "resolveAllocatorCall: rejects with on opening a file through the standard 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: []const(T)) = noop\nfn run(path: filesystem::Path) -> !void\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const file = try filesystem::File::open(path, ::Read) with &fixed\n    file.deinit()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: []const(T)) = noop\nfn run(path: filesystem::Path) -> !void\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const file = try filesystem::File::open(path) with &fixed\n    file.close()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -34948,7 +35035,7 @@ test "resolveAllocatorCall: rejects with on opening a directory through the stan
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: []const(T)) = noop\nfn run(path: filesystem::Path) -> !void\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const directory = try filesystem::Directory::open(path) with &fixed\n    directory.deinit()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: []const(T)) = noop\nfn run(path: filesystem::Path) -> !void\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const directory = try filesystem::Directory::open(path) with &fixed\n    directory.close()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -35101,7 +35188,7 @@ test "integration: keeps a map at compile time through the standard library" {
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 9 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 9 } }, found.?);
 }
 
 test "findExpectedArgument: keeps an optional as the target of an instance" {
@@ -35163,19 +35250,19 @@ test "matchLength: binds a length and an element for each array in a typeclass o
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "FIRST")) {
-            try std.testing.expectEqual(Value{ .integer = 303 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 303 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "SECOND")) {
-            try std.testing.expectEqual(Value{ .integer = 806 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 806 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "THIRD")) {
-            try std.testing.expectEqual(Value{ .integer = 101 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 101 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "FOURTH")) {
-            try std.testing.expectEqual(Value{ .integer = 0 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 0 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -35203,11 +35290,11 @@ test "addLengthConstant: gives a length parameter as a value known at compile ti
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "ONE")) {
-            try std.testing.expectEqual(Value{ .integer = 1 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 1 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "TWO")) {
-            try std.testing.expectEqual(Value{ .integer = 2 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -35235,7 +35322,7 @@ test "matchLength: binds two length parameters apart" {
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "RESULT")) {
-            try std.testing.expectEqual(Value{ .integer = 23 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 23 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -35358,11 +35445,11 @@ test "unifyLength: keeps a repeated length apart from two different lengths" {
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "ONE")) {
-            try std.testing.expectEqual(Value{ .integer = 23 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 23 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "TWO")) {
-            try std.testing.expectEqual(Value{ .integer = 2 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -35485,7 +35572,7 @@ test "integration: keeps a map of arrays at compile time through the standard li
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) found = declaration.kind.constant_declaration.known.?.*;
     }
-    try std.testing.expectEqual(Value{ .integer = 1 }, found.?);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 1 } }, found.?);
 }
 
 test "integration: copies elements at compile time through the standard library" {
@@ -35509,27 +35596,27 @@ test "integration: copies elements at compile time through the standard library"
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "DISTINCT")) {
-            for ([_]i129{ 7, 8, 9 }, constant.known.?.aggregate) |expected, value| try std.testing.expectEqual(Value{ .integer = expected }, value);
+            for ([_]u128{ 7, 8, 9 }, constant.known.?.aggregate) |expected, value| try std.testing.expectEqual(Value{ .integer = .{ .unsigned = expected } }, value);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "FORWARD")) {
-            for ([_]i129{ 3, 4, 5, 6, 7, 6, 7, 8 }, constant.known.?.aggregate) |expected, value| try std.testing.expectEqual(Value{ .integer = expected }, value);
+            for ([_]u128{ 3, 4, 5, 6, 7, 6, 7, 8 }, constant.known.?.aggregate) |expected, value| try std.testing.expectEqual(Value{ .integer = .{ .unsigned = expected } }, value);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "BACKWARD")) {
-            for ([_]i129{ 1, 2, 1, 2, 3, 4, 5, 8 }, constant.known.?.aggregate) |expected, value| try std.testing.expectEqual(Value{ .integer = expected }, value);
+            for ([_]u128{ 1, 2, 1, 2, 3, 4, 5, 8 }, constant.known.?.aggregate) |expected, value| try std.testing.expectEqual(Value{ .integer = .{ .unsigned = expected } }, value);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "SAME")) {
-            for ([_]i129{ 1, 2, 3 }, constant.known.?.aggregate) |expected, value| try std.testing.expectEqual(Value{ .integer = expected }, value);
+            for ([_]u128{ 1, 2, 3 }, constant.known.?.aggregate) |expected, value| try std.testing.expectEqual(Value{ .integer = .{ .unsigned = expected } }, value);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "STRUCTS")) {
-            try std.testing.expectEqual(Value{ .integer = 11 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .signed = 11 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "EMPTY")) {
-            try std.testing.expectEqual(Value{ .integer = 2 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -35611,11 +35698,11 @@ test "integration: runs an errdefer of an inner block only when the error is ret
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "NORMALLY")) {
-            try std.testing.expectEqual(Value{ .integer = 10 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 10 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "INSIDE")) {
-            try std.testing.expectEqual(Value{ .integer = 11 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 11 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -35760,11 +35847,11 @@ test "findLiteralFunction: gives calls that compile-time evaluation runs" {
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "ONE")) {
-            try std.testing.expectEqual(Value{ .integer = 1 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 1 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "TWO")) {
-            try std.testing.expectEqual(Value{ .integer = 6 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 6 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -36264,47 +36351,47 @@ test "expectLoopFits: accepts each index it does not reject at compile time" {
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "EXACT")) {
-            try std.testing.expectEqual(Value{ .integer = 6 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 6 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "SHORTER")) {
-            try std.testing.expectEqual(Value{ .integer = 3 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 3 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "LATER")) {
-            try std.testing.expectEqual(Value{ .integer = 5 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 5 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "PLUS_ONE")) {
-            try std.testing.expectEqual(Value{ .integer = 5 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 5 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "THROUGH_CONSTANT")) {
-            try std.testing.expectEqual(Value{ .integer = 9 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 9 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "SHADOWED")) {
-            try std.testing.expectEqual(Value{ .integer = 30 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 30 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "THROUGH_SLICE")) {
-            try std.testing.expectEqual(Value{ .integer = 6 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 6 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "AT_RUN_TIME")) {
-            try std.testing.expectEqual(Value{ .integer = 3 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 3 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "POINTER")) {
-            try std.testing.expectEqual(Value{ .integer = 6 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 6 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "ZERO_COUNT")) {
-            try std.testing.expectEqual(Value{ .integer = 9 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 9 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "WITHOUT_END")) {
-            try std.testing.expectEqual(Value{ .integer = 5 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 5 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -36332,11 +36419,11 @@ test "checkRange: keeps an empty range as a value" {
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "RESULT")) {
-            try std.testing.expectEqual(Value{ .integer = 0 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 0 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "OTHER")) {
-            try std.testing.expectEqual(Value{ .integer = 2 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -36383,7 +36470,7 @@ test "findInstance: gives a writable slice to an instance for the read-only form
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "RESULT")) {
-            try std.testing.expectEqual(Value{ .integer = 114 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 114 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -36449,7 +36536,7 @@ test "findInstance: picks the exact instance of a slice when both forms are decl
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "RESULT")) {
-            try std.testing.expectEqual(Value{ .integer = 12 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 12 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -36477,7 +36564,7 @@ test "findInstance: gives a writable pointer to an instance for the read-only fo
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "RESULT")) {
-            try std.testing.expectEqual(Value{ .integer = 114 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 114 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -36543,7 +36630,7 @@ test "findInstance: picks the exact instance of a pointer when both forms are de
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "RESULT")) {
-            try std.testing.expectEqual(Value{ .integer = 12 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 12 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -36571,7 +36658,7 @@ test "findInstance: gives a writable many to an instance for the read-only form"
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "RESULT")) {
-            try std.testing.expectEqual(Value{ .integer = 114 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 114 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -36637,7 +36724,7 @@ test "findInstance: picks the exact instance of a many when both forms are decla
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "RESULT")) {
-            try std.testing.expectEqual(Value{ .integer = 12 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 12 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -36760,7 +36847,7 @@ test "findInstance: accepts a requirement met by the read-only form" {
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "RESULT")) {
-            try std.testing.expectEqual(Value{ .integer = 2 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -36834,7 +36921,7 @@ test "integration: rejects print on a file through the standard library" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::convert::To\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::stream::Writer\nfn main -> !void\n    with memory::Heap\n    var own path = try \"a\".to(filesystem::Path)\n    defer path.deinit(own)\n    const file = try filesystem::File::open(path, ::Write)\n    defer file.deinit()\n    try file.print(\"x\", {})\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::convert::To\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::stream::Writer\nfn main -> !void\n    with memory::Heap\n    var own path = try \"a\".to(filesystem::Path)\n    defer path.deinit(own)\n    const file = try filesystem::File::open(path, { mode = ::Write })\n    defer file.close()\n    try file.print(\"x\", {})\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -37130,19 +37217,19 @@ test "checkImplicitArgument: takes a read-only pointer for an instance that only
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "DIRECT")) {
-            try std.testing.expectEqual(Value{ .integer = 16 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 16 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "GENERIC")) {
-            try std.testing.expectEqual(Value{ .integer = 16 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 16 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "DEFAULT")) {
-            try std.testing.expectEqual(Value{ .integer = 21 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 21 } }, constant.known.?.*);
             checked += 1;
         }
         if (std.mem.eql(u8, constant.name, "POINTER")) {
-            try std.testing.expectEqual(Value{ .integer = 16 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 16 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -37284,7 +37371,7 @@ test "resolveInstance: lets each function of an instance choose a read-only poin
         if (declaration.kind != .constant_declaration) continue;
         const constant = declaration.kind.constant_declaration;
         if (std.mem.eql(u8, constant.name, "RESULT")) {
-            try std.testing.expectEqual(Value{ .integer = 16 }, constant.known.?.*);
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 16 } }, constant.known.?.*);
             checked += 1;
         }
     }
@@ -37453,7 +37540,7 @@ test "integration: rejects a pointer to a path passed to open through the standa
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::filesystem\nfn run(path: filesystem::Path) -> !void\n    const file = try filesystem::File::open(&path, ::Read)\n    file.deinit()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::filesystem\nfn run(path: filesystem::Path) -> !void\n    const file = try filesystem::File::open(&path)\n    file.close()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);

@@ -2,6 +2,9 @@ import mn::codec::Decode
 import mn::codec::Decoder
 import mn::codec::Encode
 import mn::codec::Encoder
+import mn::compare::Equal
+import mn::compare::Order
+import mn::compare::Ordering
 
 private external fn mn_runtime_time_wall_clock(seconds: *i64, nanoseconds: *u32)
 private external fn mn_runtime_time_monotonic_clock() -> i64
@@ -10,6 +13,11 @@ private external fn mn_runtime_time_monotonic_clock() -> i64
 struct WallTime
     seconds: i64
     nanoseconds: u32
+
+    fn now() -> Self
+        var reading: Self = { seconds = 0, nanoseconds = 0 }
+        mn_runtime_time_wall_clock(&reading.seconds, &reading.nanoseconds)
+        return reading
 
 
 instance Encode(WallTime)
@@ -27,14 +35,30 @@ instance Decode(WallTime)
         return { seconds = seconds, nanoseconds = nanoseconds }
 
 
+instance Equal(WallTime)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.seconds == two.seconds and one.nanoseconds == two.nanoseconds
+
+
+instance Order(WallTime)
+
+    fn order(one: *const(Self), two: *const(Self)) -> Ordering
+        const seconds = one.seconds.order(&two.seconds)
+        if (seconds != ::Equal) return seconds
+        return one.nanoseconds.order(&two.nanoseconds)
+
+
 struct MonotonicTime
     nanoseconds: i64
 
-
-fn wall_clock() -> WallTime
-    var reading: WallTime = { seconds = 0, nanoseconds = 0 }
-    mn_runtime_time_wall_clock(&reading.seconds, &reading.nanoseconds)
-    return reading
+    fn now() -> Self = { nanoseconds = mn_runtime_time_monotonic_clock() }
 
 
-fn monotonic_clock() -> MonotonicTime = { nanoseconds = mn_runtime_time_monotonic_clock() }
+instance Equal(MonotonicTime)
+
+    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.nanoseconds == two.nanoseconds
+
+
+instance Order(MonotonicTime)
+
+    fn order(one: *const(Self), two: *const(Self)) -> Ordering = one.nanoseconds.order(&two.nanoseconds)

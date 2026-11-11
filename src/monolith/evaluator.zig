@@ -6,6 +6,7 @@ const types = core.types;
 
 const AnalyzeError = @import("analyzer.zig").AnalyzeError;
 const Failure = core.Failure;
+const Integer = core.Integer;
 const Value = core.Value;
 
 const followPointer = types.followPointer;
@@ -63,7 +64,7 @@ pub const Evaluator = struct {
         const bytes = try allocator.alloc(u8, slice.length);
         for (elements, bytes) |element, *byte| {
             if (element != .integer) return self.fail(location, error.ReadUndefined);
-            byte.* = @intCast(element.integer);
+            byte.* = @intCast(element.integer.unsigned);
         }
         return bytes;
     }
@@ -219,7 +220,7 @@ pub const Evaluator = struct {
     fn evaluateOtherExpression(self: *Evaluator, expression: *const ast.Expression) EvaluateError!Value {
         const location = expression.location;
         return switch (expression.kind) {
-            .integer_literal => |literal| parseInteger(findNumber(expression.type.?), literal.text),
+            .integer_literal => |literal| parseInteger(findNumber(expression.type.?), literal.text, false),
             .float_literal => |literal| .{ .float = parseFloat(findNumber(expression.type.?), literal.text) },
             .boolean_literal => |value| .{ .boolean = value },
             .string_literal => |text| self.makeString(expression.type.?, text),
@@ -256,13 +257,13 @@ pub const Evaluator = struct {
         const container = types.followPointer(access.value.type.?);
         if (container == .array) {
             _ = try self.evaluateExpression(access.value);
-            return .{ .integer = container.array.length };
+            return .{ .integer = .{ .unsigned = container.array.length } };
         }
         if (container != .slice) return self.readPlace(expression.location, try self.findPlace(expression.*));
         var slice_value = try self.evaluateExpression(access.value);
         if (slice_value == .pointer) slice_value = try self.readPlace(access.value.location, slice_value.pointer);
         const slice = slice_value.slice;
-        if (std.mem.eql(u8, access.field, "length")) return .{ .integer = slice.length };
+        if (std.mem.eql(u8, access.field, "length")) return .{ .integer = .{ .unsigned = slice.length } };
         return .{ .many = .{ .array = slice.array, .index = slice.start } };
     }
 
@@ -274,7 +275,7 @@ pub const Evaluator = struct {
         fields[1] = .{ .optional = null };
         if (range.end) |end_expression| {
             const end = try self.evaluateExpression(&end_expression);
-            if (start.integer > end.integer) return self.fail(range.start.location, error.ReversedRange);
+            if (start.integer.order(end.integer) == .gt) return self.fail(range.start.location, error.ReversedRange);
             const cell = try allocator.create(Value);
             cell.* = end;
             fields[1] = .{ .optional = cell };
@@ -448,7 +449,7 @@ pub const Evaluator = struct {
                     return self.extendPlace(try self.expectPointer(location, value), @intCast(position));
                 }
                 const many = value.many;
-                const element = many.index + position;
+                const element = many.index + @as(i128, @intCast(position));
                 const length = self.findArrayLength(many.array);
                 if (element < 0 or element >= length) return self.fail(location, error.IndexOutOfRange);
                 return self.findElementPlace(many.array, @intCast(element));
@@ -497,17 +498,18 @@ pub const Evaluator = struct {
         return value.pointer;
     }
 
-    fn expectIndex(self: *Evaluator, location: token.Location, value: Value) EvaluateError!i129 {
+    fn expectIndex(self: *Evaluator, location: token.Location, value: Value) EvaluateError!u128 {
         if (value != .integer) return self.fail(location, error.ReadUndefined);
-        return value.integer;
+        return value.integer.unsigned;
     }
 
     fn evaluateNegation(self: *Evaluator, expression: ast.Expression, operand: ast.Expression) EvaluateError!Value {
+        _ = self;
         const number = findNumber(expression.type.?);
-        return switch (try self.evaluateExpression(&operand)) {
-            .integer => |value| self.expectInRange(expression.location, number, -value),
-            .float => |value| .{ .float = -value },
-            .boolean, .void, .undefined, .optional, .aggregate, .pointer, .many, .slice, .function, .type, .enumeration, .failure => unreachable,
+        return switch (operand.kind) {
+            .integer_literal => |literal| parseInteger(number, literal.text, true),
+            .float_literal => |literal| .{ .float = -parseFloat(number, literal.text) },
+            else => unreachable,
         };
     }
 
@@ -518,13 +520,10 @@ pub const Evaluator = struct {
             .negate => {
                 const number = findNumber(expression.type.?);
                 if (operand == .float) return .{ .float = -operand.float };
-                return self.expectInRange(expression.location, number, -operand.integer);
+                const negated = operand.integer.negate(number) catch |arithmetic_error| return self.fail(expression.location, arithmetic_error);
+                return .{ .integer = negated };
             },
-            .bitwise_not => {
-                const number = findNumber(expression.type.?);
-                if (findMinimum(number) < 0) return .{ .integer = -operand.integer - 1 };
-                return .{ .integer = findMaximum(number) - operand.integer };
-            },
+            .bitwise_not => return .{ .integer = operand.integer.invert(findNumber(expression.type.?)) },
         }
     }
 
@@ -544,9 +543,9 @@ pub const Evaluator = struct {
         if (ast.findWrappingOperator(builtin)) |operator| return self.evaluateWrapping(call, operator);
         const target = (try self.evaluateExpression(&call.arguments[0].value)).type;
         switch (builtin) {
-            .size => return .{ .integer = types.findLayout(target).size },
-            .alignment => return .{ .integer = types.findLayout(target).alignment },
-            .length => return .{ .integer = target.tuple.elements.len },
+            .size => return .{ .integer = .{ .unsigned = types.findLayout(target).size } },
+            .alignment => return .{ .integer = .{ .unsigned = types.findLayout(target).alignment } },
+            .length => return .{ .integer = .{ .unsigned = target.tuple.elements.len } },
             .join => {
                 const other = (try self.evaluateExpression(&call.arguments[1].value)).type;
                 const elements = try std.mem.concat(self.arena.allocator(), types.Type, &.{ target.tuple.elements, other.tuple.elements });
@@ -564,19 +563,19 @@ pub const Evaluator = struct {
     }
 
     fn evaluateWrapping(self: *Evaluator, call: ast.Call, operator: ast.BinaryOperator) EvaluateError!Value {
-        var operands: [2]u129 = undefined;
+        var operands: [2]Integer = undefined;
         for (call.arguments, &operands) |*argument, *operand| {
             const value = try self.evaluateExpression(&argument.value);
             if (value == .undefined) return self.fail(argument.value.location, error.ReadUndefined);
-            operand.* = @bitCast(value.integer);
+            operand.* = value.integer;
         }
-        const bits = switch (operator) {
-            .add => operands[0] +% operands[1],
-            .subtract => operands[0] -% operands[1],
-            .multiply => operands[0] *% operands[1],
+        const number = findNumber(call.arguments[0].value.type.?);
+        return .{ .integer = switch (operator) {
+            .add => operands[0].addWrapping(number, operands[1]),
+            .subtract => operands[0].subtractWrapping(number, operands[1]),
+            .multiply => operands[0].multiplyWrapping(number, operands[1]),
             else => unreachable,
-        };
-        return .{ .integer = truncateInteger(findNumber(call.arguments[0].value.type.?), @bitCast(bits)) };
+        } };
     }
 
     fn castPointer(self: *Evaluator, location: token.Location, target: *const types.Pointer, argument: *const ast.Expression) EvaluateError!Value {
@@ -600,21 +599,15 @@ pub const Evaluator = struct {
         const float_target = isFloatType(target);
         switch (value) {
             .integer => |integer| {
-                if (float_target) return .{ .float = roundFloat(target, @floatFromInt(integer)) };
-                if (builtin == .truncate) return .{ .integer = truncateInteger(target, integer) };
-                if (integer < findMinimum(target) or integer > findMaximum(target)) {
-                    return self.fail(location, error.ConversionOutOfRange);
-                }
-                return value;
+                if (float_target) return .{ .float = roundFloat(target, integer.toFloat()) };
+                if (builtin == .truncate) return .{ .integer = integer.truncate(target) };
+                const converted = integer.convert(target) orelse return self.fail(location, error.ConversionOutOfRange);
+                return .{ .integer = converted };
             },
             .float => |float| {
                 if (float_target) return .{ .float = roundFloat(target, float) };
-                if (std.math.isNan(float) or std.math.isInf(float)) return self.fail(location, error.ConversionOutOfRange);
-                const truncated = @trunc(float);
-                const minimum: f128 = @floatFromInt(findMinimum(target));
-                const maximum: f128 = @floatFromInt(findMaximum(target));
-                if (truncated < minimum or truncated > maximum) return self.fail(location, error.ConversionOutOfRange);
-                return .{ .integer = @intFromFloat(truncated) };
+                const converted = Integer.fromFloat(target, float) orelse return self.fail(location, error.ConversionOutOfRange);
+                return .{ .integer = converted };
             },
             else => unreachable,
         }
@@ -697,10 +690,13 @@ pub const Evaluator = struct {
         right: Value,
     ) EvaluateError!Value {
         if (left == .many and right == .many) {
-            return self.expectInRange(location, .isize, left.many.index - right.many.index);
+            const one: Integer = .{ .signed = left.many.index };
+            const two: Integer = .{ .signed = right.many.index };
+            const difference = one.subtract(.isize, two) catch |arithmetic_error| return self.fail(location, arithmetic_error);
+            return .{ .integer = difference };
         }
         const many = if (left == .many) left.many else right.many;
-        const offset = if (left == .many) right.integer else left.integer;
+        const offset: i128 = @intCast(if (left == .many) right.integer.unsigned else left.integer.unsigned);
         const index = if (operator == .add) many.index + offset else many.index - offset;
         return .{ .many = .{ .array = many.array, .index = index } };
     }
@@ -710,38 +706,20 @@ pub const Evaluator = struct {
         location: token.Location,
         operator: ast.BinaryOperator,
         number: types.NumberType,
-        left: i129,
-        right: i129,
+        left: Integer,
+        right: Integer,
     ) EvaluateError!Value {
-        const result: i129 = switch (operator) {
-            .add => result: {
-                const sum, const overflow = @addWithOverflow(left, right);
-                if (overflow == 1) return self.fail(location, error.IntegerOverflow);
-                break :result sum;
-            },
-            .subtract => result: {
-                const difference, const overflow = @subWithOverflow(left, right);
-                if (overflow == 1) return self.fail(location, error.IntegerOverflow);
-                break :result difference;
-            },
-            .multiply => result: {
-                const product, const overflow = @mulWithOverflow(left, right);
-                if (overflow == 1) return self.fail(location, error.IntegerOverflow);
-                break :result product;
-            },
-            .divide => result: {
-                if (right == 0) return self.fail(location, error.DivisionByZero);
-                break :result @divTrunc(left, right);
-            },
-            .remainder => result: {
-                if (right == 0) return self.fail(location, error.DivisionByZero);
-                break :result @rem(left, right);
-            },
-            .bitwise_and => left & right,
-            .bitwise_exclusive_or => left ^ right,
-            .bitwise_or => left | right,
-            .shift_left => shiftLeft(number, left, right),
-            .shift_right => shiftRight(number, left, right),
+        const result: Integer.Error!Integer = switch (operator) {
+            .add => left.add(number, right),
+            .subtract => left.subtract(number, right),
+            .multiply => left.multiply(number, right),
+            .divide => left.divide(number, right),
+            .remainder => left.remainder(number, right),
+            .bitwise_and => left.bitwiseAnd(number, right),
+            .bitwise_exclusive_or => left.bitwiseExclusiveOr(number, right),
+            .bitwise_or => left.bitwiseOr(number, right),
+            .shift_left => left.shiftLeft(number, right),
+            .shift_right => left.shiftRight(number, right),
             .combine,
             .result,
             .@"orelse",
@@ -756,7 +734,8 @@ pub const Evaluator = struct {
             .@"or",
             => unreachable,
         };
-        return self.expectInRange(location, number, result);
+        const integer = result catch |arithmetic_error| return self.fail(location, arithmetic_error);
+        return .{ .integer = integer };
     }
 
     fn evaluateCompositeLiteral(
@@ -836,7 +815,6 @@ pub const Evaluator = struct {
     fn evaluateBound(self: *Evaluator, bound: ?*ast.Expression, fallback: usize) EvaluateError!usize {
         const expression = bound orelse return fallback;
         const value = try self.expectIndex(expression.location, try self.evaluateExpression(expression));
-        if (value < 0) return self.fail(expression.location, error.SliceOutOfRange);
         if (value > std.math.maxInt(usize)) return self.fail(expression.location, error.SliceOutOfRange);
         return @intCast(value);
     }
@@ -957,7 +935,7 @@ pub const Evaluator = struct {
         if (size == 0) return .void;
         if (destination != .many or source != .many) return self.fail(location, error.CannotEvaluate);
         const element_size = types.findLayout(findPointedType(destination).?).size;
-        const count: usize = @intCast(@divExact(size, @as(i129, @intCast(element_size))));
+        const count: usize = @intCast(@divExact(size, element_size));
         const elements = try self.arena.allocator().alloc(Value, count);
         for (elements, 0..) |*element, position| {
             const place = try self.findElementPlace(source.many.array, @as(usize, @intCast(source.many.index)) + position);
@@ -1396,7 +1374,7 @@ pub const Evaluator = struct {
         switch (loop.sequence) {
             .range => |range| {
                 const start = try self.expectIndex(range.start.location, try self.evaluateExpression(&range.start));
-                const end: ?i129 = if (range.end) |end_expression|
+                const end: ?u128 = if (range.end) |end_expression|
                     try self.expectIndex(end_expression.location, try self.evaluateExpression(&end_expression))
                 else
                     null;
@@ -1406,7 +1384,7 @@ pub const Evaluator = struct {
                 var index = start;
                 while (end == null or index < end.?) : (index += 1) {
                     try self.step(statement.location);
-                    try self.bindNames(statement, .{ .integer = index }, null);
+                    try self.bindNames(statement, .{ .integer = .{ .unsigned = index } }, null);
                     switch (try self.executeBlock(loop.body)) {
                         .next => {},
                         .broke => |target| {
@@ -1534,7 +1512,7 @@ pub const Evaluator = struct {
         const allocator = self.arena.allocator();
         const bytes = try decodeText(allocator, text);
         const elements = try allocator.alloc(Value, bytes.len);
-        for (bytes, elements) |byte, *element| element.* = .{ .integer = byte };
+        for (bytes, elements) |byte, *element| element.* = .{ .integer = .{ .unsigned = byte } };
         const root = try allocator.create(Value);
         root.* = .{ .aggregate = elements };
         const array = try self.program.types.addArray(allocator, bytes.len, slice_type.slice.element);
@@ -1590,18 +1568,6 @@ pub const Evaluator = struct {
     fn step(self: *Evaluator, location: token.Location) EvaluateError!void {
         self.steps += 1;
         if (self.steps > step_limit) return self.fail(location, error.StepLimit);
-    }
-
-    fn expectInRange(
-        self: *Evaluator,
-        location: token.Location,
-        number: types.NumberType,
-        value: i129,
-    ) EvaluateError!Value {
-        if (value < findMinimum(number) or value > findMaximum(number)) {
-            return self.fail(location, error.IntegerOverflow);
-        }
-        return .{ .integer = value };
     }
 
     fn fail(self: *Evaluator, location: token.Location, evaluation_error: EvaluationError) EvaluationError {
@@ -1765,6 +1731,7 @@ fn countOptionals(value_type: types.Type) usize {
 }
 
 fn convertDirectly(value: Value, value_type: types.Type, expected: types.Type) Value {
+    if (value == .integer and expected == .number) return .{ .integer = value.integer.convert(expected.number).? };
     if (expected != .slice or value_type != .pointer) return value;
     const array = value_type.pointer.target.array;
     return .{ .slice = .{ .array = value.pointer, .start = 0, .length = @intCast(array.length) } };
@@ -1772,23 +1739,6 @@ fn convertDirectly(value: Value, value_type: types.Type, expected: types.Type) V
 
 fn isFloatType(number: types.NumberType) bool {
     return number == .f16 or number == .f32 or number == .f64 or number == .f128;
-}
-
-fn truncateInteger(number: types.NumberType, value: i129) i129 {
-    const bits: u129 = @bitCast(value);
-    return switch (number) {
-        .u8 => @as(u8, @truncate(bits)),
-        .u16 => @as(u16, @truncate(bits)),
-        .u32 => @as(u32, @truncate(bits)),
-        .u64, .usize => @as(u64, @truncate(bits)),
-        .u128 => @as(u128, @truncate(bits)),
-        .i8 => @as(i8, @bitCast(@as(u8, @truncate(bits)))),
-        .i16 => @as(i16, @bitCast(@as(u16, @truncate(bits)))),
-        .i32 => @as(i32, @bitCast(@as(u32, @truncate(bits)))),
-        .i64, .isize => @as(i64, @bitCast(@as(u64, @truncate(bits)))),
-        .i128 => @as(i128, @bitCast(@as(u128, @truncate(bits)))),
-        .f16, .f32, .f64, .f128 => unreachable,
-    };
 }
 
 fn findPointedType(value: Value) ?types.Type {
@@ -1892,7 +1842,7 @@ fn isChosenCase(case: ast.BranchCase, value_type: types.Type, matched: Value) bo
         },
         .value => if (value_type == .result) matched != .failure else matched.optional != null,
         .null => matched.optional == null,
-        .integer => case.minimum <= matched.integer and matched.integer <= case.maximum,
+        .integer => case.minimum.order(matched.integer) != .gt and matched.integer.order(case.maximum) != .gt,
     };
 }
 
@@ -1979,11 +1929,10 @@ fn findNumber(value_type: types.Type) types.NumberType {
     };
 }
 
-fn parseInteger(number: types.NumberType, text: []const u8) Value {
-    const value = std.fmt.parseInt(i129, text, 0) catch unreachable;
+fn parseInteger(number: types.NumberType, text: []const u8, negative: bool) Value {
     return switch (number) {
-        .f16, .f32, .f64, .f128 => .{ .float = roundFloat(number, @floatFromInt(value)) },
-        .i8, .i16, .i32, .i64, .i128, .isize, .u8, .u16, .u32, .u64, .u128, .usize => .{ .integer = value },
+        .f16, .f32, .f64, .f128 => .{ .float = roundFloat(number, Integer.parse(.u128, text, false).toFloat()) },
+        .i8, .i16, .i32, .i64, .i128, .isize, .u8, .u16, .u32, .u64, .u128, .usize => .{ .integer = Integer.parse(number, text, negative) },
     };
 }
 
@@ -2038,7 +1987,7 @@ fn computeFloat(operator: ast.BinaryOperator, number: types.NumberType, left: f1
 
 fn compare(operator: ast.BinaryOperator, left: Value, right: Value) bool {
     const order: std.math.Order = switch (left) {
-        .integer => |value| std.math.order(value, right.integer),
+        .integer => |value| value.order(right.integer),
         .float => |value| order: {
             if (std.math.isNan(value) or std.math.isNan(right.float)) return false;
             break :order std.math.order(value, right.float);
@@ -2075,7 +2024,7 @@ fn compare(operator: ast.BinaryOperator, left: Value, right: Value) bool {
 
 fn isEqual(one: Value, two: Value) bool {
     return switch (one) {
-        .integer => |value| two == .integer and two.integer == value,
+        .integer => |value| two == .integer and value.order(two.integer) == .eq,
         .float => |value| two == .float and two.float == value,
         .boolean => |value| two == .boolean and two.boolean == value,
         .void => two == .void,
@@ -2116,61 +2065,6 @@ fn isEqual(one: Value, two: Value) bool {
 
 fn isSamePlace(one: Value.Pointer, two: Value.Pointer) bool {
     return one.root == two.root and std.mem.eql(usize, one.path, two.path);
-}
-
-fn shiftLeft(number: types.NumberType, value: i129, amount: i129) i129 {
-    const width = findWidth(number);
-    if (amount >= width) return 0;
-    const mask = (@as(u256, 1) << width) - 1;
-    const bits = @as(u256, @bitCast(@as(i256, value))) & mask;
-    const shifted = (bits << @intCast(amount)) & mask;
-    if (findMinimum(number) < 0 and shifted >> (width - 1) == 1) {
-        return @intCast(@as(i256, @intCast(shifted)) - (@as(i256, 1) << width));
-    }
-    return @intCast(shifted);
-}
-
-fn shiftRight(number: types.NumberType, value: i129, amount: i129) i129 {
-    if (amount >= findWidth(number)) return if (value < 0) -1 else 0;
-    return value >> @intCast(amount);
-}
-
-fn findWidth(number: types.NumberType) u8 {
-    return switch (number) {
-        .i8, .u8 => 8,
-        .i16, .u16, .f16 => 16,
-        .i32, .u32, .f32 => 32,
-        .i64, .u64, .isize, .usize, .f64 => 64,
-        .i128, .u128, .f128 => 128,
-    };
-}
-
-fn findMinimum(number: types.NumberType) i129 {
-    return switch (number) {
-        .i8 => std.math.minInt(i8),
-        .i16 => std.math.minInt(i16),
-        .i32 => std.math.minInt(i32),
-        .i64, .isize => std.math.minInt(i64),
-        .i128 => std.math.minInt(i128),
-        .u8, .u16, .u32, .u64, .u128, .usize => 0,
-        .f16, .f32, .f64, .f128 => unreachable,
-    };
-}
-
-fn findMaximum(number: types.NumberType) i129 {
-    return switch (number) {
-        .i8 => std.math.maxInt(i8),
-        .i16 => std.math.maxInt(i16),
-        .i32 => std.math.maxInt(i32),
-        .i64, .isize => std.math.maxInt(i64),
-        .i128 => std.math.maxInt(i128),
-        .u8 => std.math.maxInt(u8),
-        .u16 => std.math.maxInt(u16),
-        .u32 => std.math.maxInt(u32),
-        .u64, .usize => std.math.maxInt(u64),
-        .u128 => std.math.maxInt(u128),
-        .f16, .f32, .f64, .f128 => unreachable,
-    };
 }
 
 test "Evaluator.isKnown: knows a local constant computed from constants but not one computed from a variable" {
@@ -2273,7 +2167,7 @@ test "Evaluator.evaluateDefault: evaluates a field default with a call" {
 
     const elements = loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.aggregate;
     try std.testing.expectEqual(1, elements.len);
-    try std.testing.expectEqual(Value{ .integer = 3 }, elements[0]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 3 } }, elements[0]);
 }
 
 test "readResolution: rejects reading an undefined element" {
@@ -2332,8 +2226,8 @@ test "findPlace: writes through a pointer to a field" {
 
     const elements = loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.aggregate;
     try std.testing.expectEqual(2, elements.len);
-    try std.testing.expectEqual(Value{ .integer = 1 }, elements[0]);
-    try std.testing.expectEqual(Value{ .integer = 5 }, elements[1]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, elements[0]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 5 } }, elements[1]);
 }
 
 test "evaluateNegation: rejects negating the most negative value" {
@@ -2355,6 +2249,26 @@ test "evaluateNegation: rejects negating the most negative value" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 17 }, analyzer.failure.?.location.?);
 }
 
+test "evaluateNegation: gives the most negative i128 from its literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const LOWEST = -170141183460469231731687303715884105728i128" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = std.math.minInt(i128) } }, declarations[0].kind.constant_declaration.known.?.*);
+}
+
 test "evaluateUnary: inverts the bits of an unsigned integer" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2372,7 +2286,26 @@ test "evaluateUnary: inverts the bits of an unsigned integer" {
     _ = try analyzer.analyze();
 
     const value = loader.modules.items[0].declarations[0].kind.constant_declaration.value;
-    try std.testing.expectEqual(Value{ .integer = 250 }, try analyzer.type_checker.evaluator.evaluate(&value));
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 250 } }, try analyzer.type_checker.evaluator.evaluate(&value));
+}
+
+test "evaluateUnary: rejects negating the most negative i128" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const LOWEST = -170141183460469231731687303715884105728i128\nconst NEGATED = -LOWEST" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.IntegerOverflow, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 17 }, analyzer.failure.?.location.?);
 }
 
 test "evaluateFieldAccess: reads the pointer and the length of a slice at compile time" {
@@ -2392,7 +2325,7 @@ test "evaluateFieldAccess: reads the pointer and the length of a slice at compil
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 5 } }, declarations[3].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateFieldAccess: gives the length of arrays from their types without reading them" {
@@ -2412,9 +2345,9 @@ test "evaluateFieldAccess: gives the length of arrays from their types without r
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 3 }, declarations[1].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 192 }, declarations[3].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 16 }, declarations[6].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 3 } }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 192 } }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 16 } }, declarations[6].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateFieldAccess: runs a call that gives an array before taking its length" {
@@ -2433,7 +2366,7 @@ test "evaluateFieldAccess: runs a call that gives an array before taking its len
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     _ = try analyzer.analyze();
 
-    try std.testing.expectEqual(Value{ .integer = 3 }, loader.modules.items[0].declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 3 } }, loader.modules.items[0].declarations[3].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateCall: evaluates a call with any arguments at compile time" {
@@ -2452,7 +2385,7 @@ test "evaluateCall: evaluates a call with any arguments at compile time" {
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     _ = try analyzer.analyze();
 
-    try std.testing.expectEqual(Value{ .integer = 7 }, loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.*);
 }
 
 test "strip: removes whitespace from both ends at compile time" {
@@ -2476,8 +2409,8 @@ test "strip: removes whitespace from both ends at compile time" {
         try std.testing.expect(declaration.kind.constant_declaration.known.?.boolean);
     }
     try std.testing.expect(declarations[10].kind.constant_declaration.known.?.boolean);
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[11].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[12].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 1 } }, declarations[11].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, declarations[12].kind.constant_declaration.known.?.*);
 }
 
 test "Xoshiro256: gives the reference numbers and stays inside a range at compile time" {
@@ -2497,13 +2430,13 @@ test "Xoshiro256: gives the reference numbers and stays inside a range at compil
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    const mixed = [_]i129{ 16294208416658607535, 7960286522194355700, 487617019471545679, 17909611376780542444 };
+    const mixed = [_]u128{ 16294208416658607535, 7960286522194355700, 487617019471545679, 17909611376780542444 };
     for (mixed, declarations[8].kind.constant_declaration.known.?.aggregate) |expected, value| {
-        try std.testing.expectEqual(Value{ .integer = expected }, value);
+        try std.testing.expectEqual(Value{ .integer = .{ .unsigned = expected } }, value);
     }
-    const seeded = [_]i129{ 1546998764402558742, 6990951692964543102, 12544586762248559009, 17057574109182124193 };
+    const seeded = [_]u128{ 1546998764402558742, 6990951692964543102, 12544586762248559009, 17057574109182124193 };
     for (seeded, declarations[9].kind.constant_declaration.known.?.aggregate) |expected, value| {
-        try std.testing.expectEqual(Value{ .integer = expected }, value);
+        try std.testing.expectEqual(Value{ .integer = .{ .unsigned = expected } }, value);
     }
     try std.testing.expect(declarations[10].kind.constant_declaration.known.?.boolean);
     try std.testing.expect(declarations[11].kind.constant_declaration.known.?.boolean);
@@ -2526,7 +2459,7 @@ test "Default: is Xoshiro256" {
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 1546998764402558742 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 1546998764402558742 } }, declarations[4].kind.constant_declaration.known.?.*);
 }
 
 test "Allocator: creates through the allocate of an instance that takes the element type and length" {
@@ -2549,8 +2482,8 @@ test "Allocator: creates through the allocate of an instance that takes the elem
     for (loader.modules.items[0].declarations) |declaration| {
         if (declaration.kind == .constant_declaration) found = declaration.kind.constant_declaration.known.?.*;
     }
-    const expected = [_]i129{ 7, 2, 1, 0 };
-    for (expected, found.?.aggregate) |value, one| try std.testing.expectEqual(Value{ .integer = value }, one);
+    const expected = [_]u128{ 7, 2, 1, 0 };
+    for (expected, found.?.aggregate) |value, one| try std.testing.expectEqual(Value{ .integer = .{ .unsigned = value } }, one);
 }
 
 test "ArrayList: grows in place or by moving and reports running out of memory at compile time" {
@@ -2576,9 +2509,9 @@ test "ArrayList: grows in place or by moving and reports running out of memory a
     const exhausted = for (declarations) |declaration| {
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "EXHAUST")) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
-    const expected = [_]i129{ 2, 2, 40, 780 };
-    for (expected, grown) |value, found| try std.testing.expectEqual(Value{ .integer = value }, found);
-    try std.testing.expectEqual(Value{ .integer = 2 }, exhausted);
+    const expected = [_]u128{ 2, 2, 40, 780 };
+    for (expected, grown) |value, found| try std.testing.expectEqual(Value{ .integer = .{ .unsigned = value } }, found);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, exhausted);
 }
 
 test "evaluateBuiltin: converts and truncates numbers at compile time" {
@@ -2598,11 +2531,11 @@ test "evaluateBuiltin: converts and truncates numbers at compile time" {
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 300 }, declarations[6].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 300 } }, declarations[6].kind.constant_declaration.known.?.*);
     try std.testing.expectEqual(Value{ .float = 300 }, declarations[7].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = -2 }, declarations[8].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 44 }, declarations[9].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = -56 }, declarations[10].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = -2 } }, declarations[8].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 44 } }, declarations[9].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = -56 } }, declarations[10].kind.constant_declaration.known.?.*);
     try std.testing.expect(std.math.isInf(declarations[11].kind.constant_declaration.known.?.float));
 }
 
@@ -2625,6 +2558,66 @@ test "evaluateBuiltin: rejects a float that the integer type cannot hold" {
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 15 }, analyzer.failure.?.location.?);
 }
 
+test "evaluateBuiltin: truncates between i128 and u128 at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nconst LOWEST = -170141183460469231731687303715884105728i128\nconst ALL: u128 = 340282366920938463463374607431768211455\nconst HIGH = mn::truncate(u128, LOWEST)\nconst SIGNED = mn::truncate(i128, ALL)\nconst SMALL = mn::truncate(i8, ALL)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 1 << 127 } }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = -1 } }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = -1 } }, declarations[5].kind.constant_declaration.known.?.*);
+}
+
+test "evaluateBuiltin: rejects a float at 2 to the power 127 for i128" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nconst LARGE: f128 = 170141183460469231731687303715884105728.0\nconst TOO_LARGE = mn::convert(i128, LARGE)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ConversionOutOfRange, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 19 }, analyzer.failure.?.location.?);
+}
+
+test "evaluateBuiltin: rejects a float at 2 to the power 128 for u128" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nconst LARGE: f128 = 340282366920938463463374607431768211456.0\nconst TOO_LARGE = mn::convert(u128, LARGE)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ConversionOutOfRange, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 19 }, analyzer.failure.?.location.?);
+}
+
 test "castPointer: casts a pointer through a pointer to void and back at compile time" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2642,7 +2635,7 @@ test "castPointer: casts a pointer through a pointer to void and back at compile
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 5 } }, declarations[2].kind.constant_declaration.known.?.*);
 }
 
 test "castPointer: rejects a cast to another target type at compile time" {
@@ -2700,10 +2693,32 @@ test "evaluateWrapping: wraps around at compile time for signed and unsigned int
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    const expected = [_]i129{ 0, 255, 254, -128, 127, -2, -128, 0, 18446744073709551615, 18446744073709551614, -9223372036854775808, 9223372036854775807, -2, -9223372036854775808, 1, 340282366920938463463374607431768211453 };
+    const expected = [_]Integer{ .{ .unsigned = 0 }, .{ .unsigned = 255 }, .{ .unsigned = 254 }, .{ .signed = -128 }, .{ .signed = 127 }, .{ .signed = -2 }, .{ .signed = -128 }, .{ .unsigned = 0 }, .{ .unsigned = 18446744073709551615 }, .{ .unsigned = 18446744073709551614 }, .{ .signed = -9223372036854775808 }, .{ .signed = 9223372036854775807 }, .{ .signed = -2 }, .{ .signed = -9223372036854775808 }, .{ .unsigned = 1 }, .{ .unsigned = 340282366920938463463374607431768211453 } };
     for (expected, declarations[1..]) |value, declaration| {
         try std.testing.expectEqual(Value{ .integer = value }, declaration.kind.constant_declaration.known.?.*);
     }
+}
+
+test "evaluateWrapping: wraps around the i128 limits at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::math\nconst ADD = math::add_wrapping(170141183460469231731687303715884105727i128, 1)\nconst SUBTRACT = math::subtract_wrapping(-170141183460469231731687303715884105728i128, 1)\nconst NEGATE = math::multiply_wrapping(-170141183460469231731687303715884105728i128, -1)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = std.math.minInt(i128) } }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = std.math.maxInt(i128) } }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = std.math.minInt(i128) } }, declarations[3].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateBinary: orders the cases of a combined error set by the declarations of its sets" {
@@ -2804,8 +2819,8 @@ test "evaluateBinary: evaluates the fallback of catch only for an error" {
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[4].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 7 }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, declarations[5].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateBinary: compares arrays element by element" {
@@ -2847,7 +2862,7 @@ test "evaluateBinary: takes the right operand of orelse for null" {
 
     const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
     const value = body[1].kind.constant_declaration.value;
-    try std.testing.expectEqual(Value{ .integer = 3 }, try analyzer.type_checker.evaluator.evaluate(&value));
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 3 } }, try analyzer.type_checker.evaluator.evaluate(&value));
 }
 
 test "evaluateBinary: leaves out the right operand of and when the left decides" {
@@ -2887,7 +2902,7 @@ test "computeInteger: rounds a division toward zero" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[0].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = -3 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = -3 } }, known);
 }
 
 test "computeInteger: gives a remainder the sign of the left operand" {
@@ -2907,7 +2922,7 @@ test "computeInteger: gives a remainder the sign of the left operand" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[0].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = -1 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = -1 } }, known);
 }
 
 test "computeInteger: gives 0 for the remainder of the most negative value by -1" {
@@ -2927,7 +2942,7 @@ test "computeInteger: gives 0 for the remainder of the most negative value by -1
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[0].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 0 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 0 } }, known);
 }
 
 test "computeInteger: rejects an overflow" {
@@ -2989,6 +3004,110 @@ test "computeInteger: reports a division by zero in the module where it happens"
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 39 }, analyzer.failure.?.location.?);
 }
 
+test "computeInteger: rejects the most negative i128 divided by -1" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const QUOTIENT = -170141183460469231731687303715884105728i128 / -1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.IntegerOverflow, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 18 }, analyzer.failure.?.location.?);
+}
+
+test "computeInteger: gives 0 for the remainder of the most negative i128 by -1" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const REMAINDER = -170141183460469231731687303715884105728i128 % -1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 0 } }, declarations[0].kind.constant_declaration.known.?.*);
+}
+
+test "computeInteger: discards the bits shifted out to the left" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const UNSIGNED = 200u8 << 1\nconst SIGNED = 64i8 << 1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 144 } }, declarations[0].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = -128 } }, declarations[1].kind.constant_declaration.known.?.*);
+}
+
+test "computeInteger: keeps the sign of a signed integer shifted right" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const HALF = -8i8 >> 1\nconst ALL = -8i8 >> 10" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = -4 } }, declarations[0].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = -1 } }, declarations[1].kind.constant_declaration.known.?.*);
+}
+
+test "computeInteger: shifts i128 and u128 across their whole width" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const LEFT = 1i128 << 127\nconst RIGHT = -170141183460469231731687303715884105728i128 >> 127\nconst HIGH = 340282366920938463463374607431768211455u128 >> 127\nconst GONE = 1u128 << 128" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = std.math.minInt(i128) } }, declarations[0].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = -1 } }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 1 } }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 0 } }, declarations[3].kind.constant_declaration.known.?.*);
+}
+
 test "evaluateCompositeLiteral: takes missing fields from their defaults" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3007,8 +3126,8 @@ test "evaluateCompositeLiteral: takes missing fields from their defaults" {
 
     const elements = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.aggregate;
     try std.testing.expectEqual(2, elements.len);
-    try std.testing.expectEqual(Value{ .integer = 1 }, elements[0]);
-    try std.testing.expectEqual(Value{ .integer = 7 }, elements[1]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, elements[0]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 7 } }, elements[1]);
 }
 
 test "evaluateCompositeLiteral: takes each name standing alone as the value of the field of the same name" {
@@ -3028,8 +3147,8 @@ test "evaluateCompositeLiteral: takes each name standing alone as the value of t
     _ = try analyzer.analyze();
 
     const elements = loader.modules.items[0].declarations[3].kind.constant_declaration.known.?.aggregate;
-    try std.testing.expectEqual(Value{ .integer = 1 }, elements[0]);
-    try std.testing.expectEqual(Value{ .integer = 2 }, elements[1]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, elements[0]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 2 } }, elements[1]);
 }
 
 test "evaluateCompositeLiteral: gives empty braces where a slice is expected a slice of length 0" {
@@ -3048,7 +3167,7 @@ test "evaluateCompositeLiteral: gives empty braces where a slice is expected a s
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     _ = try analyzer.analyze();
 
-    try std.testing.expectEqual(Value{ .integer = 0 }, loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 0 } }, loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateCompositeLiteral: makes a read-only slice from braces with elements" {
@@ -3068,8 +3187,8 @@ test "evaluateCompositeLiteral: makes a read-only slice from braces with element
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 105 }, declarations[2].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 12 }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 105 } }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 12 } }, declarations[3].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateSlice: slices an array and reads an element" {
@@ -3089,7 +3208,7 @@ test "evaluateSlice: slices an array and reads an element" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 2 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 2 } }, known);
 }
 
 test "evaluateSlice: rejects bounds outside the length" {
@@ -3150,8 +3269,8 @@ test "evaluateTry: returns the error of a result from the function" {
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 3 }, declarations[4].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 99 }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 3 } }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 99 } }, declarations[5].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateJump: returns, breaks and continues from inside an expression at compile time" {
@@ -3171,13 +3290,13 @@ test "evaluateJump: returns, breaks and continues from inside an expression at c
     _ = try analyzer.analyze();
 
     const elements = loader.modules.items[0].declarations[7].kind.constant_declaration.known.?.aggregate;
-    try std.testing.expectEqual(Value{ .integer = 4 }, elements[0]);
-    try std.testing.expectEqual(Value{ .integer = 4 }, elements[1]);
-    try std.testing.expectEqual(Value{ .integer = -1 }, elements[2]);
-    try std.testing.expectEqual(Value{ .integer = 1 }, elements[3]);
-    try std.testing.expectEqual(Value{ .integer = 521 }, elements[4]);
-    try std.testing.expectEqual(Value{ .integer = 9 }, elements[5]);
-    try std.testing.expectEqual(Value{ .integer = 4 }, elements[6]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 4 } }, elements[0]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 4 } }, elements[1]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = -1 } }, elements[2]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, elements[3]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 521 } }, elements[4]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 9 } }, elements[5]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 4 } }, elements[6]);
 }
 
 test "evaluateBranching: gives the value of the block a run-time condition chooses at compile time, nested" {
@@ -3197,9 +3316,9 @@ test "evaluateBranching: gives the value of the block a run-time condition choos
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[1].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[2].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 3 }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 2 } }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 3 } }, declarations[3].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateBranching: gives the value of a match branch converted to the written type at compile time" {
@@ -3219,9 +3338,9 @@ test "evaluateBranching: gives the value of a match branch converted to the writ
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 7 }, declarations[1].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 300 }, declarations[2].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 400 }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 300 } }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 400 } }, declarations[3].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateBranching: takes the value of the block a compile-time condition chooses" {
@@ -3241,7 +3360,7 @@ test "evaluateBranching: takes the value of the block a compile-time condition c
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 2 } }, declarations[2].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateBranching: continues a loop from a block of a value at compile time" {
@@ -3261,7 +3380,7 @@ test "evaluateBranching: continues a loop from a block of a value at compile tim
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 8 }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 8 } }, declarations[1].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateBranching: gives a try on a match the value, the value of a branch or returns the error" {
@@ -3281,15 +3400,15 @@ test "evaluateBranching: gives a try on a match the value, the value of a branch
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 11 }, declarations[7].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 4 }, declarations[8].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 99 }, declarations[9].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 98 }, declarations[10].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[11].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[12].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 97 }, declarations[13].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 7 }, declarations[14].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 7 }, declarations[15].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 11 } }, declarations[7].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 4 } }, declarations[8].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 99 } }, declarations[9].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 98 } }, declarations[10].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, declarations[11].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, declarations[12].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 97 } }, declarations[13].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 7 } }, declarations[14].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 7 } }, declarations[15].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateDetachedBranching: gives top-level constants the value of an if and of a match" {
@@ -3309,10 +3428,10 @@ test "evaluateDetachedBranching: gives top-level constants the value of an if an
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 10 }, declarations[2].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 20 }, declarations[3].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 200 }, declarations[4].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 11 }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 10 } }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 20 } }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 200 } }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 11 } }, declarations[5].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateCall: evaluates an inline function at compile time like any function" {
@@ -3332,8 +3451,8 @@ test "evaluateCall: evaluates an inline function at compile time like any functi
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 4 }, declarations[4].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 12 }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 4 } }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 12 } }, declarations[5].kind.constant_declaration.known.?.*);
 }
 
 test "evaluateCall: runs a function at compile time" {
@@ -3353,7 +3472,7 @@ test "evaluateCall: runs a function at compile time" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 9 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 9 } }, known);
 }
 
 test "evaluateCall: calls through a pointer to a function" {
@@ -3373,7 +3492,7 @@ test "evaluateCall: calls through a pointer to a function" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 8 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 8 } }, known);
 }
 
 test "evaluateCall: calls methods with value and pointer receivers" {
@@ -3393,7 +3512,7 @@ test "evaluateCall: calls methods with value and pointer receivers" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 2 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 2 } }, known);
 }
 
 test "evaluateCall: calls a default implementation with a pointer receiver" {
@@ -3413,7 +3532,7 @@ test "evaluateCall: calls a default implementation with a pointer receiver" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 18 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 18 } }, known);
 }
 
 test "evaluateCall: rejects an external function" {
@@ -3471,7 +3590,7 @@ test "findCached: evaluates a call with the same arguments once" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 1200000 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1200000 } }, known);
 }
 
 test "isSameKey: tells floats apart bit for bit" {
@@ -3535,8 +3654,8 @@ test "executeDeferringBlock: runs deferred statements in reverse order after the
     _ = try analyzer.analyze();
 
     const elements = loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.aggregate;
-    try std.testing.expectEqual(Value{ .integer = 3 }, elements[0]);
-    try std.testing.expectEqual(Value{ .integer = 321 }, elements[1]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 3 } }, elements[0]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 321 } }, elements[1]);
 }
 
 test "executeDeferringBlock: runs errdefer only when the function returns an error" {
@@ -3556,9 +3675,9 @@ test "executeDeferringBlock: runs errdefer only when the function returns an err
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 10 }, declarations[4].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 1017 }, declarations[5].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 1017 }, declarations[6].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 10 } }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1017 } }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1017 } }, declarations[6].kind.constant_declaration.known.?.*);
 }
 
 test "executeDeferringBlock: runs the deferred statements of a loop body on break and continue" {
@@ -3578,7 +3697,7 @@ test "executeDeferringBlock: runs the deferred statements of a loop body on brea
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 44 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 44 } }, known);
 }
 
 test "executeStatement: returns the last line of a function and of each block at compile time" {
@@ -3598,10 +3717,10 @@ test "executeStatement: returns the last line of a function and of each block at
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[2].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = -1 }, declarations[3].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 0 }, declarations[4].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 5 } }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = -1 } }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 0 } }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, declarations[5].kind.constant_declaration.known.?.*);
 }
 
 test "executeTupleDeclaration: takes a tuple apart" {
@@ -3623,7 +3742,7 @@ test "executeTupleDeclaration: takes a tuple apart" {
     const elements = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.aggregate;
     try std.testing.expectEqual(2, elements.len);
     try std.testing.expectEqual(Value{ .boolean = true }, elements[0]);
-    try std.testing.expectEqual(Value{ .integer = 1 }, elements[1]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, elements[1]);
 }
 
 test "executeMatch: runs the branch of the case and binds its value" {
@@ -3643,9 +3762,9 @@ test "executeMatch: runs the branch of the case and binds its value" {
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 40 }, declarations[2].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[3].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 3 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 40 } }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 2 } }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 3 } }, declarations[4].kind.constant_declaration.known.?.*);
 }
 
 test "executeMatch: writes through a pointer to the value of a case" {
@@ -3665,7 +3784,7 @@ test "executeMatch: writes through a pointer to the value of a case" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 2 }, known.enumeration.value.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 2 } }, known.enumeration.value.?.*);
 }
 
 test "executeMatch: runs the else branch and a branch that names a case through its error set" {
@@ -3685,8 +3804,8 @@ test "executeMatch: runs the else branch and a branch that names a case through 
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[3].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 1 } }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, declarations[4].kind.constant_declaration.known.?.*);
 }
 
 test "executeMatch: runs a match in an instance of a function with a type parameter" {
@@ -3706,7 +3825,7 @@ test "executeMatch: runs a match in an instance of a function with a type parame
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 3 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 3 } }, declarations[2].kind.constant_declaration.known.?.*);
     try std.testing.expectEqual(Value{ .boolean = false }, declarations[3].kind.constant_declaration.known.?.*);
 }
 
@@ -3727,9 +3846,9 @@ test "executeMatch: runs the branch of the error or the value of a result" {
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 42 }, declarations[3].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[4].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 42 } }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 5 } }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, declarations[5].kind.constant_declaration.known.?.*);
 }
 
 test "executeMatch: takes the value of a result whose type is a type constructor applied to a type" {
@@ -3749,9 +3868,9 @@ test "executeMatch: takes the value of a result whose type is a type constructor
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 3 }, declarations[5].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 0 }, declarations[6].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[7].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 3 } }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 0 } }, declarations[6].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, declarations[7].kind.constant_declaration.known.?.*);
 }
 
 test "executeMatch: runs the branch of an optional and writes through a pointer to its value" {
@@ -3771,8 +3890,8 @@ test "executeMatch: runs the branch of an optional and writes through a pointer 
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[1].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 0 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 5 } }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 0 } }, declarations[2].kind.constant_declaration.known.?.*);
 }
 
 test "executeMatch: binds the smallest type of what is left and an error named in a case" {
@@ -3792,19 +3911,19 @@ test "executeMatch: binds the smallest type of what is left and an error named i
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 10 }, declarations[10].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[11].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[12].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 10 }, declarations[13].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[14].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 10 }, declarations[15].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[16].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[17].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 10 }, declarations[18].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 8 }, declarations[19].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 6 }, declarations[20].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[21].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 3 }, declarations[22].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 10 } }, declarations[10].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, declarations[11].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 2 } }, declarations[12].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 10 } }, declarations[13].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, declarations[14].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 10 } }, declarations[15].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 5 } }, declarations[16].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 5 } }, declarations[17].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 10 } }, declarations[18].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 8 } }, declarations[19].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 6 } }, declarations[20].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, declarations[21].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 3 } }, declarations[22].kind.constant_declaration.known.?.*);
 }
 
 test "executeMatch: binds what is left of an optional, an enum and an integer" {
@@ -3824,13 +3943,13 @@ test "executeMatch: binds what is left of an optional, an enum and an integer" {
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 4 }, declarations[7].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 0 }, declarations[8].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 4 }, declarations[9].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 7 }, declarations[10].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 9 }, declarations[11].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 4 } }, declarations[7].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 0 } }, declarations[8].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 4 } }, declarations[9].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 7 } }, declarations[10].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 9 } }, declarations[11].kind.constant_declaration.known.?.*);
     try std.testing.expectEqual(Value{ .boolean = true }, declarations[12].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[13].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 5 } }, declarations[13].kind.constant_declaration.known.?.*);
 }
 
 test "executeFunction: runs a function with a type left unknown for each argument at compile time" {
@@ -3850,8 +3969,8 @@ test "executeFunction: runs a function with a type left unknown for each argumen
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[8].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 8 }, declarations[9].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 5 } }, declarations[8].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 8 } }, declarations[9].kind.constant_declaration.known.?.*);
 }
 
 test "executeMatch: takes the value of a branch apart and binds the names of the branches after it" {
@@ -3871,8 +3990,8 @@ test "executeMatch: takes the value of a branch apart and binds the names of the
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[2].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 100 }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 5 } }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 100 } }, declarations[3].kind.constant_declaration.known.?.*);
 }
 
 test "executeMatch: lays out the parts of a tuple-valued case and writes through a pointer to one" {
@@ -3892,8 +4011,8 @@ test "executeMatch: lays out the parts of a tuple-valued case and writes through
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[3].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 15 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 5 } }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 15 } }, declarations[4].kind.constant_declaration.known.?.*);
 }
 
 test "executeMatch: runs the branch whose value or range holds an integer" {
@@ -3913,13 +4032,13 @@ test "executeMatch: runs the branch whose value or range holds an integer" {
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[1].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[2].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 4 }, declarations[3].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[4].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 3 }, declarations[5].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 5 }, declarations[6].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 4 }, declarations[7].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 1 } }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 4 } }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 3 } }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 5 } }, declarations[6].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 4 } }, declarations[7].kind.constant_declaration.known.?.*);
 }
 
 test "executeIteration: calls next on a copy of the iterator until it gives null" {
@@ -3940,9 +4059,9 @@ test "executeIteration: calls next on a copy of the iterator until it gives null
 
     const declarations = loader.modules.items[0].declarations;
     const elements = declarations[11].kind.constant_declaration.known.?.aggregate;
-    try std.testing.expectEqual(Value{ .integer = 6 }, elements[0]);
-    try std.testing.expectEqual(Value{ .integer = 4 }, elements[1]);
-    try std.testing.expectEqual(Value{ .integer = 10 }, declarations[12].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 6 } }, elements[0]);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 4 } }, elements[1]);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 10 } }, declarations[12].kind.constant_declaration.known.?.*);
 }
 
 test "executeIteration: zips iterators until the shortest ends" {
@@ -3962,8 +4081,8 @@ test "executeIteration: zips iterators until the shortest ends" {
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 8 }, declarations[4].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 2 }, declarations[5].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 8 } }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, declarations[5].kind.constant_declaration.known.?.*);
 }
 
 test "executeIteration: zips a read-only slice and a range" {
@@ -3983,7 +4102,7 @@ test "executeIteration: zips a read-only slice and a range" {
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 8 }, declarations[4].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 8 } }, declarations[4].kind.constant_declaration.known.?.*);
 }
 
 test "executeIteration: steps the cursor of a read-only slice through pointers to its elements" {
@@ -4003,8 +4122,8 @@ test "executeIteration: steps the cursor of a read-only slice through pointers t
     _ = try analyzer.analyze();
 
     const taken = loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.aggregate;
-    try std.testing.expectEqual(Value{ .integer = 7 }, taken[0]);
-    try std.testing.expectEqual(Value{ .integer = 8 }, taken[1]);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, taken[0]);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 8 } }, taken[1]);
 }
 
 test "executeIteration: steps the cursor of a slice through pointers to its elements" {
@@ -4024,8 +4143,8 @@ test "executeIteration: steps the cursor of a slice through pointers to its elem
     _ = try analyzer.analyze();
 
     const taken = loader.modules.items[0].declarations[4].kind.constant_declaration.known.?.aggregate;
-    try std.testing.expectEqual(Value{ .integer = 7 }, taken[0]);
-    try std.testing.expectEqual(Value{ .integer = 8 }, taken[1]);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, taken[0]);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 8 } }, taken[1]);
 }
 
 test "enterCondition: binds the value of an optional in an if and runs the else for null" {
@@ -4045,8 +4164,8 @@ test "enterCondition: binds the value of an optional in an if and runs the else 
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 8 }, declarations[1].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 1 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 8 } }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, declarations[2].kind.constant_declaration.known.?.*);
 }
 
 test "enterCondition: writes through a pointer to the value of an optional in an if" {
@@ -4066,7 +4185,7 @@ test "enterCondition: writes through a pointer to the value of an optional in an
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 11 }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 11 } }, declarations[1].kind.constant_declaration.known.?.*);
 }
 
 test "enterCondition: takes the value of an optional apart and writes through a pointer to an element" {
@@ -4086,8 +4205,8 @@ test "enterCondition: takes the value of an optional apart and writes through a 
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 103 }, declarations[1].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = 0 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 103 } }, declarations[1].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 0 } }, declarations[2].kind.constant_declaration.known.?.*);
 }
 
 test "enterCondition: evaluates the optional of a while loop before each run" {
@@ -4107,7 +4226,7 @@ test "enterCondition: evaluates the optional of a while loop before each run" {
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 16 }, declarations[2].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 16 } }, declarations[2].kind.constant_declaration.known.?.*);
 }
 
 test "executeWhile: runs a loop with compound assignments" {
@@ -4127,7 +4246,7 @@ test "executeWhile: runs a loop with compound assignments" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 10 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 10 } }, known);
 }
 
 test "executeWhile: rejects a loop that does not end" {
@@ -4192,9 +4311,9 @@ test "executeFor: writes each element through a pointer name" {
 
     const elements = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.aggregate;
     try std.testing.expectEqual(3, elements.len);
-    try std.testing.expectEqual(Value{ .integer = 2 }, elements[0]);
-    try std.testing.expectEqual(Value{ .integer = 4 }, elements[1]);
-    try std.testing.expectEqual(Value{ .integer = 6 }, elements[2]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 2 } }, elements[0]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 4 } }, elements[1]);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 6 } }, elements[2]);
 }
 
 test "executeFor: leaves an outer loop through its label" {
@@ -4214,7 +4333,7 @@ test "executeFor: leaves an outer loop through its label" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 2 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 2 } }, known);
 }
 
 test "executeFor: runs the else block of a loop that ends" {
@@ -4234,7 +4353,7 @@ test "executeFor: runs the else block of a loop that ends" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 99 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 99 } }, known);
 }
 
 test "executeFor: takes the elements of each tuple apart" {
@@ -4254,7 +4373,7 @@ test "executeFor: takes the elements of each tuple apart" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 14 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 14 } }, known);
 }
 
 test "makeString: decodes the escapes of a string" {
@@ -4274,7 +4393,7 @@ test "makeString: decodes the escapes of a string" {
     _ = try analyzer.analyze();
 
     const known = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*;
-    try std.testing.expectEqual(Value{ .integer = 4 }, known);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 4 } }, known);
 }
 
 test "computeFloat: rounds to the precision of the type" {
@@ -4315,46 +4434,4 @@ test "isEqual: compares optionals of optionals by their level" {
 
     const known = loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*;
     try std.testing.expectEqual(Value{ .boolean = true }, known);
-}
-
-test "shiftLeft: discards the bits shifted out" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const UNSIGNED = 200u8 << 1\nconst SIGNED = 64i8 << 1" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
-    _ = try analyzer.analyze();
-
-    const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = 144 }, declarations[0].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = -128 }, declarations[1].kind.constant_declaration.known.?.*);
-}
-
-test "shiftRight: keeps the sign of a signed integer" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const HALF = -8i8 >> 1\nconst ALL = -8i8 >> 10" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
-    _ = try analyzer.analyze();
-
-    const declarations = loader.modules.items[0].declarations;
-    try std.testing.expectEqual(Value{ .integer = -4 }, declarations[0].kind.constant_declaration.known.?.*);
-    try std.testing.expectEqual(Value{ .integer = -1 }, declarations[1].kind.constant_declaration.known.?.*);
 }
