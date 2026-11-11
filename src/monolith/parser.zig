@@ -39,6 +39,7 @@ pub const Parser = struct {
     has_range: bool = false,
     same_line_block: ?usize = null,
     line_if: ?usize = null,
+    branch_block: bool = false,
     failure: ?Failure = null,
 
     pub fn init(tokens: []const token.Token) Parser {
@@ -516,12 +517,29 @@ pub const Parser = struct {
         depth: usize,
         owner: bool,
     ) ParseError!ast.Statement {
+        if (try self.parseHandedValue(allocator, offset)) |statement| return statement;
         if (try self.parseStatement(allocator, offset, depth, owner)) |statement| return statement;
         var position = offset.*;
         const value = (try self.parseExpression(allocator, &position)) orelse {
             return self.fail(offset.*, error.ExpectedStatement);
         };
         if (!self.endsValueLine(position)) return self.fail(offset.*, error.ExpectedStatement);
+
+        offset.* = position;
+        return .{ .kind = .{ .value = value }, .location = value.location };
+    }
+
+    fn parseHandedValue(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.Statement {
+        if (!self.branch_block) return null;
+        var position = offset.*;
+        _ = self.match(&position, .keyword_own) orelse return null;
+        var value = (try self.parseExpression(allocator, &position)) orelse return null;
+        if (isCallOrTriedCall(value) or !self.endsValueLine(position)) return null;
+        value.handed = true;
 
         offset.* = position;
         return .{ .kind = .{ .value = value }, .location = value.location };
@@ -675,6 +693,9 @@ pub const Parser = struct {
         var position = offset.*;
         const start = position;
         const keyword = self.match(&position, .keyword_if) orelse return null;
+        const caller_branch_block = self.branch_block;
+        defer self.branch_block = caller_branch_block;
+        self.branch_block = true;
         const block = owner and self.opensBlock(position);
         if (!block) try self.openSameLineHeader(&position, start);
         const marker = self.match(&position, .keyword_own);
@@ -733,6 +754,9 @@ pub const Parser = struct {
         const label = self.parseLabel(&position);
         const keyword = position;
         if (self.match(&position, .keyword_while) == null) return null;
+        const caller_branch_block = self.branch_block;
+        defer self.branch_block = caller_branch_block;
+        self.branch_block = false;
         const block = owner and self.opensBlock(position);
         if (!block) try self.openSameLineHeader(&position, keyword);
         const marker = self.match(&position, .keyword_own);
@@ -810,6 +834,9 @@ pub const Parser = struct {
         const label = self.parseLabel(&position);
         const keyword = position;
         if (self.match(&position, .keyword_for) == null) return null;
+        const caller_branch_block = self.branch_block;
+        defer self.branch_block = caller_branch_block;
+        self.branch_block = false;
         const block = owner and self.opensBlock(position);
         if (!block) try self.openSameLineHeader(&position, keyword);
         const tuple = self.tokens[position].kind == .left_brace;
@@ -903,6 +930,9 @@ pub const Parser = struct {
     ) ParseError!?ast.Statement {
         var position = offset.*;
         const keyword = self.match(&position, .keyword_match) orelse return null;
+        const caller_branch_block = self.branch_block;
+        defer self.branch_block = caller_branch_block;
+        self.branch_block = true;
         const marker = self.match(&position, .keyword_own);
         const value = (try self.parseExpression(allocator, &position)) orelse {
             return self.fail(position, error.ExpectedExpression);
@@ -4006,6 +4036,57 @@ test "parseBlockLine: parses an expression on the last line of a block as a valu
     try std.testing.expectEqual(2, body.len);
     try std.testing.expectEqualStrings("one", body[1].kind.value.kind.binary.left.kind.identifier.name);
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, body[1].location);
+}
+
+test "parseHandedValue: parses own before a name as the value of a branch of an if" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn pick(flag: bool) -> i32\n    if flag\n        own one\n    else two");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const conditional = module.declarations[0].kind.function_definition.body[0].kind.@"if";
+    try std.testing.expectEqualStrings("one", conditional.body[0].kind.value.kind.identifier.name);
+    try std.testing.expect(conditional.body[0].kind.value.handed);
+    try std.testing.expect(!conditional.else_body.?[0].kind.value.handed);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 13 }, conditional.body[0].location);
+}
+
+test "parseHandedValue: parses own before a name as the value of a match branch on one line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn pick(choice: Choice) -> i32\n    match choice\n        case (One) own one\n        else two");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const matching = module.declarations[0].kind.function_definition.body[0].kind.match;
+    try std.testing.expectEqualStrings("one", matching.branches[0].body[0].kind.value.kind.identifier.name);
+    try std.testing.expect(matching.branches[0].body[0].kind.value.handed);
+    try std.testing.expect(!matching.branches[1].body[0].kind.value.handed);
+}
+
+test "parseHandedValue: rejects own before a name on the last line of a function body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn pick() -> i32\n    own one");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedOwn, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, parser.failure.?.location.?);
+}
+
+test "parseHandedValue: rejects own before a name in the body of a loop inside a branch of an if" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn pick(flag: bool)\n    if flag\n        while true\n            own one");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedOwn, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 13 }, parser.failure.?.location.?);
 }
 
 test "parseInlineBlock: rejects line that is not a statement" {

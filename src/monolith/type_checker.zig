@@ -586,8 +586,13 @@ pub const TypeChecker = struct {
                 try self.checkMoveExits(0, isErrorValue(value.*), state, exit);
                 return false;
             },
-            .discard, .call, .value => |*expression| {
+            .discard, .call => |*expression| {
                 try self.checkMoveExpression(expression, state);
+                return true;
+            },
+            .value => |*expression| {
+                try self.checkMoveExpression(expression, state);
+                if (expression.handed) try self.moveName(expression, state);
                 return true;
             },
             .constant_declaration => |*constant| {
@@ -1422,9 +1427,11 @@ pub const TypeChecker = struct {
             .@"return" => |*returned| {
                 const value = if (returned.*) |*value| value else return;
                 if (self.signature.?.return_own) {
+                    if (value.handed) return self.checkOwnDestination(value, true, true, value.location);
                     if (!try self.isOwnPlace(value.*) and self.isCopiedOwningValue(value.*)) return self.fail(value.location, error.OwnValueCopied);
                     return self.checkOwnValue(value, .owned);
                 }
+                if (value.handed) return self.checkOwnDestination(value, false, true, value.location);
                 if (self.isOwnName(value.*)) return self.fail(value.location, error.OwnNameReturned);
                 try self.checkOwnValue(value, .copied);
             },
@@ -1438,7 +1445,7 @@ pub const TypeChecker = struct {
                 try self.checkOwnValue(expression, .plain);
             },
             .call => |*expression| try self.checkOwnValue(expression, .plain),
-            .value => |*expression| try self.checkOwnValue(expression, value_place),
+            .value => |*expression| try self.checkOwnBranchValue(expression, value_place),
             .constant_declaration => |*constant| {
                 if (constant.with or constant.context) return;
                 try self.checkOwnDestination(&constant.value, constant.own, constant.moved, constant.value.location);
@@ -1552,6 +1559,11 @@ pub const TypeChecker = struct {
             .struct_type,
             => {},
         }
+    }
+
+    fn checkOwnBranchValue(self: *TypeChecker, value: *ast.Expression, place: OwnPlace) TypeError!void {
+        if (place == .owned or value.handed) return self.checkOwnDestination(value, place == .owned, value.handed, value.location);
+        try self.checkOwnValue(value, place);
     }
 
     fn checkOwnParts(self: *TypeChecker, location: token.Location, parts: []ast.Argument, place: OwnPlace) TypeError!void {
@@ -1748,6 +1760,7 @@ pub const TypeChecker = struct {
     fn checkOwnDestination(self: *TypeChecker, value: *ast.Expression, owned: bool, moved: bool, location: token.Location) TypeError!void {
         if ((owned or moved) and !self.canOwnValue(value.*)) return self.checkOwnValue(value, .owned);
         if (owned) return self.checkOwnAccepted(value, moved, location);
+        if (moved and value.handed) return self.failMisplacedBranchMove(value.*);
         if (moved) return self.fail(location, error.OwnMarkerMisplaced);
         try self.checkOwnValue(value, .copied);
     }
@@ -1778,6 +1791,14 @@ pub const TypeChecker = struct {
             return failure;
         }
         try self.checkOwnValue(value, .owned);
+    }
+
+    fn failMisplacedBranchMove(self: *TypeChecker, value: ast.Expression) TypeError {
+        const failure = self.fail(value.location, error.OwnMarkerMisplaced);
+        const text = try renderExpression(self.arena.allocator(), value) orelse return failure;
+        const format = "own before `{s}` hands it on to the place that takes the value of its if or match, and that place is not own; own goes before a branch's value only when the if or match gives the value of an own declaration, an own parameter or field, or the return of an own function, e.g. `else (_ as own rest) own rest` in `const own bytes = try match filesystem::read(path)`";
+        self.failure.?.message = try std.fmt.allocPrint(self.arena.allocator(), format, .{text});
+        return failure;
     }
 
     fn failMisplacedMove(self: *TypeChecker, moved: ast.Expression, location: token.Location) TypeError {
@@ -1827,11 +1848,11 @@ pub const TypeChecker = struct {
     }
 
     fn isAcceptedOwnValue(self: *TypeChecker, expression: ast.Expression) bool {
-        if (self.isOwnCall(expression)) return true;
+        if (self.isOwnCall(expression) or isBranchingValue(expression)) return true;
         const value_type = expression.type orelse return true;
         if (!self.canOwn(value_type)) return true;
         return switch (expression.kind) {
-            .undefined, .null, .branching => true,
+            .undefined, .null => true,
             .composite_literal => |literal| {
                 const literal_type = findLiteralType(value_type);
                 if (literal_type == .slice or literal_type == .pointer) return literal.elements.len == 0;
@@ -2474,6 +2495,7 @@ pub const TypeChecker = struct {
     ) TypeError!void {
         const expression = &statement.kind.value;
         const production = self.production orelse {
+            if (expression.handed) return self.failMisplacedBranchMove(expression.*);
             if (expression.kind == .case_literal) return self.fail(expression.location, error.CaseWithoutKnownEnum);
             return self.fail(expression.location, error.UnusedValue);
         };
@@ -6861,6 +6883,15 @@ fn isErrorValue(expression: ast.Expression) bool {
     return value_type == .@"enum" and value_type.@"enum".kind == .error_set;
 }
 
+fn isBranchingValue(expression: ast.Expression) bool {
+    return switch (expression.kind) {
+        .branching => true,
+        .@"try" => |operand| isBranchingValue(operand.*),
+        .binary => |binary| (binary.operator == .@"orelse" or binary.operator == .@"catch") and isBranchingValue(binary.left.*),
+        else => false,
+    };
+}
+
 fn isShortCircuitOperator(operator: ast.BinaryOperator) bool {
     return operator == .@"and" or operator == .@"or" or operator == .@"orelse" or operator == .@"catch";
 }
@@ -10203,6 +10234,25 @@ test "checkProducedValue: widens every block to the written type" {
 
     const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
     try std.testing.expectEqual(types.Type{ .number = .u16 }, body[0].kind.constant_declaration.value.type.?);
+}
+
+test "checkProducedValue: rejects own before the last line of a branch of an if used as a statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nfn load(flag: bool) -> memory::Error!void\n    const own one = try memory::allocate(u8, 1)\n    if flag\n        own one\n    memory::free(own one)\n\nfn main -> !void\n    with memory::Heap\n    try load(true)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.OwnMarkerMisplaced, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 13 }, analyzer.failure.?.location.?);
 }
 
 test "acceptProduced: rejects blocks of different types without a written type" {
@@ -14811,6 +14861,287 @@ test "checkOwnDestination: rejects own before the value of an assignment to a va
 
     try std.testing.expectError(error.OwnMarkerMisplaced, analyzer.analyze());
     try std.testing.expectEqual(token.Location{ .row = 29, .column = 18 }, analyzer.failure.?.location.?);
+}
+
+test "checkMoveStatement: rejects a name declared own handed on as the value of one branch of an if and held on the other" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nfn load(flag: bool) -> own memory::Error![]u8\n    const own one = try memory::allocate(u8, 1)\n    const own bytes: []u8 = if (flag) own one else {}\n    return bytes\n\nfn main -> !void\n    with memory::Heap\n    const own bytes = try load(true)\n    memory::free(own bytes)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.OwnNotConsumed, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 5 }, analyzer.failure.?.location.?);
+    try std.testing.expect(std.mem.indexOf(u8, analyzer.failure.?.message, "`one` is handed on with own on some paths but still holds what it owns at this return on another") != null);
+}
+
+test "checkOwnStatement: accepts own before a name declared own as the value of a branch of an if on the last line of an own function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nfn load(flag: bool) -> own memory::Error![]u8\n    const own one = try memory::allocate(u8, 1)\n    if flag\n        own one\n    else\n        memory::free(own one)\n        memory::allocate(u8, 2)\n\nfn main -> !void\n    with memory::Heap\n    const own bytes = try load(true)\n    memory::free(own bytes)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "checkOwnStatement: rejects own before a name declared own as the value of a branch of an if on the last line of a function that is not own" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nfn load(flag: bool, view: []u8) -> memory::Error![]u8\n    const own one = try memory::allocate(u8, 1)\n    if flag\n        own one\n    else\n        memory::free(own one)\n        view\n\nfn main -> !void\n    with memory::Heap\n    _ = try load(true, {})\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.OwnMarkerMisplaced, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 13 }, analyzer.failure.?.location.?);
+    try std.testing.expect(std.mem.indexOf(u8, analyzer.failure.?.message, "own before `one` hands it on") != null);
+}
+
+test "checkOwnValue: rejects the result of an own call in a branch of an if that is not in an own place" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nfn load(flag: bool) -> memory::Error!usize\n    const bytes = if (flag) try memory::allocate(u8, 1) else try memory::allocate(u8, 2)\n    return bytes.length\n\nfn main -> !void\n    with memory::Heap\n    _ = try load(true)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.OwnResultMisplaced, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 29 }, analyzer.failure.?.location.?);
+}
+
+test "checkOwnBranchValue: accepts the results of own calls in the branches of an if in an own declaration, also through try" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nfn load(flag: bool) -> own memory::Error![]u8\n    const own one = if (flag) try memory::allocate(u8, 1) else try memory::allocate(u8, 2)\n    errdefer memory::free(own one)\n    const own two = try if (flag) memory::allocate(u8, 3) else memory::allocate(u8, 4)\n    memory::free(own one)\n    return two\n\nfn main -> !void\n    with memory::Heap\n    const own bytes = try load(true)\n    memory::free(own bytes)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "checkOwnBranchValue: accepts an if that hands on a name declared own in one branch and gives an own call's result in the other" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nfn load(flag: bool) -> own memory::Error![]u8\n    const own one = try memory::allocate(u8, 1)\n    const own bytes = if flag\n        own one\n    else\n        memory::free(own one)\n        try memory::allocate(u8, 2)\n    return bytes\n\nfn main -> !void\n    with memory::Heap\n    const own bytes = try load(true)\n    memory::free(own bytes)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "checkOwnBranchValue: accepts a match as the value of the return of an own function that hands on a name declared own in a branch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nenum Choice\n    One\n    Two\n\nfn load(choice: Choice) -> own memory::Error![]u8\n    const own one = try memory::allocate(u8, 1)\n    return match choice\n        case (One) own one\n        case Two\n            memory::free(own one)\n            memory::allocate(u8, 2)\n\nfn main -> !void\n    with memory::Heap\n    const own bytes = try load(Choice::One)\n    memory::free(own bytes)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "checkOwnBranchValue: accepts an if as an own argument that hands on a name declared own in one branch and an own call's result in the other" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nfn keep(own bytes: []u8) -> own []u8 = bytes\n\nfn load(flag: bool) -> memory::Error!void\n    const own one = try memory::allocate(u8, 1)\n    memory::free(if (flag) own one else keep(own one))\n\nfn main -> !void\n    with memory::Heap\n    try load(true)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "checkOwnBranchValue: accepts an if as an own field of a struct literal that hands on a name declared own in one branch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Data\n    own bytes: []u8\n    size: usize\n\nfn keep(own bytes: []u8) -> own []u8 = bytes\n\nfn load(flag: bool) -> own memory::Error!Data\n    const own one = try memory::allocate(u8, 1)\n    return { bytes = if (flag) own one else keep(own one), size = 1 }\n\nfn main -> !void\n    with memory::Heap\n    const own data = try load(true)\n    memory::free(own data.bytes)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "checkOwnBranchValue: accepts an if nested in a branch of a match in an own declaration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nenum Choice\n    One\n    Two\n\nfn load(choice: Choice, flag: bool) -> own memory::Error![]u8\n    const own one = try memory::allocate(u8, 1)\n    const own bytes = match choice\n        case One\n            if flag\n                own one\n            else\n                memory::free(own one)\n                try memory::allocate(u8, 3)\n        case Two\n            memory::free(own one)\n            try memory::allocate(u8, 2)\n    return bytes\n\nfn main -> !void\n    with memory::Heap\n    const own bytes = try load(Choice::One, true)\n    memory::free(own bytes)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "checkOwnBranchValue: rejects a view as the value of a branch of a tried match in an own declaration at that branch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::filesystem\nimport mn::filesystem::Path\nimport mn::memory\nimport mn::memory::Deinit\n\nfn load(path: Path, view: []u8) -> own ![]u8\n    const own bytes = try match filesystem::read(path)\n        case (NotFound) view\n        else (_ as own rest) own rest\n    return bytes\n\nfn main -> !void\n    with memory::Heap\n    const own path = Path::init()\n    defer path.deinit(own)\n    const own bytes = try load(path, {})\n    memory::free(own bytes)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.OwnNeedsClone, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 8, .column = 25 }, analyzer.failure.?.location.?);
+    try std.testing.expect(std.mem.indexOf(u8, analyzer.failure.?.message, "`view` is a view") != null);
+    try std.testing.expect(std.mem.indexOf(u8, analyzer.failure.?.message, "this value") == null);
+}
+
+test "checkOwnBranchValue: rejects own before a branch's value when the if is not in an own place" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nfn load(flag: bool) -> memory::Error!usize\n    const own one = try memory::allocate(u8, 1)\n    const bytes = if (flag) own one else one\n    return bytes.length\n\nfn main -> !void\n    with memory::Heap\n    _ = try load(true)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.OwnMarkerMisplaced, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 33 }, analyzer.failure.?.location.?);
+    try std.testing.expect(std.mem.indexOf(u8, analyzer.failure.?.message, "own before `one` hands it on to the place that takes the value of its if or match, and that place is not own") != null);
+}
+
+test "checkOwnMatch: rejects a plain name covering an own call's value in a tried match in an own declaration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::filesystem\nimport mn::filesystem::Path\nimport mn::memory\nimport mn::memory::Deinit\n\nfn load(path: Path) -> own ![]u8\n    const own bytes = try match filesystem::read(path)\n        case (NotFound) return memory::allocate(u8, 0)\n        else (_ as rest) rest\n    return bytes\n\nfn main -> !void\n    with memory::Heap\n    const own path = Path::init()\n    defer path.deinit(own)\n    const own bytes = try load(path)\n    memory::free(own bytes)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.OwnResultMisplaced, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 7, .column = 33 }, analyzer.failure.?.location.?);
+}
+
+test "integration: accepts an own declaration through a tried match on filesystem::read whose branches return or hand on own rest" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::filesystem\nimport mn::filesystem::Path\nimport mn::memory\nimport mn::memory::Clone\nimport mn::memory::Deinit\n\nstruct Data\n    own bytes: []u8\n    size: usize\n\n    fn init() -> own Self = { bytes = {}, size = 0 }\n\nfn load(path: Path) -> own !Data\n    const own bytes = try match filesystem::read(path)\n        case (NotFound) return Data::init()\n        else (_ as own rest) own rest\n    defer memory::free(own bytes)\n    return { bytes = try bytes.clone(), size = bytes.length }\n\nfn main -> !void\n    with memory::Heap\n    const own path = Path::init()\n    defer path.deinit(own)\n    const own data = try load(path)\n    memory::free(own data.bytes)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "integration: accepts the tried match on File::open from the specification whose branches give a file that owns nothing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::filesystem\nimport mn::filesystem::File\nimport mn::filesystem::Path\nimport mn::memory\nimport mn::memory::Deinit\n\nfn create(path: Path) -> filesystem::Error!File = File::open(path)\n\nfn run(path: Path) -> !void\n    const file = try match File::open(path)\n        case (NotFound) create(path)\n        else (_ as rest) rest\n    file.close()\n\nfn main -> !void\n    with memory::Heap\n    const own path = Path::init()\n    defer path.deinit(own)\n    try run(path)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
 }
 
 test "integration: rejects discarding the result of memory::allocate through the standard library" {

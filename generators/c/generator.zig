@@ -10738,6 +10738,63 @@ test "Generator.generate: builds an executable that writes a file over longer co
     try std.testing.expectEqual(0, result.term.exited);
 }
 
+test "Generator.generate: builds an executable that loads through a tried match that returns on not found and hands on own rest otherwise, and leaks nothing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::convert::To\nimport mn::filesystem\nimport mn::filesystem::Path\nimport mn::memory\nimport mn::memory::Allocator\nimport mn::memory::Clone\nimport mn::memory::Deinit\nimport mn::process::stdout\nimport mn::text\n\nstruct Counting\n    bytes: [4096]u8\n    used: usize\n    live: usize\n\ninstance Allocator(Counting)\n\n    fn allocate(counting: *Counting, type T, count: usize) -> own memory::Error![]T\n        const size = mn::size(T) * count\n        const start = (counting.used + mn::alignment(T) - 1) / mn::alignment(T) * mn::alignment(T)\n        counting.used = start + size\n        counting.live += size\n        return mn::cast(*many(T), counting.bytes[start..counting.used].pointer)[0..count]\n\n    fn(type T) resize(_: *Counting, _: []T, _: usize) -> bool = false\n\n    fn(type T) free(counting: *Counting, own items: []const(T))\n        counting.live -= mn::size(T) * items.length\n\nstruct Data\n    own bytes: []u8\n    size: usize\n\n    fn init() -> own Self = { bytes = {}, size = 0 }\n\nfn load(path: Path) -> own !Data\n    const own bytes = try match filesystem::read(path)\n        case (NotFound) return Data::init()\n        else (_ as own rest) own rest\n    defer memory::free(own bytes)\n    return { bytes = try bytes.clone(), size = bytes.length }\n\nfn run(name: []const(u8)) -> !void\n    const own path = try name.to(Path)\n    defer path.deinit(own)\n    const own data = try load(path)\n    defer memory::free(own data.bytes)\n    try text::print(&stdout, \"{} [{s}]\\n\", { data.size, data.bytes })\n\nfn main -> !void\n    var counting: Counting = undefined\n    counting.used = 0\n    counting.live = 0\n    try run(\"missing\") with &counting\n    try run(\"data\") with &counting\n    try text::print(&stdout, \"live {}\\n\", { counting.live })\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
+    defer build_directory.close(std.testing.io);
+    const setup = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "sh", "-c", "printf 'first' > data" }, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqualStrings("", setup.stderr);
+    try std.testing.expectEqual(0, setup.term.exited);
+
+    const result = try std.process.run(allocator, std.testing.io, .{ .argv = &.{"./main"}, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqualStrings("0 []\n5 [first]\nlive 0\n", result.stdout);
+    try std.testing.expectEqual(0, result.term.exited);
+}
+
+test "Generator.generate: builds an executable that hands names declared own on through the branches of if and match values, allocating nothing more and leaking nothing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nimport mn::process::stdout\nimport mn::text\n\nstruct Counting\n    bytes: [4096]u8\n    used: usize\n    live: usize\n\ninstance Allocator(Counting)\n\n    fn allocate(counting: *Counting, type T, count: usize) -> own memory::Error![]T\n        const size = mn::size(T) * count\n        const start = (counting.used + mn::alignment(T) - 1) / mn::alignment(T) * mn::alignment(T)\n        counting.used = start + size\n        counting.live += size\n        return mn::cast(*many(T), counting.bytes[start..counting.used].pointer)[0..count]\n\n    fn(type T) resize(_: *Counting, _: []T, _: usize) -> bool = false\n\n    fn(type T) free(counting: *Counting, own items: []const(T))\n        counting.live -= mn::size(T) * items.length\n\nenum Choice\n    One\n    Two\n\nstruct Data\n    own bytes: []u8\n    size: usize\n\nfn keep(own bytes: []u8) -> own []u8 = bytes\n\nfn fill(content: []const(u8)) -> own memory::Error![]u8\n    const own bytes = try memory::allocate(u8, content.length)\n    memory::copy(bytes, content)\n    return bytes\n\nfn pick(flag: bool) -> own memory::Error![]u8\n    const own one = try fill(\"kept\")\n    const own bytes = if flag\n        own one\n    else\n        memory::free(own one)\n        try fill(\"fresh\")\n    return bytes\n\nfn choose(choice: Choice) -> own memory::Error![]u8\n    const own one = try fill(\"kept\")\n    return match choice\n        case (One) own one\n        case Two\n            memory::free(own one)\n            fill(\"other\")\n\nfn nest(choice: Choice, flag: bool) -> own memory::Error![]u8\n    const own one = try fill(\"kept\")\n    const own bytes = match choice\n        case One\n            if flag\n                own one\n            else\n                memory::free(own one)\n                try fill(\"inner\")\n        case Two\n            memory::free(own one)\n            try fill(\"outer\")\n    return bytes\n\nfn last(flag: bool) -> own memory::Error![]u8\n    const own one = try fill(\"kept\")\n    if flag\n        own one\n    else\n        memory::free(own one)\n        fill(\"final\")\n\nfn wrap(flag: bool) -> own memory::Error!Data\n    const own one = try fill(\"kept\")\n    return { bytes = if (flag) own one else keep(own one), size = 4 }\n\nfn release(flag: bool) -> memory::Error!void\n    const own one = try fill(\"kept\")\n    memory::free(if (flag) own one else keep(own one))\n\nfn run() -> !void\n    const own picked = try pick(true)\n    defer memory::free(own picked)\n    const own fresh = try pick(false)\n    defer memory::free(own fresh)\n    const own chosen = try choose(Choice::One)\n    defer memory::free(own chosen)\n    const own other = try choose(Choice::Two)\n    defer memory::free(own other)\n    const own nested = try nest(Choice::One, true)\n    defer memory::free(own nested)\n    const own inner = try nest(Choice::One, false)\n    defer memory::free(own inner)\n    const own outer = try nest(Choice::Two, true)\n    defer memory::free(own outer)\n    const own ended = try last(true)\n    defer memory::free(own ended)\n    const own final = try last(false)\n    defer memory::free(own final)\n    const own wrapped = try wrap(true)\n    defer memory::free(own wrapped.bytes)\n    const own kept = try wrap(false)\n    defer memory::free(own kept.bytes)\n    try release(true)\n    try release(false)\n    try text::print(&stdout, \"{s} {s} {s} {s} {s} {s} {s} {s} {s} {s} {s}\\n\", { picked, fresh, chosen, other, nested, inner, outer, ended, final, wrapped.bytes, kept.bytes })\n\nfn main -> !void\n    var counting: Counting = undefined\n    counting.used = 0\n    counting.live = 0\n    try run() with &counting\n    try text::print(&stdout, \"used {} live {}\\n\", { counting.used, counting.live })\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
+    defer build_directory.close(std.testing.io);
+
+    const result = try std.process.run(allocator, std.testing.io, .{ .argv = &.{"./main"}, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqualStrings("kept fresh kept other kept inner outer kept final kept kept\nused 77 live 0\n", result.stdout);
+    try std.testing.expectEqual(0, result.term.exited);
+}
+
 test "Generator.generate: builds an executable that gives not found from reading a missing file" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
