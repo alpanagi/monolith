@@ -463,6 +463,7 @@ pub const Call = struct {
     @"inline": bool = false,
     with_value: ?*Expression = null,
     braces: Braces = .none,
+    constructor: ?Resolution.Function = null,
 };
 
 pub const Name = union(enum) {
@@ -1753,6 +1754,7 @@ fn cloneCall(allocator: std.mem.Allocator, call: *const Call) std.mem.Allocator.
         .arguments = try cloneArguments(allocator, call.arguments),
         .with_value = try cloneWithValue(allocator, call.with_value),
         .braces = call.braces,
+        .constructor = call.constructor,
     };
 }
 

@@ -3837,6 +3837,7 @@ pub const TypeChecker = struct {
         expression: *ast.Expression,
     ) TypeError!types.Type {
         if (expression.kind == .method_call) try self.resolveMethodCall(parameters, expression);
+        if (expression.kind.call.constructor != null) try self.resolveConstructorCall(parameters, expression);
         try self.fillDefaultArguments(expression);
         if (ast.extractResolution(expression.kind.call.callee) == .typeclass_method) {
             try self.resolveTypeclassCall(parameters, expression);
@@ -3991,6 +3992,108 @@ pub const TypeChecker = struct {
             .with_value = method_call.with_value,
         };
         expression.kind = .{ .call = call };
+    }
+
+    fn resolveConstructorCall(
+        self: *TypeChecker,
+        parameters: []const ast.TypedName,
+        expression: *ast.Expression,
+    ) TypeError!void {
+        const call = &expression.kind.call;
+        const constructor = call.constructor.?;
+        const path = call.callee.path_expression.path;
+        const name = path[path.len - 1];
+        const allocator = self.arena.allocator();
+        const resolver = &self.resolver.?;
+        const signature = self.extractSignature(.{ .function = constructor });
+        const count = signature.parameters.len;
+        for (signature.parameters) |parameter| {
+            if (parameter.kind != .type) return self.failUndecidedConstructor(expression, parameter.name);
+        }
+        const locations = try allocator.alloc(?token.Location, count);
+        @memset(locations, null);
+        var decided: []?types.Argument = &.{};
+        if (count > 0) {
+            const outcome = try resolver.resolveConstructorPatterns(resolver.context, constructor, name);
+            const found = switch (outcome) {
+                .unseen, .nested => return self.failHiddenConstructor(expression, outcome),
+                .missing => return self.fail(expression.location, error.UnknownMethod),
+                .found => |found| found,
+            };
+            decided = try allocator.alloc(?types.Argument, found.count);
+            @memset(decided, null);
+            const matched = try allocator.alloc(?types.Argument, found.count);
+            for (call.arguments, 0..) |*argument, position| {
+                if (position >= found.patterns.len) break;
+                const pattern = found.patterns[position] orelse continue;
+                try self.matchDeclaredArgument(parameters, argument, pattern, decided, matched);
+                for (matched[0..count], locations) |current, *location| {
+                    if (current != null and location.* == null) location.* = argument.location;
+                }
+            }
+            for (signature.parameters, decided[0..count]) |parameter, one| {
+                const argument = one orelse return self.failUndecidedConstructor(expression, parameter.name);
+                if (argument != .type) return self.failUndecidedConstructor(expression, parameter.name);
+            }
+        }
+        const arguments = try allocator.alloc(ast.Argument, count);
+        for (arguments, decided[0..count], locations) |*argument, one, deciding| {
+            const value_type = one.?.type;
+            const location = deciding orelse expression.location;
+            const identifier: ast.Identifier = .{ .name = "_", .resolution = .{ .type = value_type } };
+            argument.* = .{ .name = null, .value = .{ .kind = .{ .identifier = identifier }, .location = location, .denoted = value_type }, .location = location };
+        }
+        const owner = try allocator.create(ast.Expression);
+        const owner_callee: ast.PathExpression = .{ .path = path[0 .. path.len - 1], .resolution = .{ .function = constructor } };
+        owner.* = .{ .kind = .{ .call = .{ .callee = .{ .path_expression = owner_callee }, .arguments = arguments } }, .location = expression.location };
+        const resolution = try resolver.resolveConstructorMember(resolver.context, self.current_function, self.module_index, owner, name, expression.location);
+        call.callee = .{ .member = .{ .owner = owner, .name = name, .resolution = resolution } };
+        call.constructor = null;
+    }
+
+    fn failUndecidedConstructor(self: *TypeChecker, expression: *const ast.Expression, parameter_name: []const u8) TypeError {
+        const allocator = self.arena.allocator();
+        const failure = self.fail(expression.location, error.UndecidedConstructorArgument);
+        const constructor = try renderConstructorName(allocator, expression.kind.call);
+        const form = try self.renderConstructorForm(expression.kind.call);
+        const format = "the arguments of the call do not decide `{s}` of `{s}`; write it out, e.g. `{s}`";
+        self.failure.?.message = try std.fmt.allocPrint(allocator, format, .{ parameter_name, constructor, form });
+        return failure;
+    }
+
+    fn failHiddenConstructor(self: *TypeChecker, expression: *const ast.Expression, reason: ConstructorPatterns) TypeError {
+        const allocator = self.arena.allocator();
+        const failure = self.fail(expression.location, error.HiddenConstructorSignature);
+        const call = expression.kind.call;
+        const constructor = try renderConstructorName(allocator, call);
+        const name = findCalleeName(call.callee);
+        const form = try self.renderConstructorForm(call);
+        self.failure.?.message = switch (reason) {
+            .unseen => try std.fmt.allocPrint(allocator, "the arguments of `{s}` are left out only when it gives, in its last line and with no other return, a struct written there or the type of another such function; write them out, e.g. `{s}`", .{ constructor, form }),
+            .nested => try std.fmt.allocPrint(allocator, "a parameter of `{s}` names a declaration in the block of the struct that `{s}` gives, so the arguments of `{s}` cannot be left out; write them out, e.g. `{s}`", .{ name, constructor, constructor, form }),
+            .missing, .found => unreachable,
+        };
+        return failure;
+    }
+
+    fn renderConstructorForm(self: *TypeChecker, call: ast.Call) TypeError![]const u8 {
+        const allocator = self.arena.allocator();
+        const signature = self.extractSignature(.{ .function = call.constructor.? });
+        var names: std.ArrayList([]const u8) = .empty;
+        for (signature.parameters) |parameter| try names.append(allocator, parameter.name);
+        var arguments: std.ArrayList([]const u8) = .empty;
+        for (call.arguments) |argument| {
+            const rendered = try renderExpression(allocator, argument.value) orelse {
+                arguments.clearRetainingCapacity();
+                try arguments.append(allocator, "...");
+                break;
+            };
+            try arguments.append(allocator, if (argument.own) try std.mem.concat(allocator, u8, &.{ "own ", rendered }) else rendered);
+        }
+        const constructor = try renderConstructorName(allocator, call);
+        const parameter_list = try std.mem.join(allocator, ", ", names.items);
+        const argument_list = try std.mem.join(allocator, ", ", arguments.items);
+        return std.fmt.allocPrint(allocator, "{s}({s})::{s}({s})", .{ constructor, parameter_list, findCalleeName(call.callee), argument_list });
     }
 
     fn failMarkedReceiver(self: *TypeChecker, method_call: ast.MethodCall) TypeError {
@@ -4763,23 +4866,34 @@ pub const TypeChecker = struct {
         for (expression.kind.call.arguments, signature.parameters, 0..) |*argument, parameter, position| {
             if (parameter.kind != .run_time) continue;
             const pattern = try resolver.resolveDeclaredPattern(resolver.context, template, position, bounds.items);
-            if (!types.containsVariable(pattern, .declared)) continue;
-            const argument_type = try self.adaptToPattern(pattern, try self.inferType(parameters, &argument.value));
-            @memset(found, null);
-            if (!types.matchType(pattern, argument_type, .declared, found, false)) return self.fail(argument.location, error.TypeMismatch);
-            for (found, decided) |one, *earlier| {
-                const current = one orelse continue;
-                const previous = earlier.* orelse {
-                    earlier.* = current;
-                    continue;
-                };
-                if (!std.meta.eql(previous, current)) return self.fail(argument.location, error.ConflictingDeclaredType);
-            }
+            try self.matchDeclaredArgument(parameters, argument, pattern, decided, found);
         }
         for (signature.declared, decided) |declared, one| {
             const argument = one orelse return self.fail(expression.location, error.TypeMismatch);
             for (declared.resolved_requirements) |typeclass| try self.expectInstance(expression.location, typeclass, argument.type);
             try bounds.append(allocator, .{ .type = .type, .value = .{ .type = argument.type } });
+        }
+    }
+
+    fn matchDeclaredArgument(
+        self: *TypeChecker,
+        parameters: []const ast.TypedName,
+        argument: *ast.Argument,
+        pattern: types.Type,
+        decided: []?types.Argument,
+        found: []?types.Argument,
+    ) TypeError!void {
+        @memset(found, null);
+        if (!types.containsVariable(pattern, .declared)) return;
+        const argument_type = try self.adaptToPattern(pattern, try self.inferType(parameters, &argument.value));
+        if (!types.matchType(pattern, argument_type, .declared, found, false)) return self.fail(argument.location, error.TypeMismatch);
+        for (found, decided) |one, *earlier| {
+            const current = one orelse continue;
+            const previous = earlier.* orelse {
+                earlier.* = current;
+                continue;
+            };
+            if (!std.meta.eql(previous, current)) return self.fail(argument.location, error.ConflictingDeclaredType);
         }
     }
 
@@ -6151,6 +6265,8 @@ pub const CheckError = error{
     AmbiguousMethod,
     NoSelf,
     UndecidedInstance,
+    UndecidedConstructorArgument,
+    HiddenConstructorSignature,
     AmbiguousInstance,
     MissingRequiredInstance,
     UnknownSuffix,
@@ -6309,6 +6425,8 @@ fn describeError(check_error: CheckError) []const u8 {
         error.AmbiguousMethod => "method is found in more than one place",
         error.NoSelf => "function is not a method",
         error.UndecidedInstance => "name the instance, the arguments do not decide it",
+        error.UndecidedConstructorArgument => "the arguments do not decide every argument of the function that gives the type; write them out",
+        error.HiddenConstructorSignature => "the function cannot be seen without the arguments of the function that gives its type; write them out",
         error.AmbiguousInstance => "more than one instance fits",
         error.MissingRequiredInstance => "type has no instance of a typeclass that the typeclass requires",
         error.UnknownSuffix => "unknown suffix",
@@ -6398,6 +6516,19 @@ pub const Resolver = struct {
         arguments: []const Bound,
     ) AnalyzeError!types.Type,
     resolveReturnPattern: *const fn (context: *anyopaque, template: ast.Resolution.Function) AnalyzeError!types.Type,
+    resolveConstructorPatterns: *const fn (
+        context: *anyopaque,
+        constructor: ast.Resolution.Function,
+        name: []const u8,
+    ) AnalyzeError!ConstructorPatterns,
+    resolveConstructorMember: *const fn (
+        context: *anyopaque,
+        caller: ?ast.Resolution.Function,
+        module_index: usize,
+        owner: *ast.Expression,
+        name: []const u8,
+        location: token.Location,
+    ) AnalyzeError!ast.Resolution,
     instantiate: *const fn (
         context: *anyopaque,
         template: ast.Resolution.Function,
@@ -6443,6 +6574,18 @@ pub const Resolver = struct {
 pub const Bound = struct {
     type: types.Type,
     value: Value,
+};
+
+pub const ConstructorPatterns = union(enum) {
+    unseen,
+    nested,
+    missing,
+    found: FoundPatterns,
+};
+
+pub const FoundPatterns = struct {
+    patterns: []const ?types.Type,
+    count: usize,
 };
 
 const FunctionCall = struct {
@@ -6608,6 +6751,11 @@ fn renderExpression(allocator: std.mem.Allocator, expression: ast.Expression) st
         },
         else => null,
     };
+}
+
+fn renderConstructorName(allocator: std.mem.Allocator, call: ast.Call) std.mem.Allocator.Error![]const u8 {
+    const path = call.callee.path_expression.path;
+    return std.mem.join(allocator, "::", path[0 .. path.len - 1]);
 }
 
 fn findCalleeName(callee: ast.Name) []const u8 {
@@ -24588,6 +24736,276 @@ test "resolveMethodCall: calls a default implementation with a pointer receiver"
     const area = product.left.kind.call;
     try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 3 } }, ast.extractResolution(area.callee));
     try std.testing.expectEqualStrings("self", area.arguments[0].value.kind.dereference.kind.identifier.name);
+}
+
+test "resolveConstructorCall: takes a parameter from a pointer argument and gives the function and type of the written form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Component(type T) -> type\n    return struct\n        value: *T\n\n        fn init(value: *T) -> Self = { value = value }\n\nfn run() -> u32\n    var number: u32 = 3\n    number += 1\n    const short = Component::init(&number)\n    const written = Component(u32)::init(&number)\n    const same: Component(u32) = short\n    return same.value.* + written.value.*\n\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    const body = declarations[1].kind.function_definition.body;
+    const short = body[2].kind.constant_declaration.value;
+    const written = body[3].kind.constant_declaration.value;
+    try std.testing.expectEqual(written.kind.call.callee.member.resolution.?, short.kind.call.callee.member.resolution.?);
+    try std.testing.expect(std.meta.eql(written.type.?, short.type.?));
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 8 } }, declarations[2].kind.constant_declaration.known.?.*);
+}
+
+test "resolveConstructorCall: takes two parameters from two arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Data(type One, type Two) -> type\n    return struct\n        one: One\n        two: Two\n\n        fn make(one: One, two: Two) -> Self = { one = one, two = two }\n        fn of(ones: []const(One), two: Two) -> Self = { one = ones[0], two = two }\n        fn first(_: One) -> u8 = 0\n\nfn run() -> u16\n    const short = Data::make(1u8, 2u16)\n    const written = Data(u8, u16)::make(1, 2)\n    return short.two + written.two\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
+    const short = body[0].kind.constant_declaration.value;
+    const written = body[1].kind.constant_declaration.value;
+    try std.testing.expectEqual(written.kind.call.callee.member.resolution.?, short.kind.call.callee.member.resolution.?);
+    try std.testing.expect(std.meta.eql(written.type.?, short.type.?));
+}
+
+test "resolveConstructorCall: rejects a parameter that the arguments leave undecided" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Data(type One, type Two) -> type\n    return struct\n        one: One\n        two: Two\n\n        fn make(one: One, two: Two) -> Self = { one = one, two = two }\n        fn of(ones: []const(One), two: Two) -> Self = { one = ones[0], two = two }\n        fn first(_: One) -> u8 = 0\n\nfn run(value: u8) -> u8 = Data::first(value)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UndecidedConstructorArgument, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 10, .column = 27 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("the arguments of the call do not decide `Two` of `Data`; write it out, e.g. `Data(One, Two)::first(value)`", analyzer.failure.?.message);
+}
+
+test "resolveConstructorCall: rejects a call without arguments and shows the written form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::container::ArrayList\n\nfn main\n    const list = ArrayList::init()\n    _ = list\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UndecidedConstructorArgument, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 18 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("the arguments of the call do not decide `T` of `ArrayList`; write it out, e.g. `ArrayList(T)::init()`", analyzer.failure.?.message);
+}
+
+test "resolveConstructorCall: rejects a comptime parameter as undecided" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Component(type T, comptime size: usize) -> type\n    return struct\n        values: [size]T\n\n        fn init(_: *T) -> u8 = 0\n\nfn run() -> u8\n    var number: u32 = 3\n    number += 1\n    return Component::init(&number)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UndecidedConstructorArgument, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 10, .column = 12 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("the arguments of the call do not decide `size` of `Component`; write it out, e.g. `Component(T, size)::init(&number)`", analyzer.failure.?.message);
+}
+
+test "resolveConstructorCall: rejects a parameter whose requirement is not met with the error of the written form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var short_directory = std.testing.tmpDir(.{});
+    defer short_directory.cleanup();
+    const short_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &short_directory.sub_path });
+    var short_loader = @import("loader.zig").Loader.init(short_path, "library");
+    try short_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::codec::binary\n\nfn run() -> u8\n    var number: u32 = 3\n    number += 1\n    const decoder = binary::Decoder::init(&number)\n    _ = decoder\n    return 0\n" });
+    try short_loader.loadMainModule(&arena, std.testing.io, "main");
+    var short_registry: types.Registry = .{};
+    var short_analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &short_loader, &short_registry);
+    var written_directory = std.testing.tmpDir(.{});
+    defer written_directory.cleanup();
+    const written_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &written_directory.sub_path });
+    var written_loader = @import("loader.zig").Loader.init(written_path, "library");
+    try written_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::codec::binary\n\nfn run() -> u8\n    var number: u32 = 3\n    number += 1\n    const decoder = binary::Decoder(u32)::init(&number)\n    _ = decoder\n    return 0\n" });
+    try written_loader.loadMainModule(&arena, std.testing.io, "main");
+    var written_registry: types.Registry = .{};
+    var written_analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &written_loader, &written_registry);
+
+    try std.testing.expectError(error.NoInstance, short_analyzer.analyze());
+    try std.testing.expectError(error.NoInstance, written_analyzer.analyze());
+    try std.testing.expectEqualStrings(written_analyzer.failure.?.message, short_analyzer.failure.?.message);
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 43 }, short_analyzer.failure.?.location.?);
+}
+
+test "resolveConstructorCall: calls a function other than init and a function whose result is own" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nfn Component(type T) -> type\n    return struct\n        value: *const(T)\n\n        fn init(value: *const(T)) -> Self = { value = value }\n        fn copy(value: *const(T)) -> own memory::Error![]T\n            const own items = try memory::allocate(T, 1)\n            items[0] = value.*\n            return items\n        fn read(component: *const(Self)) -> T = component.value.*\n\nfn main -> !void\n    with memory::Heap\n    const number: u32 = 4\n    const own short = try Component::copy(&number)\n    defer memory::free(own short)\n    const own written = try Component(u32)::copy(&number)\n    defer memory::free(own written)\n    const component = Component(u32)::init(&number)\n    const read = Component::read(&component)\n    const read_written = Component(u32)::read(&component)\n    _ = read + read_written\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[2].kind.function_definition.body;
+    const short = body[2].kind.constant_declaration.value.kind.@"try".kind.call.callee.member.resolution.?;
+    const written = body[4].kind.constant_declaration.value.kind.@"try".kind.call.callee.member.resolution.?;
+    try std.testing.expectEqual(written, short);
+    const read = body[7].kind.constant_declaration.value.kind.call.callee.member.resolution.?;
+    const read_written = body[8].kind.constant_declaration.value.kind.call.callee.member.resolution.?;
+    try std.testing.expectEqual(read_written, read);
+}
+
+test "resolveConstructorCall: reaches a function that gives a type in another module through its paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.createDirPath(std.testing.io, "outer");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "outer/inner.mn", .data = "fn Component(type T) -> type\n    return struct\n        value: T\n\n        fn init(value: T) -> Self = { value = value }\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import outer\nimport outer::inner\nimport outer::inner::Component\n\nfn main\n    const one = inner::Component::init(1u8)\n    const two = outer::inner::Component::init(2u8)\n    const three = Component::init(3u8)\n    const written = inner::Component(u8)::init(4)\n    _ = one\n    _ = two\n    _ = three\n    _ = written\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[3].kind.function_definition.body;
+    const written = body[3].kind.constant_declaration.value.kind.call.callee.member.resolution.?;
+    for (body[0..3]) |statement| {
+        try std.testing.expectEqual(written, statement.kind.constant_declaration.value.kind.call.callee.member.resolution.?);
+    }
+}
+
+test "resolveConstructorCall: converts an argument as for the types a function declares" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Data(type One, type Two) -> type\n    return struct\n        one: One\n        two: Two\n\n        fn of(ones: []const(One), two: Two) -> Self = { one = ones[0], two = two }\n\nfn run() -> u8\n    const ones: [2]u8 = { 4, 5 }\n    const short = Data::of(&ones, true)\n    const written = Data(u8, bool)::of(&ones, true)\n    return short.one + written.one\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[1].kind.function_definition.body;
+    const short = body[1].kind.constant_declaration.value;
+    const written = body[2].kind.constant_declaration.value;
+    try std.testing.expectEqual(written.kind.call.callee.member.resolution.?, short.kind.call.callee.member.resolution.?);
+    try std.testing.expect(std.meta.eql(written.type.?, short.type.?));
+}
+
+test "resolveConstructorCall: follows a function that gives the type of another" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Component(type T) -> type\n    return struct\n        value: *T\n\n        fn init(value: *T) -> Self = { value = value }\n\nfn Alias(type T) -> type = Component(T)\n\nfn run() -> u32\n    var number: u32 = 3\n    number += 1\n    const short = Alias::init(&number)\n    const written = Alias(u32)::init(&number)\n    return short.value.* + written.value.*\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[2].kind.function_definition.body;
+    const short = body[2].kind.constant_declaration.value;
+    const written = body[3].kind.constant_declaration.value;
+    try std.testing.expectEqual(written.kind.call.callee.member.resolution.?, short.kind.call.callee.member.resolution.?);
+    try std.testing.expect(std.meta.eql(written.type.?, short.type.?));
+}
+
+test "resolveConstructorCall: rejects a function that gives its struct from more than one return" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Component(type T) -> type\n    if T == u8\n        return struct\n            value: *T\n\n            fn init(value: *T) -> Self = { value = value }\n    return struct\n        value: *T\n\n        fn init(value: *T) -> Self = { value = value }\n\nfn run() -> u32\n    var number: u32 = 3\n    number += 1\n    const short = Component::init(&number)\n    return short.value.*\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.HiddenConstructorSignature, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 15, .column = 19 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("the arguments of `Component` are left out only when it gives, in its last line and with no other return, a struct written there or the type of another such function; write them out, e.g. `Component(T)::init(&number)`", analyzer.failure.?.message);
+}
+
+test "resolveConstructorCall: rejects a function whose parameter names a type of the struct block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Component(type T) -> type\n    return struct\n        value: Data\n\n        fn init(value: Data) -> Self = { value = value }\n\n        struct Data\n            value: T\n\nfn run(value: u8) -> u8\n    const short = Component::init(value)\n    return short.value.value\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.HiddenConstructorSignature, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 11, .column = 19 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("a parameter of `init` names a declaration in the block of the struct that `Component` gives, so the arguments of `Component` cannot be left out; write them out, e.g. `Component(T)::init(value)`", analyzer.failure.?.message);
 }
 
 test "expectReachableFunction: rejects a private method of a struct of another module" {

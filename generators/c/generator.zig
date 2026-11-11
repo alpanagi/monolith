@@ -10541,6 +10541,60 @@ test "Generator.generate: builds an executable that allocates through the heap a
     const executable = try output_directory.dir.statFile(std.testing.io, "build/main", .{});
     try std.testing.expectEqual(.file, executable.kind);
 }
+test "Generator.generate: builds an executable that round-trips a value through an encoder and a decoder whose arguments their init calls decide" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::codec::Decode\nimport mn::codec::Decoder\nimport mn::codec::Encode\nimport mn::codec::Encoder\nimport mn::codec::binary\nimport mn::container::ArrayList\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::process::stdout\nimport mn::stream\nimport mn::text\n\nfn main -> !void\n    with memory::Heap\n    var own bytes = ArrayList(u8)::init()\n    defer bytes.deinit(own)\n    var encoder = binary::Encoder::init(&bytes)\n    const value: [2]i32 = { -70000, 12 }\n    try encoder.encode(&value)\n    var source = stream::Bytes::init(bytes.items())\n    var decoder = binary::Decoder::init(&source)\n    const back = try decoder.decode([2]i32)\n    const written: binary::Decoder(stream::Bytes) = decoder\n    _ = written\n    try text::print(&stdout, \"{} {} {}\\n\", { back[0], back[1], bytes.length() })\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
+    defer build_directory.close(std.testing.io);
+
+    const result = try std.process.run(allocator, std.testing.io, .{ .argv = &.{"./main"}, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqualStrings("-70000 12 16\n", result.stdout);
+    try std.testing.expectEqual(0, result.term.exited);
+}
+
+test "Generator.generate: builds an executable that allocates through an arena whose parent its init call decides" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Arena\nimport mn::memory::Deinit\nimport mn::process::stdout\nimport mn::text\n\nfn main -> !void\n    var own arena = Arena::init(memory::Heap::init())\n    defer arena.deinit(own)\n    const own numbers = try memory::allocate(u32, 3) with &arena\n    defer memory::free(own numbers) with &arena\n    numbers[0] = 4\n    numbers[1] = 5\n    numbers[2] = 6\n    const used = arena.used\n    const same: *memory::Arena(memory::Heap) = &arena\n    try text::print(&stdout, \"{} {} {}\\n\", { numbers[0] + numbers[1] + numbers[2], used >= 12, same.used == used })\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
+    defer build_directory.close(std.testing.io);
+
+    const result = try std.process.run(allocator, std.testing.io, .{ .argv = &.{"./main"}, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqualStrings("15 true true\n", result.stdout);
+    try std.testing.expectEqual(0, result.term.exited);
+}
+
 test "Generator.generate: builds an executable that walks a directory with a path" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
