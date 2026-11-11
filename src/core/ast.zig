@@ -257,6 +257,7 @@ pub const InstanceParameter = struct {
 
 pub const Import = struct {
     path: Path,
+    crossings: []const bool = &.{},
     name: []const u8,
     typeclass: ?Resolution.Typeclass = null,
 };
@@ -446,6 +447,7 @@ pub const ExpressionKind = union(enum) {
 
 pub const CaseLiteral = struct {
     name: []const u8,
+    crossing: bool = false,
     arguments: []Argument = &.{},
     called: bool = false,
     braced: bool = false,
@@ -486,6 +488,7 @@ pub const Identifier = struct {
 
 pub const PathExpression = struct {
     path: Path,
+    crossings: []const bool = &.{},
     resolution: ?Resolution = null,
 };
 
@@ -494,6 +497,7 @@ pub const Path = []const []const u8;
 pub const Member = struct {
     owner: *Expression,
     name: []const u8,
+    crossing: bool = false,
     resolution: ?Resolution = null,
     typeclass_arguments: []const types.Argument = &.{},
 };
@@ -502,6 +506,7 @@ pub const MethodCall = struct {
     receiver: *Expression,
     name: []const u8,
     name_location: token.Location,
+    crossing: bool = false,
     arguments: []Argument,
     with_value: ?*Expression = null,
     receiver_own: bool = false,
@@ -666,6 +671,7 @@ pub const Argument = struct {
     value: Expression,
     location: token.Location,
     own: bool = false,
+    crossing: bool = false,
     receiver: bool = false,
 };
 
@@ -673,6 +679,7 @@ pub const FieldAccess = struct {
     value: *Expression,
     field: []const u8,
     field_location: token.Location,
+    crossing: bool = false,
 };
 
 pub const StructType = struct {
@@ -1652,6 +1659,7 @@ pub fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std
         .member => |member| .{ .member = .{
             .owner = try cloneExpressionPointer(allocator, member.owner),
             .name = member.name,
+            .crossing = member.crossing,
         } },
         .call => |*call| .{ .call = try cloneCall(allocator, call) },
         .method_call => |*call| .{ .method_call = try cloneMethodCall(allocator, call) },
@@ -1678,6 +1686,7 @@ pub fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std
         .inferred_type => |inferred| .{ .inferred_type = inferred },
         .case_literal => |literal| .{ .case_literal = .{
             .name = literal.name,
+            .crossing = literal.crossing,
             .arguments = try cloneArguments(allocator, literal.arguments),
             .called = literal.called,
             .braced = literal.braced,
@@ -1716,6 +1725,7 @@ pub fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std
             .value = try cloneExpressionPointer(allocator, access.value),
             .field = access.field,
             .field_location = access.field_location,
+            .crossing = access.crossing,
         } },
         .dereference => |operand| .{ .dereference = try cloneExpressionPointer(allocator, operand) },
         .unwrap => |operand| .{ .unwrap = try cloneExpressionPointer(allocator, operand) },
@@ -1750,6 +1760,7 @@ fn cloneCall(allocator: std.mem.Allocator, call: *const Call) std.mem.Allocator.
             .member => |member| .{ .member = .{
                 .owner = try cloneExpressionPointer(allocator, member.owner),
                 .name = member.name,
+                .crossing = member.crossing,
             } },
         },
         .arguments = try cloneArguments(allocator, call.arguments),
@@ -1764,6 +1775,7 @@ fn cloneMethodCall(allocator: std.mem.Allocator, call: *const MethodCall) std.me
         .receiver = try cloneExpressionPointer(allocator, call.receiver),
         .name = call.name,
         .name_location = call.name_location,
+        .crossing = call.crossing,
         .arguments = try cloneArguments(allocator, call.arguments),
         .with_value = try cloneWithValue(allocator, call.with_value),
         .receiver_own = call.receiver_own,
@@ -1989,6 +2001,7 @@ fn cloneArguments(allocator: std.mem.Allocator, arguments: []const Argument) std
             .value = try cloneExpression(allocator, argument.value),
             .location = argument.location,
             .own = argument.own,
+            .crossing = argument.crossing,
             .receiver = argument.receiver,
         };
     }

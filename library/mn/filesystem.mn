@@ -176,7 +176,10 @@ inline struct Path
     fn is_absolute(self: Self) -> bool = self.bytes.length > 0 and self.bytes[0] == separator
 
 
-    fn join(self: Self, name: []const(u8)) -> own memory::Error!Self
+    fn join(self: Self, other: Path) -> own memory::Error!Self = self.append(other.bytes)
+
+
+    fn append(self: Self, name: []const(u8)) -> own memory::Error!Self
         const length = self.bytes.length
         const is_separated = length > 0 and self.bytes[length - 1] != separator
         const start = if (is_separated) length + 1 else length

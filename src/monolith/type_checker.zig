@@ -928,12 +928,13 @@ pub const TypeChecker = struct {
     fn expectConsumed(self: *TypeChecker, owner: Owner, state: *const MoveState, exit: MoveExit) TypeError!void {
         const left = try self.findUnconsumed(state, .{ .root = owner.root }, owner.type) orelse return;
         const allocator = self.arena.allocator();
-        if (left.steps.len == 0 and !owner.pointer and !state.hasMovedAround(left) and try self.isUnendable(owner.type)) {
+        const unendable_field = if (left.steps.len == 0 and !owner.pointer and !state.hasMovedAround(left)) try self.findUnendableField(owner.type) else null;
+        if (unendable_field) |field_name| {
             const unendable = self.fail(exit.location orelse owner.location, error.OwnUnendable);
             const type_name = try ast.renderTypeName(allocator, self.program.modules, owner.type);
             const module_name = try std.mem.join(allocator, "::", self.program.modules[owner.type.@"struct".module].path);
-            const format = "`{s}` from `{s}` can be held but not ended: its module provides no `Deinit` instance and no function that takes it over, and its private fields cannot be taken apart here";
-            self.failure.?.message = try std.fmt.allocPrint(allocator, format, .{ type_name, module_name });
+            const format = "`{s}` from `{s}` can be held but not ended: its module provides no `Deinit` instance and no function that takes it over, and its private fields cannot be taken apart here; take them apart with `private` anyway, e.g. `own {s}.private.{s}`";
+            self.failure.?.message = try std.fmt.allocPrint(allocator, format, .{ type_name, module_name, owner.name, field_name });
             return unendable;
         }
         const failure = self.fail(exit.location orelse owner.location, error.OwnNotConsumed);
@@ -951,15 +952,15 @@ pub const TypeChecker = struct {
         return failure;
     }
 
-    fn isUnendable(self: *TypeChecker, value_type: types.Type) TypeError!bool {
-        if (value_type != .@"struct") return false;
+    fn findUnendableField(self: *TypeChecker, value_type: types.Type) TypeError!?[]const u8 {
+        if (value_type != .@"struct") return null;
         const struct_type = value_type.@"struct";
-        if (struct_type.module == self.module_index) return false;
-        for (struct_type.fields) |field| {
-            if (field.private and self.isOwningField(struct_type, field)) break;
-        } else return false;
+        if (struct_type.module == self.module_index) return null;
+        const owning = for (struct_type.fields) |field| {
+            if (field.private and self.isOwningField(struct_type, field)) break field.name;
+        } else return null;
         if (findMemoryTypeclass(self.program.modules, "Deinit")) |deinit| {
-            if (try self.hasTypeclassInstance(deinit, value_type)) return false;
+            if (try self.hasTypeclassInstance(deinit, value_type)) return null;
         }
         const module = self.program.modules[struct_type.module];
         for (0..module.declarations.len + module.instances.items.len) |index| {
@@ -973,10 +974,10 @@ pub const TypeChecker = struct {
             if (index < module.declarations.len and ast.isHidden(module, index)) continue;
             for (signature.parameters) |parameter| {
                 if (!parameter.own or parameter.hidden) continue;
-                if (std.meta.eql(types.followPointer(ast.extractType(parameter.type)), value_type)) return false;
+                if (std.meta.eql(types.followPointer(ast.extractType(parameter.type)), value_type)) return null;
             }
         }
-        return true;
+        return owning;
     }
 
     fn describeFirstPart(self: *TypeChecker, value_type: types.Type) TypeError![]const u8 {
@@ -3696,6 +3697,7 @@ pub const TypeChecker = struct {
                 name.resolution = .{ .case = .{ .enumeration = expected.@"enum", .index = index } };
             }
         }
+        if (name.resolution != null and literal.crossing) return self.failNeedlessPrivate(expression.location, literal.name, false);
         if (name.resolution != null and literal.called) {
             return self.failNamingType(expression.location, error.ParenthesizedCaseValue, "case {1s} of type {0s} carries its value in braces, not parentheses, e.g. `::{1s}{{ value }}`", type_name, literal.name);
         }
@@ -3721,7 +3723,7 @@ pub const TypeChecker = struct {
         const function = ast.findOwnMethod(self.program.modules, expected, literal.name) orelse {
             return self.failNamingType(expression.location, error.UnknownCase, "type {s} has no case or function {s}", type_name, literal.name);
         };
-        try self.expectReachableFunction(expression.location, expected, function);
+        try self.expectReachableFunction(expression.location, expected, function, .{ .name = literal.name, .crossed = literal.crossing });
         if (self.resolver) |*resolver| try resolver.resolve(resolver.context, function);
         const signature = self.extractSignature(.{ .function = function });
         if (signature.self_parameter != .none) {
@@ -4094,7 +4096,7 @@ pub const TypeChecker = struct {
         const method_call = expression.kind.method_call;
         const receiver = try self.inferType(parameters, method_call.receiver);
         const name = method_call.name;
-        const lookup: MethodLookup = .{ .location = method_call.name_location, .name = name, .parameters = parameters, .arguments = method_call.arguments, .receiver = method_call.receiver };
+        const lookup: MethodLookup = .{ .location = method_call.name_location, .name = name, .crossing = method_call.crossing, .parameters = parameters, .arguments = method_call.arguments, .receiver = method_call.receiver };
         const method = try self.findMethodFunction(&lookup, receiver);
         const signature = self.extractSignature(method.function);
         if (signature.self_parameter == .none) {
@@ -4179,8 +4181,10 @@ pub const TypeChecker = struct {
         const owner = try allocator.create(ast.Expression);
         const owner_callee: ast.PathExpression = .{ .path = path[0 .. path.len - 1], .resolution = .{ .function = constructor } };
         owner.* = .{ .kind = .{ .call = .{ .callee = .{ .path_expression = owner_callee }, .arguments = arguments } }, .location = expression.location };
-        const resolution = try resolver.resolveConstructorMember(resolver.context, self.current_function, self.module_index, owner, name, expression.location);
-        call.callee = .{ .member = .{ .owner = owner, .name = name, .resolution = resolution } };
+        const crossings = call.callee.path_expression.crossings;
+        const crossed = crossings.len > 0 and crossings[crossings.len - 1];
+        const resolution = try resolver.resolveConstructorMember(resolver.context, self.current_function, self.module_index, owner, name, crossed, expression.location);
+        call.callee = .{ .member = .{ .owner = owner, .name = name, .crossing = crossed, .resolution = resolution } };
         call.constructor = null;
     }
 
@@ -4463,7 +4467,7 @@ pub const TypeChecker = struct {
         const location = lookup.location;
         if (try self.findConstraintMethod(lookup, receiver)) |found| return found;
         if (ast.findOwnMethod(self.program.modules, receiver, lookup.name)) |function| {
-            try self.expectReachableFunction(location, receiver, function);
+            try self.expectReachableFunction(location, receiver, function, buildMethodCrossing(lookup));
             return .{ .resolution = .{ .function = function } };
         }
         var found: ?Found = null;
@@ -4509,7 +4513,7 @@ pub const TypeChecker = struct {
         const position = findTypeclassFunction(definition, name) orelse return null;
         const signature = definition.functions[position];
         if (signature.self_parameter == .none) return null;
-        try self.expectReachableTypeclassFunction(location, typeclass, position);
+        try self.expectReachableTypeclassFunction(location, typeclass, position, buildMethodCrossing(lookup));
         const decided = try self.arena.allocator().alloc(?types.Argument, definition.parameters.len);
         @memset(decided, null);
         const first = types.followPointer(ast.extractType(signature.parameters[0].type));
@@ -4549,7 +4553,7 @@ pub const TypeChecker = struct {
             const position = findTypeclassFunction(definition, name) orelse continue;
             const signature = definition.functions[position];
             if (signature.self_parameter == .none) continue;
-            try self.expectReachableTypeclassFunction(location, constraint.typeclass, position);
+            try self.expectReachableTypeclassFunction(location, constraint.typeclass, position, buildMethodCrossing(lookup));
             const first = types.followPointer(ast.extractType(signature.parameters[0].type));
             const argument = constraint.arguments[first.variable.index];
             if (argument != .type or !std.meta.eql(argument.type, receiver)) continue;
@@ -5147,8 +5151,14 @@ pub const TypeChecker = struct {
         const value_type = try self.inferType(parameters, access.value);
         const struct_type = switch (followPointer(value_type)) {
             .@"struct" => |struct_type| struct_type,
-            .slice => |slice| return self.checkSliceField(expression, slice),
-            .array => |array| return self.checkArrayField(parameters, expression, array),
+            .slice => |slice| {
+                if (access.crossing) return self.failNeedlessPrivate(access.field_location, access.field, false);
+                return self.checkSliceField(expression, slice);
+            },
+            .array => |array| {
+                if (access.crossing) return self.failNeedlessPrivate(access.field_location, access.field, false);
+                return self.checkArrayField(parameters, expression, array);
+            },
             .number, .boolean, .void, .type, .@"enum", .pointer, .optional, .result, .tuple, .function, .variable, .application => {
                 return self.fail(access.field_location, error.NoFields);
             },
@@ -5156,10 +5166,18 @@ pub const TypeChecker = struct {
         const field = findField(struct_type.fields, access.field) orelse {
             return self.fail(access.field_location, error.UnknownField);
         };
-        if (field.private and struct_type.module != self.module_index) {
+        const hidden = field.private and struct_type.module != self.module_index;
+        if (access.crossing and !hidden) return self.failNeedlessPrivate(access.field_location, field.name, field.private);
+        if (hidden and !access.crossing) {
             const allocator = self.arena.allocator();
             const type_name = try ast.renderTypeName(allocator, self.program.modules, .{ .@"struct" = struct_type });
-            return self.failNamingType(access.field_location, error.PrivateField, "`{1s}` is a private field of `{0s}`", type_name, field.name);
+            const way_out = if (try renderExpression(allocator, access.value.*)) |base|
+                try std.fmt.allocPrint(allocator, "{s}.private.{s}", .{ base, field.name })
+            else
+                try std.fmt.allocPrint(allocator, ".private.{s}", .{field.name});
+            const failure = self.fail(access.field_location, error.PrivateField);
+            self.failure.?.message = try std.fmt.allocPrint(allocator, "`{s}` is a private field of `{s}`; write `{s}` to use it anyway", .{ field.name, type_name, way_out });
+            return failure;
         }
         expression.type = field.type;
         return field.type;
@@ -5695,7 +5713,7 @@ pub const TypeChecker = struct {
         elements: []ast.Argument,
         struct_type: types.Struct,
     ) TypeError!void {
-        if (struct_type.module != self.module_index) try self.expectNoPrivateField(location, struct_type);
+        try self.expectCrossedFields(location, elements, struct_type);
         for (elements, 0..) |*element, index| {
             const name = element.name orelse try self.expandShorthand(element);
             const field = findField(struct_type.fields, name) orelse {
@@ -5714,18 +5732,26 @@ pub const TypeChecker = struct {
         }
     }
 
-    fn expectNoPrivateField(self: *TypeChecker, location: token.Location, struct_type: types.Struct) TypeError!void {
+    fn expectCrossedFields(self: *TypeChecker, location: token.Location, elements: []const ast.Argument, struct_type: types.Struct) TypeError!void {
+        const foreign = struct_type.module != self.module_index;
         for (struct_type.fields) |field| {
-            if (field.private) break;
-        } else return;
+            const element = findElement(elements, field.name);
+            const crossed = if (element) |found| found.crossing else false;
+            if (crossed and !(foreign and field.private)) return self.failNeedlessPrivate(element.?.location, field.name, field.private);
+            if (foreign and field.private and !crossed) return self.failPrivateFieldLiteral(location, struct_type, field.name);
+        }
+    }
+
+    fn failPrivateFieldLiteral(self: *TypeChecker, location: token.Location, struct_type: types.Struct, field_name: []const u8) TypeError {
         const allocator = self.arena.allocator();
         const value_type: types.Type = .{ .@"struct" = struct_type };
         const type_name = try ast.renderTypeName(allocator, self.program.modules, value_type);
         const failure = self.fail(location, error.PrivateFieldLiteral);
-        self.failure.?.message = if (try self.findBuilder(value_type)) |builder|
+        const reason = if (try self.findBuilder(value_type)) |builder|
             try std.fmt.allocPrint(allocator, "`{s}` has a private field, so it is built through its functions, e.g. `{s}::{s}()`", .{ type_name, type_name, builder })
         else
             try std.fmt.allocPrint(allocator, "`{s}` has a private field, so it is built through the functions of `{s}`", .{ type_name, try std.mem.join(allocator, "::", self.program.modules[struct_type.module].path) });
+        self.failure.?.message = try std.fmt.allocPrint(allocator, "{s}; write `{{ private.{s} = ... }}` to build it anyway", .{ reason, field_name });
         return failure;
     }
 
@@ -5755,33 +5781,62 @@ pub const TypeChecker = struct {
         return element.name.?;
     }
 
-    fn expectReachableFunction(self: *TypeChecker, location: token.Location, receiver: types.Type, function: ast.Resolution.Function) TypeError!void {
-        if (function.module == self.module_index) return;
+    fn expectReachableFunction(
+        self: *TypeChecker,
+        location: token.Location,
+        receiver: types.Type,
+        function: ast.Resolution.Function,
+        crossing: Crossing,
+    ) TypeError!void {
         const allocator = self.arena.allocator();
         const module = self.program.modules[function.module];
-        if (ast.findTypeDeclaration(module, receiver)) |index| {
-            if (ast.isHidden(module, index)) return self.failPrivate(location, try ast.renderTypeName(allocator, self.program.modules, receiver), function.module);
-        }
         const declaration = ast.findDeclaration(module, function.declaration).*;
-        if (!ast.isPrivate(declaration)) return;
+        if (function.module != self.module_index) {
+            if (ast.findTypeDeclaration(module, receiver)) |index| {
+                if (ast.isHidden(module, index)) {
+                    const way_out = try renderHiddenPath(allocator, module, index, ast.extractFunctionSignature(declaration).name);
+                    return self.failPrivate(location, try ast.renderTypeName(allocator, self.program.modules, receiver), function.module, way_out);
+                }
+            }
+        }
+        if (!try self.isRefused(location, function.module, ast.isPrivate(declaration), crossing)) return;
         const name = try std.mem.concat(allocator, u8, &.{ try ast.renderTypeName(allocator, self.program.modules, receiver), "::", ast.extractFunctionSignature(declaration).name });
-        return self.failPrivate(location, name, function.module);
+        return self.failPrivate(location, name, function.module, try renderCrossing(allocator, crossing));
     }
 
-    fn expectReachableTypeclassFunction(self: *TypeChecker, location: token.Location, typeclass: ast.Resolution.Typeclass, position: usize) TypeError!void {
-        if (typeclass.module == self.module_index) return;
+    fn expectReachableTypeclassFunction(
+        self: *TypeChecker,
+        location: token.Location,
+        typeclass: ast.Resolution.Typeclass,
+        position: usize,
+        crossing: Crossing,
+    ) TypeError!void {
         const definition = self.extractTypeclass(typeclass);
         const signature = definition.functions[position];
-        if (!signature.private) return;
-        const name = try std.mem.concat(self.arena.allocator(), u8, &.{ definition.name, "::", signature.name });
-        return self.failPrivate(location, name, typeclass.module);
+        if (!try self.isRefused(location, typeclass.module, signature.private, crossing)) return;
+        const allocator = self.arena.allocator();
+        const name = try std.mem.concat(allocator, u8, &.{ definition.name, "::", signature.name });
+        return self.failPrivate(location, name, typeclass.module, try renderCrossing(allocator, crossing));
     }
 
-    fn failPrivate(self: *TypeChecker, location: token.Location, name: []const u8, module_index: usize) TypeError {
+    fn isRefused(self: *TypeChecker, location: token.Location, module_index: usize, private: bool, crossing: Crossing) TypeError!bool {
+        const hidden = private and module_index != self.module_index;
+        if (crossing.crossed and !hidden) return self.failNeedlessPrivate(location, crossing.name, private);
+        return hidden and !crossing.crossed;
+    }
+
+    fn failPrivate(self: *TypeChecker, location: token.Location, name: []const u8, module_index: usize, way_out: []const u8) TypeError {
         const allocator = self.arena.allocator();
         const module_name = try std.mem.join(allocator, "::", self.program.modules[module_index].path);
         const failure = self.fail(location, error.PrivateDeclaration);
-        self.failure.?.message = try std.fmt.allocPrint(allocator, "`{s}` is private to `{s}`", .{ name, module_name });
+        self.failure.?.message = try std.fmt.allocPrint(allocator, "`{s}` is private to `{s}`; write `{s}` to use it anyway", .{ name, module_name, way_out });
+        return failure;
+    }
+
+    fn failNeedlessPrivate(self: *TypeChecker, location: token.Location, name: []const u8, private: bool) TypeError {
+        const reason = if (private) "is private to this module, which uses it without `private`" else "is not private, so `private` before it crosses nothing";
+        const failure = self.fail(location, error.NeedlessPrivate);
+        self.failure.?.message = try std.fmt.allocPrint(self.arena.allocator(), "`{s}` {s}; remove the word", .{ name, reason });
         return failure;
     }
 
@@ -6391,6 +6446,7 @@ pub const CheckError = error{
     PrivateField,
     PrivateFieldLiteral,
     PrivateDeclaration,
+    NeedlessPrivate,
     OwnUnendable,
     InlineValue,
     InlineRecursion,
@@ -6550,6 +6606,7 @@ fn describeError(check_error: CheckError) []const u8 {
         error.PrivateField => "the field is private to the module of its struct",
         error.PrivateFieldLiteral => "a struct with a private field is built through the functions of its module",
         error.PrivateDeclaration => "the declaration is private to its module",
+        error.NeedlessPrivate => "private at a use crosses into a private declaration or field of another module, and is written nowhere else",
         error.OwnUnendable => "the value can be held but not ended outside the module of its type",
         error.InlineValue => "an inline function cannot be used as a value",
         error.InlineRecursion => "an inline function cannot call itself, directly or through other functions",
@@ -6628,9 +6685,16 @@ fn describeError(check_error: CheckError) []const u8 {
 const MethodLookup = struct {
     location: token.Location,
     name: []const u8,
+    crossing: bool,
     parameters: []const ast.TypedName,
     arguments: []ast.Argument,
     receiver: *const ast.Expression,
+};
+
+const Crossing = struct {
+    name: []const u8,
+    crossed: bool = false,
+    receiver: ?*const ast.Expression = null,
 };
 
 pub const Resolver = struct {
@@ -6660,6 +6724,7 @@ pub const Resolver = struct {
         module_index: usize,
         owner: *ast.Expression,
         name: []const u8,
+        crossed: bool,
         location: token.Location,
     ) AnalyzeError!ast.Resolution,
     instantiate: *const fn (
@@ -6862,7 +6927,8 @@ fn renderExpression(allocator: std.mem.Allocator, expression: ast.Expression) st
         .identifier => |identifier| identifier.name,
         .field_access => |access| {
             const base = try renderExpression(allocator, access.value.*) orelse return null;
-            return try std.fmt.allocPrint(allocator, "{s}.{s}", .{ base, access.field });
+            const crossing = if (access.crossing) "private." else "";
+            return try std.fmt.allocPrint(allocator, "{s}.{s}{s}", .{ base, crossing, access.field });
         },
         .index => |indexing| {
             const base = try renderExpression(allocator, indexing.value.*) orelse return null;
@@ -6884,6 +6950,40 @@ fn renderExpression(allocator: std.mem.Allocator, expression: ast.Expression) st
         },
         else => null,
     };
+}
+
+fn renderCrossing(allocator: std.mem.Allocator, crossing: Crossing) std.mem.Allocator.Error![]const u8 {
+    const receiver = crossing.receiver orelse return std.fmt.allocPrint(allocator, "::private::{s}", .{crossing.name});
+    const base = try renderExpression(allocator, receiver.*) orelse return std.fmt.allocPrint(allocator, ".private.{s}()", .{crossing.name});
+    return std.fmt.allocPrint(allocator, "{s}.private.{s}()", .{ base, crossing.name });
+}
+
+fn renderHiddenPath(allocator: std.mem.Allocator, module: ast.Module, index: usize, function_name: []const u8) std.mem.Allocator.Error![]const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    try names.append(allocator, try std.fmt.allocPrint(allocator, "{s}(...)", .{function_name}));
+    var current: ?usize = index;
+    while (current) |position| {
+        const declaration = module.declarations[position];
+        const name = switch (declaration.kind) {
+            .struct_definition => |definition| definition.name,
+            .enum_definition => |definition| definition.name,
+            .function_definition, .function_declaration, .constant_declaration, .typeclass_definition, .instance_declaration, .import => break,
+        };
+        try names.append(allocator, name);
+        if (ast.isPrivate(declaration)) try names.append(allocator, "private");
+        current = declaration.owner;
+    }
+    var position = module.path.len;
+    while (position > 0) {
+        position -= 1;
+        try names.append(allocator, module.path[position]);
+    }
+    std.mem.reverse([]const u8, names.items);
+    return std.mem.join(allocator, "::", names.items);
+}
+
+fn buildMethodCrossing(lookup: *const MethodLookup) Crossing {
+    return .{ .name = lookup.name, .crossed = lookup.crossing, .receiver = lookup.receiver };
 }
 
 fn renderConstructorName(allocator: std.mem.Allocator, call: ast.Call) std.mem.Allocator.Error![]const u8 {
@@ -7425,9 +7525,20 @@ fn hasOwnType(expression: ast.Expression) bool {
 
 fn hasNames(elements: []const ast.Argument) bool {
     for (elements) |element| {
-        if (element.name != null) return true;
+        if (element.name != null or element.crossing) return true;
     }
     return false;
+}
+
+fn findElement(elements: []const ast.Argument, name: []const u8) ?*const ast.Argument {
+    for (elements) |*element| {
+        const element_name = element.name orelse switch (element.value.kind) {
+            .identifier => |identifier| identifier.name,
+            else => continue,
+        };
+        if (std.mem.eql(u8, element_name, name)) return element;
+    }
+    return null;
 }
 
 fn unifyTypes(one: types.Type, two: types.Type) ?types.Type {
@@ -13439,7 +13550,7 @@ test "expectConsumed: names an owning type of another module that can be held bu
     try std.testing.expectError(error.OwnUnendable, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 6, .column = 5 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`Thing` from `things` can be held but not ended: its module provides no `Deinit` instance and no function that takes it over, and its private fields cannot be taken apart here", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`Thing` from `things` can be held but not ended: its module provides no `Deinit` instance and no function that takes it over, and its private fields cannot be taken apart here; take them apart with `private` anyway, e.g. `own thing.private.bytes`", analyzer.failure.?.message);
 }
 
 test "expectConsumed: keeps the general error for an owning type of another module with a function that takes it over" {
@@ -15475,6 +15586,24 @@ test "integration: accepts the tried match on File::open from the specification 
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::filesystem\nimport mn::filesystem::File\nimport mn::filesystem::Path\nimport mn::memory\nimport mn::memory::Deinit\n\nfn create(path: Path) -> filesystem::Error!File = File::open(path)\n\nfn run(path: Path) -> !void\n    const file = try match File::open(path)\n        case (NotFound) create(path)\n        else (_ as rest) rest\n    file.close()\n\nfn main -> !void\n    with memory::Heap\n    const own path = Path::init()\n    defer path.deinit(own)\n    try run(path)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "integration: accepts the specification's grouped expression, call and parameter list over several lines through the standard library" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::convert::To\nimport mn::filesystem\nimport mn::filesystem::Path\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::process\n\nstruct Options\n    should_create_parents: bool = false\n\nfn create(\n    directory: Path,\n    options: Options = {},\n) -> filesystem::Error!void\n    if (!options.should_create_parents) return filesystem::create_directory(directory)\n    try filesystem::create_directory(\n        directory,\n        { should_create_parents = true },\n    )\n\nfn main -> !void\n    with memory::Heap\n    const own home = try (\n        process::environment::variable(\"HOME\") orelse \"\"\n    ).to(Path)\n    defer home.deinit(own)\n    try create(home, { should_create_parents = true })\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -25432,6 +25561,47 @@ test "resolveConstructorCall: takes a parameter from a pointer argument and give
     try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 8 } }, declarations[2].kind.constant_declaration.known.?.*);
 }
 
+test "resolveConstructorCall: allows a private function of a type that a call of another module gives after private, with its arguments left out" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "fn Wrapper(type T) -> type\n    return struct\n        value: T\n\n        private fn make(value: T) -> Self = { value = value }\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const wrapper = things::Wrapper::private::make(1u8)\n    _ = wrapper.value\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "resolveConstructorCall: rejects a private function of a type that a call of another module gives, with its arguments left out" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "fn Wrapper(type T) -> type\n    return struct\n        value: T\n\n        private fn make(value: T) -> Self = { value = value }\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const wrapper = things::Wrapper::make(1u8)\n    _ = wrapper.value\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.PrivateDeclaration, analyzer.analyze());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 21 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`Wrapper(u8)::make` is private to `things`; write `Wrapper(u8)::private::make` to use it anyway", analyzer.failure.?.message);
+}
+
 test "resolveConstructorCall: takes two parameters from two arguments" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -25696,7 +25866,48 @@ test "expectReachableFunction: rejects a private method of a struct of another m
     try std.testing.expectError(error.PrivateDeclaration, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 5, .column = 17 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`Counter::peek` is private to `things`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`Counter::peek` is private to `things`; write `counter.private.peek()` to use it anyway", analyzer.failure.?.message);
+}
+
+test "expectReachableFunction: allows a private method of a struct of another module after private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "struct Counter\n    private count: u8\n\n    fn init() -> Counter = { count = 0 }\n\n\n    private fn peek(self: Self) -> u8 = self.count\n\n\n    private fn make() -> Counter = { count = 1 }\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const counter = things::Counter::init()\n    _ = counter.private.peek()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "expectReachableFunction: rejects private before a method that is not private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "struct Counter\n    private count: u8\n\n    fn init() -> Counter = { count = 0 }\n\n\n    private fn peek(self: Self) -> u8 = self.count\n\n\n    private fn make() -> Counter = { count = 1 }\n\n\n    fn total(self: Self) -> u8 = self.count\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const counter = things::Counter::init()\n    _ = counter.private.total()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeedlessPrivate, analyzer.analyze());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 25 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`total` is not private, so `private` before it crosses nothing; remove the word", analyzer.failure.?.message);
 }
 
 test "expectReachableFunction: names a private type whose method is reached through a value" {
@@ -25718,7 +25929,7 @@ test "expectReachableFunction: names a private type whose method is reached thro
     try std.testing.expectError(error.PrivateDeclaration, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 23 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`Hidden` is private to `things`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`Hidden` is private to `things`; write `things::private::Hidden::get(...)` to use it anyway", analyzer.failure.?.message);
 }
 
 test "expectReachableTypeclassFunction: rejects a private function of a typeclass of another module called as a method" {
@@ -25740,7 +25951,26 @@ test "expectReachableTypeclassFunction: rejects a private function of a typeclas
     try std.testing.expectError(error.PrivateDeclaration, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 5, .column = 14 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`Shape::area` is private to `things`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`Shape::area` is private to `things`; write `size.private.area()` to use it anyway", analyzer.failure.?.message);
+}
+
+test "expectReachableTypeclassFunction: allows a private function of a typeclass of another module called as a method after private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "typeclass Shape(type T)\n\n    private fn area(value: T) -> u8\n    fn name(value: T) -> u8\n\n\ninstance Shape(u8)\n\n    fn area(value: u8) -> u8 = value\n    fn name(value: u8) -> u8 = value\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things::Shape\n\nfn main\n    const size: u8 = 1\n    _ = size.private.area()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
 }
 
 test "resolveTypeclassCall: decides the instance by an argument after the first" {
@@ -28761,7 +28991,7 @@ test "checkFieldAccess: rejects reading a private field from another module" {
     try std.testing.expectError(error.PrivateField, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 5, .column = 17 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`count` is a private field of `Counter`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`count` is a private field of `Counter`; write `counter.private.count` to use it anyway", analyzer.failure.?.message);
 }
 
 test "checkFieldAccess: rejects setting a private field from another module" {
@@ -28783,7 +29013,7 @@ test "checkFieldAccess: rejects setting a private field from another module" {
     try std.testing.expectError(error.PrivateField, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 5, .column = 13 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`count` is a private field of `Counter`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`count` is a private field of `Counter`; write `counter.private.count` to use it anyway", analyzer.failure.?.message);
 }
 
 test "checkFieldAccess: rejects taking the address of a private field from another module" {
@@ -28805,7 +29035,7 @@ test "checkFieldAccess: rejects taking the address of a private field from anoth
     try std.testing.expectError(error.PrivateField, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 5, .column = 30 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`count` is a private field of `Counter`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`count` is a private field of `Counter`; write `counter.private.count` to use it anyway", analyzer.failure.?.message);
 }
 
 test "checkFieldAccess: rejects taking a private field apart from another module" {
@@ -28827,7 +29057,7 @@ test "checkFieldAccess: rejects taking a private field apart from another module
     try std.testing.expectError(error.PrivateField, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 7, .column = 29 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`bytes` is a private field of `Holder`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`bytes` is a private field of `Holder`; write `holder.private.bytes` to use it anyway", analyzer.failure.?.message);
 }
 
 test "checkFieldAccess: rejects a private field of a struct that a type constructor of another module gives" {
@@ -28848,7 +29078,7 @@ test "checkFieldAccess: rejects a private field of a struct that a type construc
     try std.testing.expectError(error.PrivateField, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 9, .column = 14 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`count` is a private field of `ArrayList(u8)`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`count` is a private field of `ArrayList(u8)`; write `list.private.count` to use it anyway", analyzer.failure.?.message);
 }
 
 test "checkFieldAccess: allows reading, setting, addressing, taking apart and building with private fields in their own module" {
@@ -28868,6 +29098,89 @@ test "checkFieldAccess: allows reading, setting, addressing, taking apart and bu
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     _ = try analyzer.analyze();
+}
+
+test "checkFieldAccess: allows reading, setting, addressing and taking apart private fields of another module after private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "import mn::memory\n\n\nstruct Holder\n    private own bytes: []u8\n    private count: u8\n\n    fn init() -> own Holder = { bytes = {}, count = 0 }\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport things\n\nfn main\n    with memory::Heap\n    var own holder = things::Holder::init()\n    holder.private.count = 2\n    const pointer = &holder.private.count\n    pointer.* += holder.private.count\n    memory::free(own holder.private.bytes)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "checkFieldAccess: rejects private before a field that is not private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "struct Counter\n    label: u8\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const counter = things::Counter{ label = 1 }\n    _ = counter.private.label\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeedlessPrivate, analyzer.analyze());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 25 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`label` is not private, so `private` before it crosses nothing; remove the word", analyzer.failure.?.message);
+}
+
+test "checkFieldAccess: rejects private before a private field of the module itself" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    private count: u8\n\n\nfn main\n    const counter = Counter{ count = 1 }\n    _ = counter.private.count\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeedlessPrivate, analyzer.analyze());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 7, .column = 25 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`count` is private to this module, which uses it without `private`; remove the word", analyzer.failure.?.message);
+}
+
+test "checkFieldAccess: rejects private before the length of a slice" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main\n    const bytes: []const(u8) = \"abc\"\n    _ = bytes.private.length\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeedlessPrivate, analyzer.analyze());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 23 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`length` is not private, so `private` before it crosses nothing; remove the word", analyzer.failure.?.message);
 }
 
 test "inferType: gives a call its return type" {
@@ -32350,7 +32663,7 @@ test "checkConstruction: rejects reading a name declared own after it moved stan
     try std.testing.expectEqual(token.Location{ .row = 13, .column = 9 }, analyzer.failure.?.location.?);
 }
 
-test "expectNoPrivateField: rejects a literal of a struct with a private field from another module and names a function that builds it" {
+test "expectCrossedFields: rejects a literal of a struct with a private field from another module and names a function that builds it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -32369,10 +32682,10 @@ test "expectNoPrivateField: rejects a literal of a struct with a private field f
     try std.testing.expectError(error.PrivateFieldLiteral, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 21 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`Counter` has a private field, so it is built through its functions, e.g. `Counter::init()`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`Counter` has a private field, so it is built through its functions, e.g. `Counter::init()`; write `{ private.count = ... }` to build it anyway", analyzer.failure.?.message);
 }
 
-test "expectNoPrivateField: rejects an empty literal of a struct whose private fields have defaults" {
+test "expectCrossedFields: rejects an empty literal of a struct whose private fields have defaults" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -32391,10 +32704,10 @@ test "expectNoPrivateField: rejects an empty literal of a struct whose private f
     try std.testing.expectError(error.PrivateFieldLiteral, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 38 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`Counter` has a private field, so it is built through the functions of `things`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`Counter` has a private field, so it is built through the functions of `things`; write `{ private.count = ... }` to build it anyway", analyzer.failure.?.message);
 }
 
-test "expectNoPrivateField: names the function of a struct that a type constructor gives" {
+test "expectCrossedFields: names the function of a struct that a type constructor gives" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -32412,7 +32725,91 @@ test "expectNoPrivateField: names the function of a struct that a type construct
     try std.testing.expectError(error.PrivateFieldLiteral, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 18 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`ArrayList(u8)` has a private field, so it is built through its functions, e.g. `ArrayList(u8)::init()`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`ArrayList(u8)` has a private field, so it is built through its functions, e.g. `ArrayList(u8)::init()`; write `{ private.storage = ... }` to build it anyway", analyzer.failure.?.message);
+}
+
+test "expectCrossedFields: allows a literal of a struct of another module that names each private field after private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "struct Path\n    private bytes: []const(u8)\n    private count: u8 = 0\n    size: u8\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const count: u8 = 2\n    const path: things::Path = { private.bytes = \"cards/easy\", private.count, size = 1 }\n    _ = path.size\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "expectCrossedFields: rejects a private field left to its default beside a field written after private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "struct Path\n    private bytes: []const(u8)\n    private count: u8 = 0\n    size: u8\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const path: things::Path = { private.bytes = \"cards/easy\", size = 1 }\n    _ = path.size\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.PrivateFieldLiteral, analyzer.analyze());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 32 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`Path` has a private field, so it is built through the functions of `things`; write `{ private.count = ... }` to build it anyway", analyzer.failure.?.message);
+}
+
+test "expectCrossedFields: rejects private before a field that is not private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "struct Path\n    private bytes: []const(u8)\n    private count: u8 = 0\n    size: u8\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const path: things::Path = { private.bytes = \"cards/easy\", private.count = 1, private.size = 1 }\n    _ = path.size\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeedlessPrivate, analyzer.analyze());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 91 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`size` is not private, so `private` before it crosses nothing; remove the word", analyzer.failure.?.message);
+}
+
+test "expectCrossedFields: rejects private before a private field of the module itself" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    private count: u8\n\n\nfn main\n    const counter: Counter = { private.count = 1 }\n    _ = counter\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeedlessPrivate, analyzer.analyze());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 40 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`count` is private to this module, which uses it without `private`; remove the word", analyzer.failure.?.message);
 }
 
 test "expandShorthand: rejects a field read standing alone" {
@@ -34727,7 +35124,7 @@ test "integration: lists files with a generic function that calls itself and kee
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::convert::To\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::process::stdout\nimport mn::stream::Writer\nimport mn::text\n\nconst root = \".\"\n\nfn main -> !void\n    var heap = memory::Heap::init()\n    var own path = try root.to(filesystem::Path) with &heap\n    defer path.deinit(own) with &heap\n    try print_files(path) with &heap\n\nfn print_files(path: filesystem::Path) -> !void\n    var buffer: [filesystem::maximum_path_length]u8 = undefined\n    const own bytes = try path.to([]u8)\n    defer memory::free(own bytes)\n    for (index in 0..bytes.length) buffer[index] = bytes[index]\n\n    const directory = try filesystem::Directory::open(path)\n    defer directory.close()\n\n    while try directory.next() as entry\n        match entry.kind\n            case File\n                try text::print(&stdout, \"{s}/{s}\\n\", { buffer[..bytes.length], entry.name })\n            case Directory\n                const own inner_path = try path.join(entry.name)\n                defer inner_path.deinit(own)\n                try print_files(inner_path)\n            else noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::convert::To\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::process::stdout\nimport mn::stream::Writer\nimport mn::text\n\nconst root = \".\"\n\nfn main -> !void\n    var heap = memory::Heap::init()\n    var own path = try root.to(filesystem::Path) with &heap\n    defer path.deinit(own) with &heap\n    try print_files(path) with &heap\n\nfn print_files(path: filesystem::Path) -> !void\n    var buffer: [filesystem::maximum_path_length]u8 = undefined\n    const own bytes = try path.to([]u8)\n    defer memory::free(own bytes)\n    for (index in 0..bytes.length) buffer[index] = bytes[index]\n\n    const directory = try filesystem::Directory::open(path)\n    defer directory.close()\n\n    while try directory.next() as entry\n        match entry.kind\n            case File\n                try text::print(&stdout, \"{s}/{s}\\n\", { buffer[..bytes.length], entry.name })\n            case Directory\n                const own inner_path = try path.append(entry.name)\n                defer inner_path.deinit(own)\n                try print_files(inner_path)\n            else noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -37043,7 +37440,68 @@ test "findLiteralFunction: rejects a private function of a struct of another mod
     try std.testing.expectError(error.PrivateDeclaration, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 38 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`Counter::make` is private to `things`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`Counter::make` is private to `things`; write `::private::make` to use it anyway", analyzer.failure.?.message);
+}
+
+test "findLiteralFunction: allows a private function of a struct of another module after a leading separator and private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "struct Counter\n    private count: u8\n\n    fn init() -> Counter = { count = 0 }\n\n\n    private fn peek(self: Self) -> u8 = self.count\n\n\n    private fn make() -> Counter = { count = 1 }\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const counter: things::Counter = ::private::make()\n    _ = counter\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "resolveCaseLiteral: rejects private before a case" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Mode\n    Read\n    Write\n\n\nfn main\n    const mode: Mode = ::private::Read\n    _ = mode\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeedlessPrivate, analyzer.analyze());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 7, .column = 24 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`Read` is not private, so `private` before it crosses nothing; remove the word", analyzer.failure.?.message);
+}
+
+test "checkCompositeLiteral: rejects private before an element of a tuple literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main\n    const one: u8 = 1\n    const pair: [u8, u8] = { private.one, 2 }\n    _ = pair\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NotAStruct, analyzer.analyze());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 28 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("type is not a struct", analyzer.failure.?.message);
 }
 
 test "checkArrayIndex: rejects an index into an array of an instance when the length is zero" {

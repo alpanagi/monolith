@@ -922,10 +922,7 @@ pub const NameResolver = struct {
         const location = expression.location;
         const target = switch (expression.kind) {
             .identifier => |identifier| try self.resolveName(location, identifier.name),
-            .path_expression => |path_expression| target: {
-                const path = path_expression.path;
-                break :target try self.resolvePath(.{}, location, path);
-            },
+            .path_expression => |path_expression| try self.resolvePath(.{}, location, buildRoute(path_expression)),
             else => return self.fail(location, error.NotATypeclass),
         };
         if (target != .typeclass) return self.fail(location, error.NotATypeclass);
@@ -1149,7 +1146,7 @@ pub const NameResolver = struct {
                             const index = findDeclaration(module, identifier.name) orelse continue;
                             break :target try self.resolveDeclaration(self.module_index, index);
                         },
-                        .path_expression => |path_expression| try self.resolvePath(.{}, written.location, path_expression.path),
+                        .path_expression => |path_expression| try self.resolvePath(.{}, written.location, buildRoute(path_expression)),
                         .call => {
                             if (try self.resolveUnknownConstraint(parameter, written)) parameter.kind = .implicit;
                             continue;
@@ -1174,7 +1171,7 @@ pub const NameResolver = struct {
                 const index = findDeclaration(module, identifier.name) orelse return false;
                 break :target try self.resolveDeclaration(self.module_index, index);
             },
-            .path_expression => |path_expression| try self.resolvePath(.{}, written.location, path_expression.path),
+            .path_expression => |path_expression| try self.resolvePath(.{}, written.location, buildRoute(path_expression)),
             .member => return false,
         };
         if (target != .typeclass) return false;
@@ -1225,22 +1222,23 @@ pub const NameResolver = struct {
     }
 
     fn resolveMemberFunction(self: *NameResolver, scope: Scope, location: token.Location, member: *ast.Member) ResolveError!?ast.Resolution {
+        const crossing: Crossing = .{ .name = member.name, .crossed = member.crossing };
         if (try self.findNamedInstance(scope, member.owner)) |named| {
-            const resolution = try self.resolveInstanceFunction(location, named, member.name);
+            const resolution = try self.resolveInstanceFunction(location, named, crossing);
             if (resolution == .typeclass_function) member.typeclass_arguments = named.arguments;
             return resolution;
         }
         try self.resolveNamesInExpression(scope, member.owner);
         const receiver = try self.expectType(member.owner);
-        return self.resolveMemberOfType(location, receiver, member.name);
+        return self.resolveMemberOfType(location, receiver, crossing);
     }
 
-    fn resolveMemberOfType(self: *NameResolver, location: token.Location, receiver: types.Type, name: []const u8) ResolveError!?ast.Resolution {
-        if (try self.findNestedType(location, receiver, name)) |nested| return .{ .type = nested };
-        const function = ast.findOwnMethod(self.loader.modules.items, receiver, name) orelse {
+    fn resolveMemberOfType(self: *NameResolver, location: token.Location, receiver: types.Type, crossing: Crossing) ResolveError!?ast.Resolution {
+        if (try self.findNestedType(location, receiver, crossing)) |nested| return .{ .type = nested };
+        const function = ast.findOwnMethod(self.loader.modules.items, receiver, crossing.name) orelse {
             return self.fail(location, error.UnknownMethod);
         };
-        try self.expectReachableFunction(location, receiver, function);
+        try self.expectReachableFunction(location, receiver, function, crossing);
         return .{ .function = function };
     }
 
@@ -1249,7 +1247,7 @@ pub const NameResolver = struct {
         const call = owner.kind.call;
         const target = switch (call.callee) {
             .identifier => |identifier| try self.resolveName(owner.location, identifier.name),
-            .path_expression => |path_expression| try self.resolvePath(scope, owner.location, path_expression.path),
+            .path_expression => |path_expression| try self.resolvePath(scope, owner.location, buildRoute(path_expression)),
             .member => return null,
         };
         if (target != .typeclass) return null;
@@ -1268,15 +1266,16 @@ pub const NameResolver = struct {
         self: *NameResolver,
         location: token.Location,
         named: NamedInstance,
-        name: []const u8,
+        crossing: Crossing,
     ) ResolveError!ast.Resolution {
         const modules = self.loader.modules.items;
         const typeclass = named.typeclass;
+        const name = crossing.name;
         const definition = modules[typeclass.module].declarations[typeclass.declaration].kind.typeclass_definition;
         const position = findSignaturePosition(definition.functions, name) orelse {
             return self.fail(location, error.UnknownMethod);
         };
-        try self.expectReachableTypeclassFunction(location, typeclass, position);
+        try self.expectReachableTypeclassFunction(location, typeclass, position, crossing);
         if (isOwnParameters(named.arguments)) {
             const current = self.typeclass orelse return self.fail(location, error.NoInstance);
             if (!std.meta.eql(current, typeclass)) return self.fail(location, error.NoInstance);
@@ -1748,6 +1747,7 @@ pub const NameResolver = struct {
         module_index: usize,
         owner: *ast.Expression,
         name: []const u8,
+        crossed: bool,
         location: token.Location,
     ) AnalyzeError!ast.Resolution {
         const self: *NameResolver = @ptrCast(@alignCast(context));
@@ -1767,7 +1767,7 @@ pub const NameResolver = struct {
         self.bindings = &.{};
         if (caller) |function| self.bindings = ast.findDeclaration(self.loader.modules.items[function.module], function.declaration).kind.function_definition.bindings;
         const receiver = try self.expectType(owner);
-        const resolution = (try self.resolveMemberOfType(location, receiver, name)).?;
+        const resolution = (try self.resolveMemberOfType(location, receiver, .{ .name = name, .crossed = crossed })).?;
         if (resolution != .function) return self.fail(location, error.NotAFunction);
         return resolution;
     }
@@ -2322,11 +2322,11 @@ pub const NameResolver = struct {
         self.module_index = pending.module;
         const modules = self.loader.modules.items;
         const receiver = pending.method.receiver;
-        const name = pending.method.name;
+        const name = pending.method.crossing.name;
         const function = ast.findOwnMethod(modules, receiver, name) orelse {
             return self.fail(pending.location, error.UnknownMethod);
         };
-        try self.expectReachableFunction(pending.location, receiver, function);
+        try self.expectReachableFunction(pending.location, receiver, function, pending.method.crossing);
         if (pending.value) {
             const definition = ast.findDeclaration(modules[function.module], function.declaration);
             if (definition.kind == .function_definition and definition.kind.function_definition.signature.@"inline") {
@@ -2850,7 +2850,7 @@ pub const NameResolver = struct {
                 break :name identifier.name;
             },
             .path_expression => |path_expression| name: {
-                const target = try self.resolvePath(scope, location, path_expression.path);
+                const target = try self.resolvePath(scope, location, buildRoute(path_expression));
                 if (target != .case) return;
                 break :name try std.mem.join(self.arena.allocator(), "::", path_expression.path);
             },
@@ -2989,10 +2989,7 @@ pub const NameResolver = struct {
                 if (findTypedName(scope.parameters, identifier.name) != null) return null;
                 break :target try self.resolveName(value.location, identifier.name);
             },
-            .path_expression => |path_expression| target: {
-                const path = path_expression.path;
-                break :target try self.resolvePath(scope, value.location, path);
-            },
+            .path_expression => |path_expression| try self.resolvePath(scope, value.location, buildRoute(path_expression)),
             .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type => target: {
                 try self.resolveNamesInExpression(scope, value);
                 break :target .{ .type = ast.extractType(value.*) };
@@ -3164,7 +3161,7 @@ pub const NameResolver = struct {
             .integer_literal, .float_literal, .boolean_literal, .string_literal, .undefined, .null => {},
             .identifier => |*identifier| try self.resolveIdentifier(scope, location, identifier),
             .path_expression => |*path_expression| {
-                const target = try self.resolvePath(scope, location, path_expression.path);
+                const target = try self.resolvePath(scope, location, buildRoute(path_expression.*));
                 try self.resolveValue(location, target, &path_expression.resolution);
             },
             .member => |*member| member.resolution = try self.resolveMemberFunction(scope, location, member),
@@ -3245,7 +3242,7 @@ pub const NameResolver = struct {
         const literal_type = literal.type orelse return null;
         if (literal_type.kind != .path_expression) return null;
         const path = literal_type.kind.path_expression.path;
-        const target = try self.resolvePath(scope, literal_type.location, path);
+        const target = try self.resolvePath(scope, literal_type.location, buildRoute(literal_type.kind.path_expression));
         if (target != .case) return null;
         return .{ .path = path, .resolution = .{ .case = target.case } };
     }
@@ -3569,8 +3566,7 @@ pub const NameResolver = struct {
                 break :target .{ try self.resolveName(location, name), &identifier.resolution };
             },
             .path_expression => |*path_expression| target: {
-                const path = path_expression.path;
-                const target = try self.resolvePath(scope, location, path);
+                const target = try self.resolvePath(scope, location, buildRoute(path_expression.*));
                 break :target .{ target, &path_expression.resolution };
             },
             .member => |*member| {
@@ -3598,10 +3594,11 @@ pub const NameResolver = struct {
         callee: ast.Name,
     ) ResolveError!?ast.Resolution.Function {
         if (callee != .path_expression) return null;
-        const path = callee.path_expression.path;
+        const route = buildRoute(callee.path_expression);
+        const path = route.names;
         if (path.len < 2) return null;
-        const prefix = path[0 .. path.len - 1];
-        const found = if (prefix.len == 1) try self.findShortPathFunction(scope, prefix[0]) else try self.findLongPathFunction(scope, location, prefix);
+        const end = path.len - 1;
+        const found = if (end == 1) try self.findShortPathFunction(scope, path[0]) else try self.findLongPathFunction(scope, location, route, end);
         const function = found orelse return null;
         const declaration = ast.findDeclaration(self.loader.modules.items[function.module], function.declaration);
         if (declaration.kind != .function_definition) return null;
@@ -3632,21 +3629,23 @@ pub const NameResolver = struct {
         self: *NameResolver,
         scope: Scope,
         location: token.Location,
-        prefix: ast.Path,
+        route: Route,
+        end: usize,
     ) ResolveError!?ast.Resolution.Function {
-        if (try self.findShortPathOwner(scope, location, prefix[0]) != null) return null;
-        var namespace = try self.resolveFirstNamespace(scope, location, prefix[0]);
-        for (prefix[1 .. prefix.len - 1]) |name| {
-            if (try self.findModuleType(location, namespace, name) != null) return null;
-            namespace = try self.resolveMemberNamespace(location, namespace, name);
+        const first = route.names[0];
+        if (try self.findShortPathOwner(scope, location, first) != null) return null;
+        var namespace = try self.resolveFirstNamespace(scope, location, first);
+        for (1..end - 1) |position| {
+            if (try self.findModuleType(location, namespace, route.at(position)) != null) return null;
+            namespace = try self.resolveMemberNamespace(location, namespace, route.at(position));
         }
         const module_index = namespace.module orelse return null;
-        const index = findMember(self.loader.modules.items[module_index], prefix[prefix.len - 1]) orelse return null;
+        const index = findMember(self.loader.modules.items[module_index], route.names[end - 1]) orelse return null;
         switch (self.loader.modules.items[module_index].declarations[index].kind) {
             .function_definition, .function_declaration => {},
             .constant_declaration, .struct_definition, .enum_definition, .typeclass_definition, .instance_declaration, .import => return null,
         }
-        try self.expectReachable(location, module_index, index);
+        try self.expectReachable(location, module_index, index, route.at(end - 1));
         return .{ .module = module_index, .declaration = index };
     }
 
@@ -3739,7 +3738,8 @@ pub const NameResolver = struct {
         return findBareDeclaration(module, name);
     }
 
-    fn findNestedType(self: *NameResolver, location: token.Location, owner: types.Type, name: []const u8) ResolveError!?types.Type {
+    fn findNestedType(self: *NameResolver, location: token.Location, owner: types.Type, crossing: Crossing) ResolveError!?types.Type {
+        const name = crossing.name;
         for (self.nested_types.items) |nested| {
             if (!std.meta.eql(nested.owner, owner) or !std.mem.eql(u8, nested.name, name)) continue;
             const module_index = switch (nested.value) {
@@ -3747,10 +3747,10 @@ pub const NameResolver = struct {
                 .@"enum" => |enumeration| enumeration.module,
                 else => self.module_index,
             };
-            if (nested.private and module_index != self.module_index) {
+            if (try self.isRefused(location, module_index, nested.private, crossing)) {
                 const allocator = self.arena.allocator();
                 const full_name = try std.mem.concat(allocator, u8, &.{ try ast.renderTypeName(allocator, self.loader.modules.items, owner), "::", name });
-                return self.failPrivate(location, full_name, module_index);
+                return self.failPrivate(location, full_name, module_index, crossing);
             }
             return nested.value;
         }
@@ -3762,16 +3762,16 @@ pub const NameResolver = struct {
         const module = self.loader.modules.items[module_index];
         const owner_index = ast.findTypeDeclaration(module, owner) orelse return null;
         const index = findNestedDeclaration(module, owner_index, name) orelse return null;
-        try self.expectReachable(location, module_index, index);
+        try self.expectReachable(location, module_index, index, crossing);
         const target = try self.resolveDeclaration(module_index, index);
         return target.type;
     }
 
-    fn findNestedOwner(self: *NameResolver, location: token.Location, owner: Target, path: ast.Path) ResolveError!?Target {
+    fn findNestedOwner(self: *NameResolver, location: token.Location, owner: Target, route: Route, start: usize, end: usize) ResolveError!?Target {
         var current = owner;
-        for (path) |name| {
+        for (start..end) |position| {
             if (current != .type) return null;
-            const nested = (try self.findNestedType(location, current.type, name)) orelse {
+            const nested = (try self.findNestedType(location, current.type, route.at(position))) orelse {
                 return self.fail(location, error.UnknownName);
             };
             current = .{ .type = nested };
@@ -3783,62 +3783,68 @@ pub const NameResolver = struct {
         self: *NameResolver,
         scope: Scope,
         location: token.Location,
-        path: ast.Path,
+        route: Route,
     ) ResolveError!Target {
-        const last = path[path.len - 1];
-        if (try self.findPathOwner(scope, location, path[0 .. path.len - 1])) |owner| {
+        const last = route.names.len - 1;
+        if (try self.findPathOwner(scope, location, route, last)) |owner| {
             return switch (owner) {
-                .type => |receiver| self.resolveTypeMember(location, receiver, last),
+                .type => |receiver| self.resolveTypeMember(location, receiver, route.at(last)),
                 .typeclass => |typeclass| {
                     const declaration = self.loader.modules.items[typeclass.module].declarations[typeclass.declaration];
                     const functions = declaration.kind.typeclass_definition.functions;
-                    const position = findSignaturePosition(functions, last) orelse {
+                    const position = findSignaturePosition(functions, route.names[last]) orelse {
                         return self.fail(location, error.UnknownMethod);
                     };
-                    try self.expectReachableTypeclassFunction(location, typeclass, position);
+                    try self.expectReachableTypeclassFunction(location, typeclass, position, route.at(last));
                     return .{ .typeclass_method = .{ .typeclass = typeclass, .function = position } };
                 },
                 .function, .namespace, .constant, .local, .element, .method, .typeclass_method, .constructor, .case, .builtin => unreachable,
             };
         }
-        var namespace = try self.resolveFirstNamespace(scope, location, path[0]);
-        for (path[1 .. path.len - 1]) |name| {
-            namespace = try self.resolveMemberNamespace(location, namespace, name);
+        var namespace = try self.resolveFirstNamespace(scope, location, route.names[0]);
+        for (1..last) |position| {
+            namespace = try self.resolveMemberNamespace(location, namespace, route.at(position));
         }
-        return self.resolveMember(location, namespace, last);
+        return self.resolveMember(location, namespace, route.at(last));
     }
 
-    fn resolveTypeMember(self: *NameResolver, location: token.Location, receiver: types.Type, name: []const u8) ResolveError!Target {
-        if (try self.findNestedType(location, receiver, name)) |nested| return .{ .type = nested };
-        if (findCase(receiver, name)) |case| return .{ .case = case };
-        return .{ .method = .{ .receiver = receiver, .name = name } };
+    fn resolveTypeMember(self: *NameResolver, location: token.Location, receiver: types.Type, crossing: Crossing) ResolveError!Target {
+        if (try self.findNestedType(location, receiver, crossing)) |nested| return .{ .type = nested };
+        if (findCase(receiver, crossing.name)) |case| {
+            try self.expectNotCrossed(location, crossing);
+            return .{ .case = case };
+        }
+        return .{ .method = .{ .receiver = receiver, .crossing = crossing } };
     }
 
     fn findPathOwner(
         self: *NameResolver,
         scope: Scope,
         location: token.Location,
-        prefix: ast.Path,
+        route: Route,
+        end: usize,
     ) ResolveError!?Target {
-        if (prefix.len > 1) return self.findLongPathOwner(scope, location, prefix);
-        return self.findShortPathOwner(scope, location, prefix[0]);
+        if (end > 1) return self.findLongPathOwner(scope, location, route, end);
+        return self.findShortPathOwner(scope, location, route.names[0]);
     }
 
     fn findLongPathOwner(
         self: *NameResolver,
         scope: Scope,
         location: token.Location,
-        prefix: ast.Path,
+        route: Route,
+        end: usize,
     ) ResolveError!?Target {
-        if (try self.findShortPathOwner(scope, location, prefix[0])) |first| return self.findNestedOwner(location, first, prefix[1..]);
-        var namespace = try self.resolveFirstNamespace(scope, location, prefix[0]);
-        for (prefix[1 .. prefix.len - 1], 1..) |name, position| {
-            if (try self.findModuleType(location, namespace, name)) |owner| return self.findNestedOwner(location, owner, prefix[position + 1 ..]);
-            namespace = try self.resolveMemberNamespace(location, namespace, name);
+        const first = route.names[0];
+        if (try self.findShortPathOwner(scope, location, first)) |owner| return self.findNestedOwner(location, owner, route, 1, end);
+        var namespace = try self.resolveFirstNamespace(scope, location, first);
+        for (1..end - 1) |position| {
+            if (try self.findModuleType(location, namespace, route.at(position))) |owner| return self.findNestedOwner(location, owner, route, position + 1, end);
+            namespace = try self.resolveMemberNamespace(location, namespace, route.at(position));
         }
         const module_index = namespace.module orelse return null;
-        const index = findMember(self.loader.modules.items[module_index], prefix[prefix.len - 1]) orelse return null;
-        try self.expectReachable(location, module_index, index);
+        const index = findMember(self.loader.modules.items[module_index], route.names[end - 1]) orelse return null;
+        try self.expectReachable(location, module_index, index, route.at(end - 1));
         return self.findOwner(module_index, index);
     }
 
@@ -3866,12 +3872,12 @@ pub const NameResolver = struct {
         return self.findOwner(self.module_index, index);
     }
 
-    fn findModuleType(self: *NameResolver, location: token.Location, namespace: Namespace, name: []const u8) ResolveError!?Target {
+    fn findModuleType(self: *NameResolver, location: token.Location, namespace: Namespace, crossing: Crossing) ResolveError!?Target {
         const module_index = namespace.module orelse return null;
-        const index = findMember(self.loader.modules.items[module_index], name) orelse return null;
+        const index = findMember(self.loader.modules.items[module_index], crossing.name) orelse return null;
         const target = try self.findOwner(module_index, index) orelse return null;
         if (target != .type) return null;
-        try self.expectReachable(location, module_index, index);
+        try self.expectReachable(location, module_index, index, crossing);
         return target;
     }
 
@@ -4002,14 +4008,18 @@ pub const NameResolver = struct {
         self: *NameResolver,
         location: token.Location,
         namespace: Namespace,
-        name: []const u8,
+        crossing: Crossing,
     ) ResolveError!Namespace {
-        if (self.loader.findMember(namespace, name)) |member| return member;
+        const name = crossing.name;
+        if (self.loader.findMember(namespace, name)) |member| {
+            try self.expectNotCrossed(location, crossing);
+            return member;
+        }
         if (namespace.module) |module_index| {
             const module = self.loader.modules.items[module_index];
             if (isImported(module, name)) return self.fail(location, error.ImportNotMember);
             if (findMember(module, name)) |index| {
-                try self.expectReachable(location, module_index, index);
+                try self.expectReachable(location, module_index, index, crossing);
                 return self.expectNamespace(location, module_index, index);
             }
         }
@@ -4043,17 +4053,24 @@ pub const NameResolver = struct {
         self: *NameResolver,
         location: token.Location,
         namespace: Namespace,
-        name: []const u8,
+        crossing: Crossing,
     ) ResolveError!Target {
-        if (findBuiltin(namespace.path, name)) |builtin| return .{ .builtin = builtin };
+        const name = crossing.name;
+        if (findBuiltin(namespace.path, name)) |builtin| {
+            try self.expectNotCrossed(location, crossing);
+            return .{ .builtin = builtin };
+        }
         if (namespace.module) |module_index| {
             const module = self.loader.modules.items[module_index];
             if (findMember(module, name)) |index| {
-                try self.expectReachable(location, module_index, index);
+                try self.expectReachable(location, module_index, index, crossing);
                 return self.resolveDeclaration(module_index, index);
             }
         }
-        if (self.loader.findMember(namespace, name)) |member| return .{ .namespace = member };
+        if (self.loader.findMember(namespace, name)) |member| {
+            try self.expectNotCrossed(location, crossing);
+            return .{ .namespace = member };
+        }
         if (namespace.module) |module_index| {
             const module = self.loader.modules.items[module_index];
             if (isImported(module, name)) return self.fail(location, error.ImportNotMember);
@@ -4098,17 +4115,18 @@ pub const NameResolver = struct {
         defer self.typeclass = caller_typeclass;
         defer self.bindings = caller_bindings;
         const path = import.path;
+        const route: Route = .{ .names = path, .crossings = import.crossings, .import = true };
         var namespace = self.loader.findRoot(path[0]) orelse {
             return self.failMissingModule(location, &.{}, path[0]);
         };
         if (path.len == 1) return .{ .namespace = namespace };
-        for (path[1 .. path.len - 1], 1..) |name, position| {
-            if (try self.findModuleType(location, namespace, name)) |owner| {
-                return (try self.findNestedOwner(location, owner, path[position + 1 ..])).?;
+        for (1..path.len - 1) |position| {
+            if (try self.findModuleType(location, namespace, route.at(position))) |owner| {
+                return (try self.findNestedOwner(location, owner, route, position + 1, path.len)).?;
             }
-            namespace = try self.resolveMemberNamespace(location, namespace, name);
+            namespace = try self.resolveMemberNamespace(location, namespace, route.at(position));
         }
-        const target = try self.resolveMember(location, namespace, path[path.len - 1]);
+        const target = try self.resolveMember(location, namespace, route.at(path.len - 1));
         if (target == .typeclass) import.typeclass = target.typeclass;
         return target;
     }
@@ -4152,8 +4170,7 @@ pub const NameResolver = struct {
                 return self.expectHeldByConstant(declaration.location, target);
             },
             .path_expression => |path_expression| {
-                const path = path_expression.path;
-                const target = try self.resolvePath(.{}, declaration.location, path);
+                const target = try self.resolvePath(.{}, declaration.location, buildRoute(path_expression));
                 try self.expectNotInline(value.location, target);
                 return self.expectHeldByConstant(declaration.location, target);
             },
@@ -4402,35 +4419,64 @@ pub const NameResolver = struct {
         return name_error;
     }
 
-    fn expectReachable(self: *NameResolver, location: token.Location, module_index: usize, index: usize) ResolveError!void {
-        if (module_index == self.module_index) return;
-        if (!ast.isPrivate(self.loader.modules.items[module_index].declarations[index])) return;
-        return self.failPrivate(location, try self.buildNestedName(module_index, index), module_index);
+    fn expectReachable(self: *NameResolver, location: token.Location, module_index: usize, index: usize, crossing: Crossing) ResolveError!void {
+        const private = ast.isPrivate(self.loader.modules.items[module_index].declarations[index]);
+        if (!try self.isRefused(location, module_index, private, crossing)) return;
+        return self.failPrivate(location, try self.buildNestedName(module_index, index), module_index, crossing);
     }
 
-    fn expectReachableFunction(self: *NameResolver, location: token.Location, receiver: types.Type, function: ast.Resolution.Function) ResolveError!void {
-        if (function.module == self.module_index) return;
+    fn expectReachableFunction(
+        self: *NameResolver,
+        location: token.Location,
+        receiver: types.Type,
+        function: ast.Resolution.Function,
+        crossing: Crossing,
+    ) ResolveError!void {
         const declaration = ast.findDeclaration(self.loader.modules.items[function.module], function.declaration);
-        if (!ast.isPrivate(declaration.*)) return;
+        if (!try self.isRefused(location, function.module, ast.isPrivate(declaration.*), crossing)) return;
         const allocator = self.arena.allocator();
         const name = try std.mem.concat(allocator, u8, &.{ try ast.renderTypeName(allocator, self.loader.modules.items, receiver), "::", ast.extractFunctionSignature(declaration.*).name });
-        return self.failPrivate(location, name, function.module);
+        return self.failPrivate(location, name, function.module, crossing);
     }
 
-    fn expectReachableTypeclassFunction(self: *NameResolver, location: token.Location, typeclass: ast.Resolution.Typeclass, position: usize) ResolveError!void {
-        if (typeclass.module == self.module_index) return;
+    fn expectReachableTypeclassFunction(
+        self: *NameResolver,
+        location: token.Location,
+        typeclass: ast.Resolution.Typeclass,
+        position: usize,
+        crossing: Crossing,
+    ) ResolveError!void {
         const definition = self.loader.modules.items[typeclass.module].declarations[typeclass.declaration].kind.typeclass_definition;
         const signature = definition.functions[position];
-        if (!signature.private) return;
+        if (!try self.isRefused(location, typeclass.module, signature.private, crossing)) return;
         const name = try std.mem.concat(self.arena.allocator(), u8, &.{ definition.name, "::", signature.name });
-        return self.failPrivate(location, name, typeclass.module);
+        return self.failPrivate(location, name, typeclass.module, crossing);
     }
 
-    fn failPrivate(self: *NameResolver, location: token.Location, name: []const u8, module_index: usize) ResolveError {
+    fn isRefused(self: *NameResolver, location: token.Location, module_index: usize, private: bool, crossing: Crossing) ResolveError!bool {
+        const hidden = private and module_index != self.module_index;
+        if (crossing.crossed and !hidden) return self.failNeedlessPrivate(location, crossing.name, private);
+        return hidden and !crossing.crossed;
+    }
+
+    fn expectNotCrossed(self: *NameResolver, location: token.Location, crossing: Crossing) ResolveError!void {
+        if (crossing.crossed) return self.failNeedlessPrivate(location, crossing.name, false);
+    }
+
+    fn failPrivate(self: *NameResolver, location: token.Location, name: []const u8, module_index: usize, crossing: Crossing) ResolveError {
         const allocator = self.arena.allocator();
         const module_name = try std.mem.join(allocator, "::", self.loader.modules.items[module_index].path);
-        const message = try std.fmt.allocPrint(allocator, "`{s}` is private to `{s}`", .{ name, module_name });
+        const way_out = try renderCrossing(allocator, name, crossing);
+        const message = try std.fmt.allocPrint(allocator, "`{s}` is private to `{s}`; write `{s}` to use it anyway", .{ name, module_name, way_out });
         const name_error = self.fail(location, error.PrivateDeclaration);
+        self.failure.?.message = message;
+        return name_error;
+    }
+
+    fn failNeedlessPrivate(self: *NameResolver, location: token.Location, name: []const u8, private: bool) ResolveError {
+        const reason = if (private) "is private to this module, which uses it without `private`" else "is not private, so `private` before it crosses nothing";
+        const message = try std.fmt.allocPrint(self.arena.allocator(), "`{s}` {s}; remove the word", .{ name, reason });
+        const name_error = self.fail(location, error.NeedlessPrivate);
         self.failure.?.message = message;
         return name_error;
     }
@@ -4541,6 +4587,7 @@ pub const NameError = error{
     PrivateDeclaration,
     PrivateExternalField,
     PrivateInSignature,
+    NeedlessPrivate,
 };
 
 const StructCount = struct {
@@ -4696,7 +4743,28 @@ const Instantiated = struct {
 
 const Method = struct {
     receiver: types.Type,
+    crossing: Crossing,
+};
+
+const Crossing = struct {
     name: []const u8,
+    crossed: bool = false,
+    route: ?Route = null,
+    position: usize = 0,
+};
+
+const Route = struct {
+    names: ast.Path,
+    crossings: []const bool = &.{},
+    import: bool = false,
+
+    fn at(self: Route, position: usize) Crossing {
+        return .{ .name = self.names[position], .crossed = self.isCrossed(position), .route = self, .position = position };
+    }
+
+    fn isCrossed(self: Route, position: usize) bool {
+        return self.crossings.len > 0 and self.crossings[position];
+    }
 };
 
 fn describeError(name_error: NameError) []const u8 {
@@ -4789,6 +4857,7 @@ fn describeError(name_error: NameError) []const u8 {
         error.PrivateDeclaration => "the declaration is private to its module",
         error.PrivateExternalField => "a field of an external struct cannot be private",
         error.PrivateInSignature => "a private type cannot appear in a declaration that is not private",
+        error.NeedlessPrivate => "private at a use crosses into a private declaration or field of another module, and is written nowhere else",
     };
 }
 
@@ -4992,6 +5061,25 @@ fn findNestedDeclaration(module: ast.Module, owner: usize, name: []const u8) ?us
         if (std.mem.eql(u8, extractName(declaration), name)) return index;
     }
     return null;
+}
+
+fn buildRoute(path_expression: ast.PathExpression) Route {
+    return .{ .names = path_expression.path, .crossings = path_expression.crossings };
+}
+
+fn renderCrossing(allocator: std.mem.Allocator, name: []const u8, crossing: Crossing) std.mem.Allocator.Error![]const u8 {
+    const route = crossing.route orelse {
+        const split = std.mem.lastIndexOf(u8, name, "::") orelse return std.mem.concat(allocator, u8, &.{ "private::", name });
+        return std.mem.concat(allocator, u8, &.{ name[0 .. split + 2], "private::", name[split + 2 ..] });
+    };
+    var text: std.ArrayList(u8) = .empty;
+    if (route.import) try text.appendSlice(allocator, "import ");
+    for (route.names, 0..) |segment, position| {
+        if (position > 0) try text.appendSlice(allocator, "::");
+        if (position == crossing.position or route.isCrossed(position)) try text.appendSlice(allocator, "private::");
+        try text.appendSlice(allocator, if (std.mem.eql(u8, segment, ast.module_root)) "module" else segment);
+    }
+    return text.items;
 }
 
 fn findMember(module: ast.Module, name: []const u8) ?usize {
@@ -16141,7 +16229,7 @@ test "expectReachable: rejects a private function of another module reached by p
     try std.testing.expectError(error.PrivateDeclaration, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 9 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`helper` is private to `things`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`helper` is private to `things`; write `things::private::helper` to use it anyway", analyzer.failure.?.message);
 }
 
 test "expectReachable: rejects a private function of another module reached by import" {
@@ -16163,7 +16251,7 @@ test "expectReachable: rejects a private function of another module reached by i
     try std.testing.expectError(error.PrivateDeclaration, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`helper` is private to `things`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`helper` is private to `things`; write `import things::private::helper` to use it anyway", analyzer.failure.?.message);
 }
 
 test "expectReachable: rejects a private struct of another module named in a type" {
@@ -16185,7 +16273,7 @@ test "expectReachable: rejects a private struct of another module named in a typ
     try std.testing.expectError(error.PrivateDeclaration, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 17 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`Slot` is private to `things`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`Slot` is private to `things`; write `things::private::Slot` to use it anyway", analyzer.failure.?.message);
 }
 
 test "expectReachable: rejects a private constant of another module" {
@@ -16207,7 +16295,7 @@ test "expectReachable: rejects a private constant of another module" {
     try std.testing.expectError(error.PrivateDeclaration, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 9 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`sides` is private to `things`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`sides` is private to `things`; write `things::private::sides` to use it anyway", analyzer.failure.?.message);
 }
 
 test "expectReachable: rejects a private type nested in a struct of another module" {
@@ -16229,7 +16317,7 @@ test "expectReachable: rejects a private type nested in a struct of another modu
     try std.testing.expectError(error.PrivateDeclaration, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 19 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`Box::Inner` is private to `things`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`Box::Inner` is private to `things`; write `things::Box::private::Inner` to use it anyway", analyzer.failure.?.message);
 }
 
 test "expectReachable: allows private declarations in their own module, in nested blocks and in a struct without a name" {
@@ -16244,6 +16332,82 @@ test "expectReachable: allows private declarations in their own module, in neste
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "private const base: u8 = 1\n\n\nprivate fn helper() -> u8 = base\n\n\nstruct Box\n    value: u8\n\n    fn make() -> Box = { value = Inner{ width = helper() }.width }\n\n    private struct Inner\n        width: u8\n\n\nfn Wrapper(type T) -> type\n    return struct\n        value: T\n\n        fn make(value: T) -> Self = { value = value }\n\n        private fn get(self: Self) -> T = self.value\n\n\nfn open() -> u8\n    if (true) return helper() + Box::make().value + Wrapper(u8)::make(1).value\n    return 0\n" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    _ = things::open()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "expectReachable: allows a private function, constant and type of another module after private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "private fn helper() -> u8 = 1\n\n\nprivate const sides: u8 = 4\n\n\nprivate struct Slot\n    value: u8\n\n\nfn open() -> u8 = helper() + sides + Slot{ value = 1 }.value\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const slot: things::private::Slot = { value = things::private::sides }\n    _ = things::private::helper() + slot.value\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "expectReachable: allows a name imported after private to be used plainly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "private fn helper() -> u8 = 1\n\n\nprivate const sides: u8 = 4\n\n\nprivate struct Slot\n    value: u8\n\n\nfn open() -> u8 = helper() + sides + Slot{ value = 1 }.value\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things::private::helper\nimport things::private::Slot\n\nfn main\n    const slot: Slot = { value = helper() }\n    _ = slot.value\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "expectReachable: allows a private type nested in a struct of another module after private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "struct Box\n    value: u8\n\n    private struct Inner\n        width: u8\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const inner = things::Box::private::Inner{ width = 1 }\n    _ = inner.width\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "expectReachable: allows a private type of another module as a type argument after private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "private struct Slot\n    value: u8\n\n\nfn Box(type T) -> type\n    return struct\n        item: T\n\n\nfn open() -> u8 = Slot{ value = 1 }.value\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const box: things::Box(things::private::Slot) = { item = { value = 1 } }\n    _ = box.item.value\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -16270,7 +16434,67 @@ test "expectReachableFunction: rejects a private function in a struct's block of
     try std.testing.expectError(error.PrivateDeclaration, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 17 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`Box::make` is private to `things`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`Box::make` is private to `things`; write `things::Box::private::make` to use it anyway", analyzer.failure.?.message);
+}
+
+test "expectReachableFunction: allows a private function in a struct's block of another module after private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "struct Box\n    value: u8\n\n    private fn make() -> Box = { value = 1 }\n\n\n    fn open() -> Box = Self::make()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const box = things::Box::private::make()\n    _ = box.value\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "expectReachableFunction: allows a function of a private type of another module after private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "private struct Hidden\n    count: u8\n\n    fn make() -> Hidden = { count = 1 }\n\n\nfn open() -> u8 = Hidden::make().count\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const hidden = things::private::Hidden::make()\n    _ = hidden.count\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "expectReachableFunction: does not cover a second private name with one private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "private struct Hidden\n    count: u8\n\n    private fn make() -> Hidden = { count = 1 }\n\n\nfn open() -> u8 = Hidden::make().count\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const hidden = things::private::Hidden::make()\n    _ = hidden.count\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.PrivateDeclaration, analyzer.analyze());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 20 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`Hidden::make` is private to `things`; write `things::private::Hidden::private::make` to use it anyway", analyzer.failure.?.message);
 }
 
 test "expectReachableFunction: rejects a private function of a struct without a name of another module" {
@@ -16292,7 +16516,26 @@ test "expectReachableFunction: rejects a private function of a struct without a 
     try std.testing.expectError(error.PrivateDeclaration, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 21 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`Wrapper(u8)::make` is private to `things`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`Wrapper(u8)::make` is private to `things`; write `Wrapper(u8)::private::make` to use it anyway", analyzer.failure.?.message);
+}
+
+test "expectReachableFunction: allows a private function of a struct without a name of another module after private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "fn Wrapper(type T) -> type\n    return struct\n        value: T\n\n        private fn make(value: T) -> Self = { value = value }\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const wrapper = things::Wrapper(u8)::private::make(1)\n    _ = wrapper.value\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
 }
 
 test "expectReachableTypeclassFunction: rejects a private function of a typeclass of another module reached by path" {
@@ -16314,7 +16557,134 @@ test "expectReachableTypeclassFunction: rejects a private function of a typeclas
     try std.testing.expectError(error.PrivateDeclaration, analyzer.analyze());
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 9 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`Shape::area` is private to `things`", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`Shape::area` is private to `things`; write `Shape::private::area` to use it anyway", analyzer.failure.?.message);
+}
+
+test "expectReachableTypeclassFunction: allows a private function of a typeclass of another module after private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "typeclass Shape(type T)\n\n    private fn area(value: T) -> u8\n    fn name(value: T) -> u8\n\n\ninstance Shape(u8)\n\n    fn area(value: u8) -> u8 = value\n    fn name(value: u8) -> u8 = value\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things::Shape\n\nfn main\n    _ = Shape::private::area(1u8) + Shape(u8)::private::area(2)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "isRefused: rejects private before a name that is not private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "fn open() -> u8 = 1\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    _ = things::private::open()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeedlessPrivate, analyzer.analyze());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 9 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`open` is not private, so `private` before it crosses nothing; remove the word", analyzer.failure.?.message);
+}
+
+test "isRefused: rejects private before a private name of the module itself" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "private fn helper() -> u8 = 1\n\nfn main\n    _ = module::private::helper()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeedlessPrivate, analyzer.analyze());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 9 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`helper` is private to this module, which uses it without `private`; remove the word", analyzer.failure.?.message);
+}
+
+test "isRefused: rejects private before an imported name that is not private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "fn open() -> u8 = 1\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things::private::open\n\nfn main\n    _ = open()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeedlessPrivate, analyzer.analyze());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`open` is not private, so `private` before it crosses nothing; remove the word", analyzer.failure.?.message);
+}
+
+test "expectNotCrossed: rejects private before a case" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "enum Mode\n    Read\n    Write\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const mode = things::Mode::private::Read\n    _ = mode\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeedlessPrivate, analyzer.analyze());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 18 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`Read` is not private, so `private` before it crosses nothing; remove the word", analyzer.failure.?.message);
+}
+
+test "expectNotCrossed: rejects private before a built-in function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\n\nfn main\n    _ = mn::private::size(u8)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeedlessPrivate, analyzer.analyze());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 9 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`size` is not private, so `private` before it crosses nothing; remove the word", analyzer.failure.?.message);
 }
 
 test "loadRoot: loads a program module named monolith like any other" {
