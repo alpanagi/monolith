@@ -53,8 +53,10 @@ static int32_t mn_runtime_filesystem_error_code(int number) {
     case ENFILE:
     case ENOMEM:
         return -7;
-    default:
+    case EEXIST:
         return -8;
+    default:
+        return -9;
     }
 }
 
@@ -66,10 +68,6 @@ static int32_t mn_runtime_filesystem_mode_kind(mode_t mode) {
 }
 
 static int mn_runtime_filesystem_open_at(int base, mn_slice_u8 name, int flags, mode_t creation_mode) {
-    if (memchr(name.items, 0, name.length - 1) != NULL) {
-        errno = ENOENT;
-        return -1;
-    }
     int descriptor;
     do {
         descriptor = openat(base, (char const *)name.items, flags | O_CLOEXEC, creation_mode);
@@ -95,14 +93,12 @@ int32_t mn_runtime_filesystem_open(mn_slice_u8 name, int32_t mode) {
 }
 
 int32_t mn_runtime_filesystem_absolute(mn_slice_u8 name, mn_slice_u8 buffer) {
-    if (memchr(name.items, 0, name.length - 1) != NULL) return mn_runtime_filesystem_error_code(ENOENT);
     char const *resolved = realpath((char const *)name.items, (char *)buffer.items);
     if (resolved == NULL) return mn_runtime_filesystem_error_code(errno);
     return (int32_t)strlen(resolved);
 }
 
 int32_t mn_runtime_filesystem_metadata(mn_slice_u8 name, int32_t *kind, size_t *size, int64_t *seconds, uint32_t *nanoseconds) {
-    if (memchr(name.items, 0, name.length - 1) != NULL) return mn_runtime_filesystem_error_code(ENOENT);
     struct stat status;
     if (stat((char const *)name.items, &status) != 0) return mn_runtime_filesystem_error_code(errno);
     *kind = mn_runtime_filesystem_mode_kind(status.st_mode);
@@ -176,4 +172,9 @@ int32_t mn_runtime_filesystem_next_entry(void *handle, mn_mn_filesystem_9Directo
 
 void mn_runtime_filesystem_close_directory(void *handle) {
     closedir(handle);
+}
+
+int32_t mn_runtime_filesystem_create_directory(mn_slice_u8 name) {
+    if (mkdir((char const *)name.items, 0777) != 0) return mn_runtime_filesystem_error_code(errno);
+    return 0;
 }

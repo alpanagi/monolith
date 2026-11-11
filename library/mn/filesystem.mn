@@ -19,6 +19,7 @@ private external fn mn_runtime_filesystem_absolute(name: []const(u8), buffer: []
 
 private external fn mn_runtime_filesystem_close(descriptor: i32)
 private external fn mn_runtime_filesystem_close_directory(handle: *void)
+private external fn mn_runtime_filesystem_create_directory(name: []const(u8)) -> i32
 private external fn mn_runtime_filesystem_metadata(name: []const(u8), kind: *i32, size: *usize, seconds: *i64, nanoseconds: *u32) -> i32
 private external fn mn_runtime_filesystem_next_entry(handle: *void, entry: *Directory::RawEntry) -> i32
 private external fn mn_runtime_filesystem_open(name: []const(u8), mode: i32) -> i32
@@ -32,6 +33,7 @@ private const separator: u8 = '/'
 
 
 error Error
+    AlreadyExists
     BrokenPipe
     DeviceFailure
     IsDirectory
@@ -99,6 +101,7 @@ fn find_error(code: i32) -> Error = match code
     case (-5) Error::NotFound
     case (-6) Error::PermissionDenied
     case (-7) Error::SystemLimit
+    case (-8) Error::AlreadyExists
     else Error::SystemFailure
 
 
@@ -275,6 +278,12 @@ fn metadata(path: Path) -> Error!Metadata
     return { kind = find_kind(kind), size = size, modified_time = modified }
 
 
+fn exists(path: Path) -> Error!bool = match metadata(path)
+    case (Metadata) true
+    case (NotFound) false
+    else (_ as rest) rest
+
+
 fn read(path: Path) -> own ![]u8
     const file = try File::open(path)
     defer file.close()
@@ -299,3 +308,37 @@ fn write(path: Path, bytes: []const(u8)) -> !void
     const file = try File::open(path, { mode = ::Write })
     defer file.close()
     try file.write(bytes)
+
+
+fn create_directory(path: Path, options: CreateDirectoryOptions = {}) -> Error!void
+    var name: [maximum_path_length]u8 = undefined
+    const filled = try fill_name(path, &name)
+    if options.should_create_parents
+        for index in 0..path.bytes.length
+            if index > 0 and name[index] == separator and name[index - 1] != separator
+                name[index] = 0
+                const created = create_single_directory(name[..index + 1])
+                name[index] = separator
+                try match created
+                    case (AlreadyExists) noop
+                    else (_ as rest) rest
+    try create_single_directory(filled)
+
+
+struct CreateDirectoryOptions
+    should_create_parents: bool = false
+
+
+private fn create_single_directory(name: []const(u8)) -> Error!void
+    const code = mn_runtime_filesystem_create_directory(name)
+    if (code == 0 or is_directory(name)) return
+    return find_error(code)
+
+
+private fn is_directory(name: []const(u8)) -> bool
+    var kind: i32 = 0
+    var size: usize = 0
+    var seconds: i64 = 0
+    var nanoseconds: u32 = 0
+    const code = mn_runtime_filesystem_metadata(name, &kind, &size, &seconds, &nanoseconds)
+    return code == 0 and find_kind(kind) == File::Kind::Directory
