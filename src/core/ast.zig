@@ -18,6 +18,7 @@ pub const Program = struct {
 pub const SkippedDefer = struct {
     statement: *const Statement,
     exit: *const Expression,
+    sources: []const *const Expression = &.{},
 };
 
 pub const Module = struct {

@@ -56,6 +56,7 @@ pub const TypeChecker = struct {
     move_frames: std.ArrayList(MoveFrame) = .empty,
     move_loops: std.ArrayList(MoveLoop) = .empty,
     move_deferring: bool = false,
+    move_skipped: ?*std.ArrayList(*const ast.Statement) = null,
     own_trusted: bool = false,
     skipped_defers: std.ArrayList(ast.SkippedDefer) = .empty,
     failed_function: ?ast.Resolution.Function = null,
@@ -543,7 +544,7 @@ pub const TypeChecker = struct {
             });
         }
         var state: MoveState = .{};
-        _ = try self.checkMoveBlock(definition.body, &state, null, owners.items);
+        _ = try self.checkMoveBlock(definition.body, &state, null, owners.items, null);
     }
 
     fn checkMoveBlock(
@@ -552,13 +553,17 @@ pub const TypeChecker = struct {
         state: *MoveState,
         loop: ?*const ast.Statement,
         owners: []const Owner,
+        fallible: ?Fallible,
     ) TypeError!bool {
         const allocator = self.arena.allocator();
         try self.move_frames.append(allocator, .{ .loop = loop });
         try self.move_frames.items[self.move_frames.items.len - 1].owners.appendSlice(allocator, owners);
         var reachable = true;
-        for (statements) |*statement| {
-            reachable = try self.checkMoveStatement(statement, state);
+        for (statements, 0..) |*statement, index| {
+            reachable = if (fallible != null and index == statements.len - 1)
+                try self.checkMoveTail(statement, state, fallible.?)
+            else
+                try self.checkMoveStatement(statement, state);
             if (!reachable) break;
         }
         const kind: MoveExit.Kind = if (self.move_frames.items.len == 1) .function_end else .block_end;
@@ -576,10 +581,10 @@ pub const TypeChecker = struct {
                     try self.checkMoveExits(0, false, state, .{ .kind = .@"return", .location = statement.location });
                     return false;
                 };
-                if (self.returnsFallibleCall(value.*)) {
-                    var before = try state.clone(allocator);
-                    try self.checkMoveFallible(value, state, &before);
-                    try self.checkMoveExits(0, true, &before, .{ .kind = .@"return", .location = statement.location, .exit = value });
+                if (self.returnsFallibleValue(value.*)) {
+                    var paths: std.ArrayList(FailingPath) = .empty;
+                    try self.checkMoveFallible(value, state, .{ .paths = &paths, .operator = .@"try" });
+                    try self.checkMoveFailures(paths.items, .{ .kind = .@"return", .location = statement.location, .exit = value });
                 } else try self.checkMoveExpression(value, state);
                 if (self.signature.?.return_own and try self.isOwnPlace(value.*)) try self.moveName(value, state);
                 const exit: MoveExit = .{ .kind = .@"return", .location = statement.location, .exit = value };
@@ -639,39 +644,8 @@ pub const TypeChecker = struct {
                 try self.emptyWrittenParts(state, place, assignment.value);
                 return true;
             },
-            .@"if" => |*conditional| {
-                try self.checkMoveCondition(statement, state);
-                const owners = try self.buildElementOwners(statement, conditional.own, 0, conditional.names.len);
-                if (conditional.known) |known| {
-                    if (known) return self.checkMoveBlock(conditional.body, state, null, owners);
-                    const chosen = conditional.else_body orelse return true;
-                    return self.checkMoveBlock(chosen, state, null, &.{});
-                }
-                var other = try state.clone(allocator);
-                const body_reaches = try self.checkMoveBlock(conditional.body, state, null, owners);
-                const else_reaches = if (conditional.else_body) |body| try self.checkMoveBlock(body, &other, null, &.{}) else true;
-                return self.mergeMoveStates(state, body_reaches, &other, else_reaches);
-            },
-            .match => |*matching| {
-                try self.checkMoveExpression(&matching.value, state);
-                if (matching.moved) try self.moveName(&matching.value, state);
-                const start = try state.clone(allocator);
-                var merged: MoveState = .{ .reached = false };
-                var reaches = false;
-                for (matching.branches) |branch| {
-                    var branch_state = try start.clone(allocator);
-                    for (branch.first_name..branch.first_name + branch.name_count) |position| {
-                        branch_state.restore(.{ .root = .{ .element = .{ .statement = statement, .position = position } } });
-                    }
-                    const owners = try self.buildElementOwners(statement, branch.own, branch.first_name, branch.name_count);
-                    if (try self.checkMoveBlock(branch.body, &branch_state, null, owners)) {
-                        try merged.join(allocator, &branch_state);
-                        reaches = true;
-                    }
-                }
-                state.* = merged;
-                return reaches;
-            },
+            .@"if" => return self.checkMoveIf(statement, state, null),
+            .match => return self.checkMoveMatch(statement, state, null),
             .@"while" => |*loop| {
                 const owners = try self.buildElementOwners(statement, loop.own, 0, loop.names.len);
                 try self.checkMoveLoop(statement, true, loop.body, loop.else_body, owners, state);
@@ -706,6 +680,58 @@ pub const TypeChecker = struct {
                 }
                 return false;
             },
+        }
+    }
+
+    fn checkMoveIf(self: *TypeChecker, statement: *const ast.Statement, state: *MoveState, fallible: ?Fallible) TypeError!bool {
+        const conditional = &statement.kind.@"if";
+        try self.checkMoveCondition(statement, state);
+        const owners = try self.buildElementOwners(statement, conditional.own, 0, conditional.names.len);
+        if (conditional.known) |known| {
+            if (known) return self.checkMoveBlock(conditional.body, state, null, owners, fallible);
+            const chosen = conditional.else_body orelse return true;
+            return self.checkMoveBlock(chosen, state, null, &.{}, fallible);
+        }
+        var other = try state.clone(self.arena.allocator());
+        const body_reaches = try self.checkMoveBlock(conditional.body, state, null, owners, fallible);
+        const else_reaches = if (conditional.else_body) |body| try self.checkMoveBlock(body, &other, null, &.{}, fallible) else true;
+        return self.mergeMoveStates(state, body_reaches, &other, else_reaches);
+    }
+
+    fn checkMoveMatch(self: *TypeChecker, statement: *const ast.Statement, state: *MoveState, fallible: ?Fallible) TypeError!bool {
+        const allocator = self.arena.allocator();
+        const matching = &statement.kind.match;
+        try self.checkMoveExpression(&matching.value, state);
+        if (matching.moved) try self.moveName(&matching.value, state);
+        const start = try state.clone(allocator);
+        var merged: MoveState = .{ .reached = false };
+        var reaches = false;
+        for (matching.branches) |branch| {
+            var branch_state = try start.clone(allocator);
+            for (branch.first_name..branch.first_name + branch.name_count) |position| {
+                branch_state.restore(.{ .root = .{ .element = .{ .statement = statement, .position = position } } });
+            }
+            const owners = try self.buildElementOwners(statement, branch.own, branch.first_name, branch.name_count);
+            if (try self.checkMoveBlock(branch.body, &branch_state, null, owners, fallible)) {
+                try merged.join(allocator, &branch_state);
+                reaches = true;
+            }
+        }
+        state.* = merged;
+        return reaches;
+    }
+
+    fn checkMoveTail(self: *TypeChecker, statement: *const ast.Statement, state: *MoveState, fallible: Fallible) TypeError!bool {
+        switch (statement.kind) {
+            .value => |*expression| {
+                if (!canFail(expression.*, fallible.operator)) return self.checkMoveStatement(statement, state);
+                try self.checkMoveFallible(expression, state, fallible);
+                if (expression.handed) try self.moveName(expression, state);
+                return true;
+            },
+            .@"if" => return self.checkMoveIf(statement, state, fallible),
+            .match => return self.checkMoveMatch(statement, state, fallible),
+            else => return self.checkMoveStatement(statement, state),
         }
     }
 
@@ -765,7 +791,7 @@ pub const TypeChecker = struct {
             var iteration = try entry.clone(allocator);
             if (conditional) try self.checkMoveCondition(statement, &iteration);
             try self.move_loops.append(allocator, .{ .statement = statement });
-            const reaches = try self.checkMoveBlock(body, &iteration, statement, owners);
+            const reaches = try self.checkMoveBlock(body, &iteration, statement, owners, null);
             const context = self.move_loops.pop().?;
             breaks = context.breaks;
             var ends = context.ends;
@@ -776,7 +802,7 @@ pub const TypeChecker = struct {
         if (conditional) try self.checkMoveCondition(statement, &entry);
         if (isEndless(statement.*)) entry = .{ .reached = false };
         if (else_body) |block| {
-            if (!try self.checkMoveBlock(block, &entry, null, &.{})) entry = .{ .reached = false };
+            if (!try self.checkMoveBlock(block, &entry, null, &.{}, null)) entry = .{ .reached = false };
         }
         try entry.join(allocator, &breaks);
         state.* = entry;
@@ -826,7 +852,9 @@ pub const TypeChecker = struct {
                 if (deferred[position].on_error) {
                     if (!failing) continue;
                     if (try self.isDeferredHandedOver(deferred[position].statement, &exit_state)) {
-                        try self.recordSkippedDefer(deferred[position].statement, exit.exit);
+                        if (self.move_skipped) |skipped| {
+                            try skipped.append(self.arena.allocator(), deferred[position].statement);
+                        } else try self.recordSkippedDefer(deferred[position].statement, exit.exit, &.{});
                         continue;
                     }
                 }
@@ -847,12 +875,46 @@ pub const TypeChecker = struct {
         return false;
     }
 
-    fn recordSkippedDefer(self: *TypeChecker, statement: *const ast.Statement, exit: ?*const ast.Expression) TypeError!void {
+    fn expectAgreedErrorDefers(self: *TypeChecker, expression: *const ast.Expression, paths: []const FailingPath) TypeError!void {
+        const allocator = self.arena.allocator();
+        for (self.move_frames.items) |frame| {
+            for (frame.deferred.items) |deferred| {
+                if (!deferred.on_error) continue;
+                var moved: std.ArrayList(*const ast.Expression) = .empty;
+                try ast.collectStatementMoves(allocator, deferred.statement, &moved);
+                for (moved.items) |moved_expression| {
+                    const target = if (moved_expression.kind == .address_of) moved_expression.kind.address_of.* else moved_expression.*;
+                    const place = try self.findPlace(target) orelse continue;
+                    var handed = false;
+                    var held = false;
+                    for (paths) |path| {
+                        if (path.state.isConsumed(place)) {
+                            handed = true;
+                        } else held = true;
+                    }
+                    if (!handed or !held) continue;
+                    const failure = self.fail(expression.kind.binary.operator_location, error.OwnNotConsumed);
+                    const text = try renderPlace(allocator, self.findRootName(place.root), place);
+                    const operator = if (expression.kind.binary.operator == .@"catch") "catch" else "orelse";
+                    const format = "`{s}` is handed on with own in some branches that reach this {s} and still held in others, so its errdefer would both run and not run there; hand `{s}` on the same way in every branch that reaches the {s}, or before the if or match";
+                    self.failure.?.message = try std.fmt.allocPrint(allocator, format, .{ text, operator, text, operator });
+                    return failure;
+                }
+            }
+        }
+    }
+
+    fn recordSkippedDefer(
+        self: *TypeChecker,
+        statement: *const ast.Statement,
+        exit: ?*const ast.Expression,
+        sources: []const *const ast.Expression,
+    ) TypeError!void {
         const expression = exit orelse return;
         for (self.skipped_defers.items) |skipped| {
             if (skipped.statement == statement and skipped.exit == expression) return;
         }
-        try self.skipped_defers.append(self.arena.allocator(), .{ .statement = statement, .exit = expression });
+        try self.skipped_defers.append(self.arena.allocator(), .{ .statement = statement, .exit = expression, .sources = sources });
     }
 
     fn expectHeldParameter(self: *TypeChecker, owner: Owner, state: *const MoveState, exit: MoveExit) TypeError!void {
@@ -1004,11 +1066,14 @@ pub const TypeChecker = struct {
                 if (range.end) |*end| try self.checkMoveExpression(end, state);
             },
             .@"try" => |operand| {
-                var before = try state.clone(allocator);
-                try self.checkMoveFallible(operand, state, &before);
-                try self.checkMoveExits(0, true, &before, .{ .kind = .failure, .location = expression.location, .exit = expression });
+                var paths: std.ArrayList(FailingPath) = .empty;
+                try self.checkMoveFallible(operand, state, .{ .paths = &paths, .operator = .@"try" });
+                try self.checkMoveFailures(paths.items, .{ .kind = .failure, .location = expression.location, .exit = expression });
             },
             .binary => |binary| {
+                if (binary.left.kind == .branching and (binary.operator == .@"catch" or binary.operator == .@"orelse")) {
+                    return self.checkMoveCaught(expression, state);
+                }
                 try self.checkMoveExpression(binary.left, state);
                 if (!isShortCircuitOperator(binary.operator)) return self.checkMoveExpression(binary.right, state);
                 var other = try state.clone(allocator);
@@ -1036,8 +1101,16 @@ pub const TypeChecker = struct {
         }
     }
 
-    fn checkMoveFallible(self: *TypeChecker, expression: *const ast.Expression, state: *MoveState, before: *MoveState) TypeError!void {
+    fn checkMoveFallible(self: *TypeChecker, expression: *const ast.Expression, state: *MoveState, fallible: Fallible) TypeError!void {
         const allocator = self.arena.allocator();
+        if (expression.kind == .branching) {
+            _ = try self.checkMoveTail(expression.kind.branching, state, fallible);
+            return;
+        }
+        if (fallible.operator != .@"try") {
+            try self.checkMoveExpression(expression, state);
+            return fallible.paths.append(allocator, .{ .state = try state.clone(allocator), .source = expression });
+        }
         const arguments, const with_value = switch (expression.kind) {
             .call => |*call| arguments: {
                 if (call.callee == .member) try self.checkMoveExpression(call.callee.member.owner, state);
@@ -1048,20 +1121,58 @@ pub const TypeChecker = struct {
                 break :arguments .{ call.arguments, call.with_value };
             },
             else => {
-                before.* = try state.clone(allocator);
+                try fallible.paths.append(allocator, .{ .state = try state.clone(allocator), .source = expression });
                 return self.checkMoveExpression(expression, state);
             },
         };
         for (arguments) |*argument| try self.checkMoveExpression(&argument.value, state);
         if (with_value) |value| try self.checkMoveExpression(value, state);
-        before.* = try state.clone(allocator);
+        try fallible.paths.append(allocator, .{ .state = try state.clone(allocator), .source = expression });
         for (arguments) |*argument| {
             if (argument.own) try self.moveName(&argument.value, state);
         }
     }
 
-    fn returnsFallibleCall(self: *const TypeChecker, value: ast.Expression) bool {
-        if (value.kind != .call and value.kind != .method_call) return false;
+    fn checkMoveFailures(self: *TypeChecker, paths: []const FailingPath, exit: MoveExit) TypeError!void {
+        const allocator = self.arena.allocator();
+        const skipped = try allocator.alloc(std.ArrayList(*const ast.Statement), paths.len);
+        const outer = self.move_skipped;
+        defer self.move_skipped = outer;
+        for (paths, skipped) |*path, *path_skipped| {
+            path_skipped.* = .empty;
+            self.move_skipped = path_skipped;
+            try self.checkMoveExits(0, true, &path.state, exit);
+        }
+        self.move_skipped = outer;
+        for (skipped, 0..) |path_skipped, index| {
+            for (path_skipped.items) |statement| {
+                if (anyContainsStatement(skipped[0..index], statement)) continue;
+                var sources: std.ArrayList(*const ast.Expression) = .empty;
+                for (paths, skipped) |path, other_skipped| {
+                    if (containsStatement(other_skipped.items, statement)) try sources.append(allocator, path.source);
+                }
+                const conditional = if (sources.items.len == paths.len) &.{} else sources.items;
+                try self.recordSkippedDefer(statement, exit.exit, conditional);
+            }
+        }
+    }
+
+    fn checkMoveCaught(self: *TypeChecker, expression: *const ast.Expression, state: *MoveState) TypeError!void {
+        const allocator = self.arena.allocator();
+        const binary = expression.kind.binary;
+        var paths: std.ArrayList(FailingPath) = .empty;
+        const operator: Fallible.Operator = if (binary.operator == .@"catch") .@"catch" else .@"orelse";
+        try self.checkMoveFallible(binary.left, state, .{ .paths = &paths, .operator = operator });
+        try self.expectAgreedErrorDefers(expression, paths.items);
+        var other: MoveState = .{ .reached = false };
+        for (paths.items) |*path| try other.join(allocator, &path.state);
+        try self.checkMoveExpression(binary.right, &other);
+        if (binary.right.kind == .jump) return;
+        try state.join(allocator, &other);
+    }
+
+    fn returnsFallibleValue(self: *const TypeChecker, value: ast.Expression) bool {
+        if (value.kind != .call and value.kind != .method_call and value.kind != .branching) return false;
         const value_type = value.type orelse return false;
         return value_type == .result and canHoldError(ast.extractType(self.signature.?.return_type));
     }
@@ -6839,6 +6950,22 @@ const MoveLoop = struct {
     breaks: MoveState = .{ .reached = false },
 };
 
+const Fallible = struct {
+    paths: *std.ArrayList(FailingPath),
+    operator: Operator,
+
+    const Operator = enum {
+        @"try",
+        @"catch",
+        @"orelse",
+    };
+};
+
+const FailingPath = struct {
+    state: MoveState,
+    source: *const ast.Expression,
+};
+
 fn isOwnPointerParameter(parameter: ast.TypedName) bool {
     if (!parameter.own) return false;
     return parameter.type.kind == .pointer_type and !parameter.type.kind.pointer_type.many;
@@ -6881,6 +7008,27 @@ fn findCasePart(value_type: types.Type, case: ast.BranchCase) ?usize {
 fn isErrorValue(expression: ast.Expression) bool {
     const value_type = expression.type orelse return false;
     return value_type == .@"enum" and value_type.@"enum".kind == .error_set;
+}
+
+fn canFail(expression: ast.Expression, operator: Fallible.Operator) bool {
+    if (operator == .@"orelse" and expression.kind == .null) return true;
+    const value_type = expression.type orelse return true;
+    if (operator == .@"orelse") return value_type == .optional;
+    return value_type == .result or isErrorValue(expression);
+}
+
+fn containsStatement(statements: []const *const ast.Statement, statement: *const ast.Statement) bool {
+    for (statements) |candidate| {
+        if (candidate == statement) return true;
+    }
+    return false;
+}
+
+fn anyContainsStatement(lists: []const std.ArrayList(*const ast.Statement), statement: *const ast.Statement) bool {
+    for (lists) |list| {
+        if (containsStatement(list.items, statement)) return true;
+    }
+    return false;
 }
 
 fn isBranchingValue(expression: ast.Expression) bool {
@@ -13407,6 +13555,196 @@ test "isDeferredHandedOver: skips an errdefer whose name is handed on before a l
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     _ = try analyzer.analyze();
+}
+
+test "checkMoveFallible: accepts a tried match whose branches that can fail have handed on a name declared own" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nenum Choice\n    One\n    Two\n\nfn count(size: usize, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    return size\n\nfn take(own bytes: []u8, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    const length = bytes.length\n    memory::free(own bytes)\n    return length\n\nfn find(own bytes: []u8, present: bool) -> ?usize\n    const length = bytes.length\n    memory::free(own bytes)\n    if (present) return length\n    return null\n\nfn absent(present: bool) -> ?usize\n    if (present) return 1\n    return null\n\nfn load(choice: Choice) -> own memory::Error![]u8\n    const own one = try memory::allocate(u8, 1)\n    const own bytes = try match choice\n        case (One) own one\n        case Two\n            memory::free(own one)\n            memory::allocate(u8, 2)\n    return bytes\n\nfn main -> !void\n    with memory::Heap\n    const own bytes = try load(Choice::One)\n    memory::free(own bytes)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "checkMoveFailures: rejects a name handed on in one branch of a tried match and held in another that can fail, where the try fails" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nenum Choice\n    One\n    Two\n\nfn count(size: usize, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    return size\n\nfn take(own bytes: []u8, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    const length = bytes.length\n    memory::free(own bytes)\n    return length\n\nfn find(own bytes: []u8, present: bool) -> ?usize\n    const length = bytes.length\n    memory::free(own bytes)\n    if (present) return length\n    return null\n\nfn absent(present: bool) -> ?usize\n    if (present) return 1\n    return null\n\nfn load(choice: Choice, fails: bool) -> memory::Error!usize\n    const own one = try memory::allocate(u8, 1)\n    const size = try match choice\n        case One\n            memory::free(own one)\n            count(1, fails)\n        case Two\n            take(own one, fails)\n    return size\n\nfn main -> !void\n    with memory::Heap\n    _ = try load(Choice::One, false)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.OwnNotConsumed, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 29, .column = 18 }, analyzer.failure.?.location.?);
+    try std.testing.expect(std.mem.indexOf(u8, analyzer.failure.?.message, "`one` still holds what it owns where this try fails") != null);
+}
+
+test "checkMoveFailures: accepts an errdefer for a name handed on in one branch of a tried match and held in another that can fail" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nenum Choice\n    One\n    Two\n\nfn count(size: usize, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    return size\n\nfn take(own bytes: []u8, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    const length = bytes.length\n    memory::free(own bytes)\n    return length\n\nfn find(own bytes: []u8, present: bool) -> ?usize\n    const length = bytes.length\n    memory::free(own bytes)\n    if (present) return length\n    return null\n\nfn absent(present: bool) -> ?usize\n    if (present) return 1\n    return null\n\nfn load(choice: Choice, fails: bool) -> memory::Error!usize\n    const own one = try memory::allocate(u8, 1)\n    errdefer memory::free(own one)\n    const size = try match choice\n        case One\n            memory::free(own one)\n            count(1, fails)\n        case Two\n            take(own one, fails)\n    return size\n\nfn main -> !void\n    with memory::Heap\n    _ = try load(Choice::One, false)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "checkMoveFailures: accepts an errdefer for a name handed on in one branch of a returned match and held in another that can fail" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nenum Choice\n    One\n    Two\n\nfn count(size: usize, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    return size\n\nfn take(own bytes: []u8, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    const length = bytes.length\n    memory::free(own bytes)\n    return length\n\nfn find(own bytes: []u8, present: bool) -> ?usize\n    const length = bytes.length\n    memory::free(own bytes)\n    if (present) return length\n    return null\n\nfn absent(present: bool) -> ?usize\n    if (present) return 1\n    return null\n\nfn load(choice: Choice, fails: bool) -> memory::Error!usize\n    const own one = try memory::allocate(u8, 1)\n    errdefer memory::free(own one)\n    return match choice\n        case One\n            memory::free(own one)\n            count(1, fails)\n        case Two\n            take(own one, fails)\n\nfn main -> !void\n    with memory::Heap\n    _ = try load(Choice::One, false)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "checkMoveFailures: rejects a name handed on in one branch of a returned match and held in another that can fail, at the return" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nenum Choice\n    One\n    Two\n\nfn count(size: usize, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    return size\n\nfn take(own bytes: []u8, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    const length = bytes.length\n    memory::free(own bytes)\n    return length\n\nfn find(own bytes: []u8, present: bool) -> ?usize\n    const length = bytes.length\n    memory::free(own bytes)\n    if (present) return length\n    return null\n\nfn absent(present: bool) -> ?usize\n    if (present) return 1\n    return null\n\nfn load(choice: Choice, fails: bool) -> memory::Error!usize\n    const own one = try memory::allocate(u8, 1)\n    return match choice\n        case One\n            memory::free(own one)\n            count(1, fails)\n        case Two\n            take(own one, fails)\n\nfn main -> !void\n    with memory::Heap\n    _ = try load(Choice::One, false)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.OwnNotConsumed, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 29, .column = 5 }, analyzer.failure.?.location.?);
+    try std.testing.expect(std.mem.indexOf(u8, analyzer.failure.?.message, "`one` still holds what it owns at this return") != null);
+}
+
+test "checkMoveTail: accepts an if nested in a branch of a tried match that hands a name on in one of its branches" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nenum Choice\n    One\n    Two\n\nfn count(size: usize, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    return size\n\nfn take(own bytes: []u8, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    const length = bytes.length\n    memory::free(own bytes)\n    return length\n\nfn find(own bytes: []u8, present: bool) -> ?usize\n    const length = bytes.length\n    memory::free(own bytes)\n    if (present) return length\n    return null\n\nfn absent(present: bool) -> ?usize\n    if (present) return 1\n    return null\n\nfn load(choice: Choice, flag: bool, fails: bool) -> memory::Error!usize\n    const own one = try memory::allocate(u8, 1)\n    errdefer memory::free(own one)\n    const size = try match choice\n        case One\n            if flag\n                memory::free(own one)\n                count(1, fails)\n            else\n                take(own one, fails)\n        case Two\n            take(own one, fails)\n    return size\n\nfn main -> !void\n    with memory::Heap\n    _ = try load(Choice::One, true, false)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "checkMoveTail: rejects a name held in a branch of an if nested in a tried match, where the try fails" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nenum Choice\n    One\n    Two\n\nfn count(size: usize, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    return size\n\nfn take(own bytes: []u8, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    const length = bytes.length\n    memory::free(own bytes)\n    return length\n\nfn find(own bytes: []u8, present: bool) -> ?usize\n    const length = bytes.length\n    memory::free(own bytes)\n    if (present) return length\n    return null\n\nfn absent(present: bool) -> ?usize\n    if (present) return 1\n    return null\n\nfn load(choice: Choice, flag: bool, fails: bool) -> memory::Error!usize\n    const own one = try memory::allocate(u8, 1)\n    const size = try match choice\n        case One\n            if flag\n                memory::free(own one)\n                count(1, fails)\n            else\n                count(2, fails)\n        case Two\n            take(own one, fails)\n    return size\n\nfn main -> !void\n    with memory::Heap\n    _ = try load(Choice::One, true, false)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.OwnNotConsumed, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 29, .column = 18 }, analyzer.failure.?.location.?);
+    try std.testing.expect(std.mem.indexOf(u8, analyzer.failure.?.message, "`one` still holds what it owns where this try fails") != null);
+}
+
+test "checkMoveCaught: accepts an orelse around an if whose branches hand on a name an errdefer hands on" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nenum Choice\n    One\n    Two\n\nfn count(size: usize, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    return size\n\nfn take(own bytes: []u8, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    const length = bytes.length\n    memory::free(own bytes)\n    return length\n\nfn find(own bytes: []u8, present: bool) -> ?usize\n    const length = bytes.length\n    memory::free(own bytes)\n    if (present) return length\n    return null\n\nfn absent(present: bool) -> ?usize\n    if (present) return 1\n    return null\n\nfn load(choice: Choice, present: bool) -> memory::Error!usize\n    const own one = try memory::allocate(u8, 1)\n    errdefer memory::free(own one)\n    const size = (if (choice == Choice::One) find(own one, present) else find(own one, present)) orelse return memory::Error::OutOfMemory\n    return size\n\nfn main -> !void\n    with memory::Heap\n    _ = try load(Choice::One, true)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "expectAgreedErrorDefers: rejects a name an errdefer hands on, handed on in one branch of an if and held in another that reaches a catch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nenum Choice\n    One\n    Two\n\nfn count(size: usize, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    return size\n\nfn take(own bytes: []u8, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    const length = bytes.length\n    memory::free(own bytes)\n    return length\n\nfn find(own bytes: []u8, present: bool) -> ?usize\n    const length = bytes.length\n    memory::free(own bytes)\n    if (present) return length\n    return null\n\nfn absent(present: bool) -> ?usize\n    if (present) return 1\n    return null\n\nfn load(choice: Choice, fails: bool) -> memory::Error!usize\n    const own one = try memory::allocate(u8, 1)\n    errdefer memory::free(own one)\n    const size = (if (choice == Choice::One) count(1, fails) else take(own one, fails)) catch return memory::Error::OutOfMemory\n    return size\n\nfn main -> !void\n    with memory::Heap\n    _ = try load(Choice::One, false)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.OwnNotConsumed, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 30, .column = 89 }, analyzer.failure.?.location.?);
+    try std.testing.expect(std.mem.indexOf(u8, analyzer.failure.?.message, "`one` is handed on with own in some branches that reach this catch and still held in others") != null);
+}
+
+test "expectAgreedErrorDefers: rejects a name an errdefer hands on, handed on in one branch of an if and held in another that reaches an orelse" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nenum Choice\n    One\n    Two\n\nfn count(size: usize, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    return size\n\nfn take(own bytes: []u8, fails: bool) -> memory::Error!usize\n    if (fails) return memory::Error::OutOfMemory\n    const length = bytes.length\n    memory::free(own bytes)\n    return length\n\nfn find(own bytes: []u8, present: bool) -> ?usize\n    const length = bytes.length\n    memory::free(own bytes)\n    if (present) return length\n    return null\n\nfn absent(present: bool) -> ?usize\n    if (present) return 1\n    return null\n\nfn load(choice: Choice, fails: bool) -> memory::Error!usize\n    const own one = try memory::allocate(u8, 1)\n    errdefer memory::free(own one)\n    const size = (if (choice == Choice::One) find(own one, fails) else absent(fails)) orelse return memory::Error::OutOfMemory\n    return size\n\nfn main -> !void\n    with memory::Heap\n    _ = try load(Choice::One, false)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.OwnNotConsumed, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 30, .column = 87 }, analyzer.failure.?.location.?);
+    try std.testing.expect(std.mem.indexOf(u8, analyzer.failure.?.message, "`one` is handed on with own in some branches that reach this orelse and still held in others") != null);
 }
 
 test "expectEndedVariable: rejects giving an own variable a new value while it still holds one" {
