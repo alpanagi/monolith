@@ -1,0 +1,1290 @@
+import mn
+import mn::codec
+import mn::codec::Decode
+import mn::codec::Encode
+import mn::container::ArrayList
+import mn::convert::To
+import mn::memory
+import mn::memory::Deinit
+import mn::stream::Reader
+import mn::stream::Writer
+import mn::text
+
+private const hexadecimal_digits: []const(u8) = "0123456789ABCDEF"
+private const maximum_depth: usize = 256
+
+
+error Error
+    ExtraPart
+    KeyNotScalar
+    MissingPart
+
+
+fn Encoder(type W: Writer) -> type
+    return struct
+        private writer: *W
+        private document: EncodeFrame
+        private own frames: ArrayList(EncodeFrame)
+        private own pending: ArrayList(u8)
+        private is_line_open: bool
+
+        fn init(writer: *W) -> own Self = { writer = writer, document = { kind = ::Document, remaining = 1, indentation = 0, is_value_next = false, budget = null }, frames = ::init(), pending = ::init(), is_line_open = false }
+
+
+        private fn write_number(self: *Self, type T, value: T) -> !void
+            const place = try self.begin_scalar()
+            try text::print(&self.pending, "{}", { value })
+            try self.end_scalar(place)
+
+
+        private fn write_float(self: *Self, type T, value: T) -> !void
+            if (value != value) return self.write_scalar(".nan", false)
+            if (value - value != value - value) return self.write_scalar(if (value > 0.0) ".inf" else "-.inf", false)
+            return self.write_number(T, value)
+
+
+        private fn write_scalar(self: *Self, bytes: []const(u8), is_text: bool) -> !void
+            const place = try self.begin_scalar()
+            if is_text
+                try write_text(&self.pending, bytes)
+            else
+                try self.pending.write(bytes)
+            try self.end_scalar(place)
+
+
+        private fn open_collection(self: *Self, kind: FrameKind, count: usize) -> !void
+            const place = try self.begin_part(false)
+            if count == 0
+                if (place == ::Value) try self.pending.write(" ")
+                try self.pending.write(if (kind == ::Sequence) "[]" else "{}")
+                return self.end_scalar(place)
+            const indentation: usize = if (place == ::Document) 0 else self.find_top().indentation + 2
+            if (place == ::Value) try self.pending.write("\n")
+            self.is_line_open = place == ::Item
+            try self.frames.append({ kind, remaining = count, indentation, is_value_next = false, budget = null })
+            try self.settle()
+
+
+        private fn begin_scalar(self: *Self) -> !Place
+            const place = try self.begin_part(true)
+            if (place == ::Value) try self.pending.write(" ")
+            return place
+
+
+        private fn begin_part(self: *Self, is_scalar: bool) -> !Place
+            self.close_finished_frames()
+            const frame = self.find_top()
+            if (frame.remaining == 0 or (frame.budget orelse 1) == 0) return Error::ExtraPart
+            if (frame.kind == ::Structure and !frame.is_value_next) return Error::ExtraPart
+            if (frame.kind == ::Mapping and !frame.is_value_next and !is_scalar) return Error::KeyNotScalar
+            if (frame.budget as budget) frame.budget = budget - 1
+            if frame.kind == ::Document
+                frame.remaining = 0
+                return ::Document
+            if frame.kind == ::Sequence
+                frame.remaining -= 1
+                try self.write_indentation(frame.indentation)
+                try self.pending.write("- ")
+                return ::Item
+            if !frame.is_value_next
+                try self.write_indentation(frame.indentation)
+                frame.is_value_next = true
+                return ::Key
+            frame.remaining -= 1
+            frame.is_value_next = false
+            return ::Value
+
+
+        private fn end_scalar(self: *Self, place: Place) -> !void
+            try self.pending.write(if (place == ::Key) ":" else "\n")
+            try self.settle()
+
+
+        private fn write_indentation(self: *Self, indentation: usize) -> !void
+            if self.is_line_open
+                self.is_line_open = false
+                return
+            for (_ in 0..indentation) try self.pending.append(' ')
+
+
+        private fn find_top(self: *Self) -> *EncodeFrame
+            const length = self.frames.length()
+            if (length == 0) return &self.document
+            const frames = self.frames.items()
+            return &frames[length - 1]
+
+
+        private fn close_finished_frames(self: *Self)
+            while self.frames.length() > 0
+                const frame = self.frames.items()[self.frames.length() - 1]
+                if (frame.remaining != 0 or frame.is_value_next or frame.budget != null) return
+                _ = self.frames.pop()
+
+
+        private fn open_value(self: *Self) -> Mark
+            self.close_finished_frames()
+            const frame = self.find_top()
+            const mark: Mark = { depth = self.frames.length(), saved = frame.budget, allowed = find_allowance(frame.budget) }
+            frame.budget = mark.allowed
+            return mark
+
+
+        private fn close_value(self: *Self, mark: Mark) -> !void
+            while self.frames.length() > mark.depth
+                const open = self.frames.items()[self.frames.length() - 1]
+                if (open.remaining != 0 or open.is_value_next) return Error::MissingPart
+                _ = self.frames.pop()
+            const frame = self.find_top()
+            if (mark.allowed == 0 or (frame.budget orelse 0) != 0) return Error::MissingPart
+            frame.budget = find_restored_budget(mark.saved, mark.allowed)
+            try self.settle()
+
+
+        private fn settle(self: *Self) -> !void
+            const frame = self.find_top()
+            if (frame.budget != null or frame.is_value_next or self.pending.length() == 0) return
+            try Writer::write(self.writer, self.pending.items())
+            self.discard_pending()
+
+
+        private fn discard_pending(self: *Self)
+            while (self.pending.length() > 0) _ = self.pending.pop()
+
+
+instance(type W: Writer) codec::Encoder(Encoder(W))
+
+    fn i8(self: *Self, value: i8) -> !void = self.write_number(i128, mn::convert(i128, value))
+    fn i16(self: *Self, value: i16) -> !void = self.write_number(i128, mn::convert(i128, value))
+    fn i32(self: *Self, value: i32) -> !void = self.write_number(i128, mn::convert(i128, value))
+    fn i64(self: *Self, value: i64) -> !void = self.write_number(i128, mn::convert(i128, value))
+    fn i128(self: *Self, value: i128) -> !void = self.write_number(i128, mn::convert(i128, value))
+    fn isize(self: *Self, value: isize) -> !void = self.write_number(i128, mn::convert(i128, value))
+    fn u8(self: *Self, value: u8) -> !void = self.write_number(u128, mn::convert(u128, value))
+    fn u16(self: *Self, value: u16) -> !void = self.write_number(u128, mn::convert(u128, value))
+    fn u32(self: *Self, value: u32) -> !void = self.write_number(u128, mn::convert(u128, value))
+    fn u64(self: *Self, value: u64) -> !void = self.write_number(u128, mn::convert(u128, value))
+    fn u128(self: *Self, value: u128) -> !void = self.write_number(u128, mn::convert(u128, value))
+    fn usize(self: *Self, value: usize) -> !void = self.write_number(u128, mn::convert(u128, value))
+    fn f16(self: *Self, value: f16) -> !void = self.write_float(f16, value)
+    fn f32(self: *Self, value: f32) -> !void = self.write_float(f32, value)
+    fn f64(self: *Self, value: f64) -> !void = self.write_float(f64, value)
+    fn f128(self: *Self, value: f128) -> !void = self.write_float(f128, value)
+    fn bool(self: *Self, value: bool) -> !void = self.write_scalar(if (value) "true" else "false", false)
+    fn bytes(self: *Self, value: []const(u8)) -> !void = self.write_scalar(value, true)
+    fn absent(self: *Self) -> !void = self.write_scalar("null", false)
+    fn present(_: *Self) -> !void = noop
+    fn sequence(self: *Self, count: usize) -> !void = self.open_collection(::Sequence, count)
+    fn map(self: *Self, count: usize) -> !void = self.open_collection(::Mapping, count)
+    fn structure(self: *Self, count: usize) -> !void = self.open_collection(::Structure, count)
+
+
+    fn field(self: *Self, name: []const(u8)) -> !void
+        self.close_finished_frames()
+        const frame = self.find_top()
+        if (frame.kind != ::Structure or frame.remaining == 0) return Error::ExtraPart
+        if (frame.is_value_next) return Error::MissingPart
+        try self.write_indentation(frame.indentation)
+        try write_text(&self.pending, name)
+        try self.pending.write(":")
+        frame.is_value_next = true
+
+
+    fn tuple(self: *Self, count: usize) -> !void = self.open_collection(::Sequence, count)
+    fn variant(self: *Self, name: []const(u8), _: usize) -> !void = self.write_scalar(name, true)
+
+
+    fn(type T: Encode(_, Self)) encode(self: *Self, value: *const(T)) -> !void
+        errdefer self.discard_pending()
+        const mark = self.open_value()
+        try Encode::encode(value, self)
+        try self.close_value(mark)
+
+
+instance(type W: Writer) Deinit(Encoder(W))
+
+    fn deinit(own encoder: *Self)
+        encoder.frames.deinit(own)
+        encoder.pending.deinit(own)
+
+
+struct Decoder
+    private own nodes: ArrayList(Node)
+    private own contents: ArrayList(u8)
+    private own frames: ArrayList(DecodeFrame)
+    private document: DecodeFrame
+    private has_unread_part: bool
+
+    fn(type R: Reader) init(reader: *R) -> own !Self
+        var own input = ArrayList(u8)::init()
+        defer input.deinit(own)
+        try read_input(reader, &input)
+        var own decoder: Self = { nodes = ::init(), contents = ::init(), frames = ::init(), document = { kind = ::Document, node = 0, next = 0, remaining = 1, selected = null, budget = null }, has_unread_part = false }
+        errdefer decoder.deinit(own)
+        var parser: Parser = { input = input.items(), position = 0, line_start = 0, depth = 0, nodes = &decoder.nodes, contents = &decoder.contents }
+        const root = try parser.parse_document()
+        decoder.document.node = root
+        decoder.document.next = root
+        return decoder
+
+
+    private fn read_integer(self: *Self, type T, type W) -> codec::Error!T
+        const value = try parse_integer(W, try self.take_plain())
+        if (value < mn::convert(W, find_minimum(T)) or value > mn::convert(W, find_maximum(T))) return codec::Error::Malformed
+        return mn::convert(T, value)
+
+
+    private fn read_float(self: *Self, type T) -> (codec::Error || memory::Error)!T = parse_float(T, try self.take_plain())
+
+
+    private fn open_collection(self: *Self, kind: NodeKind, frame_kind: FrameKind) -> (codec::Error || memory::Error)!usize
+        const index = try self.take_part()
+        const node = self.nodes.items()[index]
+        if (node.kind != kind) return codec::Error::Malformed
+        try self.frames.append({ kind = frame_kind, node = index, next = node.first, remaining = node.count, selected = null, budget = null })
+        return node.count
+
+
+    private fn take_scalar(self: *Self) -> codec::Error![]const(u8)
+        const index = try self.take_part()
+        if (self.nodes.items()[index].kind != ::Scalar) return codec::Error::Malformed
+        return self.find_text(index)
+
+
+    private fn take_plain(self: *Self) -> codec::Error![]const(u8)
+        const index = try self.take_part()
+        const node = self.nodes.items()[index]
+        if (node.kind != ::Scalar or !node.is_plain) return codec::Error::Malformed
+        return self.find_text(index)
+
+
+    private fn take_part(self: *Self) -> codec::Error!usize
+        const index = try self.find_part()
+        self.consume_part()
+        return index
+
+
+    private fn find_part(self: *Self) -> codec::Error!usize
+        if (self.has_unread_part) return codec::Error::Malformed
+        self.close_finished_frames()
+        const frame = self.find_top()
+        if (frame.remaining == 0 or (frame.budget orelse 1) == 0) return codec::Error::Malformed
+        if (frame.kind != ::Structure) return frame.next
+        const selected = frame.selected orelse return codec::Error::Malformed
+        return selected
+
+
+    private fn consume_part(self: *Self)
+        const frame = self.find_top()
+        if (frame.budget as budget) frame.budget = budget - 1
+        frame.remaining -= 1
+        if frame.kind == ::Structure
+            frame.selected = null
+        else
+            frame.next = self.nodes.items()[frame.next].next
+
+
+    private fn find_text(self: *const(Self), index: usize) -> []const(u8)
+        const node = self.nodes.items()[index]
+        return self.contents.items()[node.start..node.start + node.length]
+
+
+    private fn find_top(self: *Self) -> *DecodeFrame
+        const length = self.frames.length()
+        if (length == 0) return &self.document
+        const frames = self.frames.items()
+        return &frames[length - 1]
+
+
+    private fn close_finished_frames(self: *Self)
+        while self.frames.length() > 0
+            const frame = self.frames.items()[self.frames.length() - 1]
+            if (frame.remaining != 0 or frame.selected != null or frame.budget != null) return
+            _ = self.frames.pop()
+
+
+    private fn open_value(self: *Self) -> codec::Error!Mark
+        if (self.has_unread_part) return codec::Error::Malformed
+        self.close_finished_frames()
+        const frame = self.find_top()
+        const mark: Mark = { depth = self.frames.length(), saved = frame.budget, allowed = find_allowance(frame.budget) }
+        frame.budget = mark.allowed
+        return mark
+
+
+    private fn close_value(self: *Self, mark: Mark)
+        while self.frames.length() > mark.depth
+            const open = self.frames.items()[self.frames.length() - 1]
+            if (open.remaining != 0 or open.selected != null) self.has_unread_part = true
+            _ = self.frames.pop()
+        const frame = self.find_top()
+        if (mark.allowed == 0 or (frame.budget orelse 0) != 0) self.has_unread_part = true
+        frame.budget = find_restored_budget(mark.saved, mark.allowed)
+
+
+instance codec::Decoder(Decoder)
+
+    fn i8(self: *Self) -> !i8 = self.read_integer(i8, i128)
+    fn i16(self: *Self) -> !i16 = self.read_integer(i16, i128)
+    fn i32(self: *Self) -> !i32 = self.read_integer(i32, i128)
+    fn i64(self: *Self) -> !i64 = self.read_integer(i64, i128)
+    fn i128(self: *Self) -> !i128 = self.read_integer(i128, i128)
+    fn isize(self: *Self) -> !isize = self.read_integer(isize, i128)
+    fn u8(self: *Self) -> !u8 = self.read_integer(u8, u128)
+    fn u16(self: *Self) -> !u16 = self.read_integer(u16, u128)
+    fn u32(self: *Self) -> !u32 = self.read_integer(u32, u128)
+    fn u64(self: *Self) -> !u64 = self.read_integer(u64, u128)
+    fn u128(self: *Self) -> !u128 = self.read_integer(u128, u128)
+    fn usize(self: *Self) -> !usize = self.read_integer(usize, u128)
+    fn f16(self: *Self) -> !f16 = self.read_float(f16)
+    fn f32(self: *Self) -> !f32 = self.read_float(f32)
+    fn f64(self: *Self) -> !f64 = self.read_float(f64)
+    fn f128(self: *Self) -> !f128 = self.read_float(f128)
+
+
+    fn bool(self: *Self) -> !bool
+        const scalar = try self.take_plain()
+        if (is_true_text(scalar)) return true
+        if (is_false_text(scalar)) return false
+        return codec::Error::Malformed
+
+
+    fn bytes(self: *Self) -> own ![]u8
+        const scalar = try self.take_scalar()
+        const own bytes = try memory::allocate(u8, scalar.length)
+        memory::copy(bytes, scalar)
+        return bytes
+
+
+    fn is_present(self: *Self) -> !bool
+        const index = try self.find_part()
+        const node = self.nodes.items()[index]
+        if (node.kind != ::Scalar or !node.is_plain or !is_null_text(self.find_text(index))) return true
+        self.consume_part()
+        return false
+
+
+    fn sequence(self: *Self) -> !usize = self.open_collection(::Sequence, ::Sequence)
+
+
+    fn map(self: *Self) -> !usize
+        const count = try self.open_collection(::Mapping, ::Mapping)
+        return count / 2
+
+
+    fn structure(self: *Self, count: usize) -> !void
+        const children = try self.open_collection(::Mapping, ::Structure)
+        if (children != count * 2) return codec::Error::Malformed
+        self.find_top().remaining = count
+
+
+    fn field(self: *Self, name: []const(u8)) -> !void
+        if (self.has_unread_part) return codec::Error::Malformed
+        self.close_finished_frames()
+        const frame = self.find_top()
+        if (frame.kind != ::Structure or frame.remaining == 0 or frame.selected != null) return codec::Error::Malformed
+        const nodes = self.nodes.items()
+        var key = nodes[frame.node].first
+        for _ in 0..nodes[frame.node].count / 2
+            const value = nodes[key].next
+            if memory::equal(self.find_text(key), name)
+                frame.selected = value
+                return
+            key = nodes[value].next
+        return codec::Error::Malformed
+
+
+    fn tuple(self: *Self, count: usize) -> !void
+        if (try self.open_collection(::Sequence, ::Sequence) != count) return codec::Error::Malformed
+
+
+    fn variant(self: *Self, names: []const([]const(u8))) -> !usize
+        const scalar = try self.take_scalar()
+        for index in 0..names.length
+            if (memory::equal(names[index], scalar)) return index
+        return codec::Error::Malformed
+
+
+    fn decode(self: *Self, type T: Decode(_, Self)) -> own !T
+        const mark = try self.open_value()
+        const own value = try Decode(T, Self)::decode(self)
+        self.close_value(mark)
+        return value
+
+
+instance Deinit(Decoder)
+
+    fn deinit(own decoder: *Self)
+        decoder.nodes.deinit(own)
+        decoder.contents.deinit(own)
+        decoder.frames.deinit(own)
+
+
+private struct EncodeFrame
+    kind: FrameKind
+    remaining: usize
+    indentation: usize
+    is_value_next: bool
+    budget: ?usize
+
+
+private enum Place
+    Document
+    Item
+    Key
+    Value
+
+
+private struct DecodeFrame
+    kind: FrameKind
+    node: usize
+    next: usize
+    remaining: usize
+    selected: ?usize
+    budget: ?usize
+
+
+private struct Mark
+    depth: usize
+    saved: ?usize
+    allowed: usize
+
+
+private enum FrameKind
+    Document
+    Sequence
+    Mapping
+    Structure
+
+
+private struct Parser
+    input: []const(u8)
+    position: usize
+    line_start: usize
+    depth: usize
+    nodes: *ArrayList(Node)
+    contents: *ArrayList(u8)
+
+    fn parse_document(self: *Self) -> (codec::Error || memory::Error)!usize
+        var indentation = try self.find_content_line()
+        if indentation != null and self.is_marker("---")
+            self.position = self.line_start + 3
+            try self.finish_line()
+            indentation = try self.find_content_line()
+        const root = try self.parse_root(indentation)
+        indentation = try self.find_content_line()
+        if indentation != null and self.is_marker("...")
+            self.position = self.line_start + 3
+            try self.finish_line()
+            indentation = try self.find_content_line()
+        if (indentation != null) return codec::Error::Malformed
+        return root
+
+
+    fn parse_root(self: *Self, indentation: ?usize) -> (codec::Error || memory::Error)!usize
+        const column = indentation orelse return self.add_empty_scalar()
+        if (self.is_marker("---") or self.is_marker("...")) return self.add_empty_scalar()
+        return self.parse_line_node(column, 0)
+
+
+    fn parse_line_node(self: *Self, column: usize, minimum: usize) -> (codec::Error || memory::Error)!usize
+        self.position = self.line_start + column
+        return self.parse_node_here(column, minimum)
+
+
+    fn parse_node_here(self: *Self, column: usize, minimum: usize) -> (codec::Error || memory::Error)!usize
+        try self.enter()
+        defer self.leave()
+        const byte = self.input[self.position]
+        if (byte == '-' and self.is_blank_or_line_end_at(self.position + 1)) return self.parse_block_sequence(column)
+        if (byte == '?' and self.is_blank_or_line_end_at(self.position + 1)) return codec::Error::Malformed
+        if (byte == '|' or byte == '>') return self.parse_block_scalar(minimum)
+        if (self.is_mapping_line()) return self.parse_block_mapping(column)
+        const node = try self.parse_inline_node(false)
+        try self.finish_line()
+        return node
+
+
+    fn parse_block_sequence(self: *Self, column: usize) -> (codec::Error || memory::Error)!usize
+        const sequence = try self.add_collection(::Sequence)
+        var previous: ?usize = null
+        while true
+            self.position += 1
+            self.skip_blanks()
+            var item: usize = 0
+            if self.is_comment_or_line_end()
+                self.skip_line()
+                item = try self.parse_indented_node(column)
+            else
+                item = try self.parse_node_here(self.position - self.line_start, column + 1)
+            self.attach(sequence, previous, item)
+            previous = item
+            const indentation = try self.find_content_line() orelse break
+            if (self.is_marker("---") or self.is_marker("...") or indentation < column) break
+            if (indentation > column) return codec::Error::Malformed
+            const start = self.line_start + column
+            if (self.input[start] != '-' or !self.is_blank_or_line_end_at(start + 1)) break
+            self.position = start
+        return sequence
+
+
+    fn parse_block_mapping(self: *Self, column: usize) -> (codec::Error || memory::Error)!usize
+        const mapping = try self.add_collection(::Mapping)
+        var previous: ?usize = null
+        while true
+            const key = try self.parse_key()
+            self.skip_blanks()
+            var value: usize = 0
+            if self.is_comment_or_line_end()
+                self.skip_line()
+                value = try self.parse_mapping_value_lines(column)
+            else if self.input[self.position] == '|' or self.input[self.position] == '>'
+                value = try self.parse_block_scalar(column + 1)
+            else
+                value = try self.parse_inline_node(false)
+                try self.finish_line()
+            try self.check_new_key(mapping, key)
+            self.attach(mapping, previous, key)
+            self.attach(mapping, key, value)
+            previous = value
+            const indentation = try self.find_content_line() orelse break
+            if (self.is_marker("---") or self.is_marker("...") or indentation < column) break
+            if (indentation > column) return codec::Error::Malformed
+            self.position = self.line_start + column
+        return mapping
+
+
+    fn parse_key(self: *Self) -> (codec::Error || memory::Error)!usize
+        if (self.input[self.position] == '?' and self.is_blank_or_line_end_at(self.position + 1)) return codec::Error::Malformed
+        const key = try self.parse_scalar(false)
+        self.skip_blanks()
+        if (self.position >= self.input.length or self.input[self.position] != ':') return codec::Error::Malformed
+        self.position += 1
+        if (!self.is_blank_or_line_end_at(self.position)) return codec::Error::Malformed
+        return key
+
+
+    fn parse_indented_node(self: *Self, column: usize) -> (codec::Error || memory::Error)!usize
+        const indentation = try self.find_content_line() orelse return self.add_empty_scalar()
+        if (indentation <= column) return self.add_empty_scalar()
+        return self.parse_line_node(indentation, column + 1)
+
+
+    fn parse_mapping_value_lines(self: *Self, column: usize) -> (codec::Error || memory::Error)!usize
+        const indentation = try self.find_content_line() orelse return self.add_empty_scalar()
+        if (self.is_marker("---") or self.is_marker("...")) return self.add_empty_scalar()
+        if (indentation > column) return self.parse_line_node(indentation, column + 1)
+        const start = self.line_start + column
+        if (indentation < column or self.input[start] != '-' or !self.is_blank_or_line_end_at(start + 1)) return self.add_empty_scalar()
+        return self.parse_line_node(column, column + 1)
+
+
+    fn parse_inline_node(self: *Self, is_flow: bool) -> (codec::Error || memory::Error)!usize
+        if (self.position >= self.input.length) return codec::Error::Malformed
+        const byte = self.input[self.position]
+        if (byte == '[') return self.parse_flow_sequence()
+        if (byte == '{') return self.parse_flow_mapping()
+        return self.parse_scalar(is_flow)
+
+
+    fn parse_scalar(self: *Self, is_flow: bool) -> (codec::Error || memory::Error)!usize
+        const byte = self.input[self.position]
+        if (byte == '"') return self.parse_double_quoted()
+        if (byte == '\'') return self.parse_single_quoted()
+        return self.parse_plain(is_flow)
+
+
+    fn parse_plain(self: *Self, is_flow: bool) -> (codec::Error || memory::Error)!usize
+        const start = self.position
+        if (!self.is_plain_start(is_flow)) return codec::Error::Malformed
+        var end = start
+        while !self.is_line_end_at(self.position)
+            const byte = self.input[self.position]
+            if (byte == ':' and self.is_plain_end_at(self.position + 1, is_flow)) break
+            if (byte == '#' and is_blank(self.input[self.position - 1])) break
+            if (is_flow and is_flow_indicator(byte)) break
+            self.position += 1
+            if (!is_blank(byte)) end = self.position
+        self.position = end
+        const offset = self.contents.length()
+        try self.contents.write(self.input[start..end])
+        return self.add_span(offset, true)
+
+
+    fn parse_single_quoted(self: *Self) -> (codec::Error || memory::Error)!usize
+        self.position += 1
+        const offset = self.contents.length()
+        while true
+            if (self.is_line_end_at(self.position)) return codec::Error::Malformed
+            const byte = self.input[self.position]
+            self.position += 1
+            if byte == '\''
+                if (self.position >= self.input.length or self.input[self.position] != '\'') break
+                self.position += 1
+            try self.contents.append(byte)
+        return self.add_span(offset, false)
+
+
+    fn parse_double_quoted(self: *Self) -> (codec::Error || memory::Error)!usize
+        self.position += 1
+        const offset = self.contents.length()
+        while true
+            if (self.is_line_end_at(self.position)) return codec::Error::Malformed
+            const byte = self.input[self.position]
+            self.position += 1
+            if (byte == '"') break
+            if byte == '\\'
+                try self.parse_escape()
+            else
+                try self.contents.append(byte)
+        return self.add_span(offset, false)
+
+
+    fn parse_escape(self: *Self) -> (codec::Error || memory::Error)!void
+        if (self.is_line_end_at(self.position)) return codec::Error::Malformed
+        const byte = self.input[self.position]
+        self.position += 1
+        match byte
+            case ('0') try self.contents.append(0)
+            case ('a') try self.contents.append(7)
+            case ('b') try self.contents.append(8)
+            case ('t', '\t') try self.contents.append(9)
+            case ('n') try self.contents.append(10)
+            case ('v') try self.contents.append(11)
+            case ('f') try self.contents.append(12)
+            case ('r') try self.contents.append(13)
+            case ('e') try self.contents.append(27)
+            case (' ', '"', '/', '\\') try self.contents.append(byte)
+            case ('N') try self.append_code_point(0x85)
+            case ('_') try self.append_code_point(0xa0)
+            case ('L') try self.append_code_point(0x2028)
+            case ('P') try self.append_code_point(0x2029)
+            case ('x') try self.contents.append(mn::truncate(u8, try self.parse_hexadecimal(2)))
+            case ('u') try self.append_code_point(try self.parse_hexadecimal(4))
+            case ('U') try self.append_code_point(try self.parse_hexadecimal(8))
+            else return codec::Error::Malformed
+
+
+    fn parse_hexadecimal(self: *Self, count: usize) -> codec::Error!u32
+        var value: u32 = 0
+        for _ in 0..count
+            if (self.position >= self.input.length) return codec::Error::Malformed
+            const digit = find_digit_value(self.input[self.position])
+            if (digit >= 16) return codec::Error::Malformed
+            value = (value << 4) | mn::convert(u32, digit)
+            self.position += 1
+        return value
+
+
+    fn append_code_point(self: *Self, code_point: u32) -> (codec::Error || memory::Error)!void
+        if (code_point > 0x10ffff or (code_point >= 0xd800 and code_point <= 0xdfff)) return codec::Error::Malformed
+        if code_point < 0x80
+            try self.contents.append(mn::truncate(u8, code_point))
+        else if code_point < 0x800
+            try self.contents.append(mn::truncate(u8, 0xc0 | (code_point >> 6)))
+            try self.contents.append(mn::truncate(u8, 0x80 | (code_point & 0x3f)))
+        else if code_point < 0x10000
+            try self.contents.append(mn::truncate(u8, 0xe0 | (code_point >> 12)))
+            try self.contents.append(mn::truncate(u8, 0x80 | ((code_point >> 6) & 0x3f)))
+            try self.contents.append(mn::truncate(u8, 0x80 | (code_point & 0x3f)))
+        else
+            try self.contents.append(mn::truncate(u8, 0xf0 | (code_point >> 18)))
+            try self.contents.append(mn::truncate(u8, 0x80 | ((code_point >> 12) & 0x3f)))
+            try self.contents.append(mn::truncate(u8, 0x80 | ((code_point >> 6) & 0x3f)))
+            try self.contents.append(mn::truncate(u8, 0x80 | (code_point & 0x3f)))
+
+
+    fn parse_flow_sequence(self: *Self) -> (codec::Error || memory::Error)!usize
+        try self.enter()
+        defer self.leave()
+        self.position += 1
+        const sequence = try self.add_collection(::Sequence)
+        var previous: ?usize = null
+        while true
+            self.skip_flow_space()
+            if (self.position >= self.input.length) return codec::Error::Malformed
+            if self.input[self.position] == ']'
+                self.position += 1
+                break
+            const item = try self.parse_inline_node(true)
+            self.attach(sequence, previous, item)
+            previous = item
+            self.skip_flow_space()
+            if (self.position >= self.input.length) return codec::Error::Malformed
+            const byte = self.input[self.position]
+            self.position += 1
+            if (byte == ']') break
+            if (byte != ',') return codec::Error::Malformed
+        return sequence
+
+
+    fn parse_flow_mapping(self: *Self) -> (codec::Error || memory::Error)!usize
+        try self.enter()
+        defer self.leave()
+        self.position += 1
+        const mapping = try self.add_collection(::Mapping)
+        var previous: ?usize = null
+        while true
+            self.skip_flow_space()
+            if (self.position >= self.input.length) return codec::Error::Malformed
+            if self.input[self.position] == '}'
+                self.position += 1
+                break
+            if (self.input[self.position] == '?' and self.is_blank_or_line_end_at(self.position + 1)) return codec::Error::Malformed
+            const key = try self.parse_scalar(true)
+            self.skip_blanks()
+            if (self.position >= self.input.length or self.input[self.position] != ':') return codec::Error::Malformed
+            self.position += 1
+            self.skip_flow_space()
+            if (self.position >= self.input.length) return codec::Error::Malformed
+            var value: usize = 0
+            if self.input[self.position] == ',' or self.input[self.position] == '}'
+                value = try self.add_empty_scalar()
+            else
+                value = try self.parse_inline_node(true)
+            try self.check_new_key(mapping, key)
+            self.attach(mapping, previous, key)
+            self.attach(mapping, key, value)
+            previous = value
+            self.skip_flow_space()
+            if (self.position >= self.input.length) return codec::Error::Malformed
+            const byte = self.input[self.position]
+            self.position += 1
+            if (byte == '}') break
+            if (byte != ',') return codec::Error::Malformed
+        return mapping
+
+
+    fn parse_block_scalar(self: *Self, minimum: usize) -> (codec::Error || memory::Error)!usize
+        const is_folded = self.input[self.position] == '>'
+        self.position += 1
+        var chomping = Chomping::Clip
+        var explicit: usize = 0
+        for _ in 0..2
+            if (self.position >= self.input.length) break
+            const byte = self.input[self.position]
+            if byte == '-' or byte == '+'
+                if (chomping != ::Clip) return codec::Error::Malformed
+                chomping = if (byte == '-') ::Strip else ::Keep
+            else if byte >= '1' and byte <= '9'
+                if (explicit != 0) return codec::Error::Malformed
+                explicit = mn::convert(usize, byte - '0')
+            else
+                break
+            self.position += 1
+        try self.finish_line()
+        const indentation = if (explicit != 0) minimum + explicit - 1 else self.find_block_indentation(minimum)
+        const offset = self.contents.length()
+        var empty_count: usize = 0
+        var has_content = false
+        var is_previous_more_indented = false
+        while self.line_start < self.input.length and !self.is_marker("---") and !self.is_marker("...")
+            const line_end = self.find_line_end(self.line_start)
+            var position = self.line_start
+            while (position < line_end and self.input[position] == ' ') position += 1
+            const spaces = position - self.line_start
+            if position == line_end and spaces <= indentation
+                empty_count += 1
+            else if spaces < indentation
+                break
+            else
+                const content = self.input[self.line_start + indentation..line_end]
+                const is_more_indented = content.length == 0 or content[0] == ' ' or content[0] == '\t'
+                var break_count = empty_count
+                if (has_content and (!is_folded or is_previous_more_indented or is_more_indented)) break_count += 1
+                if has_content and is_folded and break_count == 0
+                    try self.contents.append(' ')
+                for (_ in 0..break_count) try self.contents.append('\n')
+                try self.contents.write(content)
+                empty_count = 0
+                has_content = true
+                is_previous_more_indented = is_more_indented
+            self.position = line_end
+            self.skip_line()
+        if chomping != ::Strip and has_content
+            try self.contents.append('\n')
+        if chomping == ::Keep
+            for (_ in 0..empty_count) try self.contents.append('\n')
+        return self.add_span(offset, false)
+
+
+    fn find_block_indentation(self: *const(Self), minimum: usize) -> usize
+        var line_start = self.line_start
+        while line_start < self.input.length
+            const line_end = self.find_line_end(line_start)
+            var position = line_start
+            while (position < line_end and self.input[position] == ' ') position += 1
+            if position < line_end
+                const spaces = position - line_start
+                if (spaces < minimum) return minimum
+                return spaces
+            line_start = line_end
+            if (line_start < self.input.length and self.input[line_start] == '\r') line_start += 1
+            if (line_start < self.input.length) line_start += 1
+        return minimum
+
+
+    fn find_content_line(self: *Self) -> codec::Error!?usize
+        while self.line_start < self.input.length
+            var position = self.line_start
+            while (position < self.input.length and self.input[position] == ' ') position += 1
+            const indentation = position - self.line_start
+            var has_tab = false
+            while position < self.input.length and is_blank(self.input[position])
+                if (self.input[position] == '\t') has_tab = true
+                position += 1
+            if self.is_line_end_at(position) or self.input[position] == '#'
+                self.position = position
+                self.skip_line()
+            else
+                if (has_tab) return codec::Error::Malformed
+                self.position = self.line_start
+                return indentation
+        self.position = self.line_start
+        return null
+
+
+    fn finish_line(self: *Self) -> codec::Error!void
+        const start = self.position
+        self.skip_blanks()
+        const is_attached_comment = self.position == start and self.position > self.line_start and !self.is_line_end_at(self.position)
+        if (!self.is_comment_or_line_end() or is_attached_comment) return codec::Error::Malformed
+        self.skip_line()
+
+
+    fn skip_line(self: *Self)
+        while (self.position < self.input.length and self.input[self.position] != '\n') self.position += 1
+        if (self.position < self.input.length) self.position += 1
+        self.line_start = self.position
+
+
+    fn skip_blanks(self: *Self)
+        while (self.position < self.input.length and is_blank(self.input[self.position])) self.position += 1
+
+
+    fn skip_flow_space(self: *Self)
+        while self.position < self.input.length
+            const byte = self.input[self.position]
+            if is_blank(byte) or byte == '\r'
+                self.position += 1
+            else if byte == '\n'
+                self.position += 1
+                self.line_start = self.position
+            else if byte == '#' and (self.position == self.line_start or is_blank(self.input[self.position - 1]))
+                while (self.position < self.input.length and self.input[self.position] != '\n') self.position += 1
+            else
+                return
+
+
+    fn find_line_end(self: *const(Self), start: usize) -> usize
+        var position = start
+        while (position < self.input.length and self.input[position] != '\n') position += 1
+        if (position > start and self.input[position - 1] == '\r') return position - 1
+        return position
+
+
+    fn is_line_end_at(self: *const(Self), position: usize) -> bool
+        if (position >= self.input.length or self.input[position] == '\n') return true
+        return self.input[position] == '\r' and position + 1 < self.input.length and self.input[position + 1] == '\n'
+
+
+    fn is_blank_or_line_end_at(self: *const(Self), position: usize) -> bool = self.is_line_end_at(position) or is_blank(self.input[position])
+
+
+    fn is_plain_end_at(self: *const(Self), position: usize, is_flow: bool) -> bool = self.is_blank_or_line_end_at(position) or (is_flow and is_flow_indicator(self.input[position]))
+
+
+    fn is_comment_or_line_end(self: *const(Self)) -> bool = self.is_line_end_at(self.position) or self.input[self.position] == '#'
+
+
+    fn is_marker(self: *const(Self), marker: []const(u8)) -> bool
+        const end = self.line_start + marker.length
+        return end <= self.input.length and memory::equal(self.input[self.line_start..end], marker) and self.is_blank_or_line_end_at(end)
+
+
+    fn is_plain_start(self: *const(Self), is_flow: bool) -> bool
+        if (self.is_line_end_at(self.position)) return false
+        const byte = self.input[self.position]
+        if (!is_indicator(byte)) return true
+        if (byte != '-' and byte != '?' and byte != ':') return false
+        return !self.is_plain_end_at(self.position + 1, is_flow)
+
+
+    fn is_mapping_line(self: *const(Self)) -> bool
+        var position = self.position
+        const byte = self.input[position]
+        if (byte == '[' or byte == '{') return false
+        if byte == '"' or byte == '\''
+            position = self.find_quote_end(position)
+            while (position < self.input.length and is_blank(self.input[position])) position += 1
+            return position < self.input.length and self.input[position] == ':' and self.is_blank_or_line_end_at(position + 1)
+        while !self.is_line_end_at(position)
+            const current = self.input[position]
+            if (current == ':' and self.is_blank_or_line_end_at(position + 1)) return true
+            if (current == '#' and position > self.position and is_blank(self.input[position - 1])) return false
+            position += 1
+        return false
+
+
+    fn find_quote_end(self: *const(Self), start: usize) -> usize
+        const quote = self.input[start]
+        var position = start + 1
+        while !self.is_line_end_at(position)
+            const byte = self.input[position]
+            position += 1
+            if byte == '\\' and quote == '"'
+                if (!self.is_line_end_at(position)) position += 1
+            else if byte == quote
+                if (quote == '"' or position >= self.input.length or self.input[position] != '\'') return position
+                position += 1
+        return self.input.length
+
+
+    fn check_new_key(self: *const(Self), mapping: usize, key: usize) -> codec::Error!void
+        const nodes = self.nodes.items()
+        const name = self.find_text(key)
+        var index = nodes[mapping].first
+        for _ in 0..nodes[mapping].count / 2
+            if (memory::equal(self.find_text(index), name)) return codec::Error::Malformed
+            index = nodes[nodes[index].next].next
+
+
+    fn find_text(self: *const(Self), index: usize) -> []const(u8)
+        const node = self.nodes.items()[index]
+        return self.contents.items()[node.start..node.start + node.length]
+
+
+    fn add_collection(self: *Self, kind: NodeKind) -> memory::Error!usize
+        try self.nodes.append({ kind, is_plain = false, start = 0, length = 0, count = 0, first = 0, next = 0 })
+        return self.nodes.length() - 1
+
+
+    fn add_span(self: *Self, start: usize, is_plain: bool) -> memory::Error!usize
+        try self.nodes.append({ kind = ::Scalar, is_plain, start, length = self.contents.length() - start, count = 0, first = 0, next = 0 })
+        return self.nodes.length() - 1
+
+
+    fn add_empty_scalar(self: *Self) -> memory::Error!usize = self.add_span(self.contents.length(), true)
+
+
+    fn attach(self: *Self, parent: usize, previous: ?usize, child: usize)
+        const nodes = self.nodes.items()
+        if previous as index
+            nodes[index].next = child
+        else
+            nodes[parent].first = child
+        nodes[parent].count += 1
+
+
+    fn enter(self: *Self) -> codec::Error!void
+        if (self.depth == maximum_depth) return codec::Error::Malformed
+        self.depth += 1
+
+
+    fn leave(self: *Self)
+        self.depth -= 1
+
+
+private struct Node
+    kind: NodeKind
+    is_plain: bool
+    start: usize
+    length: usize
+    count: usize
+    first: usize
+    next: usize
+
+
+private enum NodeKind
+    Scalar
+    Sequence
+    Mapping
+
+
+private enum Chomping
+    Strip
+    Clip
+    Keep
+
+
+private fn write_text(list: *ArrayList(u8), bytes: []const(u8)) -> memory::Error!void
+    if (is_plain_safe(bytes)) return list.write(bytes)
+    try list.append('"')
+    var index: usize = 0
+    while index < bytes.length
+        const byte = bytes[index]
+        if byte < 0x80
+            try write_ascii_escaped(list, byte)
+            index += 1
+        else if find_code_point(bytes[index..]) as { code_point, length }
+            if is_escaped_code_point(code_point)
+                try write_code_point_escape(list, code_point)
+            else
+                try list.write(bytes[index..index + length])
+            index += length
+        else
+            try write_byte_escape(list, byte)
+            index += 1
+    try list.append('"')
+
+
+private fn is_plain_safe(bytes: []const(u8)) -> bool
+    if (bytes.length == 0 or bytes[0] == ' ' or bytes[bytes.length - 1] == ' ' or bytes[bytes.length - 1] == ':') return false
+    if (is_indicator(bytes[0]) or is_core_scalar(bytes)) return false
+    if (bytes.length >= 3 and memory::equal(bytes[..3], "...")) return false
+    var index: usize = 0
+    while index < bytes.length
+        const byte = bytes[index]
+        if (byte < 0x20 or byte == 0x7f) return false
+        if (byte == ':' and index + 1 < bytes.length and bytes[index + 1] == ' ') return false
+        if (byte == ' ' and index + 1 < bytes.length and bytes[index + 1] == '#') return false
+        if byte < 0x80
+            index += 1
+        else
+            const { code_point, length } = find_code_point(bytes[index..]) orelse return false
+            if (is_escaped_code_point(code_point)) return false
+            index += length
+    return true
+
+
+private fn is_indicator(byte: u8) -> bool = match byte
+    case ('-', '?', ':', ',', '[', ']', '{', '}', '#', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`') true
+    else false
+
+
+private fn is_core_scalar(scalar: []const(u8)) -> bool
+    if (is_null_text(scalar) or is_true_text(scalar) or is_false_text(scalar)) return true
+    return is_integer_text(scalar) or is_float_text(scalar) or is_infinity_text(scalar) or is_nan_text(scalar)
+
+
+private fn is_null_text(scalar: []const(u8)) -> bool = scalar.length == 0 or memory::equal(scalar, "~") or memory::equal(scalar, "null") or memory::equal(scalar, "Null") or memory::equal(scalar, "NULL")
+
+
+private fn is_true_text(scalar: []const(u8)) -> bool = memory::equal(scalar, "true") or memory::equal(scalar, "True") or memory::equal(scalar, "TRUE")
+
+
+private fn is_false_text(scalar: []const(u8)) -> bool = memory::equal(scalar, "false") or memory::equal(scalar, "False") or memory::equal(scalar, "FALSE")
+
+
+private fn is_integer_text(scalar: []const(u8)) -> bool
+    if (scalar.length > 2 and scalar[0] == '0' and scalar[1] == 'x') return has_only_digits(scalar[2..], 16)
+    if (scalar.length > 2 and scalar[0] == '0' and scalar[1] == 'o') return has_only_digits(scalar[2..], 8)
+    const start: usize = if (scalar.length > 0 and (scalar[0] == '-' or scalar[0] == '+')) 1 else 0
+    return start < scalar.length and has_only_digits(scalar[start..], 10)
+
+
+private fn has_only_digits(digits: []const(u8), base: u8) -> bool
+    for byte in digits
+        if (find_digit_value(byte) >= base) return false
+    return true
+
+
+private fn find_digit_value(byte: u8) -> u8
+    if (byte >= '0' and byte <= '9') return byte - '0'
+    if (byte >= 'a' and byte <= 'f') return byte - 'a' + 10
+    if (byte >= 'A' and byte <= 'F') return byte - 'A' + 10
+    return 255
+
+
+private fn is_float_text(scalar: []const(u8)) -> bool
+    var position: usize = 0
+    if (scalar.length > 0 and (scalar[0] == '-' or scalar[0] == '+')) position = 1
+    const integer_start = position
+    position = skip_digits(scalar, position)
+    const integer_length = position - integer_start
+    var fraction_length: usize = 0
+    if position < scalar.length and scalar[position] == '.'
+        const fraction_start = position + 1
+        position = skip_digits(scalar, fraction_start)
+        fraction_length = position - fraction_start
+    if (integer_length == 0 and fraction_length == 0) return false
+    if position < scalar.length and (scalar[position] == 'e' or scalar[position] == 'E')
+        position += 1
+        if (position < scalar.length and (scalar[position] == '-' or scalar[position] == '+')) position += 1
+        const exponent_start = position
+        position = skip_digits(scalar, position)
+        if (position == exponent_start) return false
+    return position == scalar.length
+
+
+private fn skip_digits(scalar: []const(u8), start: usize) -> usize
+    var position = start
+    while (position < scalar.length and scalar[position] >= '0' and scalar[position] <= '9') position += 1
+    return position
+
+
+private fn is_infinity_text(scalar: []const(u8)) -> bool
+    const start: usize = if (scalar.length > 0 and (scalar[0] == '-' or scalar[0] == '+')) 1 else 0
+    const rest = scalar[start..]
+    return memory::equal(rest, ".inf") or memory::equal(rest, ".Inf") or memory::equal(rest, ".INF")
+
+
+private fn is_nan_text(scalar: []const(u8)) -> bool = memory::equal(scalar, ".nan") or memory::equal(scalar, ".NaN") or memory::equal(scalar, ".NAN")
+
+
+private fn find_code_point(bytes: []const(u8)) -> ?[u32, usize]
+    const lead = bytes[0]
+    if (lead < 0x80) return { mn::convert(u32, lead), 1 }
+    var length: usize = 0
+    var minimum: u32 = 0
+    var code_point: u32 = 0
+    if lead >= 0xc2 and lead <= 0xdf
+        length = 2
+        minimum = 0x80
+        code_point = mn::convert(u32, lead & 0x1f)
+    else if lead >= 0xe0 and lead <= 0xef
+        length = 3
+        minimum = 0x800
+        code_point = mn::convert(u32, lead & 0x0f)
+    else if lead >= 0xf0 and lead <= 0xf4
+        length = 4
+        minimum = 0x10000
+        code_point = mn::convert(u32, lead & 0x07)
+    else
+        return null
+    if (bytes.length < length) return null
+    for index in 1..length
+        if ((bytes[index] & 0xc0) != 0x80) return null
+        code_point = (code_point << 6) | mn::convert(u32, bytes[index] & 0x3f)
+    if (code_point < minimum or code_point > 0x10ffff or (code_point >= 0xd800 and code_point <= 0xdfff)) return null
+    return { code_point, length }
+
+
+private fn is_escaped_code_point(code_point: u32) -> bool
+    if (code_point >= 0x80 and code_point <= 0x9f) return true
+    return code_point == 0x2028 or code_point == 0x2029 or code_point == 0xfeff or code_point == 0xfffe or code_point == 0xffff
+
+
+private fn write_ascii_escaped(list: *ArrayList(u8), byte: u8) -> memory::Error!void
+    match byte
+        case ('\\') try list.write("\\\\")
+        case ('"') try list.write("\\\"")
+        case ('\n') try list.write("\\n")
+        case ('\t') try list.write("\\t")
+        case ('\r') try list.write("\\r")
+        case (0) try list.write("\\0")
+        else
+            if byte < 0x20 or byte == 0x7f
+                try write_byte_escape(list, byte)
+            else
+                try list.append(byte)
+
+
+private fn write_byte_escape(list: *ArrayList(u8), byte: u8) -> memory::Error!void
+    try list.write("\\x")
+    try list.append(hexadecimal_digits[mn::convert(usize, byte >> 4)])
+    try list.append(hexadecimal_digits[mn::convert(usize, byte & 15)])
+
+
+private fn write_code_point_escape(list: *ArrayList(u8), code_point: u32) -> memory::Error!void
+    if (code_point == 0x85) return list.write("\\N")
+    if (code_point == 0x2028) return list.write("\\L")
+    if (code_point == 0x2029) return list.write("\\P")
+    try list.write("\\u")
+    var shift: usize = 16
+    while shift > 0
+        shift -= 4
+        try list.append(hexadecimal_digits[mn::convert(usize, (code_point >> shift) & 15)])
+
+
+private fn find_allowance(budget: ?usize) -> usize
+    const left = budget orelse return 1
+    if (left == 0) return 0
+    return 1
+
+
+private fn find_restored_budget(saved: ?usize, allowed: usize) -> ?usize
+    const budget = saved orelse return null
+    return budget - allowed
+
+
+private fn(type R: Reader) read_input(reader: *R, input: *ArrayList(u8)) -> !void
+    var buffer: [4096]u8 = undefined
+    while true
+        const count = try Reader::read(reader, &buffer)
+        if (count == 0) return
+        try input.write(buffer[..count])
+
+
+private fn parse_integer(type T, scalar: []const(u8)) -> codec::Error!T
+    if (scalar.length > 2 and scalar[0] == '0' and scalar[1] == 'x') return parse_digits(T, scalar[2..], 16)
+    if (scalar.length > 2 and scalar[0] == '0' and scalar[1] == 'o') return parse_digits(T, scalar[2..], 8)
+    const is_signed_plus = scalar.length > 1 and scalar[0] == '+' and scalar[1] != '-'
+    return parse_number_text(T, if (is_signed_plus) scalar[1..] else scalar)
+
+
+private fn parse_digits(type T, digits: []const(u8), base: u8) -> codec::Error!T
+    const maximum = find_maximum(T)
+    const radix = mn::convert(T, base)
+    var value: T = 0
+    for byte in digits
+        const digit = find_digit_value(byte)
+        if (digit >= base) return codec::Error::Malformed
+        const step = mn::convert(T, digit)
+        if (value > (maximum - step) / radix) return codec::Error::Malformed
+        value = value * radix + step
+    return value
+
+
+private fn parse_number_text(type T, digits: []const(u8)) -> codec::Error!T
+    const value = digits.to(T) catch return codec::Error::Malformed
+    return value
+
+
+private fn find_minimum(type T) -> T
+    if (is_unsigned(T)) return 0
+    return mn::convert(T, 1) << (mn::size(T) * 8 - 1)
+
+
+private fn is_unsigned(type T) -> bool = T == u8 or T == u16 or T == u32 or T == u64 or T == u128 or T == usize
+
+
+private fn find_maximum(type T) -> T = ~find_minimum(T)
+
+
+private fn parse_float(type T, scalar: []const(u8)) -> (codec::Error || memory::Error)!T
+    if (is_nan_text(scalar)) return parse_number_text(T, "nan")
+    if (is_infinity_text(scalar)) return parse_number_text(T, if (scalar[0] == '-') "-inf" else "inf")
+    if (!is_float_text(scalar)) return codec::Error::Malformed
+    if (is_normalized_float(scalar)) return parse_number_text(T, scalar)
+    const own normalized = try memory::allocate(u8, scalar.length + 2)
+    defer memory::free(own normalized)
+    const length = fill_normalized_float(normalized, scalar)
+    return parse_number_text(T, normalized[..length])
+
+
+private fn is_normalized_float(scalar: []const(u8)) -> bool
+    if (scalar[0] == '+') return false
+    const start: usize = if (scalar[0] == '-') 1 else 0
+    for index in start..scalar.length
+        if scalar[index] == '.'
+            if (index == start or index + 1 == scalar.length) return false
+            if (scalar[index + 1] < '0' or scalar[index + 1] > '9') return false
+    return true
+
+
+private fn fill_normalized_float(normalized: []u8, scalar: []const(u8)) -> usize
+    var length: usize = 0
+    var position: usize = 0
+    if scalar[0] == '+' or scalar[0] == '-'
+        if scalar[0] == '-'
+            normalized[0] = '-'
+            length = 1
+        position = 1
+    if position < scalar.length and scalar[position] == '.'
+        normalized[length] = '0'
+        length += 1
+    while position < scalar.length
+        const byte = scalar[position]
+        normalized[length] = byte
+        length += 1
+        position += 1
+        if byte == '.' and (position == scalar.length or scalar[position] < '0' or scalar[position] > '9')
+            normalized[length] = '0'
+            length += 1
+    return length
+
+
+private fn is_blank(byte: u8) -> bool = byte == ' ' or byte == '\t'
+
+
+private fn is_flow_indicator(byte: u8) -> bool = byte == ',' or byte == '[' or byte == ']' or byte == '{' or byte == '}'

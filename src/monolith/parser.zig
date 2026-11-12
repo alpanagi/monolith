@@ -385,10 +385,20 @@ pub const Parser = struct {
         if (self.match(&position, .colon) == null) return &.{};
         var requirements: std.ArrayList(ast.Expression) = .empty;
         while (true) {
-            const requirement = (try self.parseNameExpression(allocator, &position)) orelse {
+            const first = self.tokens[position];
+            const written = (try self.parsePathStart(allocator, &position)) orelse {
                 return self.fail(position, error.ExpectedIdentifier);
             };
-            try requirements.append(allocator, requirement);
+            if (self.match(&position, .left_parenthesis) != null) {
+                const arguments = try self.parseArguments(allocator, &position);
+                _ = try self.expect(&position, .right_parenthesis, error.ExpectedRightParenthesis);
+                try requirements.append(allocator, .{
+                    .kind = .{ .call = .{ .callee = buildName(written), .arguments = arguments } },
+                    .location = first.location,
+                });
+            } else {
+                try requirements.append(allocator, buildNameExpression(written, first.location));
+            }
             if (self.match(&position, .keyword_and) == null) break;
         }
 
@@ -2938,12 +2948,8 @@ fn buildBinary(
 }
 
 fn findTypeclassSelfParameter(signature: ast.FunctionSignature, parameters: []const ast.TypeclassParameter) ast.SelfParameter {
-    for (parameters) |parameter| {
-        if (parameter.arity != 0) continue;
-        const self_parameter = findSelfParameter(signature, parameter.name);
-        if (self_parameter != .none) return self_parameter;
-    }
-    return .none;
+    if (parameters.len == 0 or parameters[0].arity != 0) return .none;
+    return findSelfParameter(signature, parameters[0].name);
 }
 
 fn findSelfParameter(signature: ast.FunctionSignature, self_name: []const u8) ast.SelfParameter {
@@ -3870,6 +3876,26 @@ test "parseRequirements: parses requirements joined with and on a type parameter
     const typeclass_parameter = module.declarations[3].kind.typeclass_definition.parameters[0];
     try std.testing.expectEqual(2, typeclass_parameter.requirements.len);
     try std.testing.expectEqualStrings("Show", typeclass_parameter.requirements[1].kind.identifier.name);
+}
+
+test "parseRequirements: parses a requirement with arguments joined with and on a type parameter and an instance parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn decode(self: *D, type T: codec::Decode(_, D) and Show) -> T = noop\ninstance(type A: Encode(_, E), type E: Encoder) Encode(?A, E)\n\n    fn encode(value: *const(Self), encoder: *E) -> !void = noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const parameter = module.declarations[0].kind.function_definition.signature.parameters[1];
+    try std.testing.expectEqual(2, parameter.requirements.len);
+    const call = parameter.requirements[0].kind.call;
+    try std.testing.expectEqualStrings("Decode", call.callee.path_expression.path[1]);
+    try std.testing.expectEqual(2, call.arguments.len);
+    try std.testing.expect(call.arguments[0].value.kind == .inferred_type);
+    try std.testing.expectEqualStrings("D", call.arguments[1].value.kind.identifier.name);
+    try std.testing.expectEqualStrings("Show", parameter.requirements[1].kind.identifier.name);
+    const instance_parameter = module.declarations[1].kind.instance_declaration.parameters[0];
+    try std.testing.expectEqualStrings("Encode", instance_parameter.requirements[0].kind.call.callee.identifier.name);
 }
 
 test "parseRequirements: rejects and without a typeclass after it" {
@@ -5542,17 +5568,6 @@ test "parseBranch: rejects a name after else without as before an indented block
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 14 }, parser.failure.?.location.?);
 }
 
-test "parseFunctionSignature: rejects a type parameter that requires a typeclass with an unknown type" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn show(type T: Convert(_, u8)) = noop");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.ExpectedRightParenthesis, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, parser.failure.?.location.?);
-}
-
 test "parseBranch: rejects a branch without a case" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6820,6 +6835,19 @@ test "parseTypeclassDefinition: parses the parameter of a typeclass and the rece
     try std.testing.expectEqual(ast.SelfParameter.pointer, definition.functions[1].self_parameter);
     try std.testing.expectEqual(ast.SelfParameter.constant_pointer, definition.functions[2].self_parameter);
     try std.testing.expectEqual(ast.SelfParameter.none, definition.functions[3].self_parameter);
+}
+
+test "parseTypeclassDefinition: makes methods only of functions whose first parameter is the first parameter of the typeclass" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("typeclass Decode(type T, type D)\n\n    fn decode(decoder: *D) -> T\n    fn check(value: *const(T), decoder: *D) -> bool");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const definition = module.declarations[0].kind.typeclass_definition;
+    try std.testing.expectEqual(ast.SelfParameter.none, definition.functions[0].self_parameter);
+    try std.testing.expectEqual(ast.SelfParameter.constant_pointer, definition.functions[1].self_parameter);
 }
 
 test "parseTypeclassDefinition: rejects a typeclass without parameters" {

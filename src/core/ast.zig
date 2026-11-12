@@ -221,13 +221,19 @@ pub const TypeclassParameter = struct {
     name: []const u8,
     arity: usize,
     requirements: []Expression = &.{},
-    resolved_requirements: []Resolution.Typeclass = &.{},
+    resolved_requirements: []Requirement = &.{},
     location: token.Location,
 };
 
 pub const Constraint = struct {
     typeclass: Resolution.Typeclass,
     arguments: []const types.Argument,
+};
+
+pub const Requirement = struct {
+    typeclass: Resolution.Typeclass,
+    arguments: []const types.Argument = &.{},
+    unknown_position: usize = 0,
 };
 
 pub const Default = struct {
@@ -251,7 +257,7 @@ pub const InstanceParameter = struct {
     name: []const u8,
     is_length: bool = false,
     requirements: []Expression = &.{},
-    resolved_requirements: []Resolution.Typeclass = &.{},
+    resolved_requirements: []Requirement = &.{},
     location: token.Location,
 };
 
@@ -697,7 +703,7 @@ pub const TypedName = struct {
     location: token.Location,
     kind: ParameterKind = .run_time,
     requirements: []Expression = &.{},
-    resolved_requirements: []Resolution.Typeclass = &.{},
+    resolved_requirements: []Requirement = &.{},
     constraint: ?Resolution.Typeclass = null,
     constraint_arguments: []const types.Argument = &.{},
     unknown_position: usize = 0,
@@ -717,6 +723,48 @@ pub fn fillConstraintArguments(
     const arguments = try allocator.dupe(types.Argument, parameter.constraint_arguments);
     arguments[parameter.unknown_position] = .{ .type = value_type };
     return arguments;
+}
+
+pub fn fillRequirementArguments(
+    allocator: std.mem.Allocator,
+    requirement: Requirement,
+    value_type: types.Type,
+) std.mem.Allocator.Error![]types.Argument {
+    if (requirement.arguments.len == 0) return allocator.dupe(types.Argument, &.{.{ .type = value_type }});
+    const arguments = try allocator.dupe(types.Argument, requirement.arguments);
+    arguments[requirement.unknown_position] = .{ .type = value_type };
+    return arguments;
+}
+
+pub fn decideRequirement(
+    allocator: std.mem.Allocator,
+    registry: *types.Registry,
+    requirement: Requirement,
+    value: types.Argument,
+    assigned: []const ?types.Argument,
+    scope: types.Scope,
+) std.mem.Allocator.Error!?[]const ?types.Argument {
+    if (requirement.arguments.len == 0) return try allocator.dupe(?types.Argument, &.{value});
+    const known = try allocator.alloc(types.Argument, assigned.len);
+    for (assigned, known, 0..) |optional_argument, *argument, index| {
+        argument.* = optional_argument orelse .{ .type = .{ .variable = .{ .scope = scope, .index = index } } };
+    }
+    const decided = try allocator.alloc(?types.Argument, requirement.arguments.len);
+    for (requirement.arguments, decided, 0..) |argument, *slot, position| {
+        if (position == requirement.unknown_position) {
+            slot.* = value;
+            continue;
+        }
+        slot.* = switch (argument) {
+            .type => |value_type| decided: {
+                const substituted = try types.substitute(allocator, registry, value_type, known, scope);
+                if (types.containsVariable(substituted, scope)) return null;
+                break :decided .{ .type = substituted };
+            },
+            .constructor, .length => argument,
+        };
+    }
+    return decided;
 }
 
 pub const ParameterKind = enum {
@@ -895,12 +943,13 @@ pub fn isMain(signature: FunctionSignature) bool {
 pub fn findInstance(
     allocator: std.mem.Allocator,
     modules: []const Module,
+    registry: *types.Registry,
     typeclass: Resolution.Typeclass,
     decided: []const ?types.Argument,
 ) std.mem.Allocator.Error!InstanceSearch {
-    const exact = try searchInstance(allocator, modules, typeclass, decided, false);
+    const exact = try searchInstance(allocator, modules, registry, typeclass, decided, false);
     if (exact != .missing) return exact;
-    const relaxed = try searchInstance(allocator, modules, typeclass, decided, true);
+    const relaxed = try searchInstance(allocator, modules, registry, typeclass, decided, true);
     if (relaxed != .missing) return relaxed;
     return findNothingOwningInstance(allocator, modules, typeclass, decided);
 }
@@ -940,6 +989,7 @@ fn findNothingOwningInstance(
 fn searchInstance(
     allocator: std.mem.Allocator,
     modules: []const Module,
+    registry: *types.Registry,
     typeclass: Resolution.Typeclass,
     decided: []const ?types.Argument,
     relaxed: bool,
@@ -950,8 +1000,7 @@ fn searchInstance(
         const reference: InstanceReference = .{ .module = typeclass.module, .declaration = typeclass.declaration };
         return .{ .found = .{ .reference = reference, .assigned = &.{} } };
     }
-    var found: ?InstanceReference = null;
-    var found_assigned: []?types.Argument = &.{};
+    var candidates: std.ArrayList(Candidate) = .empty;
     for (modules, 0..) |module, module_index| {
         for (module.declarations, 0..) |declaration, index| {
             if (declaration.kind != .instance_declaration) continue;
@@ -967,22 +1016,116 @@ fn searchInstance(
                 if (!types.matchArgument(pattern, argument, .instance, assigned, reads_only)) break false;
             } else true;
             if (!fits) continue;
-            if (!try satisfiesRequirements(allocator, modules, instance_declaration, assigned)) continue;
-            if (found != null) return .ambiguous;
-            if (instance_declaration.parameters.len > 0) {
-                if (!try hasRequiredInstances(allocator, modules, typeclass, decided)) return .missing_requirement;
-            }
-            found = .{ .module = module_index, .declaration = index };
-            found_assigned = assigned;
+            if (!try satisfiesRequirements(allocator, modules, registry, instance_declaration, assigned)) continue;
+            try candidates.append(allocator, .{ .reference = .{ .module = module_index, .declaration = index }, .assigned = assigned });
         }
     }
-    const reference = found orelse return .missing;
-    const assigned = try allocator.alloc(types.Argument, found_assigned.len);
-    for (found_assigned, assigned) |optional_argument, *argument| {
+    if (candidates.items.len == 0) return .missing;
+    const chosen = switch (try chooseMostSpecific(allocator, modules, candidates.items)) {
+        .chosen => |chosen| chosen,
+        .ambiguous => |pair| return .{ .ambiguous = pair },
+    };
+    const instance_declaration = modules[chosen.reference.module].declarations[chosen.reference.declaration].kind.instance_declaration;
+    if (instance_declaration.parameters.len > 0) {
+        if (!try hasRequiredInstances(allocator, modules, registry, typeclass, decided)) return .missing_requirement;
+    }
+    const assigned = try allocator.alloc(types.Argument, chosen.assigned.len);
+    for (chosen.assigned, assigned) |optional_argument, *argument| {
         argument.* = optional_argument orelse return .undecided;
     }
-    return .{ .found = .{ .reference = reference, .assigned = assigned } };
+    return .{ .found = .{ .reference = chosen.reference, .assigned = assigned } };
 }
+
+fn chooseMostSpecific(allocator: std.mem.Allocator, modules: []const Module, candidates: []const Candidate) std.mem.Allocator.Error!Choice {
+    for (candidates) |candidate| {
+        const most_specific = for (candidates) |other| {
+            if (std.meta.eql(candidate.reference, other.reference)) continue;
+            if (!try isMoreSpecific(allocator, modules, candidate.reference, other.reference)) break false;
+        } else true;
+        if (most_specific) return .{ .chosen = candidate };
+    }
+    for (candidates, 0..) |one, position| {
+        for (candidates[position + 1 ..]) |two| {
+            if (try isMoreSpecific(allocator, modules, one.reference, two.reference)) continue;
+            if (try isMoreSpecific(allocator, modules, two.reference, one.reference)) continue;
+            return .{ .ambiguous = .{ one.reference, two.reference } };
+        }
+    }
+    return .{ .ambiguous = .{ candidates[0].reference, candidates[1].reference } };
+}
+
+pub fn isMoreSpecific(allocator: std.mem.Allocator, modules: []const Module, specific: InstanceReference, general: InstanceReference) std.mem.Allocator.Error!bool {
+    const one = modules[general.module].declarations[general.declaration].kind.instance_declaration;
+    const two = modules[specific.module].declarations[specific.declaration].kind.instance_declaration;
+    const sides: types.Sides = .{
+        .one = try allocator.alloc(?types.Unified, one.parameters.len),
+        .two = try allocator.alloc(?types.Unified, two.parameters.len),
+        .rigid = .two,
+    };
+    @memset(sides.one, null);
+    @memset(sides.two, null);
+    return types.unifyArguments(one.resolved_arguments, two.resolved_arguments, sides);
+}
+
+pub fn renderInstance(allocator: std.mem.Allocator, modules: []const Module, reference: InstanceReference) std.mem.Allocator.Error![]const u8 {
+    const instance_declaration = modules[reference.module].declarations[reference.declaration].kind.instance_declaration;
+    const typeclass = instance_declaration.resolved.?;
+    const name = modules[typeclass.module].declarations[typeclass.declaration].kind.typeclass_definition.name;
+    var arguments: std.ArrayList([]const u8) = .empty;
+    for (instance_declaration.resolved_arguments) |argument| {
+        try arguments.append(allocator, switch (argument) {
+            .type => |value_type| try renderInstanceType(allocator, modules, instance_declaration.parameters, value_type),
+            .constructor => |constructor| switch (constructor) {
+                .variable => |variable| instance_declaration.parameters[variable.index].name,
+                .function => |function| extractFunctionSignature(findDeclaration(modules[function.module], function.declaration).*).name,
+                .typeclass_function => "the type",
+            },
+            .length => |length| try std.fmt.allocPrint(allocator, "{d}", .{length}),
+        });
+    }
+    const module_name = try std.mem.join(allocator, "::", modules[reference.module].path);
+    return std.fmt.allocPrint(allocator, "`{s}({s})` in `{s}`", .{ name, try std.mem.join(allocator, ", ", arguments.items), module_name });
+}
+
+fn renderInstanceType(
+    allocator: std.mem.Allocator,
+    modules: []const Module,
+    parameters: []const InstanceParameter,
+    value_type: types.Type,
+) std.mem.Allocator.Error![]const u8 {
+    return switch (value_type) {
+        .variable => |variable| if (variable.scope == .instance) parameters[variable.index].name else "the type",
+        .application => |application| name: {
+            const constructor = switch (application.constructor) {
+                .variable => |variable| if (variable.scope == .instance) parameters[variable.index].name else "the type",
+                .function => |function| extractFunctionSignature(findDeclaration(modules[function.module], function.declaration).*).name,
+                .typeclass_function => "the type",
+            };
+            var arguments: std.ArrayList([]const u8) = .empty;
+            for (application.arguments) |argument| try arguments.append(allocator, try renderInstanceType(allocator, modules, parameters, argument));
+            break :name std.fmt.allocPrint(allocator, "{s}({s})", .{ constructor, try std.mem.join(allocator, ", ", arguments.items) });
+        },
+        .optional => |optional| std.fmt.allocPrint(allocator, "?{s}", .{try renderInstanceType(allocator, modules, parameters, optional.child)}),
+        .pointer => |pointer| renderReadOnly(allocator, if (pointer.many) "*many" else "*", pointer.constant, try renderInstanceType(allocator, modules, parameters, pointer.target)),
+        .slice => |slice| renderReadOnly(allocator, "[]", slice.constant, try renderInstanceType(allocator, modules, parameters, slice.element)),
+        .array => |array| name: {
+            const element = try renderInstanceType(allocator, modules, parameters, array.element);
+            if (array.length_variable) |variable| break :name std.fmt.allocPrint(allocator, "[{s}]{s}", .{ parameters[variable.index].name, element });
+            break :name std.fmt.allocPrint(allocator, "[{d}]{s}", .{ array.length, element });
+        },
+        else => renderTypeName(allocator, modules, value_type),
+    };
+}
+
+const Candidate = struct {
+    reference: InstanceReference,
+    assigned: []?types.Argument,
+};
+
+const Choice = union(enum) {
+    chosen: Candidate,
+    ambiguous: [2]InstanceReference,
+};
 
 fn isTargetParameter(modules: []const Module, typeclass: Resolution.Typeclass, position: usize) bool {
     const definition = modules[typeclass.module].declarations[typeclass.declaration].kind.typeclass_definition;
@@ -1015,7 +1158,7 @@ pub fn isLibraryTypeclass(modules: []const Module, typeclass: Resolution.Typecla
 pub const InstanceSearch = union(enum) {
     missing,
     missing_requirement,
-    ambiguous,
+    ambiguous: [2]InstanceReference,
     undecided,
     found: FoundInstance,
 };
@@ -1045,15 +1188,16 @@ pub fn findInstanceMember(modules: []const Module, reference: InstanceReference,
 fn hasRequiredInstances(
     allocator: std.mem.Allocator,
     modules: []const Module,
+    registry: *types.Registry,
     typeclass: Resolution.Typeclass,
     decided: []const ?types.Argument,
 ) std.mem.Allocator.Error!bool {
     const definition = modules[typeclass.module].declarations[typeclass.declaration].kind.typeclass_definition;
     for (definition.parameters, decided) |parameter, optional_argument| {
         const argument = optional_argument orelse continue;
-        const required: []const ?types.Argument = &.{argument};
         for (parameter.resolved_requirements) |requirement| {
-            if (try findInstance(allocator, modules, requirement, required) != .found) return false;
+            const required = try decideRequirement(allocator, registry, requirement, argument, decided, .typeclass) orelse continue;
+            if (try findInstance(allocator, modules, registry, requirement.typeclass, required) != .found) return false;
         }
     }
     return true;
@@ -1062,14 +1206,15 @@ fn hasRequiredInstances(
 fn satisfiesRequirements(
     allocator: std.mem.Allocator,
     modules: []const Module,
+    registry: *types.Registry,
     instance_declaration: InstanceDeclaration,
     assigned: []const ?types.Argument,
 ) std.mem.Allocator.Error!bool {
     for (instance_declaration.parameters, assigned) |parameter, optional_argument| {
         const argument = optional_argument orelse continue;
-        const decided: []const ?types.Argument = &.{argument};
         for (parameter.resolved_requirements) |requirement| {
-            switch (try findInstance(allocator, modules, requirement, decided)) {
+            const decided = try decideRequirement(allocator, registry, requirement, argument, assigned, .instance) orelse continue;
+            switch (try findInstance(allocator, modules, registry, requirement.typeclass, decided)) {
                 .missing, .missing_requirement => return false,
                 .found, .ambiguous, .undecided => {},
             }

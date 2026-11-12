@@ -1,3 +1,4 @@
+#define _DARWIN_C_SOURCE
 #define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
@@ -11,6 +12,12 @@
 #include <unistd.h>
 
 #include "monolith.h"
+
+#if defined(__APPLE__)
+#define mn_modified_time st_mtimespec
+#else
+#define mn_modified_time st_mtim
+#endif
 
 static_assert(PATH_MAX <= 4096, "the buffer of mn::filesystem::Path::absolute holds 4096 bytes");
 
@@ -103,8 +110,8 @@ int32_t mn_runtime_filesystem_metadata(mn_slice_u8 name, int32_t *kind, size_t *
     if (stat((char const *)name.items, &status) != 0) return mn_runtime_filesystem_error_code(errno);
     *kind = mn_runtime_filesystem_mode_kind(status.st_mode);
     *size = (size_t)status.st_size;
-    *seconds = (int64_t)status.st_mtim.tv_sec;
-    *nanoseconds = (uint32_t)status.st_mtim.tv_nsec;
+    *seconds = (int64_t)status.mn_modified_time.tv_sec;
+    *nanoseconds = (uint32_t)status.mn_modified_time.tv_nsec;
     return 0;
 }
 

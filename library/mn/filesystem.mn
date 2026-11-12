@@ -236,14 +236,14 @@ instance To(Path, []u8)
         return text
 
 
-instance Encode(Path)
+instance(type E: Encoder) Encode(Path, E)
 
-    fn encode(path: *const(Self), encoder: *Encoder) -> !void = encoder.bytes(path.bytes)
+    fn encode(path: *const(Self), encoder: *E) -> !void = encoder.bytes(path.bytes)
 
 
-instance Decode(Path)
+instance(type D: Decoder) Decode(Path, D)
 
-    fn decode(decoder: *Decoder) -> own !Self
+    fn decode(decoder: *D) -> own !Self
         const own bytes = try decoder.bytes()
         return { bytes = own bytes }
 

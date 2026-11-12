@@ -1,4 +1,5 @@
 import mn
+import mn::compare::Ordering
 import mn::container
 import mn::convert::ToOwned
 import mn::memory
@@ -29,6 +30,11 @@ fn strip(bytes: []const(u8)) -> []const(u8)
 fn is_whitespace(byte: u8) -> bool = match byte
     case (' ', '\t', '\n', '\r', 0x0b, 0x0c) true
     else false
+
+
+error Error
+    Malformed
+    OutOfRange
 
 
 fn(type Values: Tuple) write_format(writer: *Writer, comptime format: []const(u8), comptime position: usize, comptime brace: usize, comptime index: usize, values: Values) -> !void
@@ -90,8 +96,11 @@ fn write_value(writer: *Writer, type T, comptime specifier: u8, value: T) -> !vo
     else if T == u8 or T == u16 or T == u32 or T == u64 or T == u128 or T == usize
         if (specifier == 's') mn::comptime::error("an integer is formatted only with {}, {x} or {b}")
         try write_integer(writer, T, false, find_base(specifier), value)
+    else if T == f16 or T == f32 or T == f64 or T == f128
+        if (specifier != 'd') mn::comptime::error("a float is formatted only with {}")
+        try write_float(writer, T, value)
     else
-        mn::comptime::error("only integers, bools and byte slices can be formatted")
+        mn::comptime::error("only integers, floats, bools and byte slices can be formatted")
 
 
 fn write_hexadecimal(writer: *Writer, bytes: []const(u8)) -> !void
@@ -105,6 +114,14 @@ fn write_hexadecimal(writer: *Writer, bytes: []const(u8)) -> !void
             try Writer::write(writer, &buffer)
             position = 0
     if (position > 0) try Writer::write(writer, buffer[..position])
+
+
+fn read_hexadecimal(text: []const(u8), bytes: []u8) -> Error!void
+    if (text.length != bytes.length * 2) return Error::Malformed
+    for index in 0..bytes.length
+        const high = try find_value(text[index * 2])
+        const low = try find_value(text[index * 2 + 1])
+        bytes[index] = (high << 4) | low
 
 
 fn find_base(specifier: u8) -> u8 = match specifier
@@ -135,3 +152,510 @@ fn write_integer(writer: *Writer, type T, comptime is_signed: bool, comptime bas
 fn find_digit(digit: u8) -> u8
     if (digit < 10) return '0' + digit
     return 'a' + digit - 10
+
+
+private fn write_float(writer: *Writer, type T, value: T) -> !void
+    const one: u128 = 1
+    const fraction_bits = find_fraction_bits(T)
+    const exponent_bits = find_exponent_bits(T)
+    const bits = mn::convert(u128, copy_bits(Bits(T), T, &value))
+    const biased = (bits >> fraction_bits) & ((one << exponent_bits) - 1)
+    const fraction = bits & ((one << fraction_bits) - 1)
+    const is_negative = bits >> (fraction_bits + exponent_bits) != 0
+    if biased == (one << exponent_bits) - 1
+        if fraction != 0
+            try Writer::write(writer, "nan")
+        else if is_negative
+            try Writer::write(writer, "-inf")
+        else
+            try Writer::write(writer, "inf")
+        return
+    var text: [64]u8 = undefined
+    var length: usize = 0
+    if is_negative
+        text[0] = '-'
+        length = 1
+    if biased == 0 and fraction == 0
+        length = append(&text, length, "0.0")
+    else
+        var digits: [40]u8 = undefined
+        const { count, point } = find_shortest_digits(T, biased, fraction, &digits)
+        length = place_digits(&text, length, digits[..count], point)
+    try Writer::write(writer, text[..length])
+
+
+private fn find_shortest_digits(type T, biased: u128, fraction: u128, digits: *[40]u8) -> [usize, i64]
+    const one: u128 = 1
+    const lowest = find_lowest_exponent(T)
+    const mantissa = if (biased == 0) fraction else fraction | (one << find_fraction_bits(T))
+    const exponent = if (biased == 0) lowest else lowest + mn::convert(i64, biased) - 1
+    const factor: u128 = if (biased > 1 and fraction == 0) 4 else 2
+    const is_inclusive = mantissa % 2 == 0
+    var remainder: Natural(find_capacity(T)) = undefined
+    var scale: Natural(find_capacity(T)) = undefined
+    var upper: Natural(find_capacity(T)) = undefined
+    var lower: Natural(find_capacity(T)) = undefined
+    var sum: Natural(find_capacity(T)) = undefined
+    remainder.set(mantissa * factor)
+    scale.set(factor)
+    upper.set(factor / 2)
+    lower.set(1)
+    if exponent >= 0
+        remainder.shift_left(mn::convert(usize, exponent))
+        upper.shift_left(mn::convert(usize, exponent))
+        lower.shift_left(mn::convert(usize, exponent))
+    else
+        scale.shift_left(mn::convert(usize, 0 - exponent))
+
+    var point = ((mn::convert(i64, find_bit_count(mantissa)) - 1 + exponent) * 1292913986 >> 32) + 1
+    if point >= 0
+        scale.multiply_power_of_ten(mn::convert(usize, point))
+    else
+        remainder.multiply_power_of_ten(mn::convert(usize, 0 - point))
+        upper.multiply_power_of_ten(mn::convert(usize, 0 - point))
+        lower.multiply_power_of_ten(mn::convert(usize, 0 - point))
+    sum.assign_sum(&remainder, &upper)
+    while is_past(sum.order(&scale), is_inclusive)
+        scale.multiply_small(10)
+        point += 1
+    while true
+        sum.assign_sum(&remainder, &upper)
+        sum.multiply_small(10)
+        if (is_past(sum.order(&scale), is_inclusive)) break
+        remainder.multiply_small(10)
+        upper.multiply_small(10)
+        lower.multiply_small(10)
+        point -= 1
+
+    var count: usize = 0
+    while true
+        remainder.multiply_small(10)
+        upper.multiply_small(10)
+        lower.multiply_small(10)
+        var digit: u8 = 0
+        while remainder.order(&scale) != ::Less
+            remainder.subtract(&scale)
+            digit += 1
+        const is_low = is_past(lower.order(&remainder), is_inclusive)
+        sum.assign_sum(&remainder, &upper)
+        const is_high = is_past(sum.order(&scale), is_inclusive)
+        if is_low and is_high
+            remainder.shift_left(1)
+            const order = remainder.order(&scale)
+            if (order == ::Greater or (order == ::Equal and digit % 2 == 1)) digit += 1
+        else if is_high
+            digit += 1
+        digits[count] = '0' + digit
+        count += 1
+        if (is_low or is_high) return { count, point }
+
+
+private fn is_past(order: Ordering, is_inclusive: bool) -> bool = order == ::Greater or (is_inclusive and order == ::Equal)
+
+
+private fn place_digits(text: *[64]u8, start: usize, digits: []const(u8), point: i64) -> usize
+    const count = mn::convert(i64, digits.length)
+    if point - 1 < -5 or point - 1 >= 21
+        const whole = append(text, append(text, start, digits[..1]), ".")
+        const length = if (digits.length == 1) append(text, whole, "0") else append(text, whole, digits[1..])
+        return append_exponent(text, length, point - 1)
+    if (point <= 0) return append(text, append_zeros(text, append(text, start, "0."), mn::convert(usize, 0 - point)), digits)
+    if point < count
+        const whole = mn::convert(usize, point)
+        return append(text, append(text, append(text, start, digits[..whole]), "."), digits[whole..])
+    return append(text, append_zeros(text, append(text, start, digits), mn::convert(usize, point - count)), ".0")
+
+
+private fn append(text: *[64]u8, start: usize, bytes: []const(u8)) -> usize
+    memory::copy(text[start..start + bytes.length], bytes)
+    return start + bytes.length
+
+
+private fn append_zeros(text: *[64]u8, start: usize, count: usize) -> usize
+    for (index in start..start + count) text[index] = '0'
+    return start + count
+
+
+private fn append_exponent(text: *[64]u8, start: usize, exponent: i64) -> usize
+    var length = append(text, start, if (exponent < 0) "e-" else "e")
+    var rest = if (exponent < 0) 0 - exponent else exponent
+    var digits: [8]u8 = undefined
+    var count: usize = 0
+    while true
+        digits[count] = '0' + mn::convert(u8, rest % 10)
+        rest /= 10
+        count += 1
+        if (rest == 0) break
+    while count > 0
+        count -= 1
+        text[length] = digits[count]
+        length += 1
+    return length
+
+
+private fn find_value(digit: u8) -> Error!u8
+    if (digit >= '0' and digit <= '9') return digit - '0'
+    if (digit >= 'a' and digit <= 'f') return digit - 'a' + 10
+    if (digit >= 'A' and digit <= 'F') return digit - 'A' + 10
+    return Error::Malformed
+
+
+private fn parse_integer(type T, text: []const(u8)) -> Error!T
+    const is_negative = text.length > 0 and text[0] == '-'
+    const start: usize = if (is_negative) 1 else 0
+    if (start == text.length) return Error::Malformed
+    const minimum = find_minimum(T)
+    const maximum = ~minimum
+    var value: T = 0
+    var is_out_of_range = false
+    for byte in text[start..]
+        if (byte < '0' or byte > '9') return Error::Malformed
+        const digit = mn::convert(T, byte - '0')
+        if (is_out_of_range) continue
+        if !is_negative
+            if value > (maximum - digit) / 10
+                is_out_of_range = true
+            else
+                value = value * 10 + digit
+        else if value < (minimum + digit) / 10 or (minimum == 0 and digit != 0)
+            is_out_of_range = true
+        else
+            value = value * 10 - digit
+    if (is_out_of_range) return Error::OutOfRange
+    return value
+
+
+private fn find_minimum(type T) -> T
+    if (T == u8 or T == u16 or T == u32 or T == u64 or T == u128 or T == usize) return 0
+    return mn::convert(T, 1) << (mn::size(T) * 8 - 1)
+
+
+private fn parse_float(type T, text: []const(u8)) -> Error!T
+    const one: u128 = 1
+    const fraction_bits = find_fraction_bits(T)
+    const highest = (one << find_exponent_bits(T)) - 1
+    if (memory::equal(text, "nan")) return build_float(T, false, highest, one << (fraction_bits - 1))
+    if (memory::equal(text, "inf")) return build_float(T, false, highest, 0)
+    if (memory::equal(text, "-inf")) return build_float(T, true, highest, 0)
+
+    const is_negative = text.length > 0 and text[0] == '-'
+    var position: usize = if (is_negative) 1 else 0
+    var number: Natural(find_capacity(T)) = undefined
+    number.set(0)
+    var chunk: u64 = 0
+    var chunk_length: usize = 0
+    var kept: usize = 0
+    var is_truncated = false
+    var exponent: i64 = 0
+    var integer_length: usize = 0
+    var fraction_length: usize = 0
+    var has_point = false
+    while position < text.length
+        const byte = text[position]
+        if byte == '.' and !has_point
+            has_point = true
+        else if byte >= '0' and byte <= '9'
+            if has_point
+                fraction_length += 1
+                exponent -= 1
+            else
+                integer_length += 1
+            if kept == find_digit_limit(T)
+                if (byte != '0') is_truncated = true
+                exponent += 1
+            else if kept > 0 or byte != '0'
+                if chunk_length == 19
+                    number.multiply_small(10000000000000000000)
+                    number.add_small(chunk)
+                    chunk = 0
+                    chunk_length = 0
+                chunk = chunk * 10 + mn::convert(u64, byte - '0')
+                chunk_length += 1
+                kept += 1
+        else
+            break
+        position += 1
+    if (integer_length == 0 or (has_point and fraction_length == 0)) return Error::Malformed
+
+    var written: i64 = 0
+    if position < text.length and (text[position] == 'e' or text[position] == 'E')
+        position += 1
+        const is_exponent_negative = position < text.length and text[position] == '-'
+        if (position < text.length and (text[position] == '-' or text[position] == '+')) position += 1
+        const start = position
+        while position < text.length and text[position] >= '0' and text[position] <= '9'
+            if (written < 1000000000000) written = written * 10 + mn::convert(i64, text[position] - '0')
+            position += 1
+        if (position == start) return Error::Malformed
+        if (is_exponent_negative) written = 0 - written
+    if (position != text.length) return Error::Malformed
+
+    if (kept == 0) return build_float(T, is_negative, 0, 0)
+    const decimal_exponent = exponent + written
+    const magnitude = mn::convert(i64, kept) + decimal_exponent
+    if (magnitude > find_largest_magnitude(T)) return Error::OutOfRange
+    if (magnitude <= find_smallest_magnitude(T)) return build_float(T, is_negative, 0, 0)
+    const exact_power = find_exact_power(T)
+    const is_exact = mn::convert(u128, chunk) <= one << (fraction_bits + 1) and decimal_exponent >= 0 - exact_power and decimal_exponent <= exact_power
+    if !is_truncated and kept <= 19 and is_exact and magnitude < find_largest_magnitude(T)
+        const whole = mn::convert(T, chunk)
+        if (decimal_exponent < 0 and is_negative) return -(whole / find_power_of_ten(T, mn::convert(usize, 0 - decimal_exponent)))
+        if (decimal_exponent < 0) return whole / find_power_of_ten(T, mn::convert(usize, 0 - decimal_exponent))
+        if (is_negative) return -(whole * find_power_of_ten(T, mn::convert(usize, decimal_exponent)))
+        return whole * find_power_of_ten(T, mn::convert(usize, decimal_exponent))
+
+    number.multiply_small(find_small_power_of_ten(chunk_length))
+    number.add_small(chunk)
+    var divisor: Natural(find_capacity(T)) = undefined
+    divisor.set(1)
+    if decimal_exponent >= 0
+        number.multiply_power_of_ten(mn::convert(usize, decimal_exponent))
+    else
+        divisor.multiply_power_of_ten(mn::convert(usize, 0 - decimal_exponent))
+    const shift = mn::convert(i64, fraction_bits + 3 + divisor.count_bits()) - mn::convert(i64, number.count_bits())
+    if shift >= 0
+        number.shift_left(mn::convert(usize, shift))
+    else
+        divisor.shift_left(mn::convert(usize, 0 - shift))
+    const { quotient, has_remainder } = number.divide(&divisor, fraction_bits + 4)
+    return round_float(T, is_negative, quotient, 0 - shift, is_truncated or has_remainder)
+
+
+private fn round_float(type T, is_negative: bool, quotient: u128, exponent: i64, is_inexact: bool) -> Error!T
+    const one: u128 = 1
+    const fraction_bits = find_fraction_bits(T)
+    const lowest = find_lowest_exponent(T)
+    const length = mn::convert(i64, find_bit_count(quotient))
+    const top = length - 1 + exponent - mn::convert(i64, fraction_bits)
+    const unit = if (top > lowest) top else lowest
+    if (unit - exponent > length) return build_float(T, is_negative, 0, 0)
+    const dropped = mn::convert(usize, unit - exponent)
+    var mantissa = quotient >> dropped
+    const rest = quotient & ((one << dropped) - 1)
+    const half = one << (dropped - 1)
+    if (rest > half or (rest == half and (is_inexact or mantissa % 2 == 1))) mantissa += 1
+    const hidden = one << fraction_bits
+    if (mantissa < hidden) return build_float(T, is_negative, 0, mantissa)
+    const is_carried = mantissa == hidden << 1
+    const increment: u128 = if (is_carried) 2 else 1
+    const biased = mn::convert(u128, unit - lowest) + increment
+    if (biased >= (one << find_exponent_bits(T)) - 1) return Error::OutOfRange
+    return build_float(T, is_negative, biased, (if (is_carried) mantissa >> 1 else mantissa) - hidden)
+
+
+private fn build_float(type T, is_negative: bool, biased: u128, fraction: u128) -> T
+    const one: u128 = 1
+    const fraction_bits = find_fraction_bits(T)
+    const sign: u128 = if (is_negative) one << (fraction_bits + find_exponent_bits(T)) else 0
+    const bits = mn::convert(Bits(T), sign | (biased << fraction_bits) | fraction)
+    return copy_bits(T, Bits(T), &bits)
+
+
+private fn find_power_of_ten(type T, exponent: usize) -> T
+    var power: T = 1.0
+    for (_ in 0..exponent) power *= 10.0
+    return power
+
+
+private fn find_small_power_of_ten(exponent: usize) -> u64
+    var power: u64 = 1
+    for (_ in 0..exponent) power *= 10
+    return power
+
+
+private fn Bits(type T) -> type
+    if (T == f16) return u16
+    if (T == f32) return u32
+    if (T == f64) return u64
+    return u128
+
+
+private fn copy_bits(type T, type F, value: *const(F)) -> T
+    var bits: T = undefined
+    memory::copy(mn::cast(*many(u8), &bits)[0..mn::size(T)], mn::cast(*many(const(u8)), value)[0..mn::size(F)])
+    return bits
+
+
+private fn find_fraction_bits(type T) -> usize
+    if (T == f16) return 10
+    if (T == f32) return 23
+    if (T == f64) return 52
+    return 112
+
+
+private fn find_exponent_bits(type T) -> usize
+    if (T == f16) return 5
+    if (T == f32) return 8
+    if (T == f64) return 11
+    return 15
+
+
+private fn find_lowest_exponent(type T) -> i64 = 2 - (mn::convert(i64, 1) << (find_exponent_bits(T) - 1)) - mn::convert(i64, find_fraction_bits(T))
+
+
+private fn find_digit_limit(type T) -> usize
+    if (T == f16) return 23
+    if (T == f32) return 114
+    if (T == f64) return 769
+    return 11565
+
+
+private fn find_largest_magnitude(type T) -> i64
+    if (T == f16) return 5
+    if (T == f32) return 39
+    if (T == f64) return 309
+    return 4933
+
+
+private fn find_smallest_magnitude(type T) -> i64
+    if (T == f16) return -8
+    if (T == f32) return -46
+    if (T == f64) return -324
+    return -4966
+
+
+private fn find_exact_power(type T) -> i64
+    if (T == f16) return 4
+    if (T == f32) return 10
+    if (T == f64) return 22
+    return 48
+
+
+private fn find_capacity(type T) -> usize
+    const digits = mn::convert(usize, mn::convert(i64, find_digit_limit(T)) - find_smallest_magnitude(T))
+    return (digits * 3322 / 1000 + find_fraction_bits(T) + 8) / 64 + 4
+
+
+private fn find_bit_count(value: u128) -> usize
+    var rest = value
+    var count: usize = 0
+    while rest != 0
+        rest >>= 1
+        count += 1
+    return count
+
+
+private fn Natural(comptime capacity: usize) -> type
+    return struct
+        limbs: [capacity]u64
+        length: usize
+
+        fn set(self: *Self, value: u128)
+            self.limbs[0] = mn::truncate(u64, value)
+            self.limbs[1] = mn::truncate(u64, value >> 64)
+            self.length = 2
+            while (self.length > 0 and self.limbs[self.length - 1] == 0) self.length -= 1
+
+
+        fn assign_sum(self: *Self, one: *const(Self), two: *const(Self))
+            const length = if (one.length > two.length) one.length else two.length
+            var carry: u64 = 0
+            for index in 0..length
+                const first: u64 = if (index < one.length) one.limbs[index] else 0
+                const second: u64 = if (index < two.length) two.limbs[index] else 0
+                const total = mn::convert(u128, first) + mn::convert(u128, second) + mn::convert(u128, carry)
+                self.limbs[index] = mn::truncate(u64, total)
+                carry = mn::truncate(u64, total >> 64)
+            self.length = length
+            if carry != 0
+                self.limbs[length] = carry
+                self.length += 1
+
+
+        fn shift_left(self: *Self, count: usize)
+            if (self.length == 0) return
+            const limb_count = count / 64
+            const bit_count = count % 64
+            if bit_count == 0
+                var index = self.length
+                while index > 0
+                    index -= 1
+                    self.limbs[index + limb_count] = self.limbs[index]
+            else
+                self.limbs[self.length + limb_count] = self.limbs[self.length - 1] >> (64 - bit_count)
+                var index = self.length - 1
+                while index > 0
+                    self.limbs[index + limb_count] = (self.limbs[index] << bit_count) | (self.limbs[index - 1] >> (64 - bit_count))
+                    index -= 1
+                self.limbs[limb_count] = self.limbs[0] << bit_count
+                self.length += 1
+            for (index in 0..limb_count) self.limbs[index] = 0
+            self.length += limb_count
+            if (self.limbs[self.length - 1] == 0) self.length -= 1
+
+
+        fn multiply_small(self: *Self, factor: u64)
+            var carry: u64 = 0
+            for index in 0..self.length
+                const product = mn::convert(u128, self.limbs[index]) * mn::convert(u128, factor) + mn::convert(u128, carry)
+                self.limbs[index] = mn::truncate(u64, product)
+                carry = mn::truncate(u64, product >> 64)
+            if carry != 0
+                self.limbs[self.length] = carry
+                self.length += 1
+
+
+        fn add_small(self: *Self, value: u64)
+            var carry = value
+            var index: usize = 0
+            while carry != 0 and index < self.length
+                const total = mn::convert(u128, self.limbs[index]) + mn::convert(u128, carry)
+                self.limbs[index] = mn::truncate(u64, total)
+                carry = mn::truncate(u64, total >> 64)
+                index += 1
+            if carry != 0
+                self.limbs[self.length] = carry
+                self.length += 1
+
+
+        fn multiply_power_of_ten(self: *Self, exponent: usize)
+            var rest = exponent
+            while rest >= 19
+                self.multiply_small(10000000000000000000)
+                rest -= 19
+            self.multiply_small(find_small_power_of_ten(rest))
+
+
+        fn subtract(self: *Self, other: *const(Self))
+            var borrow: u64 = 0
+            var index: usize = 0
+            while index < other.length or borrow != 0
+                const part: u64 = if (index < other.length) other.limbs[index] else 0
+                const subtrahend = mn::convert(u128, part) + mn::convert(u128, borrow)
+                const minuend = mn::convert(u128, self.limbs[index])
+                if minuend >= subtrahend
+                    self.limbs[index] = mn::truncate(u64, minuend - subtrahend)
+                    borrow = 0
+                else
+                    self.limbs[index] = mn::truncate(u64, minuend + (mn::convert(u128, 1) << 64) - subtrahend)
+                    borrow = 1
+                index += 1
+            while (self.length > 0 and self.limbs[self.length - 1] == 0) self.length -= 1
+
+
+        fn divide(self: *Self, divisor: *Self, bits: usize) -> [u128, bool]
+            divisor.shift_left(bits - 1)
+            var quotient: u128 = 0
+            for _ in 0..bits
+                quotient <<= 1
+                if self.order(divisor) != ::Less
+                    self.subtract(divisor)
+                    quotient |= 1
+                self.shift_left(1)
+            return { quotient, self.length != 0 }
+
+
+        fn order(self: *const(Self), other: *const(Self)) -> Ordering
+            if (self.length < other.length) return ::Less
+            if (self.length > other.length) return ::Greater
+            var index = self.length
+            while index > 0
+                index -= 1
+                if (self.limbs[index] < other.limbs[index]) return ::Less
+                if (self.limbs[index] > other.limbs[index]) return ::Greater
+            return ::Equal
+
+
+        fn count_bits(self: *const(Self)) -> usize
+            if (self.length == 0) return 0
+            return (self.length - 1) * 64 + find_bit_count(mn::convert(u128, self.limbs[self.length - 1]))

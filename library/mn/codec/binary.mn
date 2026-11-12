@@ -48,7 +48,7 @@ instance(type W: Writer) codec::Encoder(Encoder(W))
     fn field(_: *Self, _: []const(u8)) -> !void = noop
     fn tuple(self: *Self, count: usize) -> !void = write_unsigned(self.writer, usize, count)
     fn variant(self: *Self, _: []const(u8), number: usize) -> !void = write_unsigned(self.writer, usize, number)
-    fn(type T: Encode) encode(self: *Self, value: *const(T)) -> !void = Encode::encode(value, self)
+    fn(type T: Encode(_, Self)) encode(self: *Self, value: *const(T)) -> !void = Encode::encode(value, self)
 
 
 fn Decoder(type R: Reader) -> type
@@ -159,7 +159,7 @@ instance(type R: Reader) codec::Decoder(Decoder(R))
         return number
 
 
-    fn decode(self: *Self, type T: Decode) -> own !T = Decode(T)::decode(self)
+    fn decode(self: *Self, type T: Decode(_, Self)) -> own !T = Decode(T, Self)::decode(self)
 
 
 private fn(type W: Writer) write_unsigned(writer: *W, type U, value: U) -> !void

@@ -76,17 +76,17 @@ instance stream::Writer(ArrayList(u8))
             try list.append(byte)
 
 
-instance(type A: Encode) Encode(ArrayList(A))
+instance(type A: Encode(_, E), type E: Encoder) Encode(ArrayList(A), E)
 
-    fn encode(list: *const(Self), encoder: *Encoder) -> !void
+    fn encode(list: *const(Self), encoder: *E) -> !void
         try encoder.sequence(list.count)
         for *element in list.items()
             try encoder.encode(element)
 
 
-instance(type A: Decode and Deinit) Decode(ArrayList(A))
+instance(type A: Decode(_, D) and Deinit, type D: Decoder) Decode(ArrayList(A), D)
 
-    fn decode(decoder: *Decoder) -> own !Self
+    fn decode(decoder: *D) -> own !Self
         const count = try decoder.sequence()
         var own list = Self::init()
         errdefer drain_list(A, own &list)
@@ -220,18 +220,18 @@ instance(type K: Hash and Clone, type V) Deinit(HashMap(K, V))
         memory::free(own map.table)
 
 
-instance(type K: Hash and Clone and Encode, type V: Encode) Encode(HashMap(K, V))
+instance(type K: Hash and Clone and Encode(_, E), type V: Encode(_, E), type E: Encoder) Encode(HashMap(K, V), E)
 
-    fn encode(map: *const(Self), encoder: *Encoder) -> !void
+    fn encode(map: *const(Self), encoder: *E) -> !void
         try encoder.map(map.count)
         for { *key, *value } in map.iterator()
             try encoder.encode(key)
             try encoder.encode(value)
 
 
-instance(type K: Hash and Clone and Decode and Deinit, type V: Decode and Deinit) Decode(HashMap(K, V))
+instance(type K: Hash and Clone and Decode(_, D) and Deinit, type V: Decode(_, D) and Deinit, type D: Decoder) Decode(HashMap(K, V), D)
 
-    fn decode(decoder: *Decoder) -> own !Self
+    fn decode(decoder: *D) -> own !Self
         const count = try decoder.map()
         var own map = Self::init()
         errdefer drain_map(K, V, own &map)
@@ -347,17 +347,17 @@ instance(type T: Hash) ToOwned(HashSet(T), []T)
         return set.value_storage
 
 
-instance(type T: Hash and Encode) Encode(HashSet(T))
+instance(type T: Hash and Encode(_, E), type E: Encoder) Encode(HashSet(T), E)
 
-    fn encode(set: *const(Self), encoder: *Encoder) -> !void
+    fn encode(set: *const(Self), encoder: *E) -> !void
         try encoder.sequence(set.count)
         for *value in set.values()
             try encoder.encode(value)
 
 
-instance(type T: Hash and Decode and Deinit) Decode(HashSet(T))
+instance(type T: Hash and Decode(_, D) and Deinit, type D: Decoder) Decode(HashSet(T), D)
 
-    fn decode(decoder: *Decoder) -> own !Self
+    fn decode(decoder: *D) -> own !Self
         const count = try decoder.sequence()
         var own set = Self::init()
         errdefer drain_set(T, own &set)

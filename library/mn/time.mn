@@ -2,9 +2,13 @@ import mn::codec::Decode
 import mn::codec::Decoder
 import mn::codec::Encode
 import mn::codec::Encoder
+import mn::codec::binary
+import mn::codec::yaml
 import mn::compare::Equal
 import mn::compare::Order
 import mn::compare::Ordering
+import mn::stream::Reader
+import mn::stream::Writer
 
 private external fn mn_runtime_time_wall_clock(seconds: *i64, nanoseconds: *u32)
 private external fn mn_runtime_time_monotonic_clock() -> i64
@@ -20,18 +24,39 @@ struct WallTime
         return reading
 
 
-instance Encode(WallTime)
+instance(type W: Writer) Encode(WallTime, binary::Encoder(W))
 
-    fn encode(wall_time: *const(Self), encoder: *Encoder) -> !void
+    fn encode(wall_time: *const(Self), encoder: *binary::Encoder(W)) -> !void
         try encoder.i64(wall_time.seconds)
         try encoder.u32(wall_time.nanoseconds)
 
 
-instance Decode(WallTime)
+instance(type R: Reader) Decode(WallTime, binary::Decoder(R))
 
-    fn decode(decoder: *Decoder) -> own !Self
+    fn decode(decoder: *binary::Decoder(R)) -> own !Self
         const seconds = try decoder.i64()
         const nanoseconds = try decoder.u32()
+        return { seconds = seconds, nanoseconds = nanoseconds }
+
+
+instance(type W: Writer) Encode(WallTime, yaml::Encoder(W))
+
+    fn encode(wall_time: *const(Self), encoder: *yaml::Encoder(W)) -> !void
+        try encoder.structure(2)
+        try encoder.field("seconds")
+        try encoder.encode(&wall_time.seconds)
+        try encoder.field("nanoseconds")
+        try encoder.encode(&wall_time.nanoseconds)
+
+
+instance Decode(WallTime, yaml::Decoder)
+
+    fn decode(decoder: *yaml::Decoder) -> own !Self
+        try decoder.structure(2)
+        try decoder.field("seconds")
+        const seconds = try decoder.decode(i64)
+        try decoder.field("nanoseconds")
+        const nanoseconds = try decoder.decode(u32)
         return { seconds = seconds, nanoseconds = nanoseconds }
 
 

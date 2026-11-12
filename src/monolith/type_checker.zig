@@ -4384,10 +4384,10 @@ pub const TypeChecker = struct {
         name: []const u8,
     ) TypeError!?ast.Resolution.Function {
         const modules = self.program.modules;
-        const found = switch (try ast.findInstance(self.arena.allocator(), modules, typeclass, decided)) {
+        const found = switch (try ast.findInstance(self.arena.allocator(), modules, self.program.types, typeclass, decided)) {
             .missing => return null,
             .missing_requirement => return self.fail(location, error.MissingRequiredInstance),
-            .ambiguous => return self.fail(location, error.AmbiguousInstance),
+            .ambiguous => |pair| return self.failAmbiguous(location, pair),
             .undecided => return self.fail(location, error.UndecidedInstance),
             .found => |found| found,
         };
@@ -4495,7 +4495,7 @@ pub const TypeChecker = struct {
 
     fn hasTypeclassInstance(self: *TypeChecker, typeclass: ast.Resolution.Typeclass, value_type: types.Type) TypeError!bool {
         const decided: []const ?types.Argument = &.{.{ .type = value_type }};
-        return switch (try ast.findInstance(self.arena.allocator(), self.program.modules, typeclass, decided)) {
+        return switch (try ast.findInstance(self.arena.allocator(), self.program.modules, self.program.types, typeclass, decided)) {
             .found => true,
             .missing, .missing_requirement, .ambiguous, .undecided => false,
         };
@@ -4531,7 +4531,7 @@ pub const TypeChecker = struct {
         signature: *const ast.FunctionSignature,
         decided: []?types.Argument,
     ) TypeError!?ast.Resolution {
-        switch (try ast.findInstance(self.arena.allocator(), self.program.modules, typeclass, decided)) {
+        switch (try ast.findInstance(self.arena.allocator(), self.program.modules, self.program.types, typeclass, decided)) {
             .missing => return null,
             .missing_requirement => return self.fail(lookup.location, error.MissingRequiredInstance),
             .found, .ambiguous, .undecided => {},
@@ -4547,7 +4547,7 @@ pub const TypeChecker = struct {
         const name = lookup.name;
         var mentioned = false;
         for (self.constraints) |constraint| {
-            if (!mentionsArgument(constraint, receiver)) continue;
+            if (!mentionsReceiver(constraint, receiver)) continue;
             mentioned = true;
             const definition = self.extractTypeclass(constraint.typeclass);
             const position = findTypeclassFunction(definition, name) orelse continue;
@@ -4564,7 +4564,8 @@ pub const TypeChecker = struct {
             const function = (try self.findTypeclassMethodFor(lookup, constraint.typeclass, receiver)) orelse continue;
             return .{ .resolution = function };
         }
-        if (mentioned) return self.fail(location, error.UnknownMethod);
+        const abstract = types.containsVariable(receiver, .function) or types.containsVariable(receiver, .typeclass);
+        if (mentioned and abstract) return self.fail(location, error.UnknownMethod);
         return null;
     }
 
@@ -4606,7 +4607,7 @@ pub const TypeChecker = struct {
             }
             return self.fail(location, error.NoInstance);
         }
-        switch (try ast.findInstance(self.arena.allocator(), self.program.modules, typeclass, decided)) {
+        switch (try ast.findInstance(self.arena.allocator(), self.program.modules, self.program.types, typeclass, decided)) {
             .missing => return self.fail(location, error.NoInstance),
             .missing_requirement => return self.fail(location, error.MissingRequiredInstance),
             .found, .ambiguous, .undecided => {},
@@ -4883,6 +4884,9 @@ pub const TypeChecker = struct {
                     const return_pattern = try self.substituteTypeclass(ast.extractType(callee.return_type), call.typeclass_arguments);
                     try self.fillTypeArgument(&argument.value, return_pattern, position, assigned.len);
                 }
+                const caller_compile_time = self.compile_time;
+                self.compile_time = true;
+                defer self.compile_time = caller_compile_time;
                 try self.checkExpression(parameters, &argument.value, .type);
                 if (!self.evaluator.isKnown(argument.value)) return self.fail(argument.location, error.CannotEvaluate);
                 assigned[position] = .{ .type = (try self.evaluateValue(&argument.value)).type };
@@ -4980,10 +4984,57 @@ pub const TypeChecker = struct {
             try self.checkExpression(parameters, &argument.value, parameter_type);
             if (!self.evaluator.isKnown(argument.value)) return self.fail(argument.location, error.RuntimeArgument);
             const value = try self.evaluateValue(&argument.value);
-            for (parameter.resolved_requirements) |typeclass| try self.expectInstance(argument.location, typeclass, value.type);
+            for (parameter.resolved_requirements) |requirement| {
+                if (requirement.arguments.len == 0) try self.expectInstance(argument.location, requirement.typeclass, value.type);
+            }
             try bounds.append(allocator, .{ .type = parameter_type, .value = value });
         }
         try self.inferDeclaredTypes(parameters, expression, template, bounds);
+        try self.expectArgumentRequirements(expression, template, bounds.items);
+    }
+
+    fn expectArgumentRequirements(
+        self: *TypeChecker,
+        expression: *const ast.Expression,
+        template: ast.Resolution.Function,
+        bounds: []const Bound,
+    ) TypeError!void {
+        const signature = self.extractSignature(.{ .function = template });
+        const allocator = self.arena.allocator();
+        const parameter_count = signature.parameters.len;
+        const assigned = try allocator.alloc(?types.Argument, parameter_count + signature.declared.len);
+        @memset(assigned, null);
+        var bound_index: usize = 0;
+        for (signature.parameters, 0..) |parameter, index| {
+            if (parameter.kind == .run_time) continue;
+            if (parameter.kind == .type) assigned[index] = .{ .type = bounds[bound_index].value.type };
+            bound_index += 1;
+        }
+        for (signature.declared, 0..) |_, position| {
+            assigned[parameter_count + position] = .{ .type = bounds[bound_index].value.type };
+            bound_index += 1;
+        }
+        for (signature.parameters, expression.kind.call.arguments, 0..) |parameter, argument, index| {
+            if (parameter.kind != .type) continue;
+            try self.expectRequirementsWithArguments(argument.location, parameter.resolved_requirements, assigned[index].?, assigned);
+        }
+        for (signature.declared, 0..) |declared, position| {
+            try self.expectRequirementsWithArguments(expression.location, declared.resolved_requirements, assigned[parameter_count + position].?, assigned);
+        }
+    }
+
+    fn expectRequirementsWithArguments(
+        self: *TypeChecker,
+        location: token.Location,
+        requirements: []const ast.Requirement,
+        value: types.Argument,
+        assigned: []const ?types.Argument,
+    ) TypeError!void {
+        for (requirements) |requirement| {
+            if (requirement.arguments.len == 0) continue;
+            const decided = try ast.decideRequirement(self.arena.allocator(), self.program.types, requirement, value, assigned, .function) orelse continue;
+            try self.expectDecidedInstance(location, requirement.typeclass, decided);
+        }
     }
 
     fn inferDeclaredTypes(
@@ -5007,7 +5058,9 @@ pub const TypeChecker = struct {
         }
         for (signature.declared, decided) |declared, one| {
             const argument = one orelse return self.fail(expression.location, error.TypeMismatch);
-            for (declared.resolved_requirements) |typeclass| try self.expectInstance(expression.location, typeclass, argument.type);
+            for (declared.resolved_requirements) |requirement| {
+                if (requirement.arguments.len == 0) try self.expectInstance(expression.location, requirement.typeclass, argument.type);
+            }
             try bounds.append(allocator, .{ .type = .type, .value = .{ .type = argument.type } });
         }
     }
@@ -5066,7 +5119,7 @@ pub const TypeChecker = struct {
     fn instanceOnlyReads(self: *TypeChecker, parameter: ast.TypedName, target: types.Type) TypeError!bool {
         const decided = try self.buildParameterDecided(parameter, target);
         if (containsVariable(decided)) return false;
-        const found = switch (try ast.findInstance(self.arena.allocator(), self.program.modules, parameter.constraint.?, decided)) {
+        const found = switch (try ast.findInstance(self.arena.allocator(), self.program.modules, self.program.types, parameter.constraint.?, decided)) {
             .found => |found| found,
             .missing, .missing_requirement, .ambiguous, .undecided => return false,
         };
@@ -6348,6 +6401,14 @@ pub const TypeChecker = struct {
         return number;
     }
 
+    fn failAmbiguous(self: *TypeChecker, location: token.Location, pair: [2]ast.InstanceReference) TypeError {
+        const failure = self.fail(location, error.AmbiguousInstance);
+        const allocator = self.arena.allocator();
+        const modules = self.program.modules;
+        self.failure.?.message = try std.fmt.allocPrint(allocator, "more than one instance fits and neither is more specific: {s} and {s}", .{ try ast.renderInstance(allocator, modules, pair[0]), try ast.renderInstance(allocator, modules, pair[1]) });
+        return failure;
+    }
+
     fn fail(self: *TypeChecker, location: token.Location, check_error: CheckError) CheckError {
         self.failure = .{
             .module = self.program.modules[self.module_index].path,
@@ -7598,11 +7659,10 @@ fn matchesConstraint(constraint: ast.Constraint, decided: []const ?types.Argumen
     return true;
 }
 
-fn mentionsArgument(constraint: ast.Constraint, receiver: types.Type) bool {
-    for (constraint.arguments) |argument| {
-        if (argument == .type and std.meta.eql(argument.type, receiver)) return true;
-    }
-    return false;
+fn mentionsReceiver(constraint: ast.Constraint, receiver: types.Type) bool {
+    if (constraint.arguments.len == 0) return false;
+    const first = constraint.arguments[0];
+    return first == .type and std.meta.eql(first.type, receiver);
 }
 
 fn isConcreteArguments(arguments: []const types.Argument) bool {
@@ -26786,6 +26846,47 @@ test "findMethodFunction: finds no method behind two pointers" {
     try std.testing.expectEqual(token.Location{ .row = 7, .column = 53 }, type_checker.failure.?.location.?);
 }
 
+test "findMethodFunction: takes the method of the first parameter of one typeclass beside a function of another typeclass that takes the receiver as a later parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Read(type T, type S)\n\n    fn read(source: *S) -> T\nstruct Bytes\n    next: u8\ninstance Read(u8, Bytes)\n\n    fn read(source: *Bytes) -> u8\n        source.next += 1\n        return source.next\ntypeclass Source(type S)\n\n    fn read(self: *S, type T: Read(_, S)) -> T\ninstance Source(Bytes)\n\n    fn read(self: *Self, type T: Read(_, Self)) -> T = Read(T, Self)::read(self)\nfn run() -> u8\n    var bytes: Bytes = { next = 6 }\n    return bytes.read(u8)\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, known);
+}
+
+test "findMethodFunction: finds no method through a later parameter of a typeclass" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Read(type T, type S)\n\n    fn read(source: *S) -> T\nstruct Bytes\n    next: u8\ninstance Read(u8, Bytes)\n\n    fn read(source: *Bytes) -> u8\n        source.next += 1\n        return source.next\nfn run() -> u8\n    var bytes: Bytes = { next = 6 }\n    return bytes.read()\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownMethod, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 13, .column = 18 }, analyzer.failure.?.location.?);
+}
+
 test "findSelfFunction: rejects a function of the struct through self in a default" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -26866,6 +26967,28 @@ test "checkGenericTypeclassCall: keeps the type parameters of a generic caller a
         if (declaration.kind == .constant_declaration) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
     try std.testing.expectEqual(Value{ .integer = .{ .signed = 3 } }, known);
+}
+
+test "checkGenericTypeclassCall: evaluates a type argument that a type function gives in the initial value of a variable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Make(type M)\n\n    fn make(maker: M, type T) -> usize\nstruct Maker\n    base: usize\ninstance Make(Maker)\n\n    fn make(maker: Maker, type T) -> usize\n        const made: T = { value = maker.base }\n        return made.value\nfn Box(type T) -> type\n    return struct\n        value: T\nfn run(maker: Make) -> usize\n    var count = maker.make(Box(usize))\n    count += 1\n    return count\nconst MADE = run(Maker{ base = 2 })" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind == .constant_declaration) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 3 } }, known);
 }
 
 test "instantiateCall: creates an instance for each type of the argument to an any parameter" {
@@ -27032,6 +27155,66 @@ test "instantiateCall: binds a type parameter that requires several typeclasses 
         if (declaration.kind == .constant_declaration) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
     try std.testing.expectEqual(Value{ .integer = .{ .signed = 14 } }, known);
+}
+
+test "expectArgumentRequirements: accepts a declared type with the instance its requirement names with a later declared type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type T, type U)\n\n    fn measure(value: T, unit: U) -> u8\nstruct Metre\nstruct Foot\ninstance Measure(u8, Metre)\n\n    fn measure(value: u8, _: Metre) -> u8 = value\nfn(type T: Measure(_, U), type U) total(value: T, unit: U) -> u8 = Measure::measure(value, unit)\nfn run() -> u8\n    const value: u8 = 4\n    return total(value, Metre{})\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 4 } }, known);
+}
+
+test "expectArgumentRequirements: rejects a declared type without the instance its requirement names with a later declared type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type T, type U)\n\n    fn measure(value: T, unit: U) -> u8\nstruct Metre\nstruct Foot\ninstance Measure(u8, Metre)\n\n    fn measure(value: u8, _: Metre) -> u8 = value\nfn(type T: Measure(_, U), type U) total(value: T, unit: U) -> u8 = Measure::measure(value, unit)\nfn run() -> u8\n    const value: u8 = 4\n    return total(value, Foot{})\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NoInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 12, .column = 12 }, analyzer.failure.?.location.?);
+}
+
+test "expectArgumentRequirements: rejects a type argument without the instance its requirement names at the argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type T, type U)\n\n    fn measure(value: T, unit: U) -> u8\nstruct Metre\nstruct Foot\ninstance Measure(u8, Metre)\n\n    fn measure(value: u8, _: Metre) -> u8 = value\nfn weigh(type T: Measure(_, U), type U, value: T, unit: U) -> u8 = Measure::measure(value, unit)\nfn run() -> u8\n    return weigh(u16, Metre, 1, Metre{})\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NoInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 11, .column = 18 }, analyzer.failure.?.location.?);
 }
 
 test "instantiateCall: rejects a type without an instance of one of several required typeclasses" {
@@ -34962,7 +35145,7 @@ test "integration: rejects the default placeholder with a byte slice through the
     try std.testing.expectEqualStrings("a byte slice is formatted only with {s} or {x}", analyzer.failure.?.message);
 }
 
-test "integration: rejects a float as a value to format through the standard library" {
+test "integration: rejects a float with a hexadecimal placeholder through the standard library" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -34972,13 +35155,13 @@ test "integration: rejects a float as a value to format through the standard lib
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::process::stdout\nimport mn::stream::Writer\nimport mn::text\n\nfn main -> !void\n    const value: f32 = 1.5\n    try text::print(&stdout, \"{}\\n\", { value })" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::process::stdout\nimport mn::stream::Writer\nimport mn::text\n\nfn main -> !void\n    const value: f32 = 1.5\n    try text::print(&stdout, \"{x}\\n\", { value })" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.ComptimeError, analyzer.analyze());
-    try std.testing.expectEqualStrings("only integers, bools and byte slices can be formatted", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("a float is formatted only with {}", analyzer.failure.?.message);
 }
 
 test "integration: rejects a struct as a value to format through the standard library" {
@@ -34997,7 +35180,7 @@ test "integration: rejects a struct as a value to format through the standard li
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.ComptimeError, analyzer.analyze());
-    try std.testing.expectEqualStrings("only integers, bools and byte slices can be formatted", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("only integers, floats, bools and byte slices can be formatted", analyzer.failure.?.message);
 }
 
 test "integration: rejects an opening brace without a closing one through the standard library" {
@@ -36851,7 +37034,7 @@ test "findInstance: gives an undecided instance for a length that the header doe
     try std.testing.expectEqual(token.Location{ .row = 7, .column = 27 }, analyzer.failure.?.location.?);
 }
 
-test "unifyLength: rejects a specific length after the general one" {
+test "unifyLength: chooses a specific length after the general one for its length" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -36861,16 +37044,19 @@ test "unifyLength: rejects a specific length after the general one" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Same(type T)\n\n    fn same(value: T) -> u8\ninstance(comptime N: usize) Same([N]u8)\n\n    fn same(_: [N]u8) -> u8 = 1\ninstance Same([4]u8)\n\n    fn same(_: [4]u8) -> u8 = 2\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Same(type T)\n\n    fn same(value: T) -> u8\ninstance(comptime N: usize) Same([N]u8)\n\n    fn same(_: [N]u8) -> u8 = 1\ninstance Same([4]u8)\n\n    fn same(_: [4]u8) -> u8 = 2\nconst FOUR: [4]u8 = { 1, 2, 3, 4 }\nconst THREE: [3]u8 = { 1, 2, 3 }\nconst RESULT = Same::same(FOUR) * 10 + Same::same(THREE)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
 
-    try std.testing.expectError(error.DuplicateInstance, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 7, .column = 1 }, analyzer.failure.?.location.?);
+    const known = for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 21 } }, known);
 }
 
-test "unifyLength: rejects a specific length before the general one" {
+test "unifyLength: chooses a specific length before the general one for its length" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -36880,13 +37066,16 @@ test "unifyLength: rejects a specific length before the general one" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Same(type T)\n\n    fn same(value: T) -> u8\ninstance Same([4]u8)\n\n    fn same(_: [4]u8) -> u8 = 2\ninstance(comptime N: usize) Same([N]u8)\n\n    fn same(_: [N]u8) -> u8 = 1\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Same(type T)\n\n    fn same(value: T) -> u8\ninstance Same([4]u8)\n\n    fn same(_: [4]u8) -> u8 = 2\ninstance(comptime N: usize) Same([N]u8)\n\n    fn same(_: [N]u8) -> u8 = 1\nconst FOUR: [4]u8 = { 1, 2, 3, 4 }\nconst THREE: [3]u8 = { 1, 2, 3 }\nconst RESULT = Same::same(FOUR) * 10 + Same::same(THREE)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
 
-    try std.testing.expectError(error.DuplicateInstance, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 7, .column = 1 }, analyzer.failure.?.location.?);
+    const known = for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 21 } }, known);
 }
 
 test "unifyLength: rejects two general instances" {
@@ -36940,7 +37129,7 @@ test "unifyLength: keeps a repeated length apart from two different lengths" {
     try std.testing.expectEqual(2, checked);
 }
 
-test "unifyLength: rejects a repeated length that covers two equal lengths" {
+test "unifyLength: chooses two equal lengths over a repeated length that covers them" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -36950,13 +37139,16 @@ test "unifyLength: rejects a repeated length that covers two equal lengths" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Pair(type L, type R)\n\n    fn pair(left: L, right: R) -> usize\ninstance(comptime N: usize) Pair([N]u8, [N]u8)\n\n    fn pair(_: [N]u8, _: [N]u8) -> usize = N\ninstance Pair([2]u8, [2]u8)\n\n    fn pair(_: [2]u8, _: [2]u8) -> usize = 23\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Pair(type L, type R)\n\n    fn pair(left: L, right: R) -> usize\ninstance(comptime N: usize) Pair([N]u8, [N]u8)\n\n    fn pair(_: [N]u8, _: [N]u8) -> usize = N\ninstance Pair([2]u8, [2]u8)\n\n    fn pair(_: [2]u8, _: [2]u8) -> usize = 23\nconst TWO: [2]u8 = { 1, 2 }\nconst THREE: [3]u8 = { 1, 2, 3 }\nconst RESULT = Pair::pair(TWO, TWO) * 10 + Pair::pair(THREE, THREE)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
 
-    try std.testing.expectError(error.DuplicateInstance, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 7, .column = 1 }, analyzer.failure.?.location.?);
+    const known = for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 233 } }, known);
 }
 
 test "resolveName: rejects a length parameter in a larger expression" {
@@ -38418,6 +38610,156 @@ test "findInstance: rejects a requirement that only the writable form meets" {
     try std.testing.expectEqual(token.Location{ .row = 10, .column = 1 }, analyzer.failure.?.location.?);
 }
 
+test "findInstance: takes an instance whose requirement with arguments the other instance argument meets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type T, type U)\n\n    fn measure(value: T, unit: U) -> u8\nstruct Metre\nstruct Foot\ninstance Measure(u8, Metre)\n\n    fn measure(value: u8, _: Metre) -> u8 = value\nfn Box(type T) -> type\n    return struct\n        value: T\ninstance(type A: Measure(_, U), type U) Measure(Box(A), U)\n\n    fn measure(value: Box(A), unit: U) -> u8 = Measure::measure(value.value, unit) + 1\nfn run() -> u8\n    const box: Box(u8) = { value = 4 }\n    return Measure::measure(box, Metre{})\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 5 } }, known);
+}
+
+test "findInstance: skips an instance whose requirement with arguments the other instance argument does not meet" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type T, type U)\n\n    fn measure(value: T, unit: U) -> u8\nstruct Metre\nstruct Foot\ninstance Measure(u8, Metre)\n\n    fn measure(value: u8, _: Metre) -> u8 = value\nfn Box(type T) -> type\n    return struct\n        value: T\ninstance(type A: Measure(_, U), type U) Measure(Box(A), U)\n\n    fn measure(value: Box(A), unit: U) -> u8 = Measure::measure(value.value, unit) + 1\nfn run() -> u8\n    const box: Box(u8) = { value = 4 }\n    return Measure::measure(box, Foot{})\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NoInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 17, .column = 29 }, analyzer.failure.?.location.?);
+}
+
+test "findInstance: chooses the more specific instance for its types and the generic one for others through calls, methods and generic code" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T, type U)\n\n    fn name(value: T, other: U) -> u32\nstruct Moment\nstruct One\nstruct Two\ninstance(type U) Name(Moment, U)\n\n    fn name(_: Moment, _: U) -> u32 = 1\ninstance Name(Moment, One)\n\n    fn name(_: Moment, _: One) -> u32 = 2\nfn(type U: Name(Moment, _)) through(other: U) -> u32\n    const moment: Moment = {}\n    return Name::name(moment, other)\ntypeclass Show(type T)\n\n    fn show(value: T) -> u32\nfn Box(type T) -> type\n    return struct\n        value: T\ninstance(type A) Show(Box(A))\n\n    fn show(_: Box(A)) -> u32 = 3\ninstance Show(Box(u8))\n\n    fn show(_: Box(u8)) -> u32 = 4\nfn(type T: Show) display(value: T) -> u32 = value.show()\nfn run() -> u32\n    const moment: Moment = {}\n    const one: One = {}\n    const two: Two = {}\n    const small: Box(u8) = { value = 1 }\n    const wide: Box(u16) = { value = 1 }\n    const direct = Name::name(moment, one) * 10 + Name::name(moment, two)\n    const generic = through(one) * 10 + through(two)\n    const methods = small.show() * 10 + wide.show()\n    const shown = display(small) * 10 + display(wide)\n    return direct * 1000000 + generic * 10000 + methods * 100 + shown\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 21214343 } }, known);
+}
+
+test "findInstance: rejects a use that two instances fit when neither is more specific and names both" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Pair(type T, type U)\n\n    fn pair(value: T, other: U) -> u32\ninstance(type A) Pair(A, u8)\n\n    fn pair(_: A, _: u8) -> u32 = 1\ninstance(type B) Pair(u8, B)\n\n    fn pair(_: u8, _: B) -> u32 = 2\nfn run() -> u32\n    const one: u8 = 1\n    const two: u8 = 2\n    return Pair::pair(one, two)\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.AmbiguousInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 13, .column = 23 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("more than one instance fits and neither is more specific: `Pair(A, u8)` in `main` and `Pair(u8, B)` in `main`", analyzer.failure.?.message);
+}
+
+test "findInstance: chooses a more specific instance declared in another module than the generic one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes::Show\nimport shapes::Box\ninstance Show(Box(u8))\n\n    fn show(_: Box(u8)) -> u32 = 4\nfn run() -> u32\n    const small: Box(u8) = { value = 1 }\n    const wide: Box(u16) = { value = 1 }\n    return small.show() * 10 + wide.show()\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "typeclass Show(type T)\n\n    fn show(value: T) -> u32\nfn Box(type T) -> type\n    return struct\n        value: T\ninstance(type A) Show(Box(A))\n\n    fn show(_: Box(A)) -> u32 = 3\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 43 } }, known);
+}
+
+test "findInstance: leaves out a more specific instance whose requirement the types do not meet" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T)\n\n    fn show(value: T) -> u32\ntypeclass Small(type T)\n\n    fn small(value: T) -> u32\nfn Box(type T) -> type\n    return struct\n        value: T\ninstance(type A) Show(Box(A))\n\n    fn show(_: Box(A)) -> u32 = 3\ninstance(type A: Small) Show(Box(?A))\n\n    fn show(_: Box(?A)) -> u32 = 6\ninstance Small(u8)\n\n    fn small(value: u8) -> u32 = value\nfn run() -> u32\n    const small: Box(?u8) = { value = 1 }\n    const wide: Box(?u16) = { value = 1 }\n    return small.show() * 10 + wide.show()\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 63 } }, known);
+}
+
+test "findInstance: keeps an exact generic instance ahead of a more specific instance for the read-only form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T)\n\n    fn show(value: T) -> u32\ninstance(type A) Show([]A)\n\n    fn show(_: []A) -> u32 = 1\ninstance Show([]const(u8))\n\n    fn show(_: []const(u8)) -> u32 = 2\nfn run() -> u32\n    var bytes: [2]u8 = { 1, 2 }\n    bytes[0] = 3\n    const writable: []u8 = bytes[..]\n    const constant: []const(u8) = bytes[..]\n    return Show::show(writable) * 10 + Show::show(constant)\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 12 } }, known);
+}
+
 test "findEarlierInstance: rejects the same form twice beside the other form" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -38627,7 +38969,7 @@ test "integration: rejects the default placeholder with a byte slice in text::fo
     try std.testing.expectEqualStrings("a byte slice is formatted only with {s} or {x}", analyzer.failure.?.message);
 }
 
-test "integration: rejects a float as a value in text::format through the standard library" {
+test "integration: rejects a float with a binary placeholder in text::format through the standard library" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -38637,13 +38979,13 @@ test "integration: rejects a float as a value in text::format through the standa
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::text\nstruct Data\n    value: u8\nfn main -> !void\n    const real: f64 = 1.5\n    const found = try text::format(\"{}\", { real })\n    memory::free(found)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::text\nstruct Data\n    value: u8\nfn main -> !void\n    const real: f64 = 1.5\n    const found = try text::format(\"{b}\", { real })\n    memory::free(found)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.ComptimeError, analyzer.analyze());
-    try std.testing.expectEqualStrings("only integers, bools and byte slices can be formatted", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("a float is formatted only with {}", analyzer.failure.?.message);
 }
 
 test "integration: rejects a struct as a value in text::format through the standard library" {
@@ -38662,7 +39004,7 @@ test "integration: rejects a struct as a value in text::format through the stand
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.ComptimeError, analyzer.analyze());
-    try std.testing.expectEqualStrings("only integers, bools and byte slices can be formatted", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("only integers, floats, bools and byte slices can be formatted", analyzer.failure.?.message);
 }
 
 test "integration: rejects an opening brace without a closing one in text::format through the standard library" {

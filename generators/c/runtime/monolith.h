@@ -1,6 +1,7 @@
 #ifndef MONOLITH_H
 #define MONOLITH_H
 
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -38,13 +39,13 @@ MN_SIGNED_HELPERS(i16, int16_t, uint16_t, 16)
 MN_SIGNED_HELPERS(i32, int32_t, uint32_t, 32)
 MN_SIGNED_HELPERS(i64, int64_t, uint64_t, 64)
 MN_SIGNED_HELPERS(i128, int128_t, uint128_t, 128)
-MN_SIGNED_HELPERS(isize, ptrdiff_t, size_t, PTRDIFF_WIDTH)
+MN_SIGNED_HELPERS(isize, ptrdiff_t, size_t, sizeof(ptrdiff_t) * CHAR_BIT)
 MN_UNSIGNED_HELPERS(u8, uint8_t, 8)
 MN_UNSIGNED_HELPERS(u16, uint16_t, 16)
 MN_UNSIGNED_HELPERS(u32, uint32_t, 32)
 MN_UNSIGNED_HELPERS(u64, uint64_t, 64)
 MN_UNSIGNED_HELPERS(u128, uint128_t, 128)
-MN_UNSIGNED_HELPERS(usize, size_t, SIZE_WIDTH)
+MN_UNSIGNED_HELPERS(usize, size_t, sizeof(size_t) * CHAR_BIT)
 
 #undef MN_SIGNED_HELPERS
 #undef MN_UNSIGNED_HELPERS

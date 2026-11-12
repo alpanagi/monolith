@@ -755,6 +755,7 @@ pub fn unifyArguments(one: []const Argument, two: []const Argument, sides: Sides
 pub const Sides = struct {
     one: []?Unified,
     two: []?Unified,
+    rigid: ?Side = null,
 
     fn find(self: Sides, side: Side) []?Unified {
         return switch (side) {
@@ -931,8 +932,8 @@ fn matchConstructor(pattern: Constructor, concrete: Constructor, scope: Scope, a
 fn unifyType(one: Unified, two: Unified, sides: Sides) bool {
     const left = followBinding(one, sides);
     const right = followBinding(two, sides);
-    if (isInstanceVariable(left.type)) return bindVariable(left, right, sides);
-    if (isInstanceVariable(right.type)) return bindVariable(right, left, sides);
+    if (isBindable(left, sides)) return bindVariable(left, right, sides);
+    if (isBindable(right, sides)) return bindVariable(right, left, sides);
     switch (left.type) {
         .application => |application| {
             const constructor: Constructor, const arguments = switch (right.type) {
@@ -1002,15 +1003,16 @@ fn unifyLength(one: *const Array, one_side: Side, two: *const Array, two_side: S
     const right = followLength(.{ .type = .{ .array = two }, .side = two_side }, sides);
     const left_variable = left.type.array.length_variable;
     const right_variable = right.type.array.length_variable;
-    if (left_variable) |variable| {
-        if (left.side == right.side and std.meta.eql(left_variable, right_variable)) return true;
-        sides.find(left.side)[variable.index] = right;
+    if (left_variable != null and left.side == right.side and std.meta.eql(left_variable, right_variable)) return true;
+    if (left_variable != null and sides.rigid != left.side) {
+        sides.find(left.side)[left_variable.?.index] = right;
         return true;
     }
-    if (right_variable) |variable| {
-        sides.find(right.side)[variable.index] = left;
+    if (right_variable != null and sides.rigid != right.side) {
+        sides.find(right.side)[right_variable.?.index] = left;
         return true;
     }
+    if (left_variable != null or right_variable != null) return false;
     return left.type.array.length == right.type.array.length;
 }
 
@@ -1073,6 +1075,10 @@ fn occurs(variable: Unified, term: Unified, sides: Sides) bool {
             return occurs(variable, .{ .type = function.return_type, .side = current.side }, sides);
         },
     };
+}
+
+fn isBindable(term: Unified, sides: Sides) bool {
+    return isInstanceVariable(term.type) and sides.rigid != term.side;
 }
 
 fn isInstanceVariable(value_type: Type) bool {
