@@ -20,7 +20,7 @@ fn ArrayList(type T) -> type
         private own storage: []T
         private count: usize
 
-        fn init() -> own Self = { storage = {}, count = 0 }
+        fn init -> own Self = { storage = {}, count = 0 }
 
 
         fn length(self: *const(Self)) -> usize = self.count
@@ -110,7 +110,7 @@ fn HashMap(type K: Hash and Clone, type V) -> type
         private own table: []usize
         private count: usize
 
-        fn init() -> own Self = { key_storage = {}, value_storage = {}, table = {}, count = 0 }
+        fn init -> own Self = { key_storage = {}, value_storage = {}, table = {}, count = 0 }
 
 
         fn length(self: *const(Self)) -> usize = self.count
@@ -260,7 +260,7 @@ fn HashSet(type T: Hash) -> type
         private own table: []usize
         private count: usize
 
-        fn init() -> own Self = { value_storage = {}, table = {}, count = 0 }
+        fn init -> own Self = { value_storage = {}, table = {}, count = 0 }
 
 
         fn length(self: *const(Self)) -> usize = self.count

@@ -9,7 +9,7 @@ struct Range
 
 instance Iterable(Range)
 
-    fn Cursor() -> type = RangeCursor
+    fn Cursor -> type = RangeCursor
     fn iterator(range: Self) -> Cursor() = { position = range.start, end = range.end }
 
 
@@ -20,7 +20,7 @@ struct RangeCursor
 
 instance Iterator(RangeCursor)
 
-    fn Element() -> type = [usize]
+    fn Element -> type = [usize]
 
 
     fn next(cursor: *Self) -> ?Element()
@@ -32,5 +32,5 @@ instance Iterator(RangeCursor)
 
 instance Iterable(RangeCursor)
 
-    fn Cursor() -> type = Self
+    fn Cursor -> type = Self
     fn iterator(cursor: Self) -> Cursor() = cursor

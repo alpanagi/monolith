@@ -3,7 +3,7 @@ import mn::hash
 import mn::math
 import mn::range::Range
 
-private external fn mn_runtime_random_entropy() -> u64
+private external fn mn_runtime_random_entropy -> u64
 
 const Default = Xoshiro256
 const entropy = mn_runtime_random_entropy

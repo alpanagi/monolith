@@ -1,14 +1,16 @@
 import mn
 import mn::codec
 import mn::codec::Decode
+import mn::codec::Decoder
 import mn::codec::Encode
+import mn::codec::Encoder
 import mn::container::ArrayList
-import mn::convert::To
 import mn::memory
 import mn::memory::Deinit
 import mn::stream::Reader
 import mn::stream::Writer
 import mn::text
+import mn::text::Parser as TextParser
 
 private const hexadecimal_digits: []const(u8) = "0123456789ABCDEF"
 private const maximum_depth: usize = 256
@@ -20,7 +22,7 @@ error Error
     MissingPart
 
 
-fn Encoder(type W: Writer) -> type
+fn YamlEncoder(type W: Writer) -> type
     return struct
         private writer: *W
         private document: EncodeFrame
@@ -151,7 +153,7 @@ fn Encoder(type W: Writer) -> type
             while (self.pending.length() > 0) _ = self.pending.pop()
 
 
-instance(type W: Writer) codec::Encoder(Encoder(W))
+instance(type W: Writer) Encoder(YamlEncoder(W))
 
     fn i8(self: *Self, value: i8) -> !void = self.write_number(i128, mn::convert(i128, value))
     fn i16(self: *Self, value: i16) -> !void = self.write_number(i128, mn::convert(i128, value))
@@ -200,14 +202,14 @@ instance(type W: Writer) codec::Encoder(Encoder(W))
         try self.close_value(mark)
 
 
-instance(type W: Writer) Deinit(Encoder(W))
+instance(type W: Writer) Deinit(YamlEncoder(W))
 
     fn deinit(own encoder: *Self)
         encoder.frames.deinit(own)
         encoder.pending.deinit(own)
 
 
-struct Decoder
+struct YamlDecoder
     private own nodes: ArrayList(Node)
     private own contents: ArrayList(u8)
     private own frames: ArrayList(DecodeFrame)
@@ -321,7 +323,7 @@ struct Decoder
         frame.budget = find_restored_budget(mark.saved, mark.allowed)
 
 
-instance codec::Decoder(Decoder)
+instance Decoder(YamlDecoder)
 
     fn i8(self: *Self) -> !i8 = self.read_integer(i8, i128)
     fn i16(self: *Self) -> !i16 = self.read_integer(i16, i128)
@@ -411,7 +413,7 @@ instance codec::Decoder(Decoder)
         return value
 
 
-instance Deinit(Decoder)
+instance Deinit(YamlDecoder)
 
     fn deinit(own decoder: *Self)
         decoder.nodes.deinit(own)
@@ -1226,7 +1228,7 @@ private fn parse_digits(type T, digits: []const(u8), base: u8) -> codec::Error!T
 
 
 private fn parse_number_text(type T, digits: []const(u8)) -> codec::Error!T
-    const value = digits.to(T) catch return codec::Error::Malformed
+    const value = digits.parse(T) catch return codec::Error::Malformed
     return value
 
 

@@ -712,6 +712,12 @@ pub const TypedName = struct {
     own: bool = false,
     default: ?*Expression = null,
     default_constant: ?Resolution.Constant = null,
+    inherited_default: ?InheritedDefault = null,
+};
+
+pub const InheritedDefault = struct {
+    constant: Resolution.Constant,
+    typeclass: Resolution.Typeclass,
 };
 
 pub fn fillConstraintArguments(
@@ -1951,6 +1957,7 @@ fn cloneFunctionSignature(
             .own = parameter.own,
             .default = parameter.default,
             .default_constant = parameter.default_constant,
+            .inherited_default = parameter.inherited_default,
         };
     }
     return .{

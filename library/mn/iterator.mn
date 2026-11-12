@@ -4,25 +4,25 @@ import mn::reflection::Tuple
 
 typeclass Iterator(type I)
 
-    fn Element() -> type
+    fn Element -> type
     fn next(iterator: *I) -> ?Element()
 
 
 typeclass Iterable(type T)
 
-    fn Cursor() -> type
+    fn Cursor -> type
     fn iterator(value: T) -> Cursor()
 
 
 instance(type T) Iterable([]T)
 
-    fn Cursor() -> type = SliceCursor(T)
+    fn Cursor -> type = SliceCursor(T)
     fn iterator(items: Self) -> Cursor() = { items = items, index = 0 }
 
 
 instance(type T) Iterable([]const(T))
 
-    fn Cursor() -> type = ConstSliceCursor(T)
+    fn Cursor -> type = ConstSliceCursor(T)
     fn iterator(items: Self) -> Cursor() = { items = items, index = 0 }
 
 
@@ -34,7 +34,7 @@ fn SliceCursor(type T) -> type
 
 instance(type T) Iterator(SliceCursor(T))
 
-    fn Element() -> type = [*T]
+    fn Element -> type = [*T]
 
 
     fn next(cursor: *Self) -> ?Element()
@@ -46,7 +46,7 @@ instance(type T) Iterator(SliceCursor(T))
 
 instance(type T) Iterable(SliceCursor(T))
 
-    fn Cursor() -> type = Self
+    fn Cursor -> type = Self
     fn iterator(cursor: Self) -> Cursor() = cursor
 
 
@@ -58,7 +58,7 @@ fn ConstSliceCursor(type T) -> type
 
 instance(type T) Iterator(ConstSliceCursor(T))
 
-    fn Element() -> type = [*const(T)]
+    fn Element -> type = [*const(T)]
 
 
     fn next(cursor: *Self) -> ?Element()
@@ -70,7 +70,7 @@ instance(type T) Iterator(ConstSliceCursor(T))
 
 instance(type T) Iterable(ConstSliceCursor(T))
 
-    fn Cursor() -> type = Self
+    fn Cursor -> type = Self
     fn iterator(cursor: Self) -> Cursor() = cursor
 
 
@@ -106,7 +106,7 @@ private fn fill_cursors(type T, comptime index: usize, iterables: T, cursors: *C
 
 instance(type T: Tuple) Iterator(Zipped(T))
 
-    fn Element() -> type = ZippedElement(Cursors(T, 0), 0)
+    fn Element -> type = ZippedElement(Cursors(T, 0), 0)
 
 
     fn next(zipped: *Self) -> ?Element()
@@ -118,7 +118,7 @@ instance(type T: Tuple) Iterator(Zipped(T))
 
 instance(type T: Tuple) Iterable(Zipped(T))
 
-    fn Cursor() -> type = Self
+    fn Cursor -> type = Self
     fn iterator(zipped: Self) -> Cursor() = zipped
 
 

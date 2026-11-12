@@ -170,7 +170,7 @@ private fn find_kind(code: i32) -> File::Kind = match code
 inline struct Path
     private bytes: []const(u8)
 
-    fn init() -> own Self = { bytes = {} }
+    fn init -> own Self = { bytes = {} }
 
 
     fn is_absolute(self: Self) -> bool = self.bytes.length > 0 and self.bytes[0] == separator

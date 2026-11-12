@@ -55,7 +55,7 @@ fn(type T) destroy(own pointer: *const(T))
 
 struct Heap
 
-    fn init() -> Self = {}
+    fn init -> Self = {}
 
 
 instance Allocator(Heap)

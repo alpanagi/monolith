@@ -1,20 +1,22 @@
 import mn
 import mn::codec
 import mn::codec::Decode
+import mn::codec::Decoder
 import mn::codec::Encode
+import mn::codec::Encoder
 import mn::memory
 import mn::stream::Reader
 import mn::stream::Writer
 
 
-fn Encoder(type W: Writer) -> type
+fn BinaryEncoder(type W: Writer) -> type
     return struct
         private writer: *W
 
         fn init(writer: *W) -> Self = { writer = writer }
 
 
-instance(type W: Writer) codec::Encoder(Encoder(W))
+instance(type W: Writer) Encoder(BinaryEncoder(W))
 
     fn i8(self: *Self, value: i8) -> !void = write_unsigned(self.writer, u8, copy_bits(u8, i8, &value))
     fn i16(self: *Self, value: i16) -> !void = write_unsigned(self.writer, u16, copy_bits(u16, i16, &value))
@@ -51,14 +53,14 @@ instance(type W: Writer) codec::Encoder(Encoder(W))
     fn(type T: Encode(_, Self)) encode(self: *Self, value: *const(T)) -> !void = Encode::encode(value, self)
 
 
-fn Decoder(type R: Reader) -> type
+fn BinaryDecoder(type R: Reader) -> type
     return struct
         private reader: *R
 
         fn init(reader: *R) -> Self = { reader = reader }
 
 
-instance(type R: Reader) codec::Decoder(Decoder(R))
+instance(type R: Reader) Decoder(BinaryDecoder(R))
 
     fn i8(self: *Self) -> !i8
         const bits = try read_unsigned(self.reader, u8)

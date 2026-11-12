@@ -3976,6 +3976,7 @@ pub const TypeChecker = struct {
         try self.fillDefaultArguments(expression);
         if (ast.extractResolution(expression.kind.call.callee) == .typeclass_method) {
             try self.resolveTypeclassCall(parameters, expression);
+            try self.fillDefaultArguments(expression);
         }
         if (expression.kind.call.callee == .member) {
             const member = expression.kind.call.callee.member;
@@ -4038,6 +4039,27 @@ pub const TypeChecker = struct {
     }
 
     fn prepareParameterDefault(self: *TypeChecker, parameter: ast.TypedName, constant: ast.Resolution.Constant) TypeError!void {
+        const inherited = parameter.inherited_default orelse return self.prepareWrittenDefault(parameter, constant);
+        if (!std.meta.eql(inherited.constant, constant)) return self.prepareWrittenDefault(parameter, constant);
+        self.prepareWrittenDefault(parameter, constant) catch |check_error| {
+            if (check_error == error.OutOfMemory) return check_error;
+            return self.failUnfitInstanceDefault(parameter, inherited);
+        };
+    }
+
+    fn failUnfitInstanceDefault(self: *TypeChecker, parameter: ast.TypedName, inherited: ast.InheritedDefault) TypeError {
+        const allocator = self.arena.allocator();
+        const failure = self.fail(parameter.type.location, error.UnfitInstanceDefault);
+        const modules = self.program.modules;
+        const constant = ast.findDeclaration(modules[inherited.constant.module], inherited.constant.declaration).kind.constant_declaration;
+        const type_name = try ast.renderTypeName(allocator, modules, ast.extractType(constant.type.?));
+        const format = "the default that `{s}` gives `{s}` does not fit `{s}`, the type this instance gives `{s}`";
+        self.failure.?.module = modules[inherited.constant.module].path;
+        self.failure.?.message = try std.fmt.allocPrint(allocator, format, .{ self.extractTypeclass(inherited.typeclass).name, parameter.name, type_name, parameter.name });
+        return failure;
+    }
+
+    fn prepareWrittenDefault(self: *TypeChecker, parameter: ast.TypedName, constant: ast.Resolution.Constant) TypeError!void {
         const value_type = try self.checkConstant(constant);
         if (parameter.kind == .implicit and value_type != .tuple) {
             const declaration = ast.findDeclaration(self.program.modules[constant.module], constant.declaration);
@@ -4061,11 +4083,18 @@ pub const TypeChecker = struct {
             const signature = declaration.kind.function_definition.signature;
             const position = findTypeclassFunction(definition, signature.name) orelse continue;
             for (signature.parameters, definition.functions[position].parameters) |parameter, expected| {
+                const written = parameter.default orelse {
+                    if (parameter.inherited_default) |inherited| try self.prepareParameterDefault(parameter, inherited.constant);
+                    continue;
+                };
                 const constant = parameter.default_constant orelse continue;
-                const location = parameter.default.?.location;
-                const expected_constant = expected.default_constant orelse return self.fail(location, error.InstanceDefaultMismatch);
+                const location = written.location;
+                const inherited = if (parameter.inherited_default) |inherited| inherited.constant else null;
+                const expected_constant = expected.default_constant orelse inherited orelse {
+                    return self.fail(location, error.InstanceDefaultMismatch);
+                };
                 try self.prepareParameterDefault(parameter, constant);
-                try self.prepareParameterDefault(expected, expected_constant);
+                try self.prepareParameterDefault(parameter, expected_constant);
                 const value = try self.evaluateConstant(constant);
                 const expected_value = try self.evaluateConstant(expected_constant);
                 if (!self.evaluator.isSameKey(value.*, expected_value.*)) return self.fail(location, error.InstanceDefaultMismatch);
@@ -4257,7 +4286,7 @@ pub const TypeChecker = struct {
         if (!isTypeclassVisible(module, self.module_index, method.typeclass)) {
             return self.fail(expression.location, error.UnknownMethod);
         }
-        if (call.arguments.len != signature.parameters.len) {
+        if (!acceptsArgumentCount(signature, call.arguments.len)) {
             return self.fail(expression.location, error.ArgumentCountMismatch);
         }
         const definition = self.extractTypeclass(method.typeclass);
@@ -4265,10 +4294,11 @@ pub const TypeChecker = struct {
         @memset(decided, null);
         var deciding: ?token.Location = null;
         var read_only: ?usize = null;
-        for (call.arguments, signature.parameters, 0..) |*argument, parameter, position| {
+        for (call.arguments, signature.parameters[0..call.arguments.len], 0..) |*argument, parameter, position| {
             if (parameter.kind != .run_time) continue;
             const parameter_type = ast.extractType(parameter.type);
             if (!types.containsVariable(parameter_type, .typeclass)) continue;
+            if (parameter.default != null and !hasOwnType(argument.value)) continue;
             const argument_type = try self.inferType(parameters, &argument.value);
             if (parameter_type == .pointer and argument_type == .pointer) {
                 const modifies = !parameter_type.pointer.constant;
@@ -6440,6 +6470,7 @@ pub const CheckError = error{
     MainIsExternal,
     ArgumentCountMismatch,
     InstanceDefaultMismatch,
+    UnfitInstanceDefault,
     UnusedResult,
     DiscardedVoid,
     TypeVariable,
@@ -6601,6 +6632,7 @@ fn describeError(check_error: CheckError) []const u8 {
         error.MainIsExternal => "main cannot be external",
         error.ArgumentCountMismatch => "wrong number of arguments",
         error.InstanceDefaultMismatch => "an instance's parameter default must be the default its typeclass gives that parameter, and a parameter without one in the typeclass cannot have one in the instance",
+        error.UnfitInstanceDefault => "the default the typeclass gives this parameter does not fit the type this instance gives it",
         error.UnusedResult => "call result is unused, discard it with _ =",
         error.DiscardedVoid => "there is no value to discard",
         error.TypeVariable => "variable cannot hold a type",
@@ -7681,7 +7713,7 @@ fn isConcreteArguments(arguments: []const types.Argument) bool {
 fn acceptsArgumentCount(signature: ast.FunctionSignature, count: usize) bool {
     if (count > signature.parameters.len) return false;
     for (signature.parameters[count..]) |parameter| {
-        if (parameter.default_constant == null) return false;
+        if (parameter.default_constant == null and parameter.default == null) return false;
     }
     return true;
 }
@@ -25041,6 +25073,50 @@ test "fillDefaultArguments: applies a typeclass default to an instance that writ
     try std.testing.expectEqual(Value{ .integer = .{ .signed = 10 } }, declarations[7].kind.constant_declaration.known.?.*);
 }
 
+test "fillDefaultArguments: types a typeclass default against the type each instance gives its parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Scale(type T, type O)\n\n    fn scale(value: T, options: O = {}) -> T\nstruct Data\n    factor: u32 = 2\ninstance Scale(u32, Data)\n\n    fn scale(value: u32, options: Data) -> u32 = value * options.factor\ninstance Scale(u8, [])\n\n    fn scale(value: u8, _: []) -> u8 = value + 6\nconst DEFAULT = 5u32.scale()\nconst GIVEN = 5u32.scale({ factor = 3 })\nconst EMPTY = 1u8.scale()\nconst DEFAULT_THROUGH_TYPECLASS = Scale::scale(5u32)\nconst GIVEN_THROUGH_TYPECLASS = Scale::scale(5u32, { factor = 4 })\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    var checked: usize = 0;
+    for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind != .constant_declaration) continue;
+        const constant = declaration.kind.constant_declaration;
+        if (std.mem.eql(u8, constant.name, "DEFAULT")) {
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 10 } }, constant.known.?.*);
+            checked += 1;
+        }
+        if (std.mem.eql(u8, constant.name, "GIVEN")) {
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 15 } }, constant.known.?.*);
+            checked += 1;
+        }
+        if (std.mem.eql(u8, constant.name, "EMPTY")) {
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 7 } }, constant.known.?.*);
+            checked += 1;
+        }
+        if (std.mem.eql(u8, constant.name, "DEFAULT_THROUGH_TYPECLASS")) {
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 10 } }, constant.known.?.*);
+            checked += 1;
+        }
+        if (std.mem.eql(u8, constant.name, "GIVEN_THROUGH_TYPECLASS")) {
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 20 } }, constant.known.?.*);
+            checked += 1;
+        }
+    }
+    try std.testing.expectEqual(5, checked);
+}
+
 test "fillDefaultArguments: rejects a call through a pointer that leaves out an argument with a default" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -25154,6 +25230,73 @@ test "checkInstanceDefaults: rejects an instance default for a parameter without
 
     try std.testing.expectError(error.InstanceDefaultMismatch, analyzer.analyze());
     try std.testing.expectEqual(token.Location{ .row = 8, .column = 41 }, analyzer.failure.?.location.?);
+}
+
+test "checkInstanceDefaults: rejects an instance whose type a typeclass default does not fit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Scale(type T, type O)\n\n    fn scale(value: T, options: O = {}) -> T\ninstance Scale(u32, u32)\n\n    fn scale(value: u32, options: u32) -> u32 = value * options\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnfitInstanceDefault, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 35 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("the default that `Scale` gives `options` does not fit `u32`, the type this instance gives `options`", analyzer.failure.?.message);
+}
+
+test "checkInstanceDefaults: accepts an instance default equal to a typeclass default typed against the instance's type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Scale(type T, type O)\n\n    fn scale(value: T, options: O = {}) -> T\nstruct Data\n    factor: u32 = 2\ninstance Scale(u32, Data)\n\n    fn scale(value: u32, options: Data = { factor = 2 }) -> u32 = value * options.factor\nconst DEFAULT = 5u32.scale()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    var checked: usize = 0;
+    for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind != .constant_declaration) continue;
+        const constant = declaration.kind.constant_declaration;
+        if (std.mem.eql(u8, constant.name, "DEFAULT")) {
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 10 } }, constant.known.?.*);
+            checked += 1;
+        }
+    }
+    try std.testing.expectEqual(1, checked);
+}
+
+test "checkInstanceDefaults: rejects an instance default other than a typeclass default typed against the instance's type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Scale(type T, type O)\n\n    fn scale(value: T, options: O = {}) -> T\nstruct Data\n    factor: u32 = 2\ninstance Scale(u32, Data)\n\n    fn scale(value: u32, options: Data = { factor = 3 }) -> u32 = value * options.factor\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InstanceDefaultMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 8, .column = 42 }, analyzer.failure.?.location.?);
 }
 
 test "resolveMethodCall: calls a method with its receiver as the first argument" {
@@ -25752,7 +25895,7 @@ test "resolveConstructorCall: rejects a parameter whose requirement is not met w
     defer short_directory.cleanup();
     const short_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &short_directory.sub_path });
     var short_loader = @import("loader.zig").Loader.init(short_path, "library");
-    try short_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::codec::binary\n\nfn run() -> u8\n    var number: u32 = 3\n    number += 1\n    const decoder = binary::Decoder::init(&number)\n    _ = decoder\n    return 0\n" });
+    try short_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::codec::binary\n\nfn run() -> u8\n    var number: u32 = 3\n    number += 1\n    const decoder = binary::BinaryDecoder::init(&number)\n    _ = decoder\n    return 0\n" });
     try short_loader.loadMainModule(&arena, std.testing.io, "main");
     var short_registry: types.Registry = .{};
     var short_analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &short_loader, &short_registry);
@@ -25760,7 +25903,7 @@ test "resolveConstructorCall: rejects a parameter whose requirement is not met w
     defer written_directory.cleanup();
     const written_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &written_directory.sub_path });
     var written_loader = @import("loader.zig").Loader.init(written_path, "library");
-    try written_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::codec::binary\n\nfn run() -> u8\n    var number: u32 = 3\n    number += 1\n    const decoder = binary::Decoder(u32)::init(&number)\n    _ = decoder\n    return 0\n" });
+    try written_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::codec::binary\n\nfn run() -> u8\n    var number: u32 = 3\n    number += 1\n    const decoder = binary::BinaryDecoder(u32)::init(&number)\n    _ = decoder\n    return 0\n" });
     try written_loader.loadMainModule(&arena, std.testing.io, "main");
     var written_registry: types.Registry = .{};
     var written_analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &written_loader, &written_registry);
@@ -25768,7 +25911,7 @@ test "resolveConstructorCall: rejects a parameter whose requirement is not met w
     try std.testing.expectError(error.NoInstance, short_analyzer.analyze());
     try std.testing.expectError(error.NoInstance, written_analyzer.analyze());
     try std.testing.expectEqualStrings(written_analyzer.failure.?.message, short_analyzer.failure.?.message);
-    try std.testing.expectEqual(token.Location{ .row = 6, .column = 43 }, short_analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 49 }, short_analyzer.failure.?.location.?);
 }
 
 test "resolveConstructorCall: calls a function other than init and a function whose result is own" {
@@ -26129,6 +26272,72 @@ test "resolveTypeclassCall: rejects a call that more than one instance fits" {
 
     try std.testing.expectError(error.AmbiguousInstance, analyzer.analyze());
     try std.testing.expectEqual(token.Location{ .row = 14, .column = 30 }, analyzer.failure.?.location.?);
+}
+
+test "resolveTypeclassCall: rejects a call that two instances differing only in a parameter with a default fit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Scale(type T, type O)\n\n    fn scale(value: T, options: O = {}) -> T\nstruct DataOne\n    factor: u32 = 2\nstruct DataTwo\n    factor: u32 = 3\ninstance Scale(u32, DataOne)\n\n    fn scale(value: u32, options: DataOne) -> u32 = value * options.factor\ninstance Scale(u32, DataTwo)\n\n    fn scale(value: u32, options: DataTwo) -> u32 = value * options.factor\nconst VALUE = Scale::scale(5u32)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.AmbiguousInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 14, .column = 28 }, analyzer.failure.?.location.?);
+}
+
+test "resolveTypeclassCall: decides the instance by an argument with a type of its own for a parameter with a default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Scale(type T, type O)\n\n    fn scale(value: T, options: O = {}) -> T\nstruct DataOne\n    factor: u32 = 2\nstruct DataTwo\n    factor: u32 = 3\ninstance Scale(u32, DataOne)\n\n    fn scale(value: u32, options: DataOne) -> u32 = value * options.factor\ninstance Scale(u32, DataTwo)\n\n    fn scale(value: u32, options: DataTwo) -> u32 = value * options.factor\nconst VALUE = Scale::scale(5u32, DataTwo{})\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    var checked: usize = 0;
+    for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind != .constant_declaration) continue;
+        const constant = declaration.kind.constant_declaration;
+        if (std.mem.eql(u8, constant.name, "VALUE")) {
+            try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 15 } }, constant.known.?.*);
+            checked += 1;
+        }
+    }
+    try std.testing.expectEqual(1, checked);
+}
+
+test "findInstanceFunction: rejects a method call that two instances differing only in a parameter with a default fit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Scale(type T, type O)\n\n    fn scale(value: T, options: O = {}) -> T\nstruct DataOne\n    factor: u32 = 2\nstruct DataTwo\n    factor: u32 = 3\ninstance Scale(u32, DataOne)\n\n    fn scale(value: u32, options: DataOne) -> u32 = value * options.factor\ninstance Scale(u32, DataTwo)\n\n    fn scale(value: u32, options: DataTwo) -> u32 = value * options.factor\nconst VALUE = 5u32.scale()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.AmbiguousInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 14, .column = 20 }, analyzer.failure.?.location.?);
 }
 
 test "resolveTypeclassCall: matches a type constructor parameter against a struct a call gives" {
@@ -39358,4 +39567,42 @@ test "integration: rejects a pointer to a path passed to open through the standa
 
     try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 45 }, analyzer.failure.?.location.?);
+}
+
+test "integration: rejects an option that the options type of the chosen instance does not have through the standard library" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::text::Parser\nfn main -> !void\n    const value = try \"0.5\".parse(f64, { base = ::Base16 })\n    if (value == 0.0) return\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NotAStruct, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 40 }, analyzer.failure.?.location.?);
+}
+
+test "integration: rejects a base that bytes are not parsed in through the standard library" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::text::Parser\nfn main -> !void\n    with memory::Heap\n    const own bytes = try \"ff\".parse([]u8, { base = ::Base10 })\n    memory::free(own bytes)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownCase, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 53 }, analyzer.failure.?.location.?);
 }

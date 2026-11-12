@@ -1035,6 +1035,7 @@ pub const NameResolver = struct {
         self.signature_definition = if (definition.instance != null) definition else null;
         if (!ast.isGeneric(signature.*)) try self.resolveFunctionTypes(signature);
         if (definition.default_of == null) try self.resolveParameterDefaults(signature);
+        if (definition.instance) |reference| try self.inheritParameterDefaults(signature, reference);
         signature.progress = .done;
     }
 
@@ -1046,10 +1047,40 @@ pub const NameResolver = struct {
             const default = parameter.default orelse continue;
             if (!self.takesDefault(parameter.*)) return self.fail(default.location, error.TypeclassParameterDefault);
             if (parameter.default_constant != null) continue;
-            const written = if (parameter.kind == .implicit) null else try self.resolveDefaultType(parameter.*, default.location);
+            var written: ?ast.Expression = null;
+            if (parameter.kind != .implicit) written = try self.resolveDefaultType(parameter.*, default.location) orelse continue;
             var value = try ast.cloneExpression(self.arena.allocator(), default.*);
             try self.resolveNamesInExpression(.{}, &value);
             parameter.default_constant = try self.addDefaultConstant(signature.name, parameter.*, written, value);
+        }
+    }
+
+    fn inheritParameterDefaults(self: *NameResolver, signature: *ast.FunctionSignature, reference: ast.InstanceReference) ResolveError!void {
+        const instance_declaration = self.loader.modules.items[reference.module].declarations[reference.declaration].kind.instance_declaration;
+        const typeclass = instance_declaration.resolved orelse return;
+        try self.resolveTypeclass(typeclass);
+        const definition = self.loader.modules.items[typeclass.module].declarations[typeclass.declaration].kind.typeclass_definition;
+        const expected = findSignature(definition.functions, signature.name) orelse return;
+        const caller_bindings = self.bindings;
+        defer self.bindings = caller_bindings;
+        self.bindings = try self.addOwnTypeBindings(caller_bindings, signature.*);
+        const count = @min(signature.parameters.len, expected.parameters.len);
+        for (signature.parameters[0..count], expected.parameters[0..count]) |*parameter, typeclass_parameter| {
+            const default = typeclass_parameter.default orelse continue;
+            if (typeclass_parameter.default_constant != null or parameter.inherited_default != null) continue;
+            if (parameter.kind != .run_time) continue;
+            var written = try self.resolveParameterType(parameter.*);
+            if (isGenericType(try self.expectRuntimeType(&written))) continue;
+            var value = try ast.cloneExpression(self.arena.allocator(), default.*);
+            {
+                const caller_module_index = self.module_index;
+                defer self.module_index = caller_module_index;
+                self.module_index = typeclass.module;
+                try self.resolveNamesInExpression(.{}, &value);
+            }
+            const constant = try self.addDefaultConstant(signature.name, parameter.*, written, value);
+            parameter.inherited_default = .{ .constant = constant, .typeclass = typeclass };
+            if (parameter.default == null) parameter.default_constant = constant;
         }
     }
 
@@ -1061,16 +1092,21 @@ pub const NameResolver = struct {
         };
     }
 
-    fn resolveDefaultType(self: *NameResolver, parameter: ast.TypedName, location: token.Location) ResolveError!ast.Expression {
-        var written = parameter.type;
-        if (written.denoted == null) {
-            written = try ast.cloneExpression(self.arena.allocator(), parameter.type);
-            try self.resolveNamesInExpression(.{}, &written);
-        }
+    fn resolveDefaultType(self: *NameResolver, parameter: ast.TypedName, location: token.Location) ResolveError!?ast.Expression {
+        var written = try self.resolveParameterType(parameter);
         const value_type = try self.expectRuntimeType(&written);
-        for ([_]types.Scope{ .typeclass, .instance, .function, .declared }) |scope| {
+        for ([_]types.Scope{ .instance, .function, .declared }) |scope| {
             if (types.containsVariable(value_type, scope)) return self.fail(location, error.GenericParameterDefault);
         }
+        if (!types.containsVariable(value_type, .typeclass)) return written;
+        if (self.signature_typeclass == null or value_type != .variable) return self.fail(location, error.GenericParameterDefault);
+        return null;
+    }
+
+    fn resolveParameterType(self: *NameResolver, parameter: ast.TypedName) ResolveError!ast.Expression {
+        if (parameter.type.denoted != null) return parameter.type;
+        var written = try ast.cloneExpression(self.arena.allocator(), parameter.type);
+        try self.resolveNamesInExpression(.{}, &written);
         return written;
     }
 
@@ -5772,6 +5808,13 @@ fn findSignature(
     return signatures[position];
 }
 
+fn isGenericType(value_type: types.Type) bool {
+    for (std.enums.values(types.Scope)) |scope| {
+        if (types.containsVariable(value_type, scope)) return true;
+    }
+    return false;
+}
+
 fn findSignaturePosition(signatures: []const ast.FunctionSignature, name: []const u8) ?usize {
     for (signatures, 0..) |signature, position| {
         if (std.mem.eql(u8, signature.name, name)) return position;
@@ -8139,7 +8182,7 @@ test "resolveParameterDefaults: rejects a default of a parameter whose type depe
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, name_resolver.failure.?.location.?);
 }
 
-test "resolveParameterDefaults: rejects a default of a parameter whose type depends on a parameter of the typeclass" {
+test "resolveParameterDefaults: rejects a default of a parameter whose type depends on a parameter of the instance" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -8149,13 +8192,32 @@ test "resolveParameterDefaults: rejects a default of a parameter whose type depe
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Scale(type T)\n\n    fn scale(value: T, other: T = 0) -> T" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Scale(type T)\n\n    fn scale(value: T, other: T) -> T\ninstance(type A) Scale([]A)\n\n    fn scale(value: []A, other: []A = {}) -> []A = value\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.GenericParameterDefault, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 35 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 39 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveParameterDefaults: rejects a default of a parameter whose type is built from a parameter of the typeclass" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Scale(type T)\n\n    fn scale(value: T, other: []T = {}) -> T\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.GenericParameterDefault, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 37 }, name_resolver.failure.?.location.?);
 }
 
 test "prepareInstanceFunction: resolves Self to the type the instance is for" {
