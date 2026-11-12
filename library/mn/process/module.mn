@@ -58,6 +58,11 @@ struct Stdout
     fn print(self: *const(Self), comptime format: []const(u8), values: Tuple = {}) -> !void = text::print(self, format, values)
 
 
+    fn println(self: *const(Self), comptime format: []const(u8), values: Tuple = {}) -> !void
+        try text::print(self, format, values)
+        try self.write("\n")
+
+
 instance Writer(Stdout)
 
     fn write(_: *const(Self), bytes: []const(u8)) -> !void = write_descriptor(1, bytes)
