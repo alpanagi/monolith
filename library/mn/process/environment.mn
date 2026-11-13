@@ -1,4 +1,4 @@
-private external fn mn_runtime_process_environment_variable(name: *const([]u8)) -> ?*const([]u8)
+private external fn mn_runtime_process_environment_variable(name: const(*[]u8)) -> ?const(*[]u8)
 
 
-fn variable(name: *const([]u8)) -> ?*const([]u8) = mn_runtime_process_environment_variable(name)
+fn variable(name: const(*[]u8)) -> ?const(*[]u8) = mn_runtime_process_environment_variable(name)

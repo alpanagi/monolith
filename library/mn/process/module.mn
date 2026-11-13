@@ -5,9 +5,9 @@ import mn::stream::Writer
 import mn::text
 
 private external fn mn_runtime_io_read(descriptor: i32, buffer: *[]u8) -> isize
-private external fn mn_runtime_io_write(descriptor: i32, bytes: *const([]u8)) -> isize
-private external fn mn_runtime_process_arguments -> *const([]*const([]u8))
-private external fn mn_runtime_process_invoked_as -> *const([]u8)
+private external fn mn_runtime_io_write(descriptor: i32, bytes: const(*[]u8)) -> isize
+private external fn mn_runtime_process_arguments -> const(*[]const(*[]u8))
+private external fn mn_runtime_process_invoked_as -> const(*[]u8)
 
 const stdin: Stdin = {}
 const stdout: Stdout = {}
@@ -24,9 +24,9 @@ error Error
     SystemFailure
 
 
-fn arguments -> *const([]*const([]u8)) = mn_runtime_process_arguments()
+fn arguments -> const(*[]const(*[]u8)) = mn_runtime_process_arguments()
 
-fn invoked_as -> *const([]u8) = mn_runtime_process_invoked_as()
+fn invoked_as -> const(*[]u8) = mn_runtime_process_invoked_as()
 
 
 struct Stdin
@@ -34,7 +34,7 @@ struct Stdin
 
 instance Reader(Stdin)
 
-    fn read(_: *const(Self), buffer: *[]u8) -> !usize = read_descriptor(0, buffer)
+    fn read(_: const(*Self), buffer: *[]u8) -> !usize = read_descriptor(0, buffer)
 
 
 fn read_descriptor(descriptor: i32, buffer: *[]u8) -> Error!usize
@@ -55,19 +55,19 @@ fn find_error(code: isize) -> Error = match code
 
 
 struct Stdout
-    fn print(self: *const(Self), comptime format: *const([]u8), values: Tuple = {}) -> !void = text::print(self, format, values)
+    fn print(self: const(*Self), comptime format: const(*[]u8), values: Tuple = {}) -> !void = text::print(self, format, values)
 
 
-    fn println(self: *const(Self), comptime format: *const([]u8), values: Tuple = {}) -> !void
+    fn println(self: const(*Self), comptime format: const(*[]u8), values: Tuple = {}) -> !void
         try text::print(self, format, values)
         try self.write("\n")
 
 
 instance Writer(Stdout)
 
-    fn write(_: *const(Self), bytes: *const([]u8)) -> !void = write_descriptor(1, bytes)
+    fn write(_: const(*Self), bytes: const(*[]u8)) -> !void = write_descriptor(1, bytes)
 
 
-fn write_descriptor(descriptor: i32, bytes: *const([]u8)) -> Error!void
+fn write_descriptor(descriptor: i32, bytes: const(*[]u8)) -> Error!void
     const code = mn_runtime_io_write(descriptor, bytes)
     if (code < 0) return find_error(code)

@@ -26,7 +26,7 @@ struct WallTime
 
 instance(type W: Writer) Encode(WallTime, binary::BinaryEncoder(W))
 
-    fn encode(wall_time: *const(Self), encoder: *binary::BinaryEncoder(W)) -> !void
+    fn encode(wall_time: const(*Self), encoder: *binary::BinaryEncoder(W)) -> !void
         try encoder.i64(wall_time.seconds)
         try encoder.u32(wall_time.nanoseconds)
 
@@ -41,7 +41,7 @@ instance(type R: Reader) Decode(WallTime, binary::BinaryDecoder(R))
 
 instance(type W: Writer) Encode(WallTime, yaml::YamlEncoder(W))
 
-    fn encode(wall_time: *const(Self), encoder: *yaml::YamlEncoder(W)) -> !void
+    fn encode(wall_time: const(*Self), encoder: *yaml::YamlEncoder(W)) -> !void
         try encoder.structure(2)
         try encoder.field("seconds")
         try encoder.encode(&wall_time.seconds)
@@ -62,12 +62,12 @@ instance Decode(WallTime, yaml::YamlDecoder)
 
 instance Equal(WallTime)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.seconds == two.seconds and one.nanoseconds == two.nanoseconds
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = one.seconds == two.seconds and one.nanoseconds == two.nanoseconds
 
 
 instance Order(WallTime)
 
-    fn order(one: *const(Self), two: *const(Self)) -> Ordering
+    fn order(one: const(*Self), two: const(*Self)) -> Ordering
         const seconds = one.seconds.order(&two.seconds)
         if (seconds != ::Equal) return seconds
         return one.nanoseconds.order(&two.nanoseconds)
@@ -81,9 +81,9 @@ struct MonotonicTime
 
 instance Equal(MonotonicTime)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.nanoseconds == two.nanoseconds
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = one.nanoseconds == two.nanoseconds
 
 
 instance Order(MonotonicTime)
 
-    fn order(one: *const(Self), two: *const(Self)) -> Ordering = one.nanoseconds.order(&two.nanoseconds)
+    fn order(one: const(*Self), two: const(*Self)) -> Ordering = one.nanoseconds.order(&two.nanoseconds)

@@ -9,10 +9,10 @@ typeclass Reader(type R)
 
 typeclass Writer(type W)
 
-    fn write(writer: *W, bytes: *const([]u8)) -> !void
+    fn write(writer: *W, bytes: const(*[]u8)) -> !void
 
 
-instance Reader(SliceIterator(*const([]u8)))
+instance Reader(SliceIterator(const(*[]u8)))
 
     fn read(source: *Self, buffer: *[]u8) -> !usize
         var count = source.remaining.length

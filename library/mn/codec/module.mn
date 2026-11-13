@@ -8,7 +8,7 @@ error Error
 
 typeclass Encode(type T, type E: Encoder)
 
-    fn encode(value: *const(T), encoder: *E) -> !void
+    fn encode(value: const(*T), encoder: *E) -> !void
 
 
 typeclass Encoder(type E)
@@ -30,16 +30,16 @@ typeclass Encoder(type E)
     fn f64(self: *E, value: f64) -> !void
     fn f128(self: *E, value: f128) -> !void
     fn bool(self: *E, value: bool) -> !void
-    fn bytes(self: *E, value: *const([]u8)) -> !void
+    fn bytes(self: *E, value: const(*[]u8)) -> !void
     fn absent(self: *E) -> !void
     fn present(self: *E) -> !void
     fn sequence(self: *E, count: usize) -> !void
     fn map(self: *E, count: usize) -> !void
     fn structure(self: *E, count: usize) -> !void
-    fn field(self: *E, name: *const([]u8)) -> !void
+    fn field(self: *E, name: const(*[]u8)) -> !void
     fn tuple(self: *E, count: usize) -> !void
-    fn variant(self: *E, name: *const([]u8), number: usize) -> !void
-    fn(type T: Encode(_, E)) encode(self: *E, value: *const(T)) -> !void
+    fn variant(self: *E, name: const(*[]u8), number: usize) -> !void
+    fn(type T: Encode(_, E)) encode(self: *E, value: const(*T)) -> !void
 
 
 typeclass Decode(type T, type D: Decoder)
@@ -71,15 +71,15 @@ typeclass Decoder(type D)
     fn sequence(self: *D) -> !usize
     fn map(self: *D) -> !usize
     fn structure(self: *D, count: usize) -> !void
-    fn field(self: *D, name: *const([]u8)) -> !void
+    fn field(self: *D, name: const(*[]u8)) -> !void
     fn tuple(self: *D, count: usize) -> !void
-    fn variant(self: *D, names: *const([]*const([]u8))) -> !usize
+    fn variant(self: *D, names: const(*[]const(*[]u8))) -> !usize
     fn decode(self: *D, type T: Decode(_, D)) -> own !T
 
 
 instance(type E: Encoder) Encode(i8, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.i8(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.i8(value.*)
 
 
 instance(type D: Decoder) Decode(i8, D)
@@ -89,7 +89,7 @@ instance(type D: Decoder) Decode(i8, D)
 
 instance(type E: Encoder) Encode(i16, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.i16(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.i16(value.*)
 
 
 instance(type D: Decoder) Decode(i16, D)
@@ -99,7 +99,7 @@ instance(type D: Decoder) Decode(i16, D)
 
 instance(type E: Encoder) Encode(i32, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.i32(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.i32(value.*)
 
 
 instance(type D: Decoder) Decode(i32, D)
@@ -109,7 +109,7 @@ instance(type D: Decoder) Decode(i32, D)
 
 instance(type E: Encoder) Encode(i64, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.i64(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.i64(value.*)
 
 
 instance(type D: Decoder) Decode(i64, D)
@@ -119,7 +119,7 @@ instance(type D: Decoder) Decode(i64, D)
 
 instance(type E: Encoder) Encode(i128, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.i128(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.i128(value.*)
 
 
 instance(type D: Decoder) Decode(i128, D)
@@ -129,7 +129,7 @@ instance(type D: Decoder) Decode(i128, D)
 
 instance(type E: Encoder) Encode(isize, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.isize(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.isize(value.*)
 
 
 instance(type D: Decoder) Decode(isize, D)
@@ -139,7 +139,7 @@ instance(type D: Decoder) Decode(isize, D)
 
 instance(type E: Encoder) Encode(u8, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.u8(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.u8(value.*)
 
 
 instance(type D: Decoder) Decode(u8, D)
@@ -149,7 +149,7 @@ instance(type D: Decoder) Decode(u8, D)
 
 instance(type E: Encoder) Encode(u16, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.u16(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.u16(value.*)
 
 
 instance(type D: Decoder) Decode(u16, D)
@@ -159,7 +159,7 @@ instance(type D: Decoder) Decode(u16, D)
 
 instance(type E: Encoder) Encode(u32, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.u32(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.u32(value.*)
 
 
 instance(type D: Decoder) Decode(u32, D)
@@ -169,7 +169,7 @@ instance(type D: Decoder) Decode(u32, D)
 
 instance(type E: Encoder) Encode(u64, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.u64(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.u64(value.*)
 
 
 instance(type D: Decoder) Decode(u64, D)
@@ -179,7 +179,7 @@ instance(type D: Decoder) Decode(u64, D)
 
 instance(type E: Encoder) Encode(u128, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.u128(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.u128(value.*)
 
 
 instance(type D: Decoder) Decode(u128, D)
@@ -189,7 +189,7 @@ instance(type D: Decoder) Decode(u128, D)
 
 instance(type E: Encoder) Encode(usize, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.usize(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.usize(value.*)
 
 
 instance(type D: Decoder) Decode(usize, D)
@@ -199,7 +199,7 @@ instance(type D: Decoder) Decode(usize, D)
 
 instance(type E: Encoder) Encode(f16, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.f16(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.f16(value.*)
 
 
 instance(type D: Decoder) Decode(f16, D)
@@ -209,7 +209,7 @@ instance(type D: Decoder) Decode(f16, D)
 
 instance(type E: Encoder) Encode(f32, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.f32(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.f32(value.*)
 
 
 instance(type D: Decoder) Decode(f32, D)
@@ -219,7 +219,7 @@ instance(type D: Decoder) Decode(f32, D)
 
 instance(type E: Encoder) Encode(f64, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.f64(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.f64(value.*)
 
 
 instance(type D: Decoder) Decode(f64, D)
@@ -229,7 +229,7 @@ instance(type D: Decoder) Decode(f64, D)
 
 instance(type E: Encoder) Encode(f128, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.f128(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.f128(value.*)
 
 
 instance(type D: Decoder) Decode(f128, D)
@@ -239,7 +239,7 @@ instance(type D: Decoder) Decode(f128, D)
 
 instance(type E: Encoder) Encode(bool, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.bool(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.bool(value.*)
 
 
 instance(type D: Decoder) Decode(bool, D)
@@ -247,14 +247,14 @@ instance(type D: Decoder) Decode(bool, D)
     fn decode(decoder: *D) -> own !Self = decoder.bool()
 
 
-instance(type E: Encoder) Encode(*const([]u8), E)
+instance(type E: Encoder) Encode(const(*[]u8), E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.bytes(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.bytes(value.*)
 
 
 instance(type E: Encoder) Encode(*[]u8, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void = encoder.bytes(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.bytes(value.*)
 
 
 instance(type D: Decoder) Decode(*[]u8, D)
@@ -264,7 +264,7 @@ instance(type D: Decoder) Decode(*[]u8, D)
 
 instance(type A: Encode(_, E), type E: Encoder) Encode(?A, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void
+    fn encode(value: const(*Self), encoder: *E) -> !void
         if value.* as *inner
             try encoder.present()
             try encoder.encode(inner)
@@ -282,7 +282,7 @@ instance(type A: Decode(_, D), type D: Decoder) Decode(?A, D)
 
 instance(type A: Encode(_, E), type E: Encoder, comptime N: usize) Encode([N]A, E)
 
-    fn encode(value: *const(Self), encoder: *E) -> !void
+    fn encode(value: const(*Self), encoder: *E) -> !void
         try encoder.sequence(N)
         if N > 0
             for *element in value

@@ -3,87 +3,87 @@ import mn::memory
 
 typeclass Equal(type T)
 
-    fn equal(one: *const(T), two: *const(T)) -> bool
+    fn equal(one: const(*T), two: const(*T)) -> bool
 
 
 instance Equal(i8)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = one.* == two.*
 
 
 instance Equal(i16)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = one.* == two.*
 
 
 instance Equal(i32)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = one.* == two.*
 
 
 instance Equal(i64)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = one.* == two.*
 
 
 instance Equal(i128)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = one.* == two.*
 
 
 instance Equal(isize)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = one.* == two.*
 
 
 instance Equal(u8)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = one.* == two.*
 
 
 instance Equal(u16)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = one.* == two.*
 
 
 instance Equal(u32)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = one.* == two.*
 
 
 instance Equal(u64)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = one.* == two.*
 
 
 instance Equal(u128)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = one.* == two.*
 
 
 instance Equal(usize)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = one.* == two.*
 
 
 instance Equal(bool)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = one.* == two.*
 
 
-instance Equal(*const([]u8))
+instance Equal(const(*[]u8))
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = memory::equal(one.*, two.*)
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = memory::equal(one.*, two.*)
 
 
 instance Equal(*[]u8)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = memory::equal(one.*, two.*)
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = memory::equal(one.*, two.*)
 
 
 instance(type A: Equal, comptime N: usize) Equal([N]A)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool
+    fn equal(one: const(*Self), two: const(*Self)) -> bool
         if N == 0
             return true
         else
@@ -94,10 +94,10 @@ instance(type A: Equal, comptime N: usize) Equal([N]A)
 
 typeclass Order(type T: Equal)
 
-    fn order(one: *const(T), two: *const(T)) -> Ordering
+    fn order(one: const(*T), two: const(*T)) -> Ordering
 
-    fn is_less_than(one: *const(T), two: *const(T)) -> bool = Order::order(one, two) == ::Less
-    fn is_greater_than(one: *const(T), two: *const(T)) -> bool = Order::order(one, two) == ::Greater
+    fn is_less_than(one: const(*T), two: const(*T)) -> bool = Order::order(one, two) == ::Less
+    fn is_greater_than(one: const(*T), two: const(*T)) -> bool = Order::order(one, two) == ::Greater
 
 
 enum Ordering
@@ -108,7 +108,7 @@ enum Ordering
 
 instance Order(i8)
 
-    fn order(one: *const(Self), two: *const(Self)) -> Ordering
+    fn order(one: const(*Self), two: const(*Self)) -> Ordering
         if (one.* < two.*) return ::Less
         if (one.* > two.*) return ::Greater
         return ::Equal
@@ -116,7 +116,7 @@ instance Order(i8)
 
 instance Order(i16)
 
-    fn order(one: *const(Self), two: *const(Self)) -> Ordering
+    fn order(one: const(*Self), two: const(*Self)) -> Ordering
         if (one.* < two.*) return ::Less
         if (one.* > two.*) return ::Greater
         return ::Equal
@@ -124,7 +124,7 @@ instance Order(i16)
 
 instance Order(i32)
 
-    fn order(one: *const(Self), two: *const(Self)) -> Ordering
+    fn order(one: const(*Self), two: const(*Self)) -> Ordering
         if (one.* < two.*) return ::Less
         if (one.* > two.*) return ::Greater
         return ::Equal
@@ -132,7 +132,7 @@ instance Order(i32)
 
 instance Order(i64)
 
-    fn order(one: *const(Self), two: *const(Self)) -> Ordering
+    fn order(one: const(*Self), two: const(*Self)) -> Ordering
         if (one.* < two.*) return ::Less
         if (one.* > two.*) return ::Greater
         return ::Equal
@@ -140,7 +140,7 @@ instance Order(i64)
 
 instance Order(i128)
 
-    fn order(one: *const(Self), two: *const(Self)) -> Ordering
+    fn order(one: const(*Self), two: const(*Self)) -> Ordering
         if (one.* < two.*) return ::Less
         if (one.* > two.*) return ::Greater
         return ::Equal
@@ -148,7 +148,7 @@ instance Order(i128)
 
 instance Order(isize)
 
-    fn order(one: *const(Self), two: *const(Self)) -> Ordering
+    fn order(one: const(*Self), two: const(*Self)) -> Ordering
         if (one.* < two.*) return ::Less
         if (one.* > two.*) return ::Greater
         return ::Equal
@@ -156,7 +156,7 @@ instance Order(isize)
 
 instance Order(u8)
 
-    fn order(one: *const(Self), two: *const(Self)) -> Ordering
+    fn order(one: const(*Self), two: const(*Self)) -> Ordering
         if (one.* < two.*) return ::Less
         if (one.* > two.*) return ::Greater
         return ::Equal
@@ -164,7 +164,7 @@ instance Order(u8)
 
 instance Order(u16)
 
-    fn order(one: *const(Self), two: *const(Self)) -> Ordering
+    fn order(one: const(*Self), two: const(*Self)) -> Ordering
         if (one.* < two.*) return ::Less
         if (one.* > two.*) return ::Greater
         return ::Equal
@@ -172,7 +172,7 @@ instance Order(u16)
 
 instance Order(u32)
 
-    fn order(one: *const(Self), two: *const(Self)) -> Ordering
+    fn order(one: const(*Self), two: const(*Self)) -> Ordering
         if (one.* < two.*) return ::Less
         if (one.* > two.*) return ::Greater
         return ::Equal
@@ -180,7 +180,7 @@ instance Order(u32)
 
 instance Order(u64)
 
-    fn order(one: *const(Self), two: *const(Self)) -> Ordering
+    fn order(one: const(*Self), two: const(*Self)) -> Ordering
         if (one.* < two.*) return ::Less
         if (one.* > two.*) return ::Greater
         return ::Equal
@@ -188,7 +188,7 @@ instance Order(u64)
 
 instance Order(u128)
 
-    fn order(one: *const(Self), two: *const(Self)) -> Ordering
+    fn order(one: const(*Self), two: const(*Self)) -> Ordering
         if (one.* < two.*) return ::Less
         if (one.* > two.*) return ::Greater
         return ::Equal
@@ -196,23 +196,23 @@ instance Order(u128)
 
 instance Order(usize)
 
-    fn order(one: *const(Self), two: *const(Self)) -> Ordering
+    fn order(one: const(*Self), two: const(*Self)) -> Ordering
         if (one.* < two.*) return ::Less
         if (one.* > two.*) return ::Greater
         return ::Equal
 
 
-instance Order(*const([]u8))
+instance Order(const(*[]u8))
 
-    fn order(one: *const(Self), two: *const(Self)) -> Ordering = order_bytes(one.*, two.*)
+    fn order(one: const(*Self), two: const(*Self)) -> Ordering = order_bytes(one.*, two.*)
 
 
 instance Order(*[]u8)
 
-    fn order(one: *const(Self), two: *const(Self)) -> Ordering = order_bytes(one.*, two.*)
+    fn order(one: const(*Self), two: const(*Self)) -> Ordering = order_bytes(one.*, two.*)
 
 
-private fn order_bytes(one: *const([]u8), two: *const([]u8)) -> Ordering
+private fn order_bytes(one: const(*[]u8), two: const(*[]u8)) -> Ordering
     const length = if (one.length < two.length) one.length else two.length
     for index in 0..length
         if (one[index] < two[index]) return ::Less

@@ -37,7 +37,7 @@ instance(type W: Writer) Encoder(BinaryEncoder(W))
     fn bool(self: *Self, value: bool) -> !void = write_unsigned(self.writer, u8, if (value) 1 else 0)
 
 
-    fn bytes(self: *Self, value: *const([]u8)) -> !void
+    fn bytes(self: *Self, value: const(*[]u8)) -> !void
         try write_unsigned(self.writer, usize, value.length)
         try Writer::write(self.writer, value)
 
@@ -47,10 +47,10 @@ instance(type W: Writer) Encoder(BinaryEncoder(W))
     fn sequence(self: *Self, count: usize) -> !void = write_unsigned(self.writer, usize, count)
     fn map(self: *Self, count: usize) -> !void = write_unsigned(self.writer, usize, count)
     fn structure(self: *Self, count: usize) -> !void = write_unsigned(self.writer, usize, count)
-    fn field(_: *Self, _: *const([]u8)) -> !void = noop
+    fn field(_: *Self, _: const(*[]u8)) -> !void = noop
     fn tuple(self: *Self, count: usize) -> !void = write_unsigned(self.writer, usize, count)
-    fn variant(self: *Self, _: *const([]u8), number: usize) -> !void = write_unsigned(self.writer, usize, number)
-    fn(type T: Encode(_, Self)) encode(self: *Self, value: *const(T)) -> !void = Encode::encode(value, self)
+    fn variant(self: *Self, _: const(*[]u8), number: usize) -> !void = write_unsigned(self.writer, usize, number)
+    fn(type T: Encode(_, Self)) encode(self: *Self, value: const(*T)) -> !void = Encode::encode(value, self)
 
 
 fn BinaryDecoder(type R: Reader) -> type
@@ -148,14 +148,14 @@ instance(type R: Reader) Decoder(BinaryDecoder(R))
         if (try read_unsigned(self.reader, usize) != count) return codec::Error::Malformed
 
 
-    fn field(_: *Self, _: *const([]u8)) -> !void = noop
+    fn field(_: *Self, _: const(*[]u8)) -> !void = noop
 
 
     fn tuple(self: *Self, count: usize) -> !void
         if (try read_unsigned(self.reader, usize) != count) return codec::Error::Malformed
 
 
-    fn variant(self: *Self, names: *const([]*const([]u8))) -> !usize
+    fn variant(self: *Self, names: const(*[]const(*[]u8))) -> !usize
         const number = try read_unsigned(self.reader, usize)
         if (number >= names.length) return codec::Error::Malformed
         return number
@@ -173,9 +173,9 @@ private fn(type W: Writer) write_unsigned(writer: *W, type U, value: U) -> !void
     try Writer::write(writer, bytes[..mn::size(U)])
 
 
-private fn copy_bits(type T, type F, value: *const(F)) -> T
+private fn copy_bits(type T, type F, value: const(*F)) -> T
     var bits: T = undefined
-    memory::copy(mn::cast(*many(u8), &bits)[0..mn::size(T)], mn::cast(*const(many(u8)), value)[0..mn::size(F)])
+    memory::copy(mn::cast(*[many]u8, &bits)[0..mn::size(T)], mn::cast(const(*[many]u8), value)[0..mn::size(F)])
     return bits
 
 

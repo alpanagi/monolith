@@ -23,87 +23,87 @@ const round_constants: [64]u32 = {
 
 typeclass Hash(type T: Equal)
 
-    fn hash(value: *const(T)) -> u64
+    fn hash(value: const(*T)) -> u64
 
 
 instance Hash(i8)
 
-    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::truncate(u64, value.*))
+    fn hash(value: const(*Self)) -> u64 = splitmix64(mn::truncate(u64, value.*))
 
 
 instance Hash(i16)
 
-    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::truncate(u64, value.*))
+    fn hash(value: const(*Self)) -> u64 = splitmix64(mn::truncate(u64, value.*))
 
 
 instance Hash(i32)
 
-    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::truncate(u64, value.*))
+    fn hash(value: const(*Self)) -> u64 = splitmix64(mn::truncate(u64, value.*))
 
 
 instance Hash(i64)
 
-    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::truncate(u64, value.*))
+    fn hash(value: const(*Self)) -> u64 = splitmix64(mn::truncate(u64, value.*))
 
 
 instance Hash(i128)
 
-    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::truncate(u64, value.*)) ^ splitmix64(mn::truncate(u64, value.* >> 64))
+    fn hash(value: const(*Self)) -> u64 = splitmix64(mn::truncate(u64, value.*)) ^ splitmix64(mn::truncate(u64, value.* >> 64))
 
 
 instance Hash(isize)
 
-    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::truncate(u64, value.*))
+    fn hash(value: const(*Self)) -> u64 = splitmix64(mn::truncate(u64, value.*))
 
 
 instance Hash(u8)
 
-    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::convert(u64, value.*))
+    fn hash(value: const(*Self)) -> u64 = splitmix64(mn::convert(u64, value.*))
 
 
 instance Hash(u16)
 
-    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::convert(u64, value.*))
+    fn hash(value: const(*Self)) -> u64 = splitmix64(mn::convert(u64, value.*))
 
 
 instance Hash(u32)
 
-    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::convert(u64, value.*))
+    fn hash(value: const(*Self)) -> u64 = splitmix64(mn::convert(u64, value.*))
 
 
 instance Hash(u64)
 
-    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::convert(u64, value.*))
+    fn hash(value: const(*Self)) -> u64 = splitmix64(mn::convert(u64, value.*))
 
 
 instance Hash(u128)
 
-    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::truncate(u64, value.*)) ^ splitmix64(mn::truncate(u64, value.* >> 64))
+    fn hash(value: const(*Self)) -> u64 = splitmix64(mn::truncate(u64, value.*)) ^ splitmix64(mn::truncate(u64, value.* >> 64))
 
 
 instance Hash(usize)
 
-    fn hash(value: *const(Self)) -> u64 = splitmix64(mn::convert(u64, value.*))
+    fn hash(value: const(*Self)) -> u64 = splitmix64(mn::convert(u64, value.*))
 
 
 instance Hash(bool)
 
-    fn hash(value: *const(Self)) -> u64 = splitmix64(if (value.*) 1 else 0)
+    fn hash(value: const(*Self)) -> u64 = splitmix64(if (value.*) 1 else 0)
 
 
-instance Hash(*const([]u8))
+instance Hash(const(*[]u8))
 
-    fn hash(value: *const(Self)) -> u64 = splitmix64(fnv1a64(value.*))
+    fn hash(value: const(*Self)) -> u64 = splitmix64(fnv1a64(value.*))
 
 
 instance Hash(*[]u8)
 
-    fn hash(value: *const(Self)) -> u64 = splitmix64(fnv1a64(value.*))
+    fn hash(value: const(*Self)) -> u64 = splitmix64(fnv1a64(value.*))
 
 
 instance(type A: Hash, comptime N: usize) Hash([N]A)
 
-    fn hash(value: *const(Self)) -> u64
+    fn hash(value: const(*Self)) -> u64
         var state: u64 = 0
         for *element in value.*
             state = splitmix64(state ^ Hash::hash(element))
@@ -117,7 +117,7 @@ fn splitmix64(number: u64) -> u64
     return value ^ (value >> 31)
 
 
-fn fnv1a64(bytes: *const([]u8)) -> u64
+fn fnv1a64(bytes: const(*[]u8)) -> u64
     var state: u64 = 0xcbf29ce484222325
     for byte in bytes
         state = math::multiply_wrapping(state ^ mn::convert(u64, byte), 0x100000001b3)
@@ -156,7 +156,7 @@ fn sha256(reader: *Reader) -> ![32]u8
     return digest
 
 
-fn compress(state: *[8]u32, block: *const([]u8))
+fn compress(state: *[8]u32, block: const(*[]u8))
     var schedule: [64]u32 = undefined
     for index in 0..16
         const start = index * 4

@@ -1113,13 +1113,13 @@ pub fn renderTypeName(allocator: std.mem.Allocator, modules: []const Module, val
 }
 
 fn renderPointer(allocator: std.mem.Allocator, form: PointerForm, constant: bool, target: []const u8) std.mem.Allocator.Error![]const u8 {
-    const pointed = switch (form) {
-        .one => target,
-        .many => try std.fmt.allocPrint(allocator, "many({s})", .{target}),
-        .slice => try std.fmt.allocPrint(allocator, "[]{s}", .{target}),
+    const prefix = switch (form) {
+        .one => "*",
+        .many => "*[many]",
+        .slice => "*[]",
     };
-    if (constant) return std.fmt.allocPrint(allocator, "*const({s})", .{pointed});
-    return std.fmt.allocPrint(allocator, "*{s}", .{pointed});
+    if (constant) return std.fmt.allocPrint(allocator, "const({s}{s})", .{ prefix, target });
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, target });
 }
 
 const PointerForm = enum {
@@ -2432,11 +2432,11 @@ test "renderTypeName: writes every slice and many as a form of pointer" {
     const lines: types.Slice = .{ .element = .{ .slice = &read_only }, .constant = true };
 
     try std.testing.expectEqualStrings("*[]u8", try renderTypeName(allocator, &.{}, .{ .slice = &bytes }));
-    try std.testing.expectEqualStrings("*const([]u8)", try renderTypeName(allocator, &.{}, .{ .slice = &read_only }));
+    try std.testing.expectEqualStrings("const(*[]u8)", try renderTypeName(allocator, &.{}, .{ .slice = &read_only }));
     try std.testing.expectEqualStrings("**[]u8", try renderTypeName(allocator, &.{}, .{ .pointer = &to_slice }));
-    try std.testing.expectEqualStrings("*const(*const([]u8))", try renderTypeName(allocator, &.{}, .{ .pointer = &read_only_to_slice }));
-    try std.testing.expectEqualStrings("*const(many(u8))", try renderTypeName(allocator, &.{}, .{ .pointer = &many }));
-    try std.testing.expectEqualStrings("*const([]*const([]u8))", try renderTypeName(allocator, &.{}, .{ .slice = &lines }));
+    try std.testing.expectEqualStrings("const(*const(*[]u8))", try renderTypeName(allocator, &.{}, .{ .pointer = &read_only_to_slice }));
+    try std.testing.expectEqualStrings("const(*[many]u8)", try renderTypeName(allocator, &.{}, .{ .pointer = &many }));
+    try std.testing.expectEqualStrings("const(*[]const(*[]u8))", try renderTypeName(allocator, &.{}, .{ .slice = &lines }));
 }
 
 test "extractBlocks: finds the body and the else block of a loop" {

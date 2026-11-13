@@ -16,18 +16,18 @@ import mn::stream::Reader
 import mn::stream::Writer
 import mn::time
 
-private external fn mn_runtime_filesystem_absolute(name: *const([]u8), buffer: *[]u8) -> i32
+private external fn mn_runtime_filesystem_absolute(name: const(*[]u8), buffer: *[]u8) -> i32
 
 private external fn mn_runtime_filesystem_close(descriptor: i32)
 private external fn mn_runtime_filesystem_close_directory(handle: *void)
-private external fn mn_runtime_filesystem_create_directory(name: *const([]u8)) -> i32
-private external fn mn_runtime_filesystem_metadata(name: *const([]u8), kind: *i32, size: *usize, seconds: *i64, nanoseconds: *u32) -> i32
+private external fn mn_runtime_filesystem_create_directory(name: const(*[]u8)) -> i32
+private external fn mn_runtime_filesystem_metadata(name: const(*[]u8), kind: *i32, size: *usize, seconds: *i64, nanoseconds: *u32) -> i32
 private external fn mn_runtime_filesystem_next_entry(handle: *void, entry: *Directory::RawEntry) -> i32
-private external fn mn_runtime_filesystem_open(name: *const([]u8), mode: i32) -> i32
-private external fn mn_runtime_filesystem_open_directory(name: *const([]u8), code: *i32) -> ?*void
+private external fn mn_runtime_filesystem_open(name: const(*[]u8), mode: i32) -> i32
+private external fn mn_runtime_filesystem_open_directory(name: const(*[]u8), code: *i32) -> ?*void
 private external fn mn_runtime_filesystem_size(descriptor: i32) -> isize
 private external fn mn_runtime_io_read(descriptor: i32, buffer: *[]u8) -> isize
-private external fn mn_runtime_io_write(descriptor: i32, bytes: *const([]u8)) -> isize
+private external fn mn_runtime_io_write(descriptor: i32, bytes: const(*[]u8)) -> isize
 
 const maximum_path_length: usize = 4096
 private const separator: u8 = '/'
@@ -81,7 +81,7 @@ struct File
         Other
 
 
-private fn fill_name(path: Path, buffer: *[]u8) -> Error!*const([]u8)
+private fn fill_name(path: Path, buffer: *[]u8) -> Error!const(*[]u8)
     const length = path.bytes.length
     if (length >= buffer.length) return Error::NameTooLong
     memory::copy(buffer[..length], path.bytes)
@@ -118,7 +118,7 @@ fn find_descriptor_error(code: isize) -> Error = match code
 
 instance stream::Reader(File)
 
-    fn read(file: *const(Self), buffer: *[]u8) -> !usize
+    fn read(file: const(*Self), buffer: *[]u8) -> !usize
         const count = mn_runtime_io_read(file.descriptor, buffer)
         if (count < 0) return find_descriptor_error(count)
         return mn::convert(usize, count)
@@ -126,7 +126,7 @@ instance stream::Reader(File)
 
 instance stream::Writer(File)
 
-    fn write(file: *const(Self), bytes: *const([]u8)) -> !void
+    fn write(file: const(*Self), bytes: const(*[]u8)) -> !void
         const code = mn_runtime_io_write(file.descriptor, bytes)
         if (code < 0) return find_descriptor_error(code)
 
@@ -152,12 +152,12 @@ struct Directory
     fn close(self: Self) = mn_runtime_filesystem_close_directory(self.handle)
 
     private external struct RawEntry
-        name: *const(many(u8))
+        name: const(*[many]u8)
         length: usize
         kind: i32
 
     struct Entry
-        name: *const([]u8)
+        name: const(*[]u8)
         kind: File::Kind
 
 
@@ -169,7 +169,7 @@ private fn find_kind(code: i32) -> File::Kind = match code
 
 
 inline struct Path
-    private bytes: *const([]u8)
+    private bytes: const(*[]u8)
 
     fn init -> own Self = { bytes = {} }
 
@@ -203,17 +203,17 @@ inline struct Path
 
 instance Hash(Path)
 
-    fn hash(path: *const(Self)) -> u64 = hash::splitmix64(hash::fnv1a64(path.bytes))
+    fn hash(path: const(*Self)) -> u64 = hash::splitmix64(hash::fnv1a64(path.bytes))
 
 
 instance Equal(Path)
 
-    fn equal(one: *const(Self), two: *const(Self)) -> bool = Equal::equal(&one.bytes, &two.bytes)
+    fn equal(one: const(*Self), two: const(*Self)) -> bool = Equal::equal(&one.bytes, &two.bytes)
 
 
 instance Clone(Path)
 
-    fn clone(path: *const(Self)) -> own memory::Error!Self = { bytes = try path.bytes.clone() }
+    fn clone(path: const(*Self)) -> own memory::Error!Self = { bytes = try path.bytes.clone() }
 
 
 instance Deinit(Path)
@@ -221,7 +221,7 @@ instance Deinit(Path)
     fn deinit(own path: *Self) = memory::free(own path.bytes)
 
 
-instance To(*const([]u8), Path)
+instance To(const(*[]u8), Path)
 
     fn to(text: Self, type U) -> own !U = build_path(text)
 
@@ -234,14 +234,14 @@ instance To(Path, *[]u8)
         return text
 
 
-instance View(*const([]u8), Path)
+instance View(const(*[]u8), Path)
 
     fn view(text: Self, type U) -> U = { bytes = text }
 
 
 instance(type E: Encoder) Encode(Path, E)
 
-    fn encode(path: *const(Self), encoder: *E) -> !void = encoder.bytes(path.bytes)
+    fn encode(path: const(*Self), encoder: *E) -> !void = encoder.bytes(path.bytes)
 
 
 instance(type D: Decoder) Decode(Path, D)
@@ -251,13 +251,13 @@ instance(type D: Decoder) Decode(Path, D)
         return { bytes = own bytes }
 
 
-private fn build_path(bytes: *const([]u8)) -> own memory::Error!Path
+private fn build_path(bytes: const(*[]u8)) -> own memory::Error!Path
     const own copied = try memory::allocate(u8, bytes.length)
     memory::copy(copied, bytes)
     return { bytes = own copied }
 
 
-private fn find_parent_length(bytes: *const([]u8)) -> usize
+private fn find_parent_length(bytes: const(*[]u8)) -> usize
     var end = bytes.length
     while end > 1 and bytes[end - 1] == separator
         end -= 1
@@ -310,7 +310,7 @@ fn read(path: Path) -> own !*[]u8
     return bytes
 
 
-fn write(path: Path, bytes: *const([]u8)) -> !void
+fn write(path: Path, bytes: const(*[]u8)) -> !void
     const file = try File::open(path, { mode = ::Write })
     defer file.close()
     try file.write(bytes)
@@ -335,13 +335,13 @@ struct CreateDirectoryOptions
     create_ancestors: bool = false
 
 
-private fn create_single_directory(name: *const([]u8)) -> Error!void
+private fn create_single_directory(name: const(*[]u8)) -> Error!void
     const code = mn_runtime_filesystem_create_directory(name)
     if (code == 0 or is_directory(name)) return
     return find_error(code)
 
 
-private fn is_directory(name: *const([]u8)) -> bool
+private fn is_directory(name: const(*[]u8)) -> bool
     var kind: i32 = 0
     var size: usize = 0
     var seconds: i64 = 0

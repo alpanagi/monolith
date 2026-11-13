@@ -6689,10 +6689,10 @@ fn describeError(check_error: CheckError) []const u8 {
         error.UnexpectedUndefined => "undefined can only be the initial value of a variable",
         error.UnreachableStatement => "statement never runs",
         error.UnexpectedNull => "null can only be the value of an optional",
-        error.NotSliceable => "only arrays, slices and *many(T) pointers can be sliced",
+        error.NotSliceable => "only arrays, slices and *[many]T pointers can be sliced",
         error.SlicedTemporary => "only arrays that are variables, constants, elements or fields can be sliced",
-        error.MissingEnd => "a slice of a *many(T) pointer needs an end",
-        error.NotIndexable => "only arrays, slices, *many(T) pointers and tuples can be indexed",
+        error.MissingEnd => "a slice of a *[many]T pointer needs an end",
+        error.NotIndexable => "only arrays, slices, *[many]T pointers and tuples can be indexed",
         error.IndexOutOfRange => "index is outside the length",
         error.UnknownTupleIndex => "a tuple index must be known at compile time",
         error.NotAddressable => "only variables, constants, elements, fields and functions have an address",
@@ -6700,7 +6700,7 @@ fn describeError(check_error: CheckError) []const u8 {
         error.CannotEvaluate => "cannot be evaluated at compile time",
         error.NotAPointer => "only pointers can be dereferenced",
         error.NotOptional => "value is not an optional",
-        error.SinglePointerArithmetic => "only *many(T) pointers support arithmetic",
+        error.SinglePointerArithmetic => "only *[many]T pointers support arithmetic",
         error.ZeroSizedPointerArithmetic => "pointers to zero-sized values do not support arithmetic",
         error.NotWritable => "value cannot be modified",
         error.NeverModified => "variable is never modified, declare it with const",
@@ -6714,7 +6714,7 @@ fn describeError(check_error: CheckError) []const u8 {
         error.FunctionDereferenced => "function pointers cannot be dereferenced",
         error.VoidDereferenced => "pointers to void cannot be dereferenced",
         error.ExpectedPointer => "expected a pointer to a value",
-        error.ExpectedManyPointer => "expected a *many(T) pointer",
+        error.ExpectedManyPointer => "expected a *[many]T pointer",
         error.ComptimeError => "compile-time error",
         error.NeedsAllocator => "this value cannot be computed at compile time because it allocates",
         error.AllocatorNotNeeded => "this call does not need an allocator",
@@ -6777,7 +6777,7 @@ fn describeError(check_error: CheckError) []const u8 {
         error.NotNumeric => "operator needs integers or floats",
         error.NotInteger => "operator needs integers",
         error.NotEquatable => "only numbers, bool, types, pointers, enums and arrays of them can be compared for equality",
-        error.NotOrdered => "only numbers and *many(T) pointers can be ordered",
+        error.NotOrdered => "only numbers and *[many]T pointers can be ordered",
         error.NegatedUnsigned => "unsigned integers cannot be negated",
         error.MismatchedOperands => "operands have different types",
         error.NotSequence => "for goes only over an array, a slice, a pointer to an array, a range or a value whose type has an instance of mn::iterator::Iterable",
@@ -9224,7 +9224,7 @@ test "TypeChecker.check: accepts a read of an array that a loop fills element by
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card\n    value: i32\nfn total(cards: [3]Card) -> i32\n    var pending: [cards.length]*const(Card) = undefined\n    for (index in 0..cards.length) pending[index] = &cards[index]\n    return pending[0].value + pending[2].value\nconst TOTAL = total({ Card{ value = 1 }, Card{ value = 2 }, Card{ value = 3 } })" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card\n    value: i32\nfn total(cards: [3]Card) -> i32\n    var pending: [cards.length]const(*Card) = undefined\n    for (index in 0..cards.length) pending[index] = &cards[index]\n    return pending[0].value + pending[2].value\nconst TOTAL = total({ Card{ value = 1 }, Card{ value = 2 }, Card{ value = 3 } })" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10904,7 +10904,7 @@ test "resolveAllocatorCall: gives a call the allocator of with and everything be
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn take(count: usize) -> memory::Error!usize\n    with allocator\n    const own items = try allocator.allocate(u8, count)\n    defer allocator.free(own items)\n    return items.length\nfn middle(count: usize) -> memory::Error!usize = take(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    return try middle(4) with &fixed\nconst USED = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn take(count: usize) -> memory::Error!usize\n    with allocator\n    const own items = try allocator.allocate(u8, count)\n    defer allocator.free(own items)\n    return items.length\nfn middle(count: usize) -> memory::Error!usize = take(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    return try middle(4) with &fixed\nconst USED = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10930,7 +10930,7 @@ test "resolveAllocatorCall: lets the function of an instance need an allocator t
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\ntypeclass Source(type S)\n\n    fn read(source: S) -> !usize\nstruct Left\nstruct Right\ninstance Source(Left)\n\n    fn read(_: Left) -> !usize\n        with allocator\n        const own items = try allocator.allocate(u8, 3)\n        defer allocator.free(own items)\n        return items.length\ninstance Source(Right)\n\n    fn read(_: Right) -> !usize = 7\nfn report(source: Source) -> !usize = source.read()\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const one = try report(Left{}) with &fixed\n    const two = report(Right{}) catch 0\n    return one * 10 + two\nconst RESULT = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\ntypeclass Source(type S)\n\n    fn read(source: S) -> !usize\nstruct Left\nstruct Right\ninstance Source(Left)\n\n    fn read(_: Left) -> !usize\n        with allocator\n        const own items = try allocator.allocate(u8, 3)\n        defer allocator.free(own items)\n        return items.length\ninstance Source(Right)\n\n    fn read(_: Right) -> !usize = 7\nfn report(source: Source) -> !usize = source.read()\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const one = try report(Left{}) with &fixed\n    const two = report(Right{}) catch 0\n    return one * 10 + two\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10953,7 +10953,7 @@ test "resolveAllocatorCall: rejects with on an instance of a generic function th
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\ntypeclass Source(type S)\n\n    fn read(source: S) -> !usize\nstruct Left\nstruct Right\ninstance Source(Left)\n\n    fn read(_: Left) -> !usize\n        with allocator\n        const items = try allocator.allocate(u8, 3)\n        return items.length\ninstance Source(Right)\n\n    fn read(_: Right) -> !usize = 7\nfn report(source: Source) -> !usize = source.read()\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    return report(Right{}) with &fixed catch 0\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\ntypeclass Source(type S)\n\n    fn read(source: S) -> !usize\nstruct Left\nstruct Right\ninstance Source(Left)\n\n    fn read(_: Left) -> !usize\n        with allocator\n        const items = try allocator.allocate(u8, 3)\n        return items.length\ninstance Source(Right)\n\n    fn read(_: Right) -> !usize = 7\nfn report(source: Source) -> !usize = source.read()\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    return report(Right{}) with &fixed catch 0\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -10972,7 +10972,7 @@ test "resolveAllocatorCall: infers the need of a generic function that calls its
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn depth(type T, count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    with allocator\n    const own items = try allocator.allocate(T, 1)\n    defer allocator.free(own items)\n    return items.length + try depth(T, count - 1)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    return try depth(u8, 3) with &fixed\nconst RESULT = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn depth(type T, count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    with allocator\n    const own items = try allocator.allocate(T, 1)\n    defer allocator.free(own items)\n    return items.length + try depth(T, count - 1)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    return try depth(u8, 3) with &fixed\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11058,7 +11058,7 @@ test "resolveAllocatorCall: reaches memory::allocate at the bottom of a chain wi
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn bottom(count: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, count)\nfn middle(count: usize) -> memory::Error!usize\n    const own items = try bottom(count)\n    defer memory::free(own items)\n    return items.length\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const length = try middle(5) with &fixed\n    return length * 100 + fixed.used\nconst RESULT = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn bottom(count: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, count)\nfn middle(count: usize) -> memory::Error!usize\n    const own items = try bottom(count)\n    defer memory::free(own items)\n    return items.length\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const length = try middle(5) with &fixed\n    return length * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11081,7 +11081,7 @@ test "resolveAllocatorCall: allocates from the allocator of with in every functi
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn even(count: usize) -> memory::Error!usize\n    with allocator\n    const own ignored_18 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_18)\n    if (count == 0) return 0\n    return try odd(count - 1)\nfn odd(count: usize) -> memory::Error!usize\n    with allocator\n    const own ignored_23 = try allocator.allocate(u8, 2)\n    allocator.free(own ignored_23)\n    if (count == 0) return 0\n    return try even(count - 1)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try even(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn even(count: usize) -> memory::Error!usize\n    with allocator\n    const own ignored_18 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_18)\n    if (count == 0) return 0\n    return try odd(count - 1)\nfn odd(count: usize) -> memory::Error!usize\n    with allocator\n    const own ignored_23 = try allocator.allocate(u8, 2)\n    allocator.free(own ignored_23)\n    if (count == 0) return 0\n    return try even(count - 1)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try even(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11104,7 +11104,7 @@ test "resolveAllocatorCall: finds a need late through the back edge of a cycle w
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    const value = try second(count - 1)\n    with allocator\n    const own ignored_20 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_20)\n    return value + 1\nfn second(count: usize) -> memory::Error!usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    const value = try second(count - 1)\n    with allocator\n    const own ignored_20 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_20)\n    return value + 1\nfn second(count: usize) -> memory::Error!usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11127,7 +11127,7 @@ test "resolveAllocatorCall: finds a need late through the forward edge of a cycl
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    const value = try second(count - 1)\n    with allocator\n    const own ignored_20 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_20)\n    return value + 1\nfn second(count: usize) -> memory::Error!usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try second(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    const value = try second(count - 1)\n    with allocator\n    const own ignored_20 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_20)\n    return value + 1\nfn second(count: usize) -> memory::Error!usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try second(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11150,7 +11150,7 @@ test "resolveAllocatorCall: overrides the allocator for one call inside a cycle 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    with allocator\n    const own ignored_18 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_18)\n    if (count == 0) return 0\n    return try second(count)\nfn second(count: usize) -> memory::Error!usize\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try first(count - 1) with &other\n    return value + other.used * 10\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    with allocator\n    const own ignored_18 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_18)\n    if (count == 0) return 0\n    return try second(count)\nfn second(count: usize) -> memory::Error!usize\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try first(count - 1) with &other\n    return value + other.used * 10\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11173,7 +11173,7 @@ test "resolveAllocatorCall: overrides the allocator for one call inside a cycle 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try second(count - 1) with &other\n    with allocator\n    const own ignored_22 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_22)\n    return value + other.used * 10\nfn second(count: usize) -> memory::Error!usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try second(count - 1) with &other\n    with allocator\n    const own ignored_22 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_22)\n    return value + other.used * 10\nfn second(count: usize) -> memory::Error!usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11196,7 +11196,7 @@ test "resolveAllocatorCall: allocates from the allocator of with in every functi
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn even(count: usize) -> !usize\n    with allocator\n    const own ignored_18 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_18)\n    if (count == 0) return 0\n    return try odd(count - 1)\nfn odd(count: usize) -> !usize\n    with allocator\n    const own ignored_23 = try allocator.allocate(u8, 2)\n    allocator.free(own ignored_23)\n    if (count == 0) return 0\n    return try even(count - 1)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try even(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn even(count: usize) -> !usize\n    with allocator\n    const own ignored_18 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_18)\n    if (count == 0) return 0\n    return try odd(count - 1)\nfn odd(count: usize) -> !usize\n    with allocator\n    const own ignored_23 = try allocator.allocate(u8, 2)\n    allocator.free(own ignored_23)\n    if (count == 0) return 0\n    return try even(count - 1)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try even(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11219,7 +11219,7 @@ test "resolveAllocatorCall: finds a need late through the back edge of a cycle w
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn first(count: usize) -> !usize\n    if (count == 0) return 0\n    const value = try second(count - 1)\n    with allocator\n    const own ignored_20 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_20)\n    return value + 1\nfn second(count: usize) -> !usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn first(count: usize) -> !usize\n    if (count == 0) return 0\n    const value = try second(count - 1)\n    with allocator\n    const own ignored_20 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_20)\n    return value + 1\nfn second(count: usize) -> !usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11242,7 +11242,7 @@ test "resolveAllocatorCall: finds a need late through the forward edge of a cycl
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn first(count: usize) -> !usize\n    if (count == 0) return 0\n    const value = try second(count - 1)\n    with allocator\n    const own ignored_20 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_20)\n    return value + 1\nfn second(count: usize) -> !usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try second(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn first(count: usize) -> !usize\n    if (count == 0) return 0\n    const value = try second(count - 1)\n    with allocator\n    const own ignored_20 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_20)\n    return value + 1\nfn second(count: usize) -> !usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try second(3) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11265,7 +11265,7 @@ test "resolveAllocatorCall: overrides the allocator for one call inside a cycle 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn first(count: usize) -> !usize\n    with allocator\n    const own ignored_18 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_18)\n    if (count == 0) return 0\n    return try second(count)\nfn second(count: usize) -> !usize\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try first(count - 1) with &other\n    return value + other.used * 10\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn first(count: usize) -> !usize\n    with allocator\n    const own ignored_18 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_18)\n    if (count == 0) return 0\n    return try second(count)\nfn second(count: usize) -> !usize\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try first(count - 1) with &other\n    return value + other.used * 10\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11288,7 +11288,7 @@ test "resolveAllocatorCall: overrides the allocator for one call inside a cycle 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn first(count: usize) -> !usize\n    if (count == 0) return 0\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try second(count - 1) with &other\n    with allocator\n    const own ignored_22 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_22)\n    return value + other.used * 10\nfn second(count: usize) -> !usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn first(count: usize) -> !usize\n    if (count == 0) return 0\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try second(count - 1) with &other\n    with allocator\n    const own ignored_22 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_22)\n    return value + other.used * 10\nfn second(count: usize) -> !usize = first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11311,7 +11311,7 @@ test "resolveAllocatorCall: calls back into a function whose need is found after
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try helper(count - 1) with &other\n    with allocator\n    const own ignored_22 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_22)\n    return value + other.used * 10\nfn helper(count: usize) -> memory::Error!usize\n    with allocator\n    const own ignored_26 = try allocator.allocate(u8, 2)\n    allocator.free(own ignored_26)\n    return try first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try helper(count - 1) with &other\n    with allocator\n    const own ignored_22 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_22)\n    return value + other.used * 10\nfn helper(count: usize) -> memory::Error!usize\n    with allocator\n    const own ignored_26 = try allocator.allocate(u8, 2)\n    allocator.free(own ignored_26)\n    return try first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11334,7 +11334,7 @@ test "resolveAllocatorCall: calls back into a function whose need is found after
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn first(count: usize) -> !usize\n    if (count == 0) return 0\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try helper(count - 1) with &other\n    with allocator\n    const own ignored_22 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_22)\n    return value + other.used * 10\nfn helper(count: usize) -> !usize\n    with allocator\n    const own ignored_26 = try allocator.allocate(u8, 2)\n    allocator.free(own ignored_26)\n    return try first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn first(count: usize) -> !usize\n    if (count == 0) return 0\n    var other: Fixed = undefined\n    other.used = 0\n    const value = try helper(count - 1) with &other\n    with allocator\n    const own ignored_22 = try allocator.allocate(u8, 1)\n    allocator.free(own ignored_22)\n    return value + other.used * 10\nfn helper(count: usize) -> !usize\n    with allocator\n    const own ignored_26 = try allocator.allocate(u8, 2)\n    allocator.free(own ignored_26)\n    return try first(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = try first(2) with &fixed\n    return value * 100 + fixed.used\nconst RESULT = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11357,7 +11357,7 @@ test "finishNeeds: rejects with on a call inside a cycle that turns out not to n
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    var other: Fixed = undefined\n    other.used = 0\n    return second(count - 1) with &other\nfn second(count: usize) -> memory::Error!usize = first(count)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn first(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    var other: Fixed = undefined\n    other.used = 0\n    return second(count - 1) with &other\nfn second(count: usize) -> memory::Error!usize = first(count)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11422,7 +11422,7 @@ test "resolveAllocatorCall: overrides the allocator for an inner call with its o
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn take(count: usize) -> memory::Error!usize\n    with allocator\n    const own items = try allocator.allocate(u8, count)\n    defer allocator.free(own items)\n    return items.length\nfn outer() -> memory::Error![2]usize\n    var inner: Fixed = undefined\n    inner.used = 0\n    const one = try take(3) with &inner\n    const two = try take(5)\n    return { one + inner.used, two }\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const both = try outer() with &fixed\n    return both[0] * 100 + both[1] * 10 + fixed.used\nconst USED = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn take(count: usize) -> memory::Error!usize\n    with allocator\n    const own items = try allocator.allocate(u8, count)\n    defer allocator.free(own items)\n    return items.length\nfn outer() -> memory::Error![2]usize\n    var inner: Fixed = undefined\n    inner.used = 0\n    const one = try take(3) with &inner\n    const two = try take(5)\n    return { one + inner.used, two }\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const both = try outer() with &fixed\n    return both[0] * 100 + both[1] * 10 + fixed.used\nconst USED = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11448,7 +11448,7 @@ test "resolveAllocatorCall: infers the need of functions that call each other" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn even(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    return try odd(count - 1)\nfn odd(count: usize) -> memory::Error!usize\n    with allocator\n    const own items = try allocator.allocate(u8, 1)\n    defer allocator.free(own items)\n    return items.length + try even(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    return try even(3) with &fixed\nconst USED = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn even(count: usize) -> memory::Error!usize\n    if (count == 0) return 0\n    return try odd(count - 1)\nfn odd(count: usize) -> memory::Error!usize\n    with allocator\n    const own items = try allocator.allocate(u8, 1)\n    defer allocator.free(own items)\n    return items.length + try even(count)\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    return try even(3) with &fixed\nconst USED = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11474,7 +11474,7 @@ test "resolveAllocatorCall: infers the need of an instance of a generic function
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn take(type T) -> memory::Error!usize\n    if T == u8\n        with allocator\n        const own items = try allocator.allocate(u8, 2)\n        defer allocator.free(own items)\n        return items.length\n    return 0\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const one = try take(u8) with &fixed\n    const two = try take(i32)\n    return one + two\nconst USED = run() catch 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn take(type T) -> memory::Error!usize\n    if T == u8\n        with allocator\n        const own items = try allocator.allocate(u8, 2)\n        defer allocator.free(own items)\n        return items.length\n    return 0\nfn run() -> memory::Error!usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const one = try take(u8) with &fixed\n    const two = try take(i32)\n    return one + two\nconst USED = run() catch 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11612,7 +11612,7 @@ test "checkWithOperand: rejects an allocator type with fields in the with of a c
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container::ArrayList\nimport mn::memory\nimport mn::memory::Allocator\n\nstruct Counting\n    allocations: usize\n\ninstance Allocator(Counting)\n\n    fn allocate(counting: *Counting, type T, _: usize) -> own memory::Error!*[]T\n        counting.allocations += 1\n        return memory::Error::OutOfMemory\n\n    fn(type T) resize(_: *Counting, _: *[]T, _: usize) -> bool = false\n\n    fn(type T) free(_: *Counting, own _: *const([]T)) = noop\n\nfn main -> !void\n    var list = ArrayList(u8)::init()\n    try list.append(1) with Counting\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container::ArrayList\nimport mn::memory\nimport mn::memory::Allocator\n\nstruct Counting\n    allocations: usize\n\ninstance Allocator(Counting)\n\n    fn allocate(counting: *Counting, type T, _: usize) -> own memory::Error!*[]T\n        counting.allocations += 1\n        return memory::Error::OutOfMemory\n\n    fn(type T) resize(_: *Counting, _: *[]T, _: usize) -> bool = false\n\n    fn(type T) free(_: *Counting, own _: const(*[]T)) = noop\n\nfn main -> !void\n    var list = ArrayList(u8)::init()\n    try list.append(1) with Counting\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11778,7 +11778,7 @@ test "findCreatingCall: reaches the call that created an allocator instance" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container::ArrayList\nimport mn::memory\nimport mn::memory::Allocator\n\nstruct Counting\n    allocations: usize\n\ninstance Allocator(Counting)\n\n    fn allocate(counting: *Counting, type T, _: usize) -> own memory::Error!*[]T\n        counting.allocations += 1\n        return memory::Error::OutOfMemory\n\n    fn(type T) resize(_: *Counting, _: *[]T, _: usize) -> bool = false\n\n    fn(type T) free(_: *Counting, own _: *const([]T)) = noop\n\nfn count() -> usize\n    with allocator\n    return allocator.allocations\n\nfn main -> !void\n    var counting = Counting{ allocations = 0 }\n    _ = count() with &counting\n    _ = count() with memory::Heap\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container::ArrayList\nimport mn::memory\nimport mn::memory::Allocator\n\nstruct Counting\n    allocations: usize\n\ninstance Allocator(Counting)\n\n    fn allocate(counting: *Counting, type T, _: usize) -> own memory::Error!*[]T\n        counting.allocations += 1\n        return memory::Error::OutOfMemory\n\n    fn(type T) resize(_: *Counting, _: *[]T, _: usize) -> bool = false\n\n    fn(type T) free(_: *Counting, own _: const(*[]T)) = noop\n\nfn count() -> usize\n    with allocator\n    return allocator.allocations\n\nfn main -> !void\n    var counting = Counting{ allocations = 0 }\n    _ = count() with &counting\n    _ = count() with memory::Heap\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11912,7 +11912,7 @@ test "checkOwnValue: rejects the result of an own call in a declaration that is 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const record = try make(1)\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const record = try make(1)\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11931,7 +11931,7 @@ test "checkOwnValue: rejects the result of an own call discarded with _" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    _ = try make(1)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    _ = try make(1)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11950,7 +11950,7 @@ test "checkOwnValue: rejects the result of an own call passed to a parameter tha
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    _ = look(try make(1))\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    _ = look(try make(1))\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11969,7 +11969,7 @@ test "checkOwnValue: rejects the result of an own call in a field that is not ow
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const holder = Holder{ record = try make(1) }\n    _ = holder\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const holder = Holder{ record = try make(1) }\n    _ = holder\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -11988,7 +11988,7 @@ test "checkOwnValue: rejects a literal holding an own call in a declaration that
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const record = Record{ name = try bytes(1), size = 1 }\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const record = Record{ name = try bytes(1), size = 1 }\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12007,7 +12007,7 @@ test "checkOwnValue: rejects the result of an own call in an assignment" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    var record = Record{ name = {}, size = 0 }\n    record = try make(1)\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    var record = Record{ name = {}, size = 0 }\n    record = try make(1)\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12026,7 +12026,7 @@ test "checkOwnValue: accepts the result of an own call in each own place" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn wrap(size: usize) -> own memory::Error!Record = make(size)\n\nfn pass(size: usize) -> own memory::Error!Record\n    const own record = try make(size)\n    return record\n\nfn main -> !void\n    with memory::Heap\n    const own one = try make(1)\n    _ = keep(own one)\n    _ = keep(try make(2))\n    const own two = make(3) catch return\n    _ = keep(own two)\n    const own three = Record{ name = try bytes(4), size = 4 }\n    _ = keep(own three)\n    const own four = try wrap(5)\n    _ = keep(own four)\n    var own five = try pass(6)\n    five.size = 7\n    _ = keep(own five)\n    _ = keep({ name = try bytes(8), size = 8 })\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn wrap(size: usize) -> own memory::Error!Record = make(size)\n\nfn pass(size: usize) -> own memory::Error!Record\n    const own record = try make(size)\n    return record\n\nfn main -> !void\n    with memory::Heap\n    const own one = try make(1)\n    _ = keep(own one)\n    _ = keep(try make(2))\n    const own two = make(3) catch return\n    _ = keep(own two)\n    const own three = Record{ name = try bytes(4), size = 4 }\n    _ = keep(own three)\n    const own four = try wrap(5)\n    _ = keep(own four)\n    var own five = try pass(6)\n    five.size = 7\n    _ = keep(own five)\n    _ = keep({ name = try bytes(8), size = 8 })\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12101,7 +12101,7 @@ test "checkOwnValue: rejects copying an owning value into a declaration that is 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const copy = record\n    _ = copy\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const copy = record\n    _ = copy\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12120,7 +12120,7 @@ test "checkOwnValue: rejects copying an owning value into a parameter that is no
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = look(record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = look(record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12139,7 +12139,7 @@ test "checkOwnValue: rejects copying an owning value into a field that is not ow
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const holder = Holder{ record = record }\n    _ = holder\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const holder = Holder{ record = record }\n    _ = holder\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12158,7 +12158,7 @@ test "checkOwnValue: rejects copying an owning value into a variable that is not
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    var other = Record{ name = {}, size = 0 }\n    other = record\n    _ = other\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    var other = Record{ name = {}, size = 0 }\n    other = record\n    _ = other\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12177,7 +12177,7 @@ test "checkOwnValue: rejects copying an owning value through a pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const pointer = &record\n    const copy = pointer.*\n    _ = copy\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const pointer = &record\n    const copy = pointer.*\n    _ = copy\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12196,7 +12196,7 @@ test "checkOwnValue: rejects copying an owning value into the case of an enum" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const choice = Choice::Record{ record }\n    _ = choice\n\nenum Choice\n    Record: Record\n    Nothing\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const choice = Choice::Record{ record }\n    _ = choice\n\nenum Choice\n    Record: Record\n    Nothing\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12215,7 +12215,7 @@ test "checkOwnValue: rejects copying owning values out of a tuple by taking it a
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const pair: [Record, Record] = { Record{ name = {}, size = 1 }, Record{ name = {}, size = 2 } }\n    const { one, two } = pair\n    _ = one\n    _ = two\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const pair: [Record, Record] = { Record{ name = {}, size = 1 }, Record{ name = {}, size = 2 } }\n    const { one, two } = pair\n    _ = one\n    _ = two\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12858,7 +12858,7 @@ test "checkOwnBindings: rejects a loop name that copies an owning element" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const records: [2]Record = { Record{ name = {}, size = 1 }, Record{ name = {}, size = 2 } }\n    for item in records\n        _ = item\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const records: [2]Record = { Record{ name = {}, size = 1 }, Record{ name = {}, size = 2 } }\n    for item in records\n        _ = item\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12877,7 +12877,7 @@ test "checkOwnBindings: rejects a match name that copies an owning value out of 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const maybe: ?Record = Record{ name = {}, size = 1 }\n    match maybe\n        case Record as found\n            _ = found\n        case null\n            noop\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const maybe: ?Record = Record{ name = {}, size = 1 }\n    match maybe\n        case Record as found\n            _ = found\n        case null\n            noop\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12896,7 +12896,7 @@ test "checkOwnValue: accepts fresh values, pointers, discards and values that co
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const plain = Plain{ bytes = {} }\n    const other_plain = plain\n    _ = other_plain\n    const fresh = Record{ name = {}, size = 1 }\n    _ = fresh\n    _ = look(Record{ name = {}, size = 2 })\n    const pointer = &record\n    _ = pointer.size\n    const records: [2]Record = { Record{ name = {}, size = 1 }, Record{ name = {}, size = 2 } }\n    for *item in records\n        _ = item\n    for _ in records\n        noop\n    const maybe: ?Record = Record{ name = {}, size = 1 }\n    match maybe\n        case Record as *found\n            _ = found\n        case null\n            noop\n    match maybe\n        case Record\n            noop\n        case null\n            noop\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const plain = Plain{ bytes = {} }\n    const other_plain = plain\n    _ = other_plain\n    const fresh = Record{ name = {}, size = 1 }\n    _ = fresh\n    _ = look(Record{ name = {}, size = 2 })\n    const pointer = &record\n    _ = pointer.size\n    const records: [2]Record = { Record{ name = {}, size = 1 }, Record{ name = {}, size = 2 } }\n    for *item in records\n        _ = item\n    for _ in records\n        noop\n    const maybe: ?Record = Record{ name = {}, size = 1 }\n    match maybe\n        case Record as *found\n            _ = found\n        case null\n            noop\n    match maybe\n        case Record\n            noop\n        case null\n            noop\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12914,7 +12914,7 @@ test "checkOwnValue: rejects a copy in the body of an instance of a generic func
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = pass(Record, &record) + keep(own record)\n\nfn pass(type T, value: *const(T)) -> usize\n    const copy = value.*\n    _ = copy\n    return 1\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = pass(Record, &record) + keep(own record)\n\nfn pass(type T, value: const(*T)) -> usize\n    const copy = value.*\n    _ = copy\n    return 1\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12937,7 +12937,7 @@ test "checkOwnArgument: rejects a field of another value passed to an own parame
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    const holder = Holder{ record = Record{ name = {}, size = 1 } }\n    _ = keep(holder.record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    const holder = Holder{ record = Record{ name = {}, size = 1 } }\n    _ = keep(holder.record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12956,7 +12956,7 @@ test "checkOwnArgument: rejects an element of an array passed to an own paramete
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    const records: [1]Record = { Record{ name = {}, size = 1 } }\n    _ = keep(records[0])\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    const records: [1]Record = { Record{ name = {}, size = 1 } }\n    _ = keep(records[0])\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12975,7 +12975,7 @@ test "checkOwnArgument: rejects a local that is not own passed to an own paramet
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    const record = Record{ name = {}, size = 1 }\n    _ = keep(record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    const record = Record{ name = {}, size = 1 }\n    _ = keep(record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12994,7 +12994,7 @@ test "checkOwnArgument: rejects a parameter that is not own passed to an own par
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn forward(record: Record) -> usize = keep(record)\n\nfn main -> !void\n    _ = forward(Record{ name = {}, size = 1 })\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn forward(record: Record) -> usize = keep(record)\n\nfn main -> !void\n    _ = forward(Record{ name = {}, size = 1 })\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13013,7 +13013,7 @@ test "checkOwnArgument: rejects the result of a call that is not own passed to a
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    const holder = Holder{ record = Record{ name = {}, size = 1 } }\n    _ = keep(share(&holder))\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    const holder = Holder{ record = Record{ name = {}, size = 1 } }\n    _ = keep(share(&holder))\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13032,7 +13032,7 @@ test "checkOwnArgument: accepts fresh values and values that copy freely in an o
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn adopt(own plain: Plain, own number: usize, own pointer: *const(usize)) -> usize = plain.bytes.length + number + pointer.*\n\nfn main -> !void\n    const plain = Plain{ bytes = {} }\n    const number: usize = 2\n    _ = adopt(plain, number + 1, &number)\n    _ = keep(Record{ name = {}, size = 3 })\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn adopt(own plain: Plain, own number: usize, own pointer: const(*usize)) -> usize = plain.bytes.length + number + pointer.*\n\nfn main -> !void\n    const plain = Plain{ bytes = {} }\n    const number: usize = 2\n    _ = adopt(plain, number + 1, &number)\n    _ = keep(Record{ name = {}, size = 3 })\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13050,7 +13050,7 @@ test "checkOwnArgument: rejects a name declared own passed without own" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13069,7 +13069,7 @@ test "checkOwnArgument: rejects own before a name that is not declared own" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    const record = Record{ name = {}, size = 1 }\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    const record = Record{ name = {}, size = 1 }\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13088,7 +13088,7 @@ test "checkOwnArguments: rejects own before an argument to a parameter that is n
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = look(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = look(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13107,7 +13107,7 @@ test "checkOwnArgument: rejects own before a call" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    _ = keep(own try make(1))\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    _ = keep(own try make(1))\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13126,7 +13126,7 @@ test "checkOwnArgument: passes an own parameter on with own" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn forward(own record: Record) -> usize = keep(own record)\n\nfn main -> !void\n    _ = forward(Record{ name = {}, size = 1 })\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn forward(own record: Record) -> usize = keep(own record)\n\nfn main -> !void\n    _ = forward(Record{ name = {}, size = 1 })\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13144,7 +13144,7 @@ test "checkOwnStatement: rejects returning a name declared own from a function t
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn give() -> memory::Error!Record\n    const own record = try make(1)\n    return record\n\nfn main -> !void\n    with memory::Heap\n    _ = look(try give())\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn give() -> memory::Error!Record\n    const own record = try make(1)\n    return record\n\nfn main -> !void\n    with memory::Heap\n    _ = look(try give())\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13163,7 +13163,7 @@ test "checkOwnStatement: rejects returning a copy of an owning value from a func
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(own record)\n\nfn give(holder: *const(Holder)) -> Record = holder.record\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(own record)\n\nfn give(holder: const(*Holder)) -> Record = holder.record\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13182,7 +13182,7 @@ test "checkOwnStatement: rejects returning a copy of an owning value from an own
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(own record)\n\nfn give(holder: *const(Holder)) -> own Record = holder.record\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(own record)\n\nfn give(holder: const(*Holder)) -> own Record = holder.record\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13201,7 +13201,7 @@ test "checkOwnStatement: accepts returning fresh values, the results of own call
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(own record)\n\nfn fresh() -> Record = { name = {}, size = 1 }\n\nfn forward(size: usize) -> own memory::Error!Record = make(size)\n\nfn kept(size: usize) -> own memory::Error!Record\n    const own made = try make(size)\n    return made\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(own record)\n\nfn fresh() -> Record = { name = {}, size = 1 }\n\nfn forward(size: usize) -> own memory::Error!Record = make(size)\n\nfn kept(size: usize) -> own memory::Error!Record\n    const own made = try make(size)\n    return made\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13219,7 +13219,7 @@ test "checkMoves: rejects using a name after its value moved" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(own record)\n    _ = record.size\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(own record)\n    _ = record.size\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13238,7 +13238,7 @@ test "checkMoves: rejects moving a name twice" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(own record)\n    _ = keep(own record)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(own record)\n    _ = keep(own record)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13257,7 +13257,7 @@ test "checkMoves: rejects using a name after an if that moves it in one branch" 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    if record.size > 0\n        _ = keep(own record)\n    _ = record.size\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    if record.size > 0\n        _ = keep(own record)\n    _ = record.size\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13276,7 +13276,7 @@ test "checkMoves: rejects moving a name declared outside a loop again on the nex
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    for _ in 0..2\n        _ = keep(own record)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    for _ in 0..2\n        _ = keep(own record)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13295,7 +13295,7 @@ test "checkMoves: rejects a defer that moves a name moved again before the end o
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    defer _ = keep(own record)\n    _ = keep(own record)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    defer _ = keep(own record)\n    _ = keep(own record)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13314,7 +13314,7 @@ test "checkMoves: rejects a defer that uses an own local returned from an own fu
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(own record)\n    const own given = try give(1)\n    _ = keep(own given)\n\nfn give(size: usize) -> own memory::Error!Record\n    const own made = try make(size)\n    defer _ = made.size\n    return made\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(own record)\n    const own given = try give(1)\n    _ = keep(own given)\n\nfn give(size: usize) -> own memory::Error!Record\n    const own made = try make(size)\n    defer _ = made.size\n    return made\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13333,7 +13333,7 @@ test "checkMoves: rejects an errdefer that uses a name moved before the function
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(own record)\n\nfn pass(own record: Record) -> Failure!usize\n    errdefer _ = record.size\n    const size = keep(own record)\n    try check(size > 1)\n    return size\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(own record)\n\nfn pass(own record: Record) -> Failure!usize\n    errdefer _ = record.size\n    const size = keep(own record)\n    try check(size > 1)\n    return size\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13352,7 +13352,7 @@ test "checkMoves: rejects an errdefer that uses a name moved before an error is 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(own record)\n\nfn pass(own record: Record) -> Failure!usize\n    errdefer _ = record.size\n    const size = keep(own record)\n    if (size > 1) return Failure::Failed\n    return size\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = keep(own record)\n\nfn pass(own record: Record) -> Failure!usize\n    errdefer _ = record.size\n    const size = keep(own record)\n    if (size > 1) return Failure::Failed\n    return size\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13699,7 +13699,7 @@ test "expectConsumed: names an owning type of another module that can be held bu
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "import mn::memory\n\n\nstruct Thing\n    private own bytes: *[]u8\n\n    fn init() -> own Thing = { bytes = {} }\n\n\n    fn size(self: *const(Self)) -> usize = self.bytes.length\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "import mn::memory\n\n\nstruct Thing\n    private own bytes: *[]u8\n\n    fn init() -> own Thing = { bytes = {} }\n\n\n    fn size(self: const(*Self)) -> usize = self.bytes.length\n" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport things\n\nfn main\n    with memory::Heap\n    const own thing = things::Thing::init()\n    _ = thing.size()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -13721,7 +13721,7 @@ test "expectConsumed: keeps the general error for an owning type of another modu
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "import mn::memory\n\n\nstruct Thing\n    private own bytes: *[]u8\n\n    fn init() -> own Thing = { bytes = {} }\n\n\n    fn size(self: *const(Self)) -> usize = self.bytes.length\n\n\nfn end(own thing: *Thing) = memory::free(own thing.bytes)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "import mn::memory\n\n\nstruct Thing\n    private own bytes: *[]u8\n\n    fn init() -> own Thing = { bytes = {} }\n\n\n    fn size(self: const(*Self)) -> usize = self.bytes.length\n\n\nfn end(own thing: *Thing) = memory::free(own thing.bytes)\n" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport things\n\nfn main\n    with memory::Heap\n    const own thing = things::Thing::init()\n    _ = thing.size()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -13762,7 +13762,7 @@ test "isTrustedFunction: leaves the free of an instance of Allocator unchecked" 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\n\nstruct Fixed\n    bytes: [8]u8\n\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T = mn::cast(*many(T), fixed.bytes[0..].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\n\nfn main -> !void\n    var fixed: Fixed = undefined\n    with &fixed\n    const own items = try memory::allocate(u8, 1)\n    memory::free(own items)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\n\nstruct Fixed\n    bytes: [8]u8\n\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T = mn::cast(*[many]T, fixed.bytes[0..].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\n\nfn main -> !void\n    var fixed: Fixed = undefined\n    with &fixed\n    const own items = try memory::allocate(u8, 1)\n    memory::free(own items)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14288,7 +14288,7 @@ test "checkOwnAccepted: rejects a literal value moved into an own parameter of a
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container::ArrayList\nimport mn::container::HashMap\nimport mn::memory\nimport mn::memory::Deinit\n\nexternal fn finish(own path: *[]u8, hash: u64) -> u64\n\nstruct Record\n    own path: *[]u8\n    hash: u64\n\nstruct Inner\n    own record: Record\n    count: usize\n\nstruct Owner\n    own inner: Inner\n    size: usize\n\nstruct Pair\n    own one: *[]u8\n    own two: *[]u8\n\nfn make(size: usize) -> own memory::Error!Record\n    const own path = try memory::allocate(u8, size)\n    return { path = own path, hash = 0 }\n\nfn find(size: usize) -> own ?Record\n    if (size == 0) return null\n    const own record = make(size) catch return null\n    return record\n\nfn keep(own record: Record) -> u64 = finish(own record.path, record.hash)\n\nfn end(own record: *Record) = memory::free(own record.path)\n\nfn main -> !void\n    with memory::Heap\n    var own map = HashMap(*const([]u8), *const([]u8))::init()\n    defer map.deinit(own)\n    const own previous = try map.put(\"key\", \"alpha\")\n    _ = previous\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container::ArrayList\nimport mn::container::HashMap\nimport mn::memory\nimport mn::memory::Deinit\n\nexternal fn finish(own path: *[]u8, hash: u64) -> u64\n\nstruct Record\n    own path: *[]u8\n    hash: u64\n\nstruct Inner\n    own record: Record\n    count: usize\n\nstruct Owner\n    own inner: Inner\n    size: usize\n\nstruct Pair\n    own one: *[]u8\n    own two: *[]u8\n\nfn make(size: usize) -> own memory::Error!Record\n    const own path = try memory::allocate(u8, size)\n    return { path = own path, hash = 0 }\n\nfn find(size: usize) -> own ?Record\n    if (size == 0) return null\n    const own record = make(size) catch return null\n    return record\n\nfn keep(own record: Record) -> u64 = finish(own record.path, record.hash)\n\nfn end(own record: *Record) = memory::free(own record.path)\n\nfn main -> !void\n    with memory::Heap\n    var own map = HashMap(const(*[]u8), const(*[]u8))::init()\n    defer map.deinit(own)\n    const own previous = try map.put(\"key\", \"alpha\")\n    _ = previous\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14308,7 +14308,7 @@ test "checkOwnAccepted: rejects a name declared own in an own field of a literal
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    label: *const([]u8)\n\nfn make(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn main -> !void\n    with memory::Heap\n    const own name = try make(1)\n    const own record = Record{ name = name, label = \"first\" }\n    memory::free(own record.name)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    label: const(*[]u8)\n\nfn make(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn main -> !void\n    with memory::Heap\n    const own name = try make(1)\n    const own record = Record{ name = name, label = \"first\" }\n    memory::free(own record.name)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14328,7 +14328,7 @@ test "checkOwnAccepted: keeps a view in a field that is not own of a literal in 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    label: *const([]u8)\n\nfn make(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn main -> !void\n    with memory::Heap\n    const own name = try make(1)\n    const own record = Record{ name = own name, label = \"first\" }\n    memory::free(own record.name)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    label: const(*[]u8)\n\nfn make(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn main -> !void\n    with memory::Heap\n    const own name = try make(1)\n    const own record = Record{ name = own name, label = \"first\" }\n    memory::free(own record.name)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14478,7 +14478,7 @@ test "checkOwnAccepted: rejects moving a value out of a field of a value that is
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const holder = Holder{ record = { name = {}, size = 1 } }\n    _ = keep(own holder.record)\n    _ = keep(own record)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const holder = Holder{ record = { name = {}, size = 1 } }\n    _ = keep(own holder.record)\n    _ = keep(own record)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14497,7 +14497,7 @@ test "checkOwnAccepted: accepts moving a part out of a field of an own local" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const own owner = Owner{ record = own record }\n    _ = keep(own owner.record)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const own owner = Owner{ record = own record }\n    _ = keep(own owner.record)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14515,7 +14515,7 @@ test "checkOwnAccepted: rejects moving a value out of a pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const pointer = &record\n    _ = keep(own pointer.*)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const pointer = &record\n    _ = keep(own pointer.*)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14534,7 +14534,7 @@ test "checkOwnAccepted: rejects moving a value out of an element" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const records: [1]Record = { { name = {}, size = 1 } }\n    _ = keep(own records[0])\n    _ = keep(own record)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const records: [1]Record = { { name = {}, size = 1 } }\n    _ = keep(own records[0])\n    _ = keep(own record)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14553,7 +14553,7 @@ test "checkOwnAccepted: accepts moving an element with a known index out of an o
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const own records: [1]Record = { Record{ name = {}, size = 2 } }\n    _ = keep(own records[0])\n    _ = keep(own record)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    const own records: [1]Record = { Record{ name = {}, size = 2 } }\n    _ = keep(own records[0])\n    _ = keep(own record)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14745,7 +14745,7 @@ test "checkMoves: accepts moves on every path that gives the name a new value or
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    var own other = make(2) catch Record{ name = {}, size = 2 }\n    if record.size > 0\n        _ = keep(own other)\n        other = make(3) catch Record{ name = {}, size = 3 }\n    _ = other.size\n    for _ in 0..2\n        _ = keep(own other)\n        other = make(4) catch Record{ name = {}, size = 4 }\n    while true\n        _ = keep(own other)\n        break\n    if record.size > 5\n        _ = keep(own record)\n        return\n    defer _ = keep(own record)\n    _ = record.size\n    var own owner = Owner{ record = try make(5) }\n    _ = keep(memory::replace(&owner.record, Record{ name = {}, size = 0 }))\n    _ = keep(own owner.record)\n    _ = try pass(try make(6))\n    try hand(try make(7))\n\nfn pass(own record: Record) -> Failure!usize\n    errdefer _ = record.size\n    try check(record.size > 9)\n    return keep(own record)\n\nfn hand(own record: Record) -> Failure!void\n    errdefer _ = record.size\n    try store(own record)\n\nfn store(own record: Record) -> Failure!void\n    try check(record.size > 9)\n    _ = keep(own record)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    var own other = make(2) catch Record{ name = {}, size = 2 }\n    if record.size > 0\n        _ = keep(own other)\n        other = make(3) catch Record{ name = {}, size = 3 }\n    _ = other.size\n    for _ in 0..2\n        _ = keep(own other)\n        other = make(4) catch Record{ name = {}, size = 4 }\n    while true\n        _ = keep(own other)\n        break\n    if record.size > 5\n        _ = keep(own record)\n        return\n    defer _ = keep(own record)\n    _ = record.size\n    var own owner = Owner{ record = try make(5) }\n    _ = keep(memory::replace(&owner.record, Record{ name = {}, size = 0 }))\n    _ = keep(own owner.record)\n    _ = try pass(try make(6))\n    try hand(try make(7))\n\nfn pass(own record: Record) -> Failure!usize\n    errdefer _ = record.size\n    try check(record.size > 9)\n    return keep(own record)\n\nfn hand(own record: Record) -> Failure!void\n    errdefer _ = record.size\n    try store(own record)\n\nfn store(own record: Record) -> Failure!void\n    try check(record.size > 9)\n    _ = keep(own record)\n\nstruct Owner\n    own record: Record\n\nerror Failure\n    Failed\n\nfn check(failing: bool) -> Failure!void\n    if (failing) return Failure::Failed\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14763,7 +14763,7 @@ test "checkOwnStatement: moves a name declared own into an element, a field or t
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    var own records: [1]Record = { Record{ name = {}, size = 2 } }\n    records[0] = own record\n    const own other = Record{ name = {}, size = 3 }\n    var own owner = Owner{ record = Record{ name = {}, size = 4 } }\n    owner.record = own other\n    const own third = Record{ name = {}, size = 5 }\n    const pointer = &records[0]\n    pointer.* = own third\n    _ = owner.record.size\n    _ = keep(own records[0])\n    _ = keep(own owner.record)\n\nstruct Owner\n    own record: Record\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    var own records: [1]Record = { Record{ name = {}, size = 2 } }\n    records[0] = own record\n    const own other = Record{ name = {}, size = 3 }\n    var own owner = Owner{ record = Record{ name = {}, size = 4 } }\n    owner.record = own other\n    const own third = Record{ name = {}, size = 5 }\n    const pointer = &records[0]\n    pointer.* = own third\n    _ = owner.record.size\n    _ = keep(own records[0])\n    _ = keep(own owner.record)\n\nstruct Owner\n    own record: Record\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14781,7 +14781,7 @@ test "checkMoves: rejects using a name after moving it into an element" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    var own records: [1]Record = { Record{ name = {}, size = 2 } }\n    records[0] = own record\n    _ = record.size\n    _ = keep(own records[0])\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    var own records: [1]Record = { Record{ name = {}, size = 2 } }\n    records[0] = own record\n    _ = record.size\n    _ = keep(own records[0])\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14819,7 +14819,7 @@ test "checkOwnStatement: rejects assigning a name declared own to an element wit
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    var own records: [1]Record = { try make(2) }\n    records[0] = record\n    _ = records\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    var own records: [1]Record = { try make(2) }\n    records[0] = record\n    _ = records\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14857,7 +14857,7 @@ test "checkOwnStatement: rejects discarding a name declared own" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = record\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own record = try make(1)\n    _ = record\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14876,7 +14876,7 @@ test "checkOwnReturnType: rejects own on a return type that cannot hold an alloc
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn count() -> own u32 = 1\n\nfn main -> !void\n    const own number = count()\n    _ = number\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn count() -> own u32 = 1\n\nfn main -> !void\n    const own number = count()\n    _ = number\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14895,7 +14895,7 @@ test "checkOwnReturnType: rejects own on a struct without a pointer, a slice or 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nstruct Pair\n    one: u32\n    two: [2]u8\n\nfn pair() -> own Pair = { one = 1, two = { 2, 3 } }\n\nfn main -> !void\n    const own value = pair()\n    _ = value\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nstruct Pair\n    one: u32\n    two: [2]u8\n\nfn pair() -> own Pair = { one = 1, two = { 2, 3 } }\n\nfn main -> !void\n    const own value = pair()\n    _ = value\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14914,7 +14914,7 @@ test "checkOwnReturnType: exempts an instance of a generic function" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn give(type T, value: T) -> own T = value\n\nfn main -> !void\n    const own number = give(u32, 1)\n    _ = number\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn give(type T, value: T) -> own T = value\n\nfn main -> !void\n    const own number = give(u32, 1)\n    _ = number\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14932,7 +14932,7 @@ test "checkOwnArgument: applies an own parameter of a generic function to each i
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn take(type T, own value: T) -> usize\n    _ = value\n    return 1\n\nfn main -> !void\n    const holder = Holder{ record = Record{ name = {}, size = 1 } }\n    _ = take(u32, 2)\n    _ = take(Record, holder.record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn take(type T, own value: T) -> usize\n    _ = value\n    return 1\n\nfn main -> !void\n    const holder = Holder{ record = Record{ name = {}, size = 1 } }\n    _ = take(u32, 2)\n    _ = take(Record, holder.record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14951,7 +14951,7 @@ test "isOwningType: finds an own field through an array" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn adopt(own records: [1]Record) -> usize = keep(own records[0])\n\nfn main -> !void\n    const holder = Holder{ record = Record{ name = {}, size = 1 } }\n    const held: [1][1]Record = { { Record{ name = {}, size = holder.record.size } } }\n    _ = adopt(held[0])\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn adopt(own records: [1]Record) -> usize = keep(own records[0])\n\nfn main -> !void\n    const holder = Holder{ record = Record{ name = {}, size = 1 } }\n    const held: [1][1]Record = { { Record{ name = {}, size = holder.record.size } } }\n    _ = adopt(held[0])\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14970,7 +14970,7 @@ test "isOwningType: finds an own field through an optional" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn adopt(own record: ?Record) -> bool = keep(own record.?) > 0\n\nfn main -> !void\n    const held: [1]?Record = { Record{ name = {}, size = 1 } }\n    _ = adopt(held[0])\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn adopt(own record: ?Record) -> bool = keep(own record.?) > 0\n\nfn main -> !void\n    const held: [1]?Record = { Record{ name = {}, size = 1 } }\n    _ = adopt(held[0])\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -14989,7 +14989,7 @@ test "isOwningType: finds an own field through a tuple" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn adopt(own pair: [u8, Record]) -> usize = keep(own pair[1])\n\nfn main -> !void\n    const held: [1][u8, Record] = { { 1, Record{ name = {}, size = 1 } } }\n    _ = adopt(held[0])\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn adopt(own pair: [u8, Record]) -> usize = keep(own pair[1])\n\nfn main -> !void\n    const held: [1][u8, Record] = { { 1, Record{ name = {}, size = 1 } } }\n    _ = adopt(held[0])\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15008,7 +15008,7 @@ test "isOwningType: finds an own field through the payload of an enum" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nenum Choice\n    Record: Record\n    Nothing\n\nfn adopt(own choice: Choice) -> usize\n    _ = end_choice(own choice)\n    return 1\n\nfn main -> !void\n    const held: [1]Choice = { ::Nothing }\n    _ = adopt(held[0])\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n\nexternal fn end_choice(own choice: Choice) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nenum Choice\n    Record: Record\n    Nothing\n\nfn adopt(own choice: Choice) -> usize\n    _ = end_choice(own choice)\n    return 1\n\nfn main -> !void\n    const held: [1]Choice = { ::Nothing }\n    _ = adopt(held[0])\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n\nexternal fn end_choice(own choice: Choice) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15027,7 +15027,7 @@ test "isOwningType: lets a struct of slices without own copy freely" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn adopt(own plain: Plain) -> usize = plain.bytes.length\n\nfn main -> !void\n    const held: [1]Plain = { Plain{ bytes = {} } }\n    _ = adopt(held[0])\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn adopt(own plain: Plain) -> usize = plain.bytes.length\n\nfn main -> !void\n    const held: [1]Plain = { Plain{ bytes = {} } }\n    _ = adopt(held[0])\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15045,7 +15045,7 @@ test "isOwningType: finds an own field through the field of a struct" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn adopt(own holder: Holder) -> usize = keep(own holder.record)\n\nfn main -> !void\n    const held: [1]Holder = { Holder{ record = Record{ name = {}, size = 1 } } }\n    _ = adopt(held[0])\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn adopt(own holder: Holder) -> usize = keep(own holder.record)\n\nfn main -> !void\n    const held: [1]Holder = { Holder{ record = Record{ name = {}, size = 1 } } }\n    _ = adopt(held[0])\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15064,7 +15064,7 @@ test "isOwningField: ends an inline struct held by an own name through its field
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: *const([]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nfn main -> !void\n    with memory::Heap\n    var own name = try make()\n    const view = name\n    _ = length(view) + length(name)\n    name.deinit(own)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: const(*[]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nfn main -> !void\n    with memory::Heap\n    var own name = try make()\n    const view = name\n    _ = length(view) + length(name)\n    name.deinit(own)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15083,7 +15083,7 @@ test "isOwningField: rejects an own name of an inline struct that still holds it
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: *const([]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nfn main -> !void\n    with memory::Heap\n    const own name = try make()\n    _ = length(name)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: const(*[]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nfn main -> !void\n    with memory::Heap\n    const own name = try make()\n    _ = length(name)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15102,7 +15102,7 @@ test "isOwningField: ends a nested inline struct through the field of its field"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: *const([]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\ninline struct Label\n    name: Name\n\nfn end(own label: *Label) = memory::free(own label.name.bytes)\n\nfn main -> !void\n    with memory::Heap\n    var own label: Label = { name = try make() }\n    _ = length(label.name)\n    end(own &label)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: const(*[]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\ninline struct Label\n    name: Name\n\nfn end(own label: *Label) = memory::free(own label.name.bytes)\n\nfn main -> !void\n    with memory::Heap\n    var own label: Label = { name = try make() }\n    _ = length(label.name)\n    end(own &label)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15121,7 +15121,7 @@ test "isOwningField: rejects an own pointer to a nested inline struct whose fiel
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: *const([]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\ninline struct Label\n    name: Name\n\nfn end(own label: *Label) = _ = label.name.bytes.length\n\nfn main -> !void\n    with memory::Heap\n    var own label: Label = { name = try make() }\n    end(own &label)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: const(*[]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\ninline struct Label\n    name: Name\n\nfn end(own label: *Label) = _ = label.name.bytes.length\n\nfn main -> !void\n    with memory::Heap\n    var own label: Label = { name = try make() }\n    end(own &label)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15140,7 +15140,7 @@ test "isOwningType: makes a struct with an own field of an inline struct owning"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: *const([]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nstruct Record\n    own name: Name\n    size: usize\n\nfn copy(record: *const(Record)) -> usize\n    const other = record.*\n    return other.size\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: const(*[]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nstruct Record\n    own name: Name\n    size: usize\n\nfn copy(record: const(*Record)) -> usize\n    const other = record.*\n    return other.size\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15159,7 +15159,7 @@ test "isOwningType: lets a struct with a field of an inline struct without own c
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: *const([]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nstruct Record\n    name: Name\n    size: usize\n\nfn copy(record: *const(Record)) -> usize\n    const other = record.*\n    return other.size + length(other.name)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: const(*[]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nstruct Record\n    name: Name\n    size: usize\n\nfn copy(record: const(*Record)) -> usize\n    const other = record.*\n    return other.size + length(other.name)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15178,7 +15178,7 @@ test "isOwningType: keeps a struct with one own field that is not inline owning"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Index\n    own records: *[]u8\n\nfn copy(index: *const(Index)) -> usize\n    const other = index.*\n    return other.records.length\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Index\n    own records: *[]u8\n\nfn copy(index: const(*Index)) -> usize\n    const other = index.*\n    return other.records.length\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15197,7 +15197,7 @@ test "checkOwnValue: rejects own on the field of an inline struct in a literal t
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: *const([]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nfn main -> !void\n    with memory::Heap\n    const own bytes = try memory::allocate(u8, 2)\n    const name: Name = { bytes = own bytes }\n    _ = length(name)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: const(*[]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nfn main -> !void\n    with memory::Heap\n    const own bytes = try memory::allocate(u8, 2)\n    const name: Name = { bytes = own bytes }\n    _ = length(name)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15216,7 +15216,7 @@ test "checkOwnAccepted: rejects a view of an inline struct moved into an own pla
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: *const([]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nfn keep(name: Name)\n    var own kept = name\n    kept.deinit(own)\n\nfn main -> !void\n    with memory::Heap\n    var own name = try make()\n    keep(name)\n    name.deinit(own)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: const(*[]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nfn keep(name: Name)\n    var own kept = name\n    kept.deinit(own)\n\nfn main -> !void\n    with memory::Heap\n    var own name = try make()\n    keep(name)\n    name.deinit(own)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15235,7 +15235,7 @@ test "failMisplacedMove: rejects own on the field of an inline struct held by a 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: *const([]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nfn end(name: Name) = memory::free(own name.bytes)\n\nfn main -> !void\n    with memory::Heap\n    var own name = try make()\n    end(name)\n    name.deinit(own)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: const(*[]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nfn end(name: Name) = memory::free(own name.bytes)\n\nfn main -> !void\n    with memory::Heap\n    var own name = try make()\n    end(name)\n    name.deinit(own)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15254,7 +15254,7 @@ test "isInlineOwnedPart: rejects writing to the field of an own inline struct th
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: *const([]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nfn replace(own name: *Name, own bytes: *[]u8)\n    name.bytes = own bytes\n    name.deinit(own)\n\nfn main -> !void\n    with memory::Heap\n    const own bytes = try memory::allocate(u8, 3)\n    errdefer memory::free(own bytes)\n    var own name = try make()\n    replace(own &name, own bytes)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: const(*[]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nfn replace(own name: *Name, own bytes: *[]u8)\n    name.bytes = own bytes\n    name.deinit(own)\n\nfn main -> !void\n    with memory::Heap\n    const own bytes = try memory::allocate(u8, 3)\n    errdefer memory::free(own bytes)\n    var own name = try make()\n    replace(own &name, own bytes)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15273,7 +15273,7 @@ test "isInlineOwnedPart: writes the field of an own inline struct once it is han
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: *const([]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nfn main -> !void\n    with memory::Heap\n    var own name = try make()\n    memory::free(own name.bytes)\n    const own bytes = try memory::allocate(u8, 3)\n    name.bytes = own bytes\n    name.deinit(own)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: const(*[]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nfn main -> !void\n    with memory::Heap\n    var own name = try make()\n    memory::free(own name.bytes)\n    const own bytes = try memory::allocate(u8, 3)\n    name.bytes = own bytes\n    name.deinit(own)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15292,7 +15292,7 @@ test "isInlineOwnedPart: rejects a view written to the field of an own inline st
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: *const([]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nfn main -> !void\n    with memory::Heap\n    var own name = try make()\n    memory::free(own name.bytes)\n    name.bytes = \"ab\"\n    name.deinit(own)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\ninline struct Name\n    bytes: const(*[]u8)\n\ninstance Deinit(Name)\n\n    fn deinit(own name: *Name) = memory::free(own name.bytes)\n\nfn make() -> own memory::Error!Name\n    const own bytes = try memory::allocate(u8, 2)\n    return { bytes = own bytes }\n\nfn length(name: Name) -> usize = name.bytes.length\n\nfn main -> !void\n    with memory::Heap\n    var own name = try make()\n    memory::free(own name.bytes)\n    name.bytes = \"ab\"\n    name.deinit(own)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15311,7 +15311,7 @@ test "checkOwnDestination: rejects a field of another value in an own declaratio
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    const holder = Holder{ record = Record{ name = {}, size = 1 } }\n    const own record = holder.record\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    const holder = Holder{ record = Record{ name = {}, size = 1 } }\n    const own record = holder.record\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15330,7 +15330,7 @@ test "checkOwnDestination: moves a name declared own into an own declaration wit
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own one = try make(1)\n    const own two = own one\n    var own three = own two\n    three.size = 2\n    _ = keep(own three)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own one = try make(1)\n    const own two = own one\n    var own three = own two\n    three.size = 2\n    _ = keep(own three)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15348,7 +15348,7 @@ test "checkOwnDestination: rejects a name declared own in an own declaration wit
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own one = try make(1)\n    const own two = one\n    _ = two\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own one = try make(1)\n    const own two = one\n    _ = two\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15367,7 +15367,7 @@ test "checkOwnDestination: rejects own before the value of a declaration that is
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own one = try make(1)\n    const two = own one\n    _ = two\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own one = try make(1)\n    const two = own one\n    _ = two\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15386,7 +15386,7 @@ test "checkOwnDestination: rejects the value a map gives by copy in an own decla
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nimport mn::container::HashMap\n\nfn main -> !void\n    with memory::Heap\n    var own records = HashMap(u32, Record)::init()\n    defer records.deinit(own)\n    const lookup_321: u32 = 1\n    const own found = records.get(&lookup_321).?.*\n    _ = found\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nimport mn::container::HashMap\n\nfn main -> !void\n    with memory::Heap\n    var own records = HashMap(u32, Record)::init()\n    defer records.deinit(own)\n    const lookup_321: u32 = 1\n    const own found = records.get(&lookup_321).?.*\n    _ = found\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15405,7 +15405,7 @@ test "checkOwnDestination: rejects an element of a list in an own declaration" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nimport mn::container::ArrayList\n\nfn main -> !void\n    with memory::Heap\n    var own records = ArrayList(Record)::init()\n    defer records.deinit(own)\n    try records.append(Record{ name = {}, size = 1 })\n    const own first = records.view(*const([]Record))[0]\n    _ = first\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nimport mn::container::ArrayList\n\nfn main -> !void\n    with memory::Heap\n    var own records = ArrayList(Record)::init()\n    defer records.deinit(own)\n    try records.append(Record{ name = {}, size = 1 })\n    const own first = records.view(const(*[]Record))[0]\n    _ = first\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15424,7 +15424,7 @@ test "checkOwnDestination: accepts the result of an own call and a moved name in
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    var own record = try make(1)\n    _ = keep(own record)\n    record = try make(2)\n    _ = keep(own record)\n    const own other = try make(3)\n    record = own other\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    var own record = try make(1)\n    _ = keep(own record)\n    record = try make(2)\n    _ = keep(own record)\n    const own other = try make(3)\n    record = own other\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15442,7 +15442,7 @@ test "checkOwnDestination: rejects a field of another value in an assignment to 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const holder = Holder{ record = Record{ name = {}, size = 1 } }\n    var own record = try make(1)\n    record = holder.record\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const holder = Holder{ record = Record{ name = {}, size = 1 } }\n    var own record = try make(1)\n    record = holder.record\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -15461,7 +15461,7 @@ test "checkOwnDestination: rejects own before the value of an assignment to a va
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own one = try make(1)\n    var record = Record{ name = {}, size = 1 }\n    record = own one\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: *[]u8\n\nfn bytes(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: const(*Holder)) -> Record = { name = {}, size = holder.record.size }\n\nfn main -> !void\n    with memory::Heap\n    const own one = try make(1)\n    var record = Record{ name = {}, size = 1 }\n    record = own one\n    _ = keep(own record)\n\nexternal fn finish(own name: *[]u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -16069,7 +16069,7 @@ test "integration: rejects a held key put in a map through the standard library"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::container::ArrayList\nimport mn::container::HashMap\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\n\nfn main -> !void\n    with memory::Heap\n    var own keys = ArrayList(ArrayList(u8))::init()\n    defer keys.deinit(own)\n    try keys.append(ArrayList(u8)::init())\n    var own map = HashMap(*[]u8, ArrayList(u8))::init()\n    defer map.deinit(own)\n    const key: *[]u8 = {}\n    const own previous = try map.put(&key, keys.view(*const([]ArrayList(u8)))[0])\n    _ = previous\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::container::ArrayList\nimport mn::container::HashMap\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\n\nfn main -> !void\n    with memory::Heap\n    var own keys = ArrayList(ArrayList(u8))::init()\n    defer keys.deinit(own)\n    try keys.append(ArrayList(u8)::init())\n    var own map = HashMap(*[]u8, ArrayList(u8))::init()\n    defer map.deinit(own)\n    const key: *[]u8 = {}\n    const own previous = try map.put(&key, keys.view(const(*[]ArrayList(u8)))[0])\n    _ = previous\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -16327,7 +16327,7 @@ test "integration: moves a name whose address deinit takes with own through the 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::container::ArrayList\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\n\nfn main -> !void\n    with memory::Heap\n    var own list = ArrayList(u8)::init()\n    list.deinit(own)\n    _ = list.view(*const([]u8))\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::container::ArrayList\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\n\nfn main -> !void\n    with memory::Heap\n    var own list = ArrayList(u8)::init()\n    list.deinit(own)\n    _ = list.view(const(*[]u8))\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -16365,7 +16365,7 @@ test "integration: frees a name at the end of its block with a deferred deinit t
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::container::ArrayList\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\n\nfn main -> !void\n    with memory::Heap\n    var own list = ArrayList(u8)::init()\n    defer list.deinit(own)\n    try list.append(1)\n    _ = list.view(*const([]u8))\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::container::ArrayList\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\n\nfn main -> !void\n    with memory::Heap\n    var own list = ArrayList(u8)::init()\n    defer list.deinit(own)\n    try list.append(1)\n    _ = list.view(const(*[]u8))\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -17038,7 +17038,7 @@ test "traceStatement: accepts a statement after a for loop whose body returns" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(items: *const([]i32)) -> i32\n    for (item in items) return item\n    return 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(items: const(*[]i32)) -> i32\n    for (item in items) return item\n    return 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -17059,7 +17059,7 @@ test "traceStatement: rejects a statement after a for loop whose else block retu
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(items: *const([]i32)) -> i32\n    for (item in items) _ = item\n    else return 1\n    return 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(items: const(*[]i32)) -> i32\n    for (item in items) _ = item\n    else return 1\n    return 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -17873,7 +17873,7 @@ test "checkFunction: rejects a function that ends with a for loop" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(items: *const([]i32)) -> i32\n    for (item in items) return item" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(items: const(*[]i32)) -> i32\n    for (item in items) return item" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -17894,7 +17894,7 @@ test "checkFunction: accepts a for loop whose else block returns" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(items: *const([]i32)) -> i32\n    for item in items\n        if (item > 0) return item\n    else return 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(items: const(*[]i32)) -> i32\n    for item in items\n        if (item > 0) return item\n    else return 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -18316,7 +18316,7 @@ test "checkStatement: moves a multiple value pointer with compound assignments" 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn advance(items: *many(i32)) -> *many(i32)\n    var cursor = items\n    cursor += 2\n    cursor -= 1\n    return cursor" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn advance(items: *[many]i32) -> *[many]i32\n    var cursor = items\n    cursor += 2\n    cursor -= 1\n    return cursor" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -18337,7 +18337,7 @@ test "checkStatement: rejects a compound assignment that gives the difference of
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn advance(items: *many(i32)) -> *many(i32)\n    var cursor = items\n    cursor -= items\n    return cursor" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn advance(items: *[many]i32) -> *[many]i32\n    var cursor = items\n    cursor -= items\n    return cursor" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -18547,7 +18547,7 @@ test "checkStatement: rejects writing an element of a read-only slice" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(bytes: *const([]u8)) = bytes[0] = 1" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(bytes: const(*[]u8)) = bytes[0] = 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -18589,7 +18589,7 @@ test "checkStatement: rejects writing through a read-only pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(pointer: *const(i32)) = pointer.* = 1" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(pointer: const(*i32)) = pointer.* = 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -18610,7 +18610,7 @@ test "checkStatement: accepts writing an element through a multiple value pointe
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(items: *many(u8)) = items[1] = 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(items: *[many]u8) = items[1] = 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -18631,7 +18631,7 @@ test "checkStatement: rejects writing an element through a read-only multiple va
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(items: *const(many(u8))) = items[1] = 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(items: const(*[many]u8)) = items[1] = 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -18673,7 +18673,7 @@ test "checkStatement: rejects writing a field through a read-only pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point\n    x: i32\nfn move(point: *const(Point)) = point.x = 2" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point\n    x: i32\nfn move(point: const(*Point)) = point.x = 2" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -18778,7 +18778,7 @@ test "checkStatement: rejects writing an element of the array behind a read-only
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(values: *const([2]i32)) = values[0] = 1" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(values: const(*[2]i32)) = values[0] = 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -19990,7 +19990,7 @@ test "checkImplicitArgument: takes a read-only pointer when the instance only re
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Read(type A, type B)\n\n    fn read(value: *A) -> B\nstruct Data\n    value: u8\ninstance Read(Data, u8)\n\n    fn read(value: *const(Data)) -> u8 = value.value\nfn show(value: *Read(_, u8)) -> u8 = value.read()\nfn main\n    const data: Data = { value = 3 }\n    _ = show(&data)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Read(type A, type B)\n\n    fn read(value: *A) -> B\nstruct Data\n    value: u8\ninstance Read(Data, u8)\n\n    fn read(value: const(*Data)) -> u8 = value.value\nfn show(value: *Read(_, u8)) -> u8 = value.read()\nfn main\n    const data: Data = { value = 3 }\n    _ = show(&data)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -21499,7 +21499,7 @@ test "countTypeDependency: keeps a condition that passes a type argument to a fu
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nfn check(buffer: *const([]u8), count: usize) -> bool\n    if (memory::equal(buffer, \"y\")) return true\n    if (count == mn::size(u8)) return true\n    return false" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nfn check(buffer: const(*[]u8), count: usize) -> bool\n    if (memory::equal(buffer, \"y\")) return true\n    if (count == mn::size(u8)) return true\n    return false" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -22160,7 +22160,7 @@ test "checkElementAddress: gives a read-only pointer to an element of a read-onl
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(values: *const([]i32)) = for (*value in values) value.* = 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(values: const(*[]i32)) = for (*value in values) value.* = 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -22353,7 +22353,7 @@ test "checkSequence: rejects a multiple value pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32) = _ = value\nfn show(items: *many(i32)) = for (item in items) take(item)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32) = _ = value\nfn show(items: *[many]i32) = for (item in items) take(item)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -23714,7 +23714,7 @@ test "checkExpression: accepts a string literal as a constant byte slice" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() -> *const([]u8) = return \"hello\"" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn greeting() -> const(*[]u8) = return \"hello\"" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -23771,7 +23771,7 @@ test "checkExpression: rejects an integer for a constant byte slice" {
         &.{ ".zig-cache", "tmp", &compiler_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, compiler_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn name() -> *const([]u8) = return 1" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn name() -> const(*[]u8) = return 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -24094,7 +24094,7 @@ test "checkExpression: converts a mutable slice to a constant slice" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(bytes: *const([]u8)) = _ = bytes\nfn main()\n    var buffer: [4]u8 = undefined\n    const bytes = buffer[..]\n    take(bytes)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(bytes: const(*[]u8)) = _ = bytes\nfn main()\n    var buffer: [4]u8 = undefined\n    const bytes = buffer[..]\n    take(bytes)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -24158,7 +24158,7 @@ test "checkExpression: rejects a read-only slice constant where a mutable slice 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(bytes: *[]u8) = _ = bytes\nfn main()\n    var buffer: [4]u8 = undefined\n    const view: *const([]u8) = buffer[..]\n    fill(view)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(bytes: *[]u8) = _ = bytes\nfn main()\n    var buffer: [4]u8 = undefined\n    const view: const(*[]u8) = buffer[..]\n    fill(view)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -24200,7 +24200,7 @@ test "checkExpression: converts a pointer to a read-only pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: *const(i32)) = _ = value\nfn give(value: *i32) = take(value)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: const(*i32)) = _ = value\nfn give(value: *i32) = take(value)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -24220,7 +24220,7 @@ test "checkExpression: rejects a read-only pointer where a mutable pointer is ex
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: *i32) = _ = value\nfn give(value: *const(i32)) = take(value)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: *i32) = _ = value\nfn give(value: const(*i32)) = take(value)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -24241,7 +24241,7 @@ test "checkExpression: rejects a read-only many-value pointer where a modifiable
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn write(bytes: *many(u8)) = bytes[0] = 1\nfn pass(bytes: *const(many(u8))) = write(bytes)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn write(bytes: *[many]u8) = bytes[0] = 1\nfn pass(bytes: const(*[many]u8)) = write(bytes)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -24260,7 +24260,7 @@ test "checkExpression: converts a many-value pointer to a read-only one" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(bytes: *const(many(u8))) -> u8 = return bytes[0]\nfn pass(bytes: *many(u8)) -> u8 = return read(bytes)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(bytes: const(*[many]u8)) -> u8 = return bytes[0]\nfn pass(bytes: *[many]u8) -> u8 = return read(bytes)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -24279,7 +24279,7 @@ test "checkExpression: rejects a pointer to a single value where multiple values
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(values: *const(many(i32))) = _ = values\nfn give(value: *i32) = take(value)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(values: const(*[many]i32)) = _ = values\nfn give(value: *i32) = take(value)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -24300,7 +24300,7 @@ test "checkExpression: converts a pointer to a pointer to void and a read-only p
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn keep(pointer: *void)\nexternal fn look(pointer: *const(void))\nfn run(value: *i32, values: *many(u8), constant: *const(i32))\n    keep(value)\n    keep(values)\n    look(constant)\n    look(value)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn keep(pointer: *void)\nexternal fn look(pointer: const(*void))\nfn run(value: *i32, values: *[many]u8, constant: const(*i32))\n    keep(value)\n    keep(values)\n    look(constant)\n    look(value)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -24320,7 +24320,7 @@ test "checkExpression: rejects a read-only pointer where a pointer to void is ex
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn keep(pointer: *void)\nfn run(constant: *const(i32)) = keep(constant)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn keep(pointer: *void)\nfn run(constant: const(*i32)) = keep(constant)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -24339,7 +24339,7 @@ test "checkExpression: rejects a function pointer where a pointer to void is exp
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn keep(pointer: *const(void))\nfn act() = noop\nfn run() = keep(&act)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn keep(pointer: const(*void))\nfn act() = noop\nfn run() = keep(&act)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -24402,7 +24402,7 @@ test "checkExpression: converts a pointer to an array to a read-only slice" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(bytes: *const([]u8)) = _ = bytes\nfn main()\n    var buffer: [4]u8 = undefined\n    show(&buffer)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(bytes: const(*[]u8)) = _ = bytes\nfn main()\n    var buffer: [4]u8 = undefined\n    show(&buffer)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -24423,7 +24423,7 @@ test "checkExpression: converts a read-only pointer to an array to a read-only s
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(bytes: *const([]u8)) = _ = bytes\nfn pass(buffer: *const([4]u8)) = show(buffer)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(bytes: const(*[]u8)) = _ = bytes\nfn pass(buffer: const(*[4]u8)) = show(buffer)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -24444,7 +24444,7 @@ test "checkExpression: rejects a read-only pointer to an array where a mutable s
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(bytes: *[]u8) = _ = bytes\nfn pass(buffer: *const([4]u8)) = fill(buffer)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(bytes: *[]u8) = _ = bytes\nfn pass(buffer: const(*[4]u8)) = fill(buffer)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -24486,7 +24486,7 @@ test "checkExpression: rejects a multiple value pointer to an array where a slic
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(bytes: *[]u8) = _ = bytes\nfn pass(buffers: *many([4]u8)) = fill(buffers)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn fill(bytes: *[]u8) = _ = bytes\nfn pass(buffers: *[many][4]u8) = fill(buffers)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -25809,7 +25809,7 @@ test "resolveMethodCall: takes the address of the value for a method with a poin
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    count: i32\n\n    fn read(self: Self) -> i32 = return self.count\n    fn increment(self: *Self) = self.count += 1\n    fn peek(self: *const(Self)) -> i32 = return self.count\nfn main()\n    var counter = Counter{ count = 0 }\n    counter.increment()\n    _ = counter.peek()\n    _ = counter.read()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    count: i32\n\n    fn read(self: Self) -> i32 = return self.count\n    fn increment(self: *Self) = self.count += 1\n    fn peek(self: const(*Self)) -> i32 = return self.count\nfn main()\n    var counter = Counter{ count = 0 }\n    counter.increment()\n    _ = counter.peek()\n    _ = counter.read()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -25837,7 +25837,7 @@ test "resolveMethodCall: calls the methods of a typeclass with each kind of rece
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(self: T) -> i32\n    fn grow(self: *T)\n    fn measure(self: *const(T)) -> i32\nstruct Square\n    side: i32\ninstance Shape(Square)\n\n    fn area(self: Square) -> i32 = return self.side\n    fn grow(self: *Square) = self.side += 1\n    fn measure(self: *const(Square)) -> i32 = return self.side\nfn main()\n    var square = Square{ side = 1 }\n    square.grow()\n    _ = square.measure()\n    _ = square.area()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(self: T) -> i32\n    fn grow(self: *T)\n    fn measure(self: const(*T)) -> i32\nstruct Square\n    side: i32\ninstance Shape(Square)\n\n    fn area(self: Square) -> i32 = return self.side\n    fn grow(self: *Square) = self.side += 1\n    fn measure(self: const(*Square)) -> i32 = return self.side\nfn main()\n    var square = Square{ side = 1 }\n    square.grow()\n    _ = square.measure()\n    _ = square.area()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -25866,7 +25866,7 @@ test "resolveMethodCall: calls a default implementation with a pointer receiver"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(self: T) -> i32\n    fn double(self: *const(T)) -> i32 = return self.area() * 2\nstruct Square\n    side: i32\ninstance Shape(Square)\n\n    fn area(self: Square) -> i32 = return self.side\nfn main()\n    const square = Square{ side = 1 }\n    _ = square.double()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(self: T) -> i32\n    fn double(self: const(*T)) -> i32 = return self.area() * 2\nstruct Square\n    side: i32\ninstance Shape(Square)\n\n    fn area(self: Square) -> i32 = return self.side\nfn main()\n    const square = Square{ side = 1 }\n    _ = square.double()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -25961,7 +25961,7 @@ test "resolveConstructorCall: takes two parameters from two arguments" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Data(type One, type Two) -> type\n    return struct\n        one: One\n        two: Two\n\n        fn make(one: One, two: Two) -> Self = { one = one, two = two }\n        fn of(ones: *const([]One), two: Two) -> Self = { one = ones[0], two = two }\n        fn first(_: One) -> u8 = 0\n\nfn run() -> u16\n    const short = Data::make(1u8, 2u16)\n    const written = Data(u8, u16)::make(1, 2)\n    return short.two + written.two\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Data(type One, type Two) -> type\n    return struct\n        one: One\n        two: Two\n\n        fn make(one: One, two: Two) -> Self = { one = one, two = two }\n        fn of(ones: const(*[]One), two: Two) -> Self = { one = ones[0], two = two }\n        fn first(_: One) -> u8 = 0\n\nfn run() -> u16\n    const short = Data::make(1u8, 2u16)\n    const written = Data(u8, u16)::make(1, 2)\n    return short.two + written.two\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -25984,7 +25984,7 @@ test "resolveConstructorCall: rejects a parameter that the arguments leave undec
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Data(type One, type Two) -> type\n    return struct\n        one: One\n        two: Two\n\n        fn make(one: One, two: Two) -> Self = { one = one, two = two }\n        fn of(ones: *const([]One), two: Two) -> Self = { one = ones[0], two = two }\n        fn first(_: One) -> u8 = 0\n\nfn run(value: u8) -> u8 = Data::first(value)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Data(type One, type Two) -> type\n    return struct\n        one: One\n        two: Two\n\n        fn make(one: One, two: Two) -> Self = { one = one, two = two }\n        fn of(ones: const(*[]One), two: Two) -> Self = { one = ones[0], two = two }\n        fn first(_: One) -> u8 = 0\n\nfn run(value: u8) -> u8 = Data::first(value)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -26070,7 +26070,7 @@ test "resolveConstructorCall: calls a function other than init and a function wh
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nfn Component(type T) -> type\n    return struct\n        value: *const(T)\n\n        fn init(value: *const(T)) -> Self = { value = value }\n        fn copy(value: *const(T)) -> own memory::Error!*[]T\n            const own items = try memory::allocate(T, 1)\n            items[0] = value.*\n            return items\n        fn read(component: *const(Self)) -> T = component.value.*\n\nfn main -> !void\n    with memory::Heap\n    const number: u32 = 4\n    const own short = try Component::copy(&number)\n    defer memory::free(own short)\n    const own written = try Component(u32)::copy(&number)\n    defer memory::free(own written)\n    const component = Component(u32)::init(&number)\n    const read = Component::read(&component)\n    const read_written = Component(u32)::read(&component)\n    _ = read + read_written\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nfn Component(type T) -> type\n    return struct\n        value: const(*T)\n\n        fn init(value: const(*T)) -> Self = { value = value }\n        fn copy(value: const(*T)) -> own memory::Error!*[]T\n            const own items = try memory::allocate(T, 1)\n            items[0] = value.*\n            return items\n        fn read(component: const(*Self)) -> T = component.value.*\n\nfn main -> !void\n    with memory::Heap\n    const number: u32 = 4\n    const own short = try Component::copy(&number)\n    defer memory::free(own short)\n    const own written = try Component(u32)::copy(&number)\n    defer memory::free(own written)\n    const component = Component(u32)::init(&number)\n    const read = Component::read(&component)\n    const read_written = Component(u32)::read(&component)\n    _ = read + read_written\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -26120,7 +26120,7 @@ test "resolveConstructorCall: converts an argument as for the types a function d
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Data(type One, type Two) -> type\n    return struct\n        one: One\n        two: Two\n\n        fn of(ones: *const([]One), two: Two) -> Self = { one = ones[0], two = two }\n\nfn run() -> u8\n    const ones: [2]u8 = { 4, 5 }\n    const short = Data::of(&ones, true)\n    const written = Data(u8, bool)::of(&ones, true)\n    return short.one + written.one\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Data(type One, type Two) -> type\n    return struct\n        one: One\n        two: Two\n\n        fn of(ones: const(*[]One), two: Two) -> Self = { one = ones[0], two = two }\n\nfn run() -> u8\n    const ones: [2]u8 = { 4, 5 }\n    const short = Data::of(&ones, true)\n    const written = Data(u8, bool)::of(&ones, true)\n    return short.one + written.one\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -26332,7 +26332,7 @@ test "resolveTypeclassCall: decides the instance by an argument after the first"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(shape: T) -> i32\n    fn scale(factor: i32, shape: T) -> i32\n    fn total(shapes: *const([]T)) -> i32\n    fn same(one: T, two: T) -> bool\nstruct Square\n    side: i32\nstruct Circle\n    radius: i32\ninstance Shape(Square)\n\n    fn area(shape: Square) -> i32 = return shape.side\n    fn scale(factor: i32, shape: Square) -> i32 = return factor * shape.side\n    fn total(shapes: *const([]Square)) -> i32 = return shapes[0].side\n    fn same(one: Square, two: Square) -> bool = return one.side == two.side\ninstance Shape(Circle)\n\n    fn area(shape: Circle) -> i32 = return shape.radius\n    fn scale(factor: i32, shape: Circle) -> i32 = return factor * shape.radius\n    fn total(shapes: *const([]Circle)) -> i32 = return shapes[0].radius\n    fn same(one: Circle, two: Circle) -> bool = return one.radius == two.radius\nconst SCALED = Shape::scale(2, Circle{ radius = 3 })" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(shape: T) -> i32\n    fn scale(factor: i32, shape: T) -> i32\n    fn total(shapes: const(*[]T)) -> i32\n    fn same(one: T, two: T) -> bool\nstruct Square\n    side: i32\nstruct Circle\n    radius: i32\ninstance Shape(Square)\n\n    fn area(shape: Square) -> i32 = return shape.side\n    fn scale(factor: i32, shape: Square) -> i32 = return factor * shape.side\n    fn total(shapes: const(*[]Square)) -> i32 = return shapes[0].side\n    fn same(one: Square, two: Square) -> bool = return one.side == two.side\ninstance Shape(Circle)\n\n    fn area(shape: Circle) -> i32 = return shape.radius\n    fn scale(factor: i32, shape: Circle) -> i32 = return factor * shape.radius\n    fn total(shapes: const(*[]Circle)) -> i32 = return shapes[0].radius\n    fn same(one: Circle, two: Circle) -> bool = return one.radius == two.radius\nconst SCALED = Shape::scale(2, Circle{ radius = 3 })" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -26352,7 +26352,7 @@ test "resolveTypeclassCall: decides the instance through a slice of the paramete
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(shape: T) -> i32\n    fn scale(factor: i32, shape: T) -> i32\n    fn total(shapes: *const([]T)) -> i32\n    fn same(one: T, two: T) -> bool\nstruct Square\n    side: i32\nstruct Circle\n    radius: i32\ninstance Shape(Square)\n\n    fn area(shape: Square) -> i32 = return shape.side\n    fn scale(factor: i32, shape: Square) -> i32 = return factor * shape.side\n    fn total(shapes: *const([]Square)) -> i32 = return shapes[0].side\n    fn same(one: Square, two: Square) -> bool = return one.side == two.side\ninstance Shape(Circle)\n\n    fn area(shape: Circle) -> i32 = return shape.radius\n    fn scale(factor: i32, shape: Circle) -> i32 = return factor * shape.radius\n    fn total(shapes: *const([]Circle)) -> i32 = return shapes[0].radius\n    fn same(one: Circle, two: Circle) -> bool = return one.radius == two.radius\nconst SQUARES = [2]Square{ Square{ side = 4 }, Square{ side = 5 } }\nconst TOTAL = Shape::total(SQUARES[..])" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(shape: T) -> i32\n    fn scale(factor: i32, shape: T) -> i32\n    fn total(shapes: const(*[]T)) -> i32\n    fn same(one: T, two: T) -> bool\nstruct Square\n    side: i32\nstruct Circle\n    radius: i32\ninstance Shape(Square)\n\n    fn area(shape: Square) -> i32 = return shape.side\n    fn scale(factor: i32, shape: Square) -> i32 = return factor * shape.side\n    fn total(shapes: const(*[]Square)) -> i32 = return shapes[0].side\n    fn same(one: Square, two: Square) -> bool = return one.side == two.side\ninstance Shape(Circle)\n\n    fn area(shape: Circle) -> i32 = return shape.radius\n    fn scale(factor: i32, shape: Circle) -> i32 = return factor * shape.radius\n    fn total(shapes: const(*[]Circle)) -> i32 = return shapes[0].radius\n    fn same(one: Circle, two: Circle) -> bool = return one.radius == two.radius\nconst SQUARES = [2]Square{ Square{ side = 4 }, Square{ side = 5 } }\nconst TOTAL = Shape::total(SQUARES[..])" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -26372,7 +26372,7 @@ test "resolveTypeclassCall: rejects arguments that decide different instances" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(shape: T) -> i32\n    fn scale(factor: i32, shape: T) -> i32\n    fn total(shapes: *const([]T)) -> i32\n    fn same(one: T, two: T) -> bool\nstruct Square\n    side: i32\nstruct Circle\n    radius: i32\ninstance Shape(Square)\n\n    fn area(shape: Square) -> i32 = return shape.side\n    fn scale(factor: i32, shape: Square) -> i32 = return factor * shape.side\n    fn total(shapes: *const([]Square)) -> i32 = return shapes[0].side\n    fn same(one: Square, two: Square) -> bool = return one.side == two.side\ninstance Shape(Circle)\n\n    fn area(shape: Circle) -> i32 = return shape.radius\n    fn scale(factor: i32, shape: Circle) -> i32 = return factor * shape.radius\n    fn total(shapes: *const([]Circle)) -> i32 = return shapes[0].radius\n    fn same(one: Circle, two: Circle) -> bool = return one.radius == two.radius\nconst SAME = Shape::same(Square{ side = 1 }, Circle{ radius = 1 })" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(shape: T) -> i32\n    fn scale(factor: i32, shape: T) -> i32\n    fn total(shapes: const(*[]T)) -> i32\n    fn same(one: T, two: T) -> bool\nstruct Square\n    side: i32\nstruct Circle\n    radius: i32\ninstance Shape(Square)\n\n    fn area(shape: Square) -> i32 = return shape.side\n    fn scale(factor: i32, shape: Square) -> i32 = return factor * shape.side\n    fn total(shapes: const(*[]Square)) -> i32 = return shapes[0].side\n    fn same(one: Square, two: Square) -> bool = return one.side == two.side\ninstance Shape(Circle)\n\n    fn area(shape: Circle) -> i32 = return shape.radius\n    fn scale(factor: i32, shape: Circle) -> i32 = return factor * shape.radius\n    fn total(shapes: const(*[]Circle)) -> i32 = return shapes[0].radius\n    fn same(one: Circle, two: Circle) -> bool = return one.radius == two.radius\nconst SAME = Shape::same(Square{ side = 1 }, Circle{ radius = 1 })" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -26518,7 +26518,7 @@ test "findInstanceFunction: decides a parameter of a generic instance through an
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Iterator\nimport mn::iterator::Zip\nfn Numbered(type I) -> type\n    return struct\n        inner: I\n        index: usize\ninstance(type I: Iterator(_, E), type E) Iterator(Numbered(I), [usize, E])\n\n    fn next(numbered: *Self) -> ?[usize, E]\n        const value = numbered.inner.next() orelse return null\n        numbered.index += 1\n        return { numbered.index, value }\nfn run() -> usize\n    const ages: *const([]u8) = { 31, 25 }\n    var numbered = Numbered(mn::iterator::Zipped([*const([]u8), mn::range::Range])){ inner = Zip::zip({ ages, 10.. }), index = 0 }\n    var sum: usize = 0\n    while numbered.next() as { index, value }\n        sum += index * 1000 + value[1] + mn::convert(usize, value[0].*)\n    return sum\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Iterator\nimport mn::iterator::Zip\nfn Numbered(type I) -> type\n    return struct\n        inner: I\n        index: usize\ninstance(type I: Iterator(_, E), type E) Iterator(Numbered(I), [usize, E])\n\n    fn next(numbered: *Self) -> ?[usize, E]\n        const value = numbered.inner.next() orelse return null\n        numbered.index += 1\n        return { numbered.index, value }\nfn run() -> usize\n    const ages: const(*[]u8) = { 31, 25 }\n    var numbered = Numbered(mn::iterator::Zipped([const(*[]u8), mn::range::Range])){ inner = Zip::zip({ ages, 10.. }), index = 0 }\n    var sum: usize = 0\n    while numbered.next() as { index, value }\n        sum += index * 1000 + value[1] + mn::convert(usize, value[0].*)\n    return sum\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -26845,7 +26845,7 @@ test "resolveTypeclassCall: finds the instance for the type a pointer argument p
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(self: T) -> i32\n    fn grow(self: *T)\n    fn measure(self: *const(T)) -> i32\nstruct Square\n    side: i32\ninstance Shape(Square)\n\n    fn area(self: Square) -> i32 = return self.side\n    fn grow(self: *Square) = self.side += 1\n    fn measure(self: *const(Square)) -> i32 = return self.side\nfn main()\n    var square = Square{ side = 1 }\n    Shape::grow(&square)\n    _ = Shape::measure(&square)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(self: T) -> i32\n    fn grow(self: *T)\n    fn measure(self: const(*T)) -> i32\nstruct Square\n    side: i32\ninstance Shape(Square)\n\n    fn area(self: Square) -> i32 = return self.side\n    fn grow(self: *Square) = self.side += 1\n    fn measure(self: const(*Square)) -> i32 = return self.side\nfn main()\n    var square = Square{ side = 1 }\n    Shape::grow(&square)\n    _ = Shape::measure(&square)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -26871,7 +26871,7 @@ test "resolveTypeclassCall: accepts a pointer that can modify the value for a re
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(self: T) -> i32\n    fn grow(self: *T)\n    fn measure(self: *const(T)) -> i32\nstruct Square\n    side: i32\ninstance Shape(Square)\n\n    fn area(self: Square) -> i32 = return self.side\n    fn grow(self: *Square) = self.side += 1\n    fn measure(self: *const(Square)) -> i32 = return self.side\nfn show(pointer: *Square) -> i32 = return Shape::measure(pointer)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(self: T) -> i32\n    fn grow(self: *T)\n    fn measure(self: const(*T)) -> i32\nstruct Square\n    side: i32\ninstance Shape(Square)\n\n    fn area(self: Square) -> i32 = return self.side\n    fn grow(self: *Square) = self.side += 1\n    fn measure(self: const(*Square)) -> i32 = return self.side\nfn show(pointer: *Square) -> i32 = return Shape::measure(pointer)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -26892,7 +26892,7 @@ test "resolveTypeclassCall: rejects a read-only pointer for a receiver that modi
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(self: T) -> i32\n    fn grow(self: *T)\n    fn measure(self: *const(T)) -> i32\nstruct Square\n    side: i32\ninstance Shape(Square)\n\n    fn area(self: Square) -> i32 = return self.side\n    fn grow(self: *Square) = self.side += 1\n    fn measure(self: *const(Square)) -> i32 = return self.side\nfn bump(pointer: *const(Square)) = Shape::grow(pointer)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(self: T) -> i32\n    fn grow(self: *T)\n    fn measure(self: const(*T)) -> i32\nstruct Square\n    side: i32\ninstance Shape(Square)\n\n    fn area(self: Square) -> i32 = return self.side\n    fn grow(self: *Square) = self.side += 1\n    fn measure(self: const(*Square)) -> i32 = return self.side\nfn bump(pointer: const(*Square)) = Shape::grow(pointer)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -26913,7 +26913,7 @@ test "resolveTypeclassCall: rejects a value that is not a pointer for a pointer 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(self: T) -> i32\n    fn grow(self: *T)\n    fn measure(self: *const(T)) -> i32\nstruct Square\n    side: i32\ninstance Shape(Square)\n\n    fn area(self: Square) -> i32 = return self.side\n    fn grow(self: *Square) = self.side += 1\n    fn measure(self: *const(Square)) -> i32 = return self.side\nfn bump(square: Square) = Shape::grow(square)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(self: T) -> i32\n    fn grow(self: *T)\n    fn measure(self: const(*T)) -> i32\nstruct Square\n    side: i32\ninstance Shape(Square)\n\n    fn area(self: Square) -> i32 = return self.side\n    fn grow(self: *Square) = self.side += 1\n    fn measure(self: const(*Square)) -> i32 = return self.side\nfn bump(square: Square) = Shape::grow(square)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -26934,7 +26934,7 @@ test "resolveTypeclassCall: calls a default implementation with a pointer receiv
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(self: T) -> i32\n    fn double(self: *const(T)) -> i32 = return self.area() * 2\nstruct Square\n    side: i32\ninstance Shape(Square)\n\n    fn area(self: Square) -> i32 = return self.side\nfn main()\n    const square = Square{ side = 1 }\n    _ = Shape::double(&square)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Shape(type T)\n\n    fn area(self: T) -> i32\n    fn double(self: const(*T)) -> i32 = return self.area() * 2\nstruct Square\n    side: i32\ninstance Shape(Square)\n\n    fn area(self: Square) -> i32 = return self.side\nfn main()\n    const square = Square{ side = 1 }\n    _ = Shape::double(&square)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -27139,7 +27139,7 @@ test "buildReceiver: rejects a constant for a receiver that modifies it" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    count: i32\n\n    fn read(self: Self) -> i32 = return self.count\n    fn increment(self: *Self) = self.count += 1\n    fn peek(self: *const(Self)) -> i32 = return self.count\nfn main()\n    const counter = Counter{ count = 0 }\n    counter.increment()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    count: i32\n\n    fn read(self: Self) -> i32 = return self.count\n    fn increment(self: *Self) = self.count += 1\n    fn peek(self: const(*Self)) -> i32 = return self.count\nfn main()\n    const counter = Counter{ count = 0 }\n    counter.increment()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -27160,7 +27160,7 @@ test "buildReceiver: accepts a constant for a read-only pointer receiver" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    count: i32\n\n    fn read(self: Self) -> i32 = return self.count\n    fn increment(self: *Self) = self.count += 1\n    fn peek(self: *const(Self)) -> i32 = return self.count\nfn main()\n    const counter = Counter{ count = 0 }\n    _ = counter.peek()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    count: i32\n\n    fn read(self: Self) -> i32 = return self.count\n    fn increment(self: *Self) = self.count += 1\n    fn peek(self: const(*Self)) -> i32 = return self.count\nfn main()\n    const counter = Counter{ count = 0 }\n    _ = counter.peek()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -27181,7 +27181,7 @@ test "buildReceiver: rejects a call result for a pointer receiver" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    count: i32\n\n    fn read(self: Self) -> i32 = return self.count\n    fn increment(self: *Self) = self.count += 1\n    fn peek(self: *const(Self)) -> i32 = return self.count\nfn make() -> Counter = return { count = 0 }\nfn main() = _ = make().peek()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    count: i32\n\n    fn read(self: Self) -> i32 = return self.count\n    fn increment(self: *Self) = self.count += 1\n    fn peek(self: const(*Self)) -> i32 = return self.count\nfn make() -> Counter = return { count = 0 }\nfn main() = _ = make().peek()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -27202,7 +27202,7 @@ test "buildReceiver: dereferences a pointer for a value receiver" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    count: i32\n\n    fn read(self: Self) -> i32 = return self.count\n    fn increment(self: *Self) = self.count += 1\n    fn peek(self: *const(Self)) -> i32 = return self.count\nfn show(pointer: *const(Counter)) -> i32 = return pointer.read()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    count: i32\n\n    fn read(self: Self) -> i32 = return self.count\n    fn increment(self: *Self) = self.count += 1\n    fn peek(self: const(*Self)) -> i32 = return self.count\nfn show(pointer: const(*Counter)) -> i32 = return pointer.read()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -27225,7 +27225,7 @@ test "buildReceiver: passes a pointer as it is for a pointer receiver" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    count: i32\n\n    fn read(self: Self) -> i32 = return self.count\n    fn increment(self: *Self) = self.count += 1\n    fn peek(self: *const(Self)) -> i32 = return self.count\nfn bump(pointer: *Counter) -> i32\n    pointer.increment()\n    return pointer.peek()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    count: i32\n\n    fn read(self: Self) -> i32 = return self.count\n    fn increment(self: *Self) = self.count += 1\n    fn peek(self: const(*Self)) -> i32 = return self.count\nfn bump(pointer: *Counter) -> i32\n    pointer.increment()\n    return pointer.peek()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -27250,7 +27250,7 @@ test "buildReceiver: rejects a read-only pointer for a receiver that modifies" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    count: i32\n\n    fn read(self: Self) -> i32 = return self.count\n    fn increment(self: *Self) = self.count += 1\n    fn peek(self: *const(Self)) -> i32 = return self.count\nfn bump(pointer: *const(Counter)) = pointer.increment()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    count: i32\n\n    fn read(self: Self) -> i32 = return self.count\n    fn increment(self: *Self) = self.count += 1\n    fn peek(self: const(*Self)) -> i32 = return self.count\nfn bump(pointer: const(*Counter)) = pointer.increment()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -27294,7 +27294,7 @@ test "findMethodFunction: finds no method behind two pointers" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    count: i32\n\n    fn read(self: Self) -> i32 = return self.count\n    fn increment(self: *Self) = self.count += 1\n    fn peek(self: *const(Self)) -> i32 = return self.count\nfn show(pointer: **Counter) -> i32 = return pointer.read()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Counter\n    count: i32\n\n    fn read(self: Self) -> i32 = return self.count\n    fn increment(self: *Self) = self.count += 1\n    fn peek(self: const(*Self)) -> i32 = return self.count\nfn show(pointer: **Counter) -> i32 = return pointer.read()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -27356,7 +27356,7 @@ test "findMethodFunction: finds no read on a plain byte slice, which reads throu
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::stream::Reader\nfn take(bytes: *const([]u8)) -> !usize\n    var source = bytes\n    var buffer: [2]u8 = undefined\n    return source.read(&buffer)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::stream::Reader\nfn take(bytes: const(*[]u8)) -> !usize\n    var source = bytes\n    var buffer: [2]u8 = undefined\n    return source.read(&buffer)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -27765,7 +27765,7 @@ test "expectArgumentRequirements: accepts an iterator whose instance gives the e
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\nimport mn::iterator::Zip\nfn(type I: Iterator(_, [*const(*const([]u8)), *const(u8)])) first(iterator: *I) -> u8 = iterator.next().?[1].*\nfn run() -> u8\n    const names: *const([]*const([]u8)) = { \"Anna\", \"Ben\" }\n    const ages: *const([]u8) = { 31, 25 }\n    var pairs = Zip::zip({ names, ages })\n    return first(&pairs)\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\nimport mn::iterator::Zip\nfn(type I: Iterator(_, [const(*const(*[]u8)), const(*u8)])) first(iterator: *I) -> u8 = iterator.next().?[1].*\nfn run() -> u8\n    const names: const(*[]const(*[]u8)) = { \"Anna\", \"Ben\" }\n    const ages: const(*[]u8) = { 31, 25 }\n    var pairs = Zip::zip({ names, ages })\n    return first(&pairs)\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -27787,7 +27787,7 @@ test "expectArgumentRequirements: rejects an iterator whose instance gives anoth
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\nimport mn::iterator::Zip\nfn(type I: Iterator(_, [*const(*const([]u8)), *const(u8)])) first(iterator: *I) -> u8 = iterator.next().?[1].*\nfn run() -> u8\n    const names: *const([]*const([]u8)) = { \"Anna\", \"Ben\" }\n    const ages: *const([]u16) = { 31, 25 }\n    var pairs = Zip::zip({ names, ages })\n    return first(&pairs)\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\nimport mn::iterator::Zip\nfn(type I: Iterator(_, [const(*const(*[]u8)), const(*u8)])) first(iterator: *I) -> u8 = iterator.next().?[1].*\nfn run() -> u8\n    const names: const(*[]const(*[]u8)) = { \"Anna\", \"Ben\" }\n    const ages: const(*[]u16) = { 31, 25 }\n    var pairs = Zip::zip({ names, ages })\n    return first(&pairs)\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28067,7 +28067,7 @@ test "inferDeclaredTypes: takes each declared type from the argument types" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Card\n    value: i32\nfn(type Item) count(items: *const([]Item)) -> usize = return items.length\nfn(type Item) first(items: *const([]Item), fallback: Item) -> Item\n    if (items.length == 0) return fallback\n    return items[0]\nfn run() -> i32\n    var cards: [3]Card = { Card{ value = 1 }, Card{ value = 2 }, Card{ value = 3 } }\n    const slice: *[]Card = &cards\n    const sizes = count(&cards) + count(slice) * 10 + count(\"ab\") * 100\n    return mn::convert(i32, sizes) + first(slice, Card{ value = 9 }).value * 1000 + first(slice[..0], Card{ value = 9 }).value * 10000\nconst RESULT = run()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Card\n    value: i32\nfn(type Item) count(items: const(*[]Item)) -> usize = return items.length\nfn(type Item) first(items: const(*[]Item), fallback: Item) -> Item\n    if (items.length == 0) return fallback\n    return items[0]\nfn run() -> i32\n    var cards: [3]Card = { Card{ value = 1 }, Card{ value = 2 }, Card{ value = 3 } }\n    const slice: *[]Card = &cards\n    const sizes = count(&cards) + count(slice) * 10 + count(\"ab\") * 100\n    return mn::convert(i32, sizes) + first(slice, Card{ value = 9 }).value * 1000 + first(slice[..0], Card{ value = 9 }).value * 10000\nconst RESULT = run()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28095,7 +28095,7 @@ test "inferDeclaredTypes: rejects arguments that give a declared type two differ
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card\n    value: i32\nfn(type Item) count(items: *const([]Item)) -> usize = return items.length\nfn(type Item) first(items: *const([]Item), fallback: Item) -> Item\n    if (items.length == 0) return fallback\n    return items[0]\nfn run() -> Card\n    const cards: [1]Card = { Card{ value = 1 } }\n    return first(&cards, 5i32)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card\n    value: i32\nfn(type Item) count(items: const(*[]Item)) -> usize = return items.length\nfn(type Item) first(items: const(*[]Item), fallback: Item) -> Item\n    if (items.length == 0) return fallback\n    return items[0]\nfn run() -> Card\n    const cards: [1]Card = { Card{ value = 1 } }\n    return first(&cards, 5i32)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28114,7 +28114,7 @@ test "inferDeclaredTypes: rejects an argument that does not fit the parameter's 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card\n    value: i32\nfn(type Item) count(items: *const([]Item)) -> usize = return items.length\nfn(type Item) first(items: *const([]Item), fallback: Item) -> Item\n    if (items.length == 0) return fallback\n    return items[0]\nfn run() -> usize = return count(5i32)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card\n    value: i32\nfn(type Item) count(items: const(*[]Item)) -> usize = return items.length\nfn(type Item) first(items: const(*[]Item), fallback: Item) -> Item\n    if (items.length == 0) return fallback\n    return items[0]\nfn run() -> usize = return count(5i32)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28152,7 +28152,7 @@ test "inferDeclaredTypes: infers declared types of inline functions and of funct
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card\n    value: i32\ninline fn(type Item) pair(item: Item) -> [2]Item = return { item, item }\nstruct Bag\n    count: usize\n\n    fn(type Item) add(self: *Self, items: *const([]Item)) = self.count += items.length\nfn Stack(type T) -> type\n    return struct\n        count: usize\n\n        fn(type Item) push_all(self: *Self, items: *const([]Item), extra: T)\n            _ = extra\n            self.count += items.length\nfn run() -> usize\n    const cards = pair(Card{ value = 1 })\n    var bag = Bag{ count = 0 }\n    bag.add(&cards)\n    bag.add(\"abc\")\n    var stack = Stack(i32){ count = 0 }\n    stack.push_all(&cards, 1)\n    stack.push_all(cards[..1], 2)\n    return bag.count * 10 + stack.count\nconst RESULT = run()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card\n    value: i32\ninline fn(type Item) pair(item: Item) -> [2]Item = return { item, item }\nstruct Bag\n    count: usize\n\n    fn(type Item) add(self: *Self, items: const(*[]Item)) = self.count += items.length\nfn Stack(type T) -> type\n    return struct\n        count: usize\n\n        fn(type Item) push_all(self: *Self, items: const(*[]Item), extra: T)\n            _ = extra\n            self.count += items.length\nfn run() -> usize\n    const cards = pair(Card{ value = 1 })\n    var bag = Bag{ count = 0 }\n    bag.add(&cards)\n    bag.add(\"abc\")\n    var stack = Stack(i32){ count = 0 }\n    stack.push_all(&cards, 1)\n    stack.push_all(cards[..1], 2)\n    return bag.count * 10 + stack.count\nconst RESULT = run()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28175,7 +28175,7 @@ test "inferDeclaredTypes: infers declared types of a typeclass's functions and d
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Store(type S)\n\n    fn(type Item) put(store: *S, items: *const([]Item)) -> usize\n    fn(type Item) put_twice(store: *S, items: *const([]Item)) -> usize = return Store::put(store, items) * 2\nstruct Box\n    count: usize\ninstance Store(Box)\n\n    fn(type Item) put(store: *Box, items: *const([]Item)) -> usize\n        store.count += items.length\n        return store.count\nfn run() -> usize\n    var box = Box{ count = 0 }\n    const one = Store::put(&box, \"ab\")\n    return one + box.put_twice(\"abc\") * 10\nconst RESULT = run()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Store(type S)\n\n    fn(type Item) put(store: *S, items: const(*[]Item)) -> usize\n    fn(type Item) put_twice(store: *S, items: const(*[]Item)) -> usize = return Store::put(store, items) * 2\nstruct Box\n    count: usize\ninstance Store(Box)\n\n    fn(type Item) put(store: *Box, items: const(*[]Item)) -> usize\n        store.count += items.length\n        return store.count\nfn run() -> usize\n    var box = Box{ count = 0 }\n    const one = Store::put(&box, \"ab\")\n    return one + box.put_twice(\"abc\") * 10\nconst RESULT = run()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28198,7 +28198,7 @@ test "inferDeclaredTypes: checks a function with declared types even if it is ne
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card\n    value: i32\nfn(type Item) broken(items: *const([]Item)) -> usize = return true" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Card\n    value: i32\nfn(type Item) broken(items: const(*[]Item)) -> usize = return true" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28217,7 +28217,7 @@ test "inferDeclaredTypes: frees read-only slices, array pointers and read-only p
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nimport mn::memory::Deinit\nstruct Card\n    value: i64\nfn run() -> memory::Error!void\n    var heap = memory::Heap::init()\n    var own arena = memory::Arena(memory::Heap)::init(heap)\n    defer arena.deinit(own)\n    const own owned: *const([]Card) = try arena.allocate(Card, 4)\n    arena.free(own owned)\n    var fixed: [2]Card = { Card{ value = 1 }, Card{ value = 2 } }\n    arena.free(&fixed)\n    const own card: *const(Card) = try heap.create(Card)\n    heap.destroy(own card)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nimport mn::memory::Deinit\nstruct Card\n    value: i64\nfn run() -> memory::Error!void\n    var heap = memory::Heap::init()\n    var own arena = memory::Arena(memory::Heap)::init(heap)\n    defer arena.deinit(own)\n    const own owned: const(*[]Card) = try arena.allocate(Card, 4)\n    arena.free(own owned)\n    var fixed: [2]Card = { Card{ value = 1 }, Card{ value = 2 } }\n    arena.free(&fixed)\n    const own card: const(*Card) = try heap.create(Card)\n    heap.destroy(own card)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28258,7 +28258,7 @@ test "decideFromRequirements: decides a declared type through an instance whose 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\nimport mn::iterator::Zip\nfn(type I: Iterator(_, E), type E) count(iterator: *I) -> usize\n    var total: usize = 0\n    while (iterator.next() != null) total += 1\n    return total\nfn run() -> usize\n    const names: *const([]*const([]u8)) = { \"Anna\", \"Ben\" }\n    const ages: *const([]u8) = { 31, 25 }\n    var pairs = Zip::zip({ names, ages })\n    return count(&pairs)\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\nimport mn::iterator::Zip\nfn(type I: Iterator(_, E), type E) count(iterator: *I) -> usize\n    var total: usize = 0\n    while (iterator.next() != null) total += 1\n    return total\nfn run() -> usize\n    const names: const(*[]const(*[]u8)) = { \"Anna\", \"Ben\" }\n    const ages: const(*[]u8) = { 31, 25 }\n    var pairs = Zip::zip({ names, ages })\n    return count(&pairs)\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28299,7 +28299,7 @@ test "checkImplicitArgument: takes a pointer to a value of each type with an ins
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type M)\n\n    fn measure(value: *M) -> usize\n    fn peek(value: *const(M)) -> usize\nstruct Box\n    size: usize\nstruct Crate\n    weight: usize\ninstance Measure(Box)\n\n    fn measure(value: *Box) -> usize\n        value.size += 1\n        return value.size\n    fn peek(value: *const(Box)) -> usize = return value.size\ninstance Measure(Crate)\n\n    fn measure(value: *Crate) -> usize\n        value.weight += 10\n        return value.weight\n    fn peek(value: *const(Crate)) -> usize = return value.weight\nfn grow(measured: *Measure) -> usize = return Measure::measure(measured)\nfn look(measured: *const(Measure)) -> usize = return measured.peek()\nfn run() -> usize\n    var box = Box{ size = 1 }\n    var crate = Crate{ weight = 2 }\n    const first = grow(&box) + grow(&crate)\n    const second = grow(&box) * 100 + look(&box) * 1000 + look(&crate) * 10000\n    return first + second\nconst RESULT = run()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type M)\n\n    fn measure(value: *M) -> usize\n    fn peek(value: const(*M)) -> usize\nstruct Box\n    size: usize\nstruct Crate\n    weight: usize\ninstance Measure(Box)\n\n    fn measure(value: *Box) -> usize\n        value.size += 1\n        return value.size\n    fn peek(value: const(*Box)) -> usize = return value.size\ninstance Measure(Crate)\n\n    fn measure(value: *Crate) -> usize\n        value.weight += 10\n        return value.weight\n    fn peek(value: const(*Crate)) -> usize = return value.weight\nfn grow(measured: *Measure) -> usize = return Measure::measure(measured)\nfn look(measured: const(*Measure)) -> usize = return measured.peek()\nfn run() -> usize\n    var box = Box{ size = 1 }\n    var crate = Crate{ weight = 2 }\n    const first = grow(&box) + grow(&crate)\n    const second = grow(&box) * 100 + look(&box) * 1000 + look(&crate) * 10000\n    return first + second\nconst RESULT = run()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28331,7 +28331,7 @@ test "checkImplicitArgument: rejects a pointer to a type without an instance at 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type M)\n\n    fn measure(value: *M) -> usize\n    fn peek(value: *const(M)) -> usize\nstruct Box\n    size: usize\nstruct Crate\n    weight: usize\ninstance Measure(Box)\n\n    fn measure(value: *Box) -> usize\n        value.size += 1\n        return value.size\n    fn peek(value: *const(Box)) -> usize = return value.size\ninstance Measure(Crate)\n\n    fn measure(value: *Crate) -> usize\n        value.weight += 10\n        return value.weight\n    fn peek(value: *const(Crate)) -> usize = return value.weight\nfn grow(measured: *Measure) -> usize = return Measure::measure(measured)\nfn look(measured: *const(Measure)) -> usize = return measured.peek()\nstruct Plain\n    size: usize\nfn run() -> usize\n    var plain = Plain{ size = 1 }\n    return grow(&plain)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type M)\n\n    fn measure(value: *M) -> usize\n    fn peek(value: const(*M)) -> usize\nstruct Box\n    size: usize\nstruct Crate\n    weight: usize\ninstance Measure(Box)\n\n    fn measure(value: *Box) -> usize\n        value.size += 1\n        return value.size\n    fn peek(value: const(*Box)) -> usize = return value.size\ninstance Measure(Crate)\n\n    fn measure(value: *Crate) -> usize\n        value.weight += 10\n        return value.weight\n    fn peek(value: const(*Crate)) -> usize = return value.weight\nfn grow(measured: *Measure) -> usize = return Measure::measure(measured)\nfn look(measured: const(*Measure)) -> usize = return measured.peek()\nstruct Plain\n    size: usize\nfn run() -> usize\n    var plain = Plain{ size = 1 }\n    return grow(&plain)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28350,7 +28350,7 @@ test "checkImplicitArgument: rejects a value instead of a pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type M)\n\n    fn measure(value: *M) -> usize\n    fn peek(value: *const(M)) -> usize\nstruct Box\n    size: usize\nstruct Crate\n    weight: usize\ninstance Measure(Box)\n\n    fn measure(value: *Box) -> usize\n        value.size += 1\n        return value.size\n    fn peek(value: *const(Box)) -> usize = return value.size\ninstance Measure(Crate)\n\n    fn measure(value: *Crate) -> usize\n        value.weight += 10\n        return value.weight\n    fn peek(value: *const(Crate)) -> usize = return value.weight\nfn grow(measured: *Measure) -> usize = return Measure::measure(measured)\nfn look(measured: *const(Measure)) -> usize = return measured.peek()\nfn run() -> usize\n    var box = Box{ size = 1 }\n    return grow(box) + grow(&box)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type M)\n\n    fn measure(value: *M) -> usize\n    fn peek(value: const(*M)) -> usize\nstruct Box\n    size: usize\nstruct Crate\n    weight: usize\ninstance Measure(Box)\n\n    fn measure(value: *Box) -> usize\n        value.size += 1\n        return value.size\n    fn peek(value: const(*Box)) -> usize = return value.size\ninstance Measure(Crate)\n\n    fn measure(value: *Crate) -> usize\n        value.weight += 10\n        return value.weight\n    fn peek(value: const(*Crate)) -> usize = return value.weight\nfn grow(measured: *Measure) -> usize = return Measure::measure(measured)\nfn look(measured: const(*Measure)) -> usize = return measured.peek()\nfn run() -> usize\n    var box = Box{ size = 1 }\n    return grow(box) + grow(&box)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28369,7 +28369,7 @@ test "checkImplicitArgument: rejects a read-only pointer for a modifiable one" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type M)\n\n    fn measure(value: *M) -> usize\n    fn peek(value: *const(M)) -> usize\nstruct Box\n    size: usize\nstruct Crate\n    weight: usize\ninstance Measure(Box)\n\n    fn measure(value: *Box) -> usize\n        value.size += 1\n        return value.size\n    fn peek(value: *const(Box)) -> usize = return value.size\ninstance Measure(Crate)\n\n    fn measure(value: *Crate) -> usize\n        value.weight += 10\n        return value.weight\n    fn peek(value: *const(Crate)) -> usize = return value.weight\nfn grow(measured: *Measure) -> usize = return Measure::measure(measured)\nfn look(measured: *const(Measure)) -> usize = return measured.peek()\nfn run() -> usize\n    const box = Box{ size = 1 }\n    return look(&box) + grow(&box)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type M)\n\n    fn measure(value: *M) -> usize\n    fn peek(value: const(*M)) -> usize\nstruct Box\n    size: usize\nstruct Crate\n    weight: usize\ninstance Measure(Box)\n\n    fn measure(value: *Box) -> usize\n        value.size += 1\n        return value.size\n    fn peek(value: const(*Box)) -> usize = return value.size\ninstance Measure(Crate)\n\n    fn measure(value: *Crate) -> usize\n        value.weight += 10\n        return value.weight\n    fn peek(value: const(*Crate)) -> usize = return value.weight\nfn grow(measured: *Measure) -> usize = return Measure::measure(measured)\nfn look(measured: const(*Measure)) -> usize = return measured.peek()\nfn run() -> usize\n    const box = Box{ size = 1 }\n    return look(&box) + grow(&box)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28407,7 +28407,7 @@ test "checkImplicitArgument: takes pointers in a method of a type constructor's 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\ntypeclass Measure(type M)\n\n    fn measure(value: *M) -> usize\n    fn peek(value: *const(M)) -> usize\nstruct Box\n    size: usize\nstruct Crate\n    weight: usize\ninstance Measure(Box)\n\n    fn measure(value: *Box) -> usize\n        value.size += 1\n        return value.size\n    fn peek(value: *const(Box)) -> usize = return value.size\ninstance Measure(Crate)\n\n    fn measure(value: *Crate) -> usize\n        value.weight += 10\n        return value.weight\n    fn peek(value: *const(Crate)) -> usize = return value.weight\nfn grow(measured: *Measure) -> usize = return Measure::measure(measured)\nfn look(measured: *const(Measure)) -> usize = return measured.peek()\nfn Stack(type T) -> type\n    return struct\n        count: usize\n\n        fn push(self: *Self, measured: *Measure, item: T) -> usize\n            _ = item\n            self.count += Measure::measure(measured)\n            return self.count\nfn sized(measured: *const(Measure), type T) -> usize = return mn::size(T) + look(measured)\nfn run() -> usize\n    var box = Box{ size = 1 }\n    var crate = Crate{ weight = 2 }\n    var stack = Stack(i32){ count = 0 }\n    _ = stack.push(&box, 5)\n    return stack.push(&crate, 6) + sized(&box, u64) * 100\nconst RESULT = run()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\ntypeclass Measure(type M)\n\n    fn measure(value: *M) -> usize\n    fn peek(value: const(*M)) -> usize\nstruct Box\n    size: usize\nstruct Crate\n    weight: usize\ninstance Measure(Box)\n\n    fn measure(value: *Box) -> usize\n        value.size += 1\n        return value.size\n    fn peek(value: const(*Box)) -> usize = return value.size\ninstance Measure(Crate)\n\n    fn measure(value: *Crate) -> usize\n        value.weight += 10\n        return value.weight\n    fn peek(value: const(*Crate)) -> usize = return value.weight\nfn grow(measured: *Measure) -> usize = return Measure::measure(measured)\nfn look(measured: const(*Measure)) -> usize = return measured.peek()\nfn Stack(type T) -> type\n    return struct\n        count: usize\n\n        fn push(self: *Self, measured: *Measure, item: T) -> usize\n            _ = item\n            self.count += Measure::measure(measured)\n            return self.count\nfn sized(measured: const(*Measure), type T) -> usize = return mn::size(T) + look(measured)\nfn run() -> usize\n    var box = Box{ size = 1 }\n    var crate = Crate{ weight = 2 }\n    var stack = Stack(i32){ count = 0 }\n    _ = stack.push(&box, 5)\n    return stack.push(&crate, 6) + sized(&box, u64) * 100\nconst RESULT = run()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28492,7 +28492,7 @@ test "checkBuiltinCall: gives the size and the alignment of types as C lays them
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Pair\n    small: u8\n    large: i32\nenum Token\n    Number: i64\n    End\nconst NUMBER = mn::size(i32)\nconst PAIR = mn::size(Pair)\nconst PAIR_ALIGNMENT = mn::alignment(Pair)\nconst TEXT = mn::size(*const([]u8))\nconst MAYBE = mn::size(?i32)\nconst TOKEN = mn::size(Token)\nconst ARRAY = mn::size([3]u16)\nconst ARRAY_ALIGNMENT = mn::alignment([3]u16)\nconst EMPTY = mn::size([0]u8)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nstruct Pair\n    small: u8\n    large: i32\nenum Token\n    Number: i64\n    End\nconst NUMBER = mn::size(i32)\nconst PAIR = mn::size(Pair)\nconst PAIR_ALIGNMENT = mn::alignment(Pair)\nconst TEXT = mn::size(const(*[]u8))\nconst MAYBE = mn::size(?i32)\nconst TOKEN = mn::size(Token)\nconst ARRAY = mn::size([3]u16)\nconst ARRAY_ALIGNMENT = mn::alignment([3]u16)\nconst EMPTY = mn::size([0]u8)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28634,7 +28634,7 @@ test "checkBuiltinCall: casts a pointer to another pointer type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nexternal struct Header\n    size: u32\nfn read(buffer: *const([]u8)) -> *const(Header) = return mn::cast(*const(Header), buffer.pointer)\nfn back(header: *Header) -> *many(u8) = return mn::cast(*many(u8), header)\nfn from(pointer: *void) -> *i32 = return mn::cast(*i32, pointer)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nexternal struct Header\n    size: u32\nfn read(buffer: const(*[]u8)) -> const(*Header) = return mn::cast(const(*Header), buffer.pointer)\nfn back(header: *Header) -> *[many]u8 = return mn::cast(*[many]u8, header)\nfn from(pointer: *void) -> *i32 = return mn::cast(*i32, pointer)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28655,7 +28655,7 @@ test "checkBuiltinCall: removes const when the target type has none" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn drop(pointer: *const(i32)) -> *i32 = return mn::cast(*i32, pointer)\nfn keep(pointer: *i32) -> *const(u8) = return mn::cast(*const(u8), pointer)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn drop(pointer: const(*i32)) -> *i32 = return mn::cast(*i32, pointer)\nfn keep(pointer: *i32) -> const(*u8) = return mn::cast(const(*u8), pointer)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28678,7 +28678,7 @@ test "checkBuiltinCall: keeps const when the target type has it" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn write(pointer: *i32) = mn::cast(*const(i32), pointer).* = 5" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn write(pointer: *i32) = mn::cast(const(*i32), pointer).* = 5" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28815,7 +28815,7 @@ test "checkAlign: gives the type of the multiple value pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn next(pointer: *const(many(u8)), alignment: usize) -> *const(many(u8)) = return mn::align(pointer, alignment)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn next(pointer: const(*[many]u8), alignment: usize) -> const(*[many]u8) = return mn::align(pointer, alignment)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -28920,7 +28920,7 @@ test "checkComptimeError: rejects a message that is not known at compile time" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn fail(message: *const([]u8)) = mn::comptime::error(message)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn fail(message: const(*[]u8)) = mn::comptime::error(message)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -29557,7 +29557,7 @@ test "checkSliceField: gives the pointer and the length of a slice and of a poin
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(values: *const([]u8), other: **[]i32) -> usize\n    const pointer = values.pointer\n    const items = other.pointer\n    _ = pointer\n    _ = items\n    return values.length + other.length" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(values: const(*[]u8), other: **[]i32) -> usize\n    const pointer = values.pointer\n    const items = other.pointer\n    _ = pointer\n    _ = items\n    return values.length + other.length" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -29600,7 +29600,7 @@ test "checkSliceField: rejects the address of the length of a slice" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn address(values: *[]i32) -> *const(usize) = return &values.length" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn address(values: *[]i32) -> const(*usize) = return &values.length" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -29700,7 +29700,7 @@ test "checkDereference: rejects dereferencing a pointer to void" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: void) = _ = value\nfn read(pointer: *const(void)) = take(pointer.*)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: void) = _ = value\nfn read(pointer: const(*void)) = take(pointer.*)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -29719,7 +29719,7 @@ test "checkFieldAccess: reads a field through a pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point\n    x: i32\nfn read(point: *const(Point))\n    const x = point.x\n    _ = x" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point\n    x: i32\nfn read(point: const(*Point))\n    const x = point.x\n    _ = x" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -29763,7 +29763,7 @@ test "checkFieldAccess: reads a field through a multiple value pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point\n    x: i32\nfn read(points: *many(Point)) -> i32\n    const x = points.x\n    return x" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point\n    x: i32\nfn read(points: *[many]Point) -> i32\n    const x = points.x\n    return x" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -29916,14 +29916,14 @@ test "checkFieldAccess: names a struct that a type constructor gives for a slice
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::container::ArrayList\nimport mn::memory\nimport mn::memory::Deinit\n\nfn main\n    with memory::Heap\n    var own list = ArrayList(*const([]u8))::init()\n    defer list.deinit(own)\n    _ = list.count\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::container::ArrayList\nimport mn::memory\nimport mn::memory::Deinit\n\nfn main\n    with memory::Heap\n    var own list = ArrayList(const(*[]u8))::init()\n    defer list.deinit(own)\n    _ = list.count\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.PrivateField, analyzer.analyze());
     try std.testing.expectEqual(token.Location{ .row = 9, .column = 14 }, analyzer.failure.?.location.?);
-    try std.testing.expectEqualStrings("`count` is a private field of `ArrayList(*const([]u8))`; write `list.private.count` to use it anyway", analyzer.failure.?.message);
+    try std.testing.expectEqualStrings("`count` is a private field of `ArrayList(const(*[]u8))`; write `list.private.count` to use it anyway", analyzer.failure.?.message);
 }
 
 test "checkFieldAccess: allows reading, setting, addressing, taking apart and building with private fields in their own module" {
@@ -30017,7 +30017,7 @@ test "checkFieldAccess: rejects private before the length of a slice" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main\n    const bytes: *const([]u8) = \"abc\"\n    _ = bytes.private.length\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main\n    const bytes: const(*[]u8) = \"abc\"\n    _ = bytes.private.length\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -30393,7 +30393,7 @@ test "checkBinary: rejects comparing enums that carry values without equality" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Text\n    Word: *const([]u8)\nfn same(one: Text, two: Text) -> bool = return one == two" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Text\n    Word: const(*[]u8)\nfn same(one: Text, two: Text) -> bool = return one == two" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -30669,7 +30669,7 @@ test "checkBinary: orders pointers to multiple values" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn less(left: *many(i32), right: *many(i32)) -> bool = return left < right" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn less(left: *[many]i32, right: *[many]i32) -> bool = return left < right" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -30755,7 +30755,7 @@ test "checkBinary: rejects comparing a slice with a string literal" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn same(text: *const([]u8)) -> bool = return text == \"yes\"" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn same(text: const(*[]u8)) -> bool = return text == \"yes\"" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -30774,7 +30774,7 @@ test "checkBinary: compares the elements of slices through mn::memory::equal" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn same(one: *const([]u8), two: *[]u8, length: usize) -> bool = return memory::equal(two[0..length], \"yes\\n\") and memory::equal(one, two)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn same(one: const(*[]u8), two: *[]u8, length: usize) -> bool = return memory::equal(two[0..length], \"yes\\n\") and memory::equal(one, two)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -30794,7 +30794,7 @@ test "checkFunctionCall: rejects a slice of elements other than bytes passed to 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn same(one: *const([]i32), two: *const([]i32)) -> bool = return memory::equal(one, two)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nfn same(one: const(*[]i32), two: const(*[]i32)) -> bool = return memory::equal(one, two)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31252,7 +31252,7 @@ test "checkOrElse: converts a mutable pointer fallback to the read-only child" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(maybe: ?*const(i32), pointer: *i32)\n    const value = maybe orelse pointer\n    _ = value" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(maybe: ?const(*i32), pointer: *i32)\n    const value = maybe orelse pointer\n    _ = value" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31421,7 +31421,7 @@ test "checkAdditive: gives a multiple value pointer moved by a literal its own t
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next(items: *many(i32))\n    const moved = items + 1\n    _ = moved" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next(items: *[many]i32)\n    const moved = items + 1\n    _ = moved" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31446,7 +31446,7 @@ test "checkAdditive: gives a usize plus a multiple value pointer the type of the
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next(items: *many(i32), count: usize)\n    const moved = count + items\n    _ = moved" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next(items: *[many]i32, count: usize)\n    const moved = count + items\n    _ = moved" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31469,7 +31469,7 @@ test "checkAdditive: gives a literal plus a multiple value pointer the type usiz
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next(items: *many(i32))\n    const moved = 1 + items\n    _ = moved" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next(items: *[many]i32)\n    const moved = 1 + items\n    _ = moved" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31492,7 +31492,7 @@ test "checkAdditive: rejects subtracting a pointer from a number" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next(items: *many(i32)) -> *many(i32) = return 1 - items" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next(items: *[many]i32) -> *[many]i32 = return 1 - items" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31513,7 +31513,7 @@ test "checkOffsetPlusPointer: rejects an offset of another integer type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next(items: *many(i32), count: u32) -> *many(i32) = return count + items" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next(items: *[many]i32, count: u32) -> *[many]i32 = return count + items" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31555,7 +31555,7 @@ test "checkPointerArithmetic: moves a multiple value pointer back by a usize" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn previous(items: *many(i32), count: usize)\n    const moved = items - count\n    _ = moved" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn previous(items: *[many]i32, count: usize)\n    const moved = items - count\n    _ = moved" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31578,7 +31578,7 @@ test "checkPointerArithmetic: rejects moving a multiple value pointer by a signe
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next(items: *many(i32), count: i32) -> *many(i32) = return items + count" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn next(items: *[many]i32, count: i32) -> *[many]i32 = return items + count" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31599,7 +31599,7 @@ test "checkPointerArithmetic: rejects moving a multiple value pointer back by an
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn previous(items: *many(i32), count: u32) -> *many(i32) = return items - count" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn previous(items: *[many]i32, count: u32) -> *[many]i32 = return items - count" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31641,7 +31641,7 @@ test "checkPointerArithmetic: gives the difference of two multiple value pointer
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn distance(end: *many(i32), start: *many(i32))\n    const count = end - start\n    _ = count" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn distance(end: *[many]i32, start: *[many]i32)\n    const count = end - start\n    _ = count" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31664,7 +31664,7 @@ test "checkPointerArithmetic: subtracts a read-only pointer from a mutable point
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn distance(end: *many(i32), start: *const(many(i32))) -> isize = return end - start" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn distance(end: *[many]i32, start: const(*[many]i32)) -> isize = return end - start" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31685,7 +31685,7 @@ test "checkPointerArithmetic: rejects the difference of pointers to different ty
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn distance(end: *many(i32), start: *many(u8)) -> isize = return end - start" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn distance(end: *[many]i32, start: *[many]u8) -> isize = return end - start" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31706,7 +31706,7 @@ test "expectArithmeticPointer: rejects moving a pointer to zero-sized values" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn next(markers: *many(Marker)) -> *many(Marker) = return markers + 1" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn next(markers: *[many]Marker) -> *[many]Marker = return markers + 1" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31727,7 +31727,7 @@ test "expectArithmeticPointer: rejects a usize plus a pointer to zero-sized valu
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn next(markers: *many(Marker), count: usize) -> *many(Marker) = return count + markers" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn next(markers: *[many]Marker, count: usize) -> *[many]Marker = return count + markers" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31748,7 +31748,7 @@ test "expectArithmeticPointer: rejects the difference of pointers to zero-sized 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn count(one: *many(Marker), two: *many(Marker)) -> isize = return one - two" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Marker\nfn count(one: *[many]Marker, two: *[many]Marker) -> isize = return one - two" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31879,7 +31879,7 @@ test "checkOperands: compares a pointer with a read-only pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn same(left: *i32, right: *const(i32)) -> bool = return left == right\nfn other(left: *const(i32), right: *i32) -> bool = return left != right" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn same(left: *i32, right: const(*i32)) -> bool = return left == right\nfn other(left: const(*i32), right: *i32) -> bool = return left != right" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31923,7 +31923,7 @@ test "checkExactExpression: rejects a narrower number as an index" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(items: *const([]i32), index: u8) -> i32 = return items[index]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(items: const(*[]i32), index: u8) -> i32 = return items[index]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -32159,7 +32159,7 @@ test "checkAddressOf: gives the address of a name of a for loop a read-only poin
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(pointer: *const(i32)) = _ = pointer\nfn show(items: *const([]i32)) = for (item in items) take(&item)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(pointer: const(*i32)) = _ = pointer\nfn show(items: const(*[]i32)) = for (item in items) take(&item)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -32231,7 +32231,7 @@ test "checkAddressOf: gives the address of an element of a read-only slice a rea
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(values: *const([]i32))\n    const pointer = &values[0]\n    _ = pointer" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(values: const(*[]i32))\n    const pointer = &values[0]\n    _ = pointer" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -32255,7 +32255,7 @@ test "checkAddressOf: gives the address of the target of a read-only pointer a r
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(value: *const(i32))\n    const pointer = &value.*\n    _ = pointer" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn show(value: const(*i32))\n    const pointer = &value.*\n    _ = pointer" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -32347,7 +32347,7 @@ test "checkAddressOf: rejects the address of an unwrapped optional" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(maybe: ?i32) -> *const(i32) = return &maybe.?" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(maybe: ?i32) -> const(*i32) = return &maybe.?" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -32368,7 +32368,7 @@ test "checkCompositeLiteral: gives empty braces where a slice is expected a slic
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(items: *[]i32, read: *const([]u8)) -> usize = return items.length + read.length\nfn run() -> usize = return take({}, {})" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(items: *[]i32, read: const(*[]u8)) -> usize = return items.length + read.length\nfn run() -> usize = return take({}, {})" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -32408,7 +32408,7 @@ test "checkCompositeLiteral: makes a read-only slice from braces with elements k
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const PRIMES: *const([]i32) = { 2, 3, 5 }\nfn sum(values: *const([]i32)) -> i32\n    var total: i32 = 0\n    for (value in values) total += value\n    return total\nfn local() -> i32\n    const squares: *const([]i32) = { 1, 4, 9 }\n    return sum(squares)\nfn argument() -> i32 = return sum({ 10, 20 })\nconst TOTAL = sum(PRIMES) + local() * 100 + argument() * 10000" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const PRIMES: const(*[]i32) = { 2, 3, 5 }\nfn sum(values: const(*[]i32)) -> i32\n    var total: i32 = 0\n    for (value in values) total += value\n    return total\nfn local() -> i32\n    const squares: const(*[]i32) = { 1, 4, 9 }\n    return sum(squares)\nfn argument() -> i32 = return sum({ 10, 20 })\nconst TOTAL = sum(PRIMES) + local() * 100 + argument() * 10000" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -32428,7 +32428,7 @@ test "checkCompositeLiteral: rejects braces with elements not known at compile t
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count(value: i32) -> usize\n    const items: *const([]i32) = { value, 1 }\n    return items.length" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count(value: i32) -> usize\n    const items: const(*[]i32) = { value, 1 }\n    return items.length" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -33442,7 +33442,7 @@ test "checkConstruction: moves a name declared own standing alone with own into 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    label: *const([]u8)\n\nfn make(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn main -> !void\n    with memory::Heap\n    const own name = try make(1)\n    const label = \"first\"\n    const own record = Record{ own name, label }\n    memory::free(own record.name)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    label: const(*[]u8)\n\nfn make(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn main -> !void\n    with memory::Heap\n    const own name = try make(1)\n    const label = \"first\"\n    const own record = Record{ own name, label }\n    memory::free(own record.name)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -33459,7 +33459,7 @@ test "checkConstruction: rejects a name declared own standing alone without own 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    label: *const([]u8)\n\nfn make(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn main -> !void\n    with memory::Heap\n    const own name = try make(1)\n    const own record = Record{ name, label = \"first\" }\n    memory::free(own record.name)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    label: const(*[]u8)\n\nfn make(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn main -> !void\n    with memory::Heap\n    const own name = try make(1)\n    const own record = Record{ name, label = \"first\" }\n    memory::free(own record.name)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -33479,7 +33479,7 @@ test "checkConstruction: rejects a view standing alone for an own field" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    label: *const([]u8)\n\nfn make(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn wrap(name: *[]u8) -> own Record = return Record{ name, label = \"first\" }\n\nfn main -> !void\n    with memory::Heap\n    var bytes: [1]u8 = { 0 }\n    const own record = wrap(bytes[0..])\n    memory::free(own record.name)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    label: const(*[]u8)\n\nfn make(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn wrap(name: *[]u8) -> own Record = return Record{ name, label = \"first\" }\n\nfn main -> !void\n    with memory::Heap\n    var bytes: [1]u8 = { 0 }\n    const own record = wrap(bytes[0..])\n    memory::free(own record.name)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -33499,7 +33499,7 @@ test "checkConstruction: rejects reading a name declared own after it moved stan
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    label: *const([]u8)\n\nfn make(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn main -> !void\n    with memory::Heap\n    const own name = try make(1)\n    const own record = Record{ own name, label = \"first\" }\n    _ = name.length\n    memory::free(own record.name)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nstruct Record\n    own name: *[]u8\n    label: const(*[]u8)\n\nfn make(size: usize) -> own memory::Error!*[]u8 = memory::allocate(u8, size)\n\nfn main -> !void\n    with memory::Heap\n    const own name = try make(1)\n    const own record = Record{ own name, label = \"first\" }\n    _ = name.length\n    memory::free(own record.name)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -33583,7 +33583,7 @@ test "expectCrossedFields: allows a literal of a struct of another module that n
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "struct Path\n    private bytes: *const([]u8)\n    private count: u8 = 0\n    size: u8\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "struct Path\n    private bytes: const(*[]u8)\n    private count: u8 = 0\n    size: u8\n" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const count: u8 = 2\n    const path: things::Path = { private.bytes = \"cards/easy\", private.count, size = 1 }\n    _ = path.size\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -33602,7 +33602,7 @@ test "expectCrossedFields: rejects a private field left to its default beside a 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "struct Path\n    private bytes: *const([]u8)\n    private count: u8 = 0\n    size: u8\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "struct Path\n    private bytes: const(*[]u8)\n    private count: u8 = 0\n    size: u8\n" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const path: things::Path = { private.bytes = \"cards/easy\", size = 1 }\n    _ = path.size\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -33624,7 +33624,7 @@ test "expectCrossedFields: rejects private before a field that is not private" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "struct Path\n    private bytes: *const([]u8)\n    private count: u8 = 0\n    size: u8\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "struct Path\n    private bytes: const(*[]u8)\n    private count: u8 = 0\n    size: u8\n" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things\n\nfn main\n    const path: things::Path = { private.bytes = \"cards/easy\", private.count = 1, private.size = 1 }\n    _ = path.size\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
@@ -33800,7 +33800,7 @@ test "checkIndex: gives an element of a slice its element type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(values: *const([]u8))\n    const element = values[0]\n    _ = element" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(values: const(*[]u8))\n    const element = values[0]\n    _ = element" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -33823,7 +33823,7 @@ test "checkIndex: gives an element through a multiple value pointer its target t
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(values: *many(bool))\n    const element = values[3]\n    _ = element" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(values: *[many]bool)\n    const element = values[3]\n    _ = element" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -33869,7 +33869,7 @@ test "checkIndex: indexes the array behind a pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(values: *const([2]i64))\n    const element = values[1]\n    _ = element" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(values: const(*[2]i64))\n    const element = values[1]\n    _ = element" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -33934,7 +33934,7 @@ test "checkIndex: rejects an index of another integer type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(values: *const([]i32), position: u32) -> i32 = return values[position]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn first(values: const(*[]i32), position: u32) -> i32 = return values[position]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -34365,7 +34365,7 @@ test "inferSliceType: keeps a slice of a read-only slice read-only" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(values: *const([]i32))\n    const items = values[..1]\n    _ = items" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(values: const(*[]i32))\n    const items = values[..1]\n    _ = items" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -34412,7 +34412,7 @@ test "inferSliceType: gives a slice of the array behind a read-only pointer a co
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(values: *const([4]i32))\n    const items = values[1..3]\n    _ = items" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(values: const(*[4]i32))\n    const items = values[1..3]\n    _ = items" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -34435,7 +34435,7 @@ test "inferSliceType: slices a multiple value pointer with an end" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(items: *many(u8))\n    const bytes = items[0..4]\n    _ = bytes" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(items: *[many]u8)\n    const bytes = items[0..4]\n    _ = bytes" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -34459,7 +34459,7 @@ test "inferSliceType: gives a slice of a read-only multiple value pointer a cons
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(items: *const(many(u8)))\n    const bytes = items[..4]\n    _ = bytes" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(items: const(*[many]u8))\n    const bytes = items[..4]\n    _ = bytes" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -34482,7 +34482,7 @@ test "inferSliceType: gives literal bounds the type usize" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(values: *const([]i32))\n    const items = values[1..2]\n    _ = items" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(values: const(*[]i32))\n    const items = values[1..2]\n    _ = items" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -34548,7 +34548,7 @@ test "inferSliceType: rejects a slice of a multiple value pointer without an end
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(items: *many(u8))\n    const bytes = items[1..]\n    _ = bytes" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(items: *[many]u8)\n    const bytes = items[1..]\n    _ = bytes" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -34590,7 +34590,7 @@ test "inferSliceType: rejects a bound of another integer type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(values: *const([]i32), start: u32)\n    const items = values[start..]\n    _ = items" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn part(values: const(*[]i32), start: u32)\n    const items = values[start..]\n    _ = items" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -34611,7 +34611,7 @@ test "inferSliceType: rejects a slice of an array obtained through an unwrap" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(maybe: ?[2]i32) -> *const([]i32) = return maybe.?[..]" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(maybe: ?[2]i32) -> const(*[]i32) = return maybe.?[..]" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -34632,7 +34632,7 @@ test "checkDereference: gives the target of a pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(value: *const(i32))\n    const copy = value.*\n    _ = copy" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(value: const(*i32))\n    const copy = value.*\n    _ = copy" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -34655,7 +34655,7 @@ test "checkDereference: gives the first target of a multiple value pointer" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(values: *many(bool))\n    const copy = values.*\n    _ = copy" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(values: *[many]bool)\n    const copy = values.*\n    _ = copy" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -35133,7 +35133,7 @@ test "computeFunctionType: gives an external function the type of its signature"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn measure(text: *const([]u8)) -> usize\nfn get() -> *fn(*const([]u8)) -> usize = return &measure" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn measure(text: const(*[]u8)) -> usize\nfn get() -> *fn(const(*[]u8)) -> usize = return &measure" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -35557,7 +35557,7 @@ test "computeLiteralType: gives a string literal the constant byte slice type" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> *const([]u8) = return greeting\nconst greeting = \"hi\"\nfn main() = noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn one() -> const(*[]u8) = return greeting\nconst greeting = \"hi\"\nfn main() = noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
@@ -35893,7 +35893,7 @@ test "integration: rejects a type that owns memory without a written instance of
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Clone\nimport mn::memory::Deinit\nstruct Owner\n    own bytes: *[]u8\nfn end(type T: Deinit, _: *const(T)) -> usize = mn::size(T)\nfn copy(type T: Clone, _: *const(T)) -> usize = mn::size(T)\nfn run(owner: *const(Owner)) -> usize = end(Owner, owner)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Clone\nimport mn::memory::Deinit\nstruct Owner\n    own bytes: *[]u8\nfn end(type T: Deinit, _: const(*T)) -> usize = mn::size(T)\nfn copy(type T: Clone, _: const(*T)) -> usize = mn::size(T)\nfn run(owner: const(*Owner)) -> usize = end(Owner, owner)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -35912,7 +35912,7 @@ test "integration: rejects a type that owns memory without a written instance of
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Clone\nimport mn::memory::Deinit\nstruct Owner\n    own bytes: *[]u8\nfn end(type T: Deinit, _: *const(T)) -> usize = mn::size(T)\nfn copy(type T: Clone, _: *const(T)) -> usize = mn::size(T)\nfn run(owner: *const(Owner)) -> usize = copy(Owner, owner)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Clone\nimport mn::memory::Deinit\nstruct Owner\n    own bytes: *[]u8\nfn end(type T: Deinit, _: const(*T)) -> usize = mn::size(T)\nfn copy(type T: Clone, _: const(*T)) -> usize = mn::size(T)\nfn run(owner: const(*Owner)) -> usize = copy(Owner, owner)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -35988,7 +35988,7 @@ test "integration: formats into a list of bytes that grows as it is written thro
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::stream::Writer\nimport mn::text\nstruct Fixed\n    bytes: [128]u8\n    used: usize\ninstance memory::Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 128) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn build() -> memory::Error![10]u8\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    var own list = mn::container::ArrayList(u8)::init()\n    defer list.deinit(own) with &fixed\n    const own first = try text::format(\"{}-{x}\", { 12u8, 255u8 }) with &fixed\n    defer memory::free(own first) with &fixed\n    try list.write(first) with &fixed\n    const own second = try text::format(\"{s}\\n\", { \"done\" }) with &fixed\n    defer memory::free(own second) with &fixed\n    try list.write(second) with &fixed\n    var result: [10]u8 = undefined\n    for (index in 0..10) result[index] = list.view(*const([]u8))[index]\n    return result\nconst TEXT = build() catch [10]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::stream::Writer\nimport mn::text\nstruct Fixed\n    bytes: [128]u8\n    used: usize\ninstance memory::Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 128) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn build() -> memory::Error![10]u8\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    var own list = mn::container::ArrayList(u8)::init()\n    defer list.deinit(own) with &fixed\n    const own first = try text::format(\"{}-{x}\", { 12u8, 255u8 }) with &fixed\n    defer memory::free(own first) with &fixed\n    try list.write(first) with &fixed\n    const own second = try text::format(\"{s}\\n\", { \"done\" }) with &fixed\n    defer memory::free(own second) with &fixed\n    try list.write(second) with &fixed\n    var result: [10]u8 = undefined\n    for (index in 0..10) result[index] = list.view(const(*[]u8))[index]\n    return result\nconst TEXT = build() catch [10]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -36012,7 +36012,7 @@ test "integration: gives out of memory as an error of mn::memory when a list of 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::stream::Writer\nimport mn::text\nstruct Fixed\n    bytes: [4]u8\n    used: usize\ninstance memory::Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 4) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn build() -> memory::Error![10]u8\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    var own list = mn::container::ArrayList(u8)::init()\n    defer list.deinit(own) with &fixed\n    const own first = try text::format(\"{}-{x}\", { 12u8, 255u8 }) with &fixed\n    defer memory::free(own first) with &fixed\n    try list.write(first) with &fixed\n    var result: [10]u8 = undefined\n    for (index in 0..10) result[index] = list.view(*const([]u8))[index]\n    return result\nfn fails() -> bool\n    _ = build() catch return true\n    return false\nconst FAILED = fails()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::stream::Writer\nimport mn::text\nstruct Fixed\n    bytes: [4]u8\n    used: usize\ninstance memory::Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 4) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn build() -> memory::Error![10]u8\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    var own list = mn::container::ArrayList(u8)::init()\n    defer list.deinit(own) with &fixed\n    const own first = try text::format(\"{}-{x}\", { 12u8, 255u8 }) with &fixed\n    defer memory::free(own first) with &fixed\n    try list.write(first) with &fixed\n    var result: [10]u8 = undefined\n    for (index in 0..10) result[index] = list.view(const(*[]u8))[index]\n    return result\nfn fails() -> bool\n    _ = build() catch return true\n    return false\nconst FAILED = fails()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -36036,7 +36036,7 @@ test "integration: gives the published digests of SHA-256 through the standard l
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::hash\nimport mn::stream\nstruct Source\n    bytes: *const([]u8)\n    position: usize\n    limit: usize\ninstance stream::Reader(Source)\n\n    fn read(source: *Source, buffer: *[]u8) -> !usize\n        var count = source.bytes.length - source.position\n        if (count > source.limit) count = source.limit\n        if (count > buffer.length) count = buffer.length\n        for (index in 0..count) buffer[index] = source.bytes[source.position + index]\n        source.position += count\n        return count\nfn digest(text: *const([]u8), limit: usize) -> ![32]u8\n    var source = Source{ bytes = text, position = 0, limit = limit }\n    return hash::sha256(&source)\nconst EMPTY = digest(\"\", 64) catch [32]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }\nconst SHORT = digest(\"abc\", 64) catch [32]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }\nconst LONG = digest(\"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq\", 64) catch [32]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::hash\nimport mn::stream\nstruct Source\n    bytes: const(*[]u8)\n    position: usize\n    limit: usize\ninstance stream::Reader(Source)\n\n    fn read(source: *Source, buffer: *[]u8) -> !usize\n        var count = source.bytes.length - source.position\n        if (count > source.limit) count = source.limit\n        if (count > buffer.length) count = buffer.length\n        for (index in 0..count) buffer[index] = source.bytes[source.position + index]\n        source.position += count\n        return count\nfn digest(text: const(*[]u8), limit: usize) -> ![32]u8\n    var source = Source{ bytes = text, position = 0, limit = limit }\n    return hash::sha256(&source)\nconst EMPTY = digest(\"\", 64) catch [32]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }\nconst SHORT = digest(\"abc\", 64) catch [32]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }\nconst LONG = digest(\"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq\", 64) catch [32]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -36074,7 +36074,7 @@ test "integration: gives the digests around the block boundaries of SHA-256 thro
     var text: [120]u8 = undefined;
     for (&text, 0..) |*byte, index| byte.* = 'a' + @as(u8, @intCast(index % 26));
     var source: std.ArrayList(u8) = .empty;
-    try source.appendSlice(allocator, "import mn::hash\nimport mn::stream\nstruct Source\n    bytes: *const([]u8)\n    position: usize\n    limit: usize\ninstance stream::Reader(Source)\n\n    fn read(source: *Source, buffer: *[]u8) -> !usize\n        var count = source.bytes.length - source.position\n        if (count > source.limit) count = source.limit\n        if (count > buffer.length) count = buffer.length\n        for (index in 0..count) buffer[index] = source.bytes[source.position + index]\n        source.position += count\n        return count\nfn digest(text: *const([]u8), limit: usize) -> ![32]u8\n    var source = Source{ bytes = text, position = 0, limit = limit }\n    return hash::sha256(&source)\n");
+    try source.appendSlice(allocator, "import mn::hash\nimport mn::stream\nstruct Source\n    bytes: const(*[]u8)\n    position: usize\n    limit: usize\ninstance stream::Reader(Source)\n\n    fn read(source: *Source, buffer: *[]u8) -> !usize\n        var count = source.bytes.length - source.position\n        if (count > source.limit) count = source.limit\n        if (count > buffer.length) count = buffer.length\n        for (index in 0..count) buffer[index] = source.bytes[source.position + index]\n        source.position += count\n        return count\nfn digest(text: const(*[]u8), limit: usize) -> ![32]u8\n    var source = Source{ bytes = text, position = 0, limit = limit }\n    return hash::sha256(&source)\n");
     for (lengths) |length| try source.print(allocator, "const LENGTH_{d} = digest(\"{s}\", 64) catch [32]u8{{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }}\n", .{ length, text[0..length] });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = source.items });
     try loader.loadMainModule(&arena, std.testing.io, "main");
@@ -36103,7 +36103,7 @@ test "integration: gives the same digest for short reads through the standard li
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::hash\nimport mn::stream\nstruct Source\n    bytes: *const([]u8)\n    position: usize\n    limit: usize\ninstance stream::Reader(Source)\n\n    fn read(source: *Source, buffer: *[]u8) -> !usize\n        var count = source.bytes.length - source.position\n        if (count > source.limit) count = source.limit\n        if (count > buffer.length) count = buffer.length\n        for (index in 0..count) buffer[index] = source.bytes[source.position + index]\n        source.position += count\n        return count\nfn digest(text: *const([]u8), limit: usize) -> ![32]u8\n    var source = Source{ bytes = text, position = 0, limit = limit }\n    return hash::sha256(&source)\nconst WHOLE = digest(\"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq0123456789\", 64) catch [32]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }\nconst SINGLE = digest(\"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq0123456789\", 1) catch [32]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }\nconst SEVEN = digest(\"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq0123456789\", 7) catch [32]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::hash\nimport mn::stream\nstruct Source\n    bytes: const(*[]u8)\n    position: usize\n    limit: usize\ninstance stream::Reader(Source)\n\n    fn read(source: *Source, buffer: *[]u8) -> !usize\n        var count = source.bytes.length - source.position\n        if (count > source.limit) count = source.limit\n        if (count > buffer.length) count = buffer.length\n        for (index in 0..count) buffer[index] = source.bytes[source.position + index]\n        source.position += count\n        return count\nfn digest(text: const(*[]u8), limit: usize) -> ![32]u8\n    var source = Source{ bytes = text, position = 0, limit = limit }\n    return hash::sha256(&source)\nconst WHOLE = digest(\"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq0123456789\", 64) catch [32]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }\nconst SINGLE = digest(\"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq0123456789\", 1) catch [32]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }\nconst SEVEN = digest(\"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq0123456789\", 7) catch [32]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -36153,7 +36153,7 @@ test "integration: writes each byte of a slice as two hexadecimal digits through
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::stream::Writer\nimport mn::text\nstruct Capture\n    bytes: [16]u8\n    length: usize\ninstance Writer(Capture)\n\n    fn write(capture: *Capture, bytes: *const([]u8)) -> !void\n        for byte in bytes\n            capture.bytes[capture.length] = byte\n            capture.length += 1\nfn run() -> ![7]u8\n    var capture: Capture = undefined\n    capture.length = 0\n    const data: [3]u8 = { 0, 10, 255 }\n    try text::write_hexadecimal(&capture, data[..])\n    try capture.write(\"|\")\n    return { capture.bytes[0], capture.bytes[1], capture.bytes[2], capture.bytes[3], capture.bytes[4], capture.bytes[5], capture.bytes[6] }\nconst RESULT = run() catch [7]u8{ 0, 0, 0, 0, 0, 0, 0 }" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::stream::Writer\nimport mn::text\nstruct Capture\n    bytes: [16]u8\n    length: usize\ninstance Writer(Capture)\n\n    fn write(capture: *Capture, bytes: const(*[]u8)) -> !void\n        for byte in bytes\n            capture.bytes[capture.length] = byte\n            capture.length += 1\nfn run() -> ![7]u8\n    var capture: Capture = undefined\n    capture.length = 0\n    const data: [3]u8 = { 0, 10, 255 }\n    try text::write_hexadecimal(&capture, data[..])\n    try capture.write(\"|\")\n    return { capture.bytes[0], capture.bytes[1], capture.bytes[2], capture.bytes[3], capture.bytes[4], capture.bytes[5], capture.bytes[6] }\nconst RESULT = run() catch [7]u8{ 0, 0, 0, 0, 0, 0, 0 }" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -36176,7 +36176,7 @@ test "integration: writes nothing for an empty slice in hexadecimal through the 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::stream::Writer\nimport mn::text\nstruct Capture\n    bytes: [16]u8\n    length: usize\ninstance Writer(Capture)\n\n    fn write(capture: *Capture, bytes: *const([]u8)) -> !void\n        for byte in bytes\n            capture.bytes[capture.length] = byte\n            capture.length += 1\nfn run() -> !usize\n    var capture: Capture = undefined\n    capture.length = 0\n    const data: *const([]u8) = \"\"\n    try text::write_hexadecimal(&capture, data)\n    return capture.length\nconst RESULT = run() catch 99" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::stream::Writer\nimport mn::text\nstruct Capture\n    bytes: [16]u8\n    length: usize\ninstance Writer(Capture)\n\n    fn write(capture: *Capture, bytes: const(*[]u8)) -> !void\n        for byte in bytes\n            capture.bytes[capture.length] = byte\n            capture.length += 1\nfn run() -> !usize\n    var capture: Capture = undefined\n    capture.length = 0\n    const data: const(*[]u8) = \"\"\n    try text::write_hexadecimal(&capture, data)\n    return capture.length\nconst RESULT = run() catch 99" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -36390,7 +36390,7 @@ test "resolveCaseLiteral: rejects a case for a pointer to an enum" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Mode\n    Read\n    Write\nconst mode: *const(Mode) = ::Read" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Mode\n    Read\n    Write\nconst mode: const(*Mode) = ::Read" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -36526,7 +36526,7 @@ test "resolveCaseLiteral: rejects a case that needs a value without one" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token\n    Name: *const([]u8)\nconst token: Token = ::Name" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token\n    Name: const(*[]u8)\nconst token: Token = ::Name" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -36623,7 +36623,7 @@ test "resolveCaseLiteral: calls a function of the block beside a case with its v
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token\n    Number: i64\n    Name: *const([]u8)\n    End\n\n    fn load(text: *const([]u8)) -> Self = ::Name{ text }\nfn pick(flag: bool) -> Token\n    if (flag) return ::load(\"cards\")\n    return ::Number{ 42 }" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Token\n    Number: i64\n    Name: const(*[]u8)\n    End\n\n    fn load(text: const(*[]u8)) -> Self = ::Name{ text }\nfn pick(flag: bool) -> Token\n    if (flag) return ::load(\"cards\")\n    return ::Number{ 42 }" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -36651,7 +36651,7 @@ test "resolveCaseLiteral: gives cases that compile-time evaluation reads" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Mode\n    Read\n    Write\n\nenum Token\n    Name: *const([]u8)\n    Number: u32\n    End\n\nstruct Holder\n    mode: Mode = ::Write\n\nfn flip(mode: Mode) -> Mode\n    if (mode == ::Read) return ::Write\n    return ::Read\n\nfn code(comptime mode: Mode) -> u8\n    if mode == ::Write\n        return 2\n    return 1\n\nconst WRITE: Mode = ::Write\nconst FLIPPED = flip(::Write)\nconst NUMBER: Token = ::Number{ 7 }\nconst OPTIONAL: ?Mode = ::Write\nconst DEFAULT = Holder{}.mode\nconst CHOSEN = code(::Write)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "enum Mode\n    Read\n    Write\n\nenum Token\n    Name: const(*[]u8)\n    Number: u32\n    End\n\nstruct Holder\n    mode: Mode = ::Write\n\nfn flip(mode: Mode) -> Mode\n    if (mode == ::Read) return ::Write\n    return ::Read\n\nfn code(comptime mode: Mode) -> u8\n    if mode == ::Write\n        return 2\n    return 1\n\nconst WRITE: Mode = ::Write\nconst FLIPPED = flip(::Write)\nconst NUMBER: Token = ::Number{ 7 }\nconst OPTIONAL: ?Mode = ::Write\nconst DEFAULT = Holder{}.mode\nconst CHOSEN = code(::Write)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -37092,7 +37092,7 @@ test "resolveAllocatorCall: rejects with on a selected instance that does not al
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\ntypeclass To(type T, type U)\n\n    fn to(value: T, type U) -> !U\nstruct Data\n    number: u8\ninstance To(Data, u8)\n\n    fn to(value: Data, type U) -> !U = value.number\nfn main\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = Data{ number = 7 }.to(u8) with &fixed catch 0\n    if (value == 0) return\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\ntypeclass To(type T, type U)\n\n    fn to(value: T, type U) -> !U\nstruct Data\n    number: u8\ninstance To(Data, u8)\n\n    fn to(value: Data, type U) -> !U = value.number\nfn main\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const value = Data{ number = 7 }.to(u8) with &fixed catch 0\n    if (value == 0) return\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -37346,7 +37346,7 @@ test "resolveAllocatorCall: rejects with on opening a file through the standard 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn run(path: filesystem::Path) -> !void\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const file = try filesystem::File::open(path) with &fixed\n    file.close()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn run(path: filesystem::Path) -> !void\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const file = try filesystem::File::open(path) with &fixed\n    file.close()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -37364,7 +37364,7 @@ test "resolveAllocatorCall: rejects with on opening a directory through the stan
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn run(path: filesystem::Path) -> !void\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const directory = try filesystem::Directory::open(path) with &fixed\n    directory.close()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn run(path: filesystem::Path) -> !void\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const directory = try filesystem::Directory::open(path) with &fixed\n    directory.close()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -37401,7 +37401,7 @@ test "integration: rejects an instance of Hash for a type without an instance of
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::hash\nstruct Data\n    number: u8\ninstance mn::hash::Hash(Data)\n\n    fn hash(_: *const(Data)) -> u64 = 1\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::hash\nstruct Data\n    number: u8\ninstance mn::hash::Hash(Data)\n\n    fn hash(_: const(*Data)) -> u64 = 1\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -37420,7 +37420,7 @@ test "integration: rejects with on contains of a map through the standard librar
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container::HashMap\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(_: *Fixed, type T, _: usize) -> own memory::Error!*[]T = memory::Error::OutOfMemory\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn run\n    var fixed = Fixed{ used = 0 }\n    var seen = HashMap(u64, u8)::init()\n    const lookup_141: u64 = 1\n    const found = seen.contains(&lookup_141) with &fixed\n    if (found) return\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container::HashMap\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(_: *Fixed, type T, _: usize) -> own memory::Error!*[]T = memory::Error::OutOfMemory\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn run\n    var fixed = Fixed{ used = 0 }\n    var seen = HashMap(u64, u8)::init()\n    const lookup_141: u64 = 1\n    const found = seen.contains(&lookup_141) with &fixed\n    if (found) return\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -37438,7 +37438,7 @@ test "integration: rejects with on remove of a map through the standard library"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container::HashMap\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(_: *Fixed, type T, _: usize) -> own memory::Error!*[]T = memory::Error::OutOfMemory\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn run\n    var fixed = Fixed{ used = 0 }\n    var seen = HashMap(u64, u8)::init()\n    const lookup_141: u64 = 1\n    const found = seen.remove(&lookup_141) with &fixed\n    if (found != null) return\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container::HashMap\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(_: *Fixed, type T, _: usize) -> own memory::Error!*[]T = memory::Error::OutOfMemory\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn run\n    var fixed = Fixed{ used = 0 }\n    var seen = HashMap(u64, u8)::init()\n    const lookup_141: u64 = 1\n    const found = seen.remove(&lookup_141) with &fixed\n    if (found != null) return\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -37507,7 +37507,7 @@ test "integration: keeps a map at compile time through the standard library" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container::HashMap\nimport mn::memory\nimport mn::memory::Allocator\nimport mn::memory::Deinit\nstruct Fixed\n    slots: [256]usize\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const start = fixed.used\n        fixed.used += count\n        return mn::cast(*many(T), fixed.slots[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn run() -> !usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    var own seen = HashMap(usize, usize)::init()\n    defer seen.deinit(own) with &fixed\n    for index in 0..10\n        _ = try seen.put(&index, 1) with &fixed\n    const lookup_221: usize = 4\n    const own removed = seen.remove(&lookup_221)\n    const five: usize = 5\n    const own repeated = try seen.put(&five, 2) with &fixed\n    var total: usize = 0\n    const lookup_252: usize = 5\n    const lookup_253: usize = 9\n    const lookup_254: usize = 4\n    if (removed != null and repeated != null and seen.get(&lookup_252).?.* == 2 and seen.contains(&lookup_253) and !seen.contains(&lookup_254)) total = seen.length()\n    return total\nconst RESULT = run() catch 0\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container::HashMap\nimport mn::memory\nimport mn::memory::Allocator\nimport mn::memory::Deinit\nstruct Fixed\n    slots: [256]usize\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        const start = fixed.used\n        fixed.used += count\n        return mn::cast(*[many]T, fixed.slots[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn run() -> !usize\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    var own seen = HashMap(usize, usize)::init()\n    defer seen.deinit(own) with &fixed\n    for index in 0..10\n        _ = try seen.put(&index, 1) with &fixed\n    const lookup_221: usize = 4\n    const own removed = seen.remove(&lookup_221)\n    const five: usize = 5\n    const own repeated = try seen.put(&five, 2) with &fixed\n    var total: usize = 0\n    const lookup_252: usize = 5\n    const lookup_253: usize = 9\n    const lookup_254: usize = 4\n    if (removed != null and repeated != null and seen.get(&lookup_252).?.* == 2 and seen.contains(&lookup_253) and !seen.contains(&lookup_254)) total = seen.length()\n    return total\nconst RESULT = run() catch 0\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -37900,7 +37900,7 @@ test "integration: keeps a map of arrays at compile time through the standard li
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container::HashMap\nimport mn::memory\nimport mn::memory::Allocator\nimport mn::memory::Deinit\nstruct Fixed\n    pairs: [32][2]u8\n    bytes: [32]u8\n    numbers: [32]usize\n    used_pairs: usize\n    used_bytes: usize\n    used_numbers: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        if mn::size(T) == 2\n            const start = fixed.used_pairs\n            fixed.used_pairs += count\n            return mn::cast(*many(T), fixed.pairs[start..fixed.used_pairs].pointer)[0..count]\n        if mn::size(T) == 1\n            const start = fixed.used_bytes\n            fixed.used_bytes += count\n            return mn::cast(*many(T), fixed.bytes[start..fixed.used_bytes].pointer)[0..count]\n        const start = fixed.used_numbers\n        fixed.used_numbers += count\n        return mn::cast(*many(T), fixed.numbers[start..fixed.used_numbers].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn run() -> !usize\n    var fixed: Fixed = undefined\n    fixed.used_pairs = 0\n    fixed.used_bytes = 0\n    fixed.used_numbers = 0\n    var own seen = HashMap([2]u8, u8)::init()\n    defer seen.deinit(own) with &fixed\n    const one_two: [2]u8 = { 1, 2 }\n    const two_one: [2]u8 = { 2, 1 }\n    _ = try seen.put(&one_two, 1) with &fixed\n    _ = try seen.put(&two_one, 2) with &fixed\n    const own repeated = try seen.put(&one_two, 3) with &fixed\n    const lookup_381: [2]u8 = { 2, 1 }\n    const own removed = seen.remove(&lookup_381)\n    var total: usize = 0\n    const lookup_402: [2]u8 = { 1, 2 }\n    const lookup_403: [2]u8 = { 2, 1 }\n    if (repeated != null and removed != null and seen.contains(&lookup_402) and !seen.contains(&lookup_403)) total = seen.length()\n    return total\nconst RESULT = run() catch 0\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container::HashMap\nimport mn::memory\nimport mn::memory::Allocator\nimport mn::memory::Deinit\nstruct Fixed\n    pairs: [32][2]u8\n    bytes: [32]u8\n    numbers: [32]usize\n    used_pairs: usize\n    used_bytes: usize\n    used_numbers: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error!*[]T\n        if mn::size(T) == 2\n            const start = fixed.used_pairs\n            fixed.used_pairs += count\n            return mn::cast(*[many]T, fixed.pairs[start..fixed.used_pairs].pointer)[0..count]\n        if mn::size(T) == 1\n            const start = fixed.used_bytes\n            fixed.used_bytes += count\n            return mn::cast(*[many]T, fixed.bytes[start..fixed.used_bytes].pointer)[0..count]\n        const start = fixed.used_numbers\n        fixed.used_numbers += count\n        return mn::cast(*[many]T, fixed.numbers[start..fixed.used_numbers].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn run() -> !usize\n    var fixed: Fixed = undefined\n    fixed.used_pairs = 0\n    fixed.used_bytes = 0\n    fixed.used_numbers = 0\n    var own seen = HashMap([2]u8, u8)::init()\n    defer seen.deinit(own) with &fixed\n    const one_two: [2]u8 = { 1, 2 }\n    const two_one: [2]u8 = { 2, 1 }\n    _ = try seen.put(&one_two, 1) with &fixed\n    _ = try seen.put(&two_one, 2) with &fixed\n    const own repeated = try seen.put(&one_two, 3) with &fixed\n    const lookup_381: [2]u8 = { 2, 1 }\n    const own removed = seen.remove(&lookup_381)\n    var total: usize = 0\n    const lookup_402: [2]u8 = { 1, 2 }\n    const lookup_403: [2]u8 = { 2, 1 }\n    if (repeated != null and removed != null and seen.contains(&lookup_402) and !seen.contains(&lookup_403)) total = seen.length()\n    return total\nconst RESULT = run() catch 0\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -38007,7 +38007,7 @@ test "integration: rejects with on copy through the standard library" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(_: *Fixed, type T, _: usize) -> own memory::Error!*[]T = memory::Error::OutOfMemory\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: *const([]T)) = noop\nfn run\n    var fixed = Fixed{ used = 0 }\n    var numbers: [2]u8 = { 1, 2 }\n    memory::copy(numbers[..1], numbers[1..]) with &fixed\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(_: *Fixed, type T, _: usize) -> own memory::Error!*[]T = memory::Error::OutOfMemory\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn run\n    var fixed = Fixed{ used = 0 }\n    var numbers: [2]u8 = { 1, 2 }\n    memory::copy(numbers[..1], numbers[1..]) with &fixed\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -38266,7 +38266,7 @@ test "findLiteralFunction: names the type for a reserved name that it does not h
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Parser\n    size: usize\n\n    fn match(pattern: *const([]u8)) -> Self = Self{ size = pattern.length }\nconst VALUE: Parser = ::for()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Parser\n    size: usize\n\n    fn match(pattern: const(*[]u8)) -> Self = Self{ size = pattern.length }\nconst VALUE: Parser = ::for()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -38641,7 +38641,7 @@ test "expectLoopFits: rejects an index through a pointer to an array" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn give(value: *const([3]u8)) -> u8\n    var sum: u8 = 0\n    for index in 0..5\n        sum += value[index]\n    return sum\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn give(value: const(*[3]u8)) -> u8\n    var sum: u8 = 0\n    for index in 0..5\n        sum += value[index]\n    return sum\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -38739,7 +38739,7 @@ test "expectLoopFits: accepts each index it does not reject at compile time" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn exact(value: [3]u8) -> u8\n    var sum: u8 = 0\n    for index in 0..3\n        sum += value[index]\n    return sum\nfn shorter(value: [3]u8) -> u8\n    var sum: u8 = 0\n    for index in 0..2\n        sum += value[index]\n    return sum\nfn later(value: [3]u8) -> u8\n    var sum: u8 = 0\n    for index in 1..3\n        sum += value[index]\n    return sum\nfn plus_one(value: [3]u8) -> u8\n    var sum: u8 = 0\n    for index in 0..2\n        sum += value[index + 1]\n    return sum\nfn through_constant(value: [3]u8) -> u8\n    var sum: u8 = 0\n    for index in 0..5\n        const position = index % 3\n        sum += value[position]\n    return sum\nfn shadowed(value: [3]u8) -> u8\n    var sum: u8 = 0\n    for index in 0..5\n        if (index == 9) sum = 0\n        for index in 0..3\n            sum += value[index]\n    return sum\nfn through_slice(value: *const([]u8)) -> u8\n    var sum: u8 = 0\n    for index in 0..3\n        sum += value[index]\n    return sum\nfn at_run_time(value: [3]u8, count: usize) -> u8\n    var sum: u8 = 0\n    for index in 0..count\n        sum += value[index]\n    return sum\nfn pointer(value: *const([3]u8)) -> u8\n    var sum: u8 = 0\n    for index in 0..3\n        sum += value[index]\n    return sum\nfn zero_count(count: usize) -> usize\n    var sum: usize = 9\n    for index in 0..count\n        sum += index\n    return sum\nfn without_end() -> usize\n    var sum: usize = 0\n    for index in 5..\n        sum += index\n        break\n    return sum\nconst THREE: [3]u8 = { 1, 2, 3 }\nconst EXACT = exact(THREE)\nconst SHORTER = shorter(THREE)\nconst LATER = later(THREE)\nconst PLUS_ONE = plus_one(THREE)\nconst THROUGH_CONSTANT = through_constant(THREE)\nconst SHADOWED = shadowed(THREE)\nconst THROUGH_SLICE = through_slice(THREE[..])\nconst AT_RUN_TIME = at_run_time(THREE, 2)\nconst POINTER = pointer(&THREE)\nconst ZERO_COUNT = zero_count(0)\nconst WITHOUT_END = without_end()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn exact(value: [3]u8) -> u8\n    var sum: u8 = 0\n    for index in 0..3\n        sum += value[index]\n    return sum\nfn shorter(value: [3]u8) -> u8\n    var sum: u8 = 0\n    for index in 0..2\n        sum += value[index]\n    return sum\nfn later(value: [3]u8) -> u8\n    var sum: u8 = 0\n    for index in 1..3\n        sum += value[index]\n    return sum\nfn plus_one(value: [3]u8) -> u8\n    var sum: u8 = 0\n    for index in 0..2\n        sum += value[index + 1]\n    return sum\nfn through_constant(value: [3]u8) -> u8\n    var sum: u8 = 0\n    for index in 0..5\n        const position = index % 3\n        sum += value[position]\n    return sum\nfn shadowed(value: [3]u8) -> u8\n    var sum: u8 = 0\n    for index in 0..5\n        if (index == 9) sum = 0\n        for index in 0..3\n            sum += value[index]\n    return sum\nfn through_slice(value: const(*[]u8)) -> u8\n    var sum: u8 = 0\n    for index in 0..3\n        sum += value[index]\n    return sum\nfn at_run_time(value: [3]u8, count: usize) -> u8\n    var sum: u8 = 0\n    for index in 0..count\n        sum += value[index]\n    return sum\nfn pointer(value: const(*[3]u8)) -> u8\n    var sum: u8 = 0\n    for index in 0..3\n        sum += value[index]\n    return sum\nfn zero_count(count: usize) -> usize\n    var sum: usize = 9\n    for index in 0..count\n        sum += index\n    return sum\nfn without_end() -> usize\n    var sum: usize = 0\n    for index in 5..\n        sum += index\n        break\n    return sum\nconst THREE: [3]u8 = { 1, 2, 3 }\nconst EXACT = exact(THREE)\nconst SHORTER = shorter(THREE)\nconst LATER = later(THREE)\nconst PLUS_ONE = plus_one(THREE)\nconst THROUGH_CONSTANT = through_constant(THREE)\nconst SHADOWED = shadowed(THREE)\nconst THROUGH_SLICE = through_slice(THREE[..])\nconst AT_RUN_TIME = at_run_time(THREE, 2)\nconst POINTER = pointer(&THREE)\nconst ZERO_COUNT = zero_count(0)\nconst WITHOUT_END = without_end()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -38858,7 +38858,7 @@ test "findInstance: gives a writable slice to an instance for the read-only form
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*const([]u8))\n\n    fn name(_: *const([]u8)) -> u8 = 1\nfn through_constraint(type T: Name, value: T) -> u8 = Name::name(value)\nfn through_parameter(value: Name) -> u8 = value.name()\nfn run() -> u8\n    var bytes: [2]u8 = { 1, 2 }\n    bytes[0] = 3\n    const written: *[]u8 = bytes[..]\n    const read: *const([]u8) = written\n    return written.name() * 100 + Name::name(written) * 10 + read.name() + through_constraint(*[]u8, written) + through_parameter(written) + through_constraint(*const([]u8), read)\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(const(*[]u8))\n\n    fn name(_: const(*[]u8)) -> u8 = 1\nfn through_constraint(type T: Name, value: T) -> u8 = Name::name(value)\nfn through_parameter(value: Name) -> u8 = value.name()\nfn run() -> u8\n    var bytes: [2]u8 = { 1, 2 }\n    bytes[0] = 3\n    const written: *[]u8 = bytes[..]\n    const read: const(*[]u8) = written\n    return written.name() * 100 + Name::name(written) * 10 + read.name() + through_constraint(*[]u8, written) + through_parameter(written) + through_constraint(const(*[]u8), read)\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -38886,7 +38886,7 @@ test "findInstance: rejects a read-only slice for an instance of the writable fo
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*[]u8)\n\n    fn name(_: *[]u8) -> u8 = 1\nfn run() -> u8\n    const bytes: [2]u8 = { 1, 2 }\n    const read: *const([]u8) = bytes[..]\n    return read.name()\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*[]u8)\n\n    fn name(_: *[]u8) -> u8 = 1\nfn run() -> u8\n    const bytes: [2]u8 = { 1, 2 }\n    const read: const(*[]u8) = bytes[..]\n    return read.name()\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -38905,7 +38905,7 @@ test "findInstance: rejects a read-only slice for an instance of the writable fo
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*[]u8)\n\n    fn name(_: *[]u8) -> u8 = 1\nfn run() -> u8\n    const bytes: [2]u8 = { 1, 2 }\n    const read: *const([]u8) = bytes[..]\n    return Name::name(read)\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*[]u8)\n\n    fn name(_: *[]u8) -> u8 = 1\nfn run() -> u8\n    const bytes: [2]u8 = { 1, 2 }\n    const read: const(*[]u8) = bytes[..]\n    return Name::name(read)\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -38924,7 +38924,7 @@ test "findInstance: picks the exact instance of a slice when both forms are decl
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*[]u8)\n\n    fn name(_: *[]u8) -> u8 = 1\ninstance Name(*const([]u8))\n\n    fn name(_: *const([]u8)) -> u8 = 2\nfn run() -> u8\n    var bytes: [2]u8 = { 1, 2 }\n    bytes[0] = 3\n    const written: *[]u8 = bytes[..]\n    const read: *const([]u8) = written\n    return written.name() * 10 + read.name()\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*[]u8)\n\n    fn name(_: *[]u8) -> u8 = 1\ninstance Name(const(*[]u8))\n\n    fn name(_: const(*[]u8)) -> u8 = 2\nfn run() -> u8\n    var bytes: [2]u8 = { 1, 2 }\n    bytes[0] = 3\n    const written: *[]u8 = bytes[..]\n    const read: const(*[]u8) = written\n    return written.name() * 10 + read.name()\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -38952,7 +38952,7 @@ test "findInstance: gives a writable pointer to an instance for the read-only fo
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*const(u8))\n\n    fn name(_: *const(u8)) -> u8 = 1\nfn through_constraint(type T: Name, value: T) -> u8 = Name::name(value)\nfn through_parameter(value: Name) -> u8 = value.name()\nfn run() -> u8\n    var bytes: [2]u8 = { 1, 2 }\n    bytes[0] = 3\n    const written: *u8 = &bytes[0]\n    const read: *const(u8) = written\n    return written.name() * 100 + Name::name(written) * 10 + read.name() + through_constraint(*u8, written) + through_parameter(written) + through_constraint(*const(u8), read)\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(const(*u8))\n\n    fn name(_: const(*u8)) -> u8 = 1\nfn through_constraint(type T: Name, value: T) -> u8 = Name::name(value)\nfn through_parameter(value: Name) -> u8 = value.name()\nfn run() -> u8\n    var bytes: [2]u8 = { 1, 2 }\n    bytes[0] = 3\n    const written: *u8 = &bytes[0]\n    const read: const(*u8) = written\n    return written.name() * 100 + Name::name(written) * 10 + read.name() + through_constraint(*u8, written) + through_parameter(written) + through_constraint(const(*u8), read)\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -38980,7 +38980,7 @@ test "findInstance: rejects a read-only pointer for an instance of the writable 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*u8)\n\n    fn name(_: *u8) -> u8 = 1\nfn run() -> u8\n    const bytes: [2]u8 = { 1, 2 }\n    const read: *const(u8) = &bytes[0]\n    return read.name()\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*u8)\n\n    fn name(_: *u8) -> u8 = 1\nfn run() -> u8\n    const bytes: [2]u8 = { 1, 2 }\n    const read: const(*u8) = &bytes[0]\n    return read.name()\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -38999,7 +38999,7 @@ test "findInstance: rejects a read-only pointer for an instance of the writable 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*u8)\n\n    fn name(_: *u8) -> u8 = 1\nfn run() -> u8\n    const bytes: [2]u8 = { 1, 2 }\n    const read: *const(u8) = &bytes[0]\n    return Name::name(read)\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*u8)\n\n    fn name(_: *u8) -> u8 = 1\nfn run() -> u8\n    const bytes: [2]u8 = { 1, 2 }\n    const read: const(*u8) = &bytes[0]\n    return Name::name(read)\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39018,7 +39018,7 @@ test "findInstance: picks the exact instance of a pointer when both forms are de
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*u8)\n\n    fn name(_: *u8) -> u8 = 1\ninstance Name(*const(u8))\n\n    fn name(_: *const(u8)) -> u8 = 2\nfn run() -> u8\n    var bytes: [2]u8 = { 1, 2 }\n    bytes[0] = 3\n    const written: *u8 = &bytes[0]\n    const read: *const(u8) = written\n    return written.name() * 10 + read.name()\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*u8)\n\n    fn name(_: *u8) -> u8 = 1\ninstance Name(const(*u8))\n\n    fn name(_: const(*u8)) -> u8 = 2\nfn run() -> u8\n    var bytes: [2]u8 = { 1, 2 }\n    bytes[0] = 3\n    const written: *u8 = &bytes[0]\n    const read: const(*u8) = written\n    return written.name() * 10 + read.name()\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39046,7 +39046,7 @@ test "findInstance: gives a writable many to an instance for the read-only form"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*const(many(u8)))\n\n    fn name(_: *const(many(u8))) -> u8 = 1\nfn through_constraint(type T: Name, value: T) -> u8 = Name::name(value)\nfn through_parameter(value: Name) -> u8 = value.name()\nfn run() -> u8\n    var bytes: [2]u8 = { 1, 2 }\n    bytes[0] = 3\n    const written: *many(u8) = bytes[..].pointer\n    const read: *const(many(u8)) = written\n    return written.name() * 100 + Name::name(written) * 10 + read.name() + through_constraint(*many(u8), written) + through_parameter(written) + through_constraint(*const(many(u8)), read)\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(const(*[many]u8))\n\n    fn name(_: const(*[many]u8)) -> u8 = 1\nfn through_constraint(type T: Name, value: T) -> u8 = Name::name(value)\nfn through_parameter(value: Name) -> u8 = value.name()\nfn run() -> u8\n    var bytes: [2]u8 = { 1, 2 }\n    bytes[0] = 3\n    const written: *[many]u8 = bytes[..].pointer\n    const read: const(*[many]u8) = written\n    return written.name() * 100 + Name::name(written) * 10 + read.name() + through_constraint(*[many]u8, written) + through_parameter(written) + through_constraint(const(*[many]u8), read)\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39074,7 +39074,7 @@ test "findInstance: rejects a read-only many for an instance of the writable for
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*many(u8))\n\n    fn name(_: *many(u8)) -> u8 = 1\nfn run() -> u8\n    const bytes: [2]u8 = { 1, 2 }\n    const read: *const(many(u8)) = bytes[..].pointer\n    return read.name()\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*[many]u8)\n\n    fn name(_: *[many]u8) -> u8 = 1\nfn run() -> u8\n    const bytes: [2]u8 = { 1, 2 }\n    const read: const(*[many]u8) = bytes[..].pointer\n    return read.name()\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39093,7 +39093,7 @@ test "findInstance: rejects a read-only many for an instance of the writable for
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*many(u8))\n\n    fn name(_: *many(u8)) -> u8 = 1\nfn run() -> u8\n    const bytes: [2]u8 = { 1, 2 }\n    const read: *const(many(u8)) = bytes[..].pointer\n    return Name::name(read)\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*[many]u8)\n\n    fn name(_: *[many]u8) -> u8 = 1\nfn run() -> u8\n    const bytes: [2]u8 = { 1, 2 }\n    const read: const(*[many]u8) = bytes[..].pointer\n    return Name::name(read)\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39112,7 +39112,7 @@ test "findInstance: picks the exact instance of a many when both forms are decla
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*many(u8))\n\n    fn name(_: *many(u8)) -> u8 = 1\ninstance Name(*const(many(u8)))\n\n    fn name(_: *const(many(u8))) -> u8 = 2\nfn run() -> u8\n    var bytes: [2]u8 = { 1, 2 }\n    bytes[0] = 3\n    const written: *many(u8) = bytes[..].pointer\n    const read: *const(many(u8)) = written\n    return written.name() * 10 + read.name()\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*[many]u8)\n\n    fn name(_: *[many]u8) -> u8 = 1\ninstance Name(const(*[many]u8))\n\n    fn name(_: const(*[many]u8)) -> u8 = 2\nfn run() -> u8\n    var bytes: [2]u8 = { 1, 2 }\n    bytes[0] = 3\n    const written: *[many]u8 = bytes[..].pointer\n    const read: const(*[many]u8) = written\n    return written.name() * 10 + read.name()\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39149,6 +39149,25 @@ test "findInstance: rejects a slice for an instance over a pointer to one value"
     try std.testing.expectEqual(token.Location{ .row = 12, .column = 32 }, analyzer.failure.?.location.?);
 }
 
+test "findInstance: rejects a many pointer for an instance over a pointer to one value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance(type T) Name(*T)\n\n    fn name(_: *T) -> u8 = 1\nfn run() -> u8\n    var bytes: [2]u8 = { 1, 2 }\n    bytes[0] = 3\n    const single = Name::name(&bytes[0])\n    const run: *[many]u8 = bytes[..].pointer\n    return single + Name::name(run)\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NoInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 12, .column = 32 }, analyzer.failure.?.location.?);
+}
+
 test "findInstance: leaves the flag of an inner slice alone" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -39159,7 +39178,7 @@ test "findInstance: leaves the flag of an inner slice alone" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*[]*const([]u8))\n\n    fn name(_: *[]*const([]u8)) -> u8 = 1\nfn run(items: *[]*[]u8) -> u8 = Name::name(items)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*[]const(*[]u8))\n\n    fn name(_: *[]const(*[]u8)) -> u8 = 1\nfn run(items: *[]*[]u8) -> u8 = Name::name(items)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39178,7 +39197,7 @@ test "findInstance: leaves the flag of an inner slice alone behind a relaxed out
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*const([]*const([]u8)))\n\n    fn name(_: *const([]*const([]u8))) -> u8 = 1\nfn run(items: *[]*[]u8) -> u8 = Name::name(items)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(const(*[]const(*[]u8)))\n\n    fn name(_: const(*[]const(*[]u8))) -> u8 = 1\nfn run(items: *[]*[]u8) -> u8 = Name::name(items)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39197,7 +39216,7 @@ test "checkFunctionCall: rejects a nested writable slice as an argument for a ne
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(_: *[]*const([]u8)) = noop\nfn run(items: *[]*[]u8) = take(items)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(_: *[]const(*[]u8)) = noop\nfn run(items: *[]*[]u8) = take(items)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39216,7 +39235,7 @@ test "findInstance: keeps a target chosen by a type argument exact" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass To(type T, type U)\n\n    fn to(value: T, type U) -> !U\nstruct Data\n    number: u8\ninstance To(Data, *const([]u8))\n\n    fn to(_: Data, type U) -> !U = \"text\"\nfn run(data: Data) -> usize\n    const text = data.to(*[]u8) catch return 0\n    return text.length\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass To(type T, type U)\n\n    fn to(value: T, type U) -> !U\nstruct Data\n    number: u8\ninstance To(Data, const(*[]u8))\n\n    fn to(_: Data, type U) -> !U = \"text\"\nfn run(data: Data) -> usize\n    const text = data.to(*[]u8) catch return 0\n    return text.length\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39235,7 +39254,7 @@ test "findInstance: keeps a read-only target exact" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass To(type T, type U)\n\n    fn to(value: T, type U) -> !U\nstruct Data\n    number: u8\ninstance To(Data, *[]u8)\n\n    fn to(_: Data, type U) -> !U = {}\nfn run(data: Data) -> usize\n    const text = data.to(*const([]u8)) catch return 0\n    return text.length\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass To(type T, type U)\n\n    fn to(value: T, type U) -> !U\nstruct Data\n    number: u8\ninstance To(Data, *[]u8)\n\n    fn to(_: Data, type U) -> !U = {}\nfn run(data: Data) -> usize\n    const text = data.to(const(*[]u8)) catch return 0\n    return text.length\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39254,7 +39273,7 @@ test "findInstance: accepts a requirement met by the read-only form" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Same(type T)\n\n    fn same(one: T) -> u8\ntypeclass Order(type T: Same)\n\n    fn order(one: T) -> u8\ninstance Same(*const([]u8))\n\n    fn same(_: *const([]u8)) -> u8 = 1\ninstance Order(*[]u8)\n\n    fn order(_: *[]u8) -> u8 = 2\nfn run() -> u8\n    var bytes: [1]u8 = { 1 }\n    bytes[0] = 2\n    const written: *[]u8 = bytes[..]\n    return Order::order(written)\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Same(type T)\n\n    fn same(one: T) -> u8\ntypeclass Order(type T: Same)\n\n    fn order(one: T) -> u8\ninstance Same(const(*[]u8))\n\n    fn same(_: const(*[]u8)) -> u8 = 1\ninstance Order(*[]u8)\n\n    fn order(_: *[]u8) -> u8 = 2\nfn run() -> u8\n    var bytes: [1]u8 = { 1 }\n    bytes[0] = 2\n    const written: *[]u8 = bytes[..]\n    return Order::order(written)\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39282,7 +39301,7 @@ test "findInstance: rejects a requirement that only the writable form meets" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Same(type T)\n\n    fn same(one: T) -> u8\ntypeclass Order(type T: Same)\n\n    fn order(one: T) -> u8\ninstance Same(*[]u8)\n\n    fn same(_: *[]u8) -> u8 = 1\ninstance Order(*const([]u8))\n\n    fn order(_: *const([]u8)) -> u8 = 2\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Same(type T)\n\n    fn same(one: T) -> u8\ntypeclass Order(type T: Same)\n\n    fn order(one: T) -> u8\ninstance Same(*[]u8)\n\n    fn same(_: *[]u8) -> u8 = 1\ninstance Order(const(*[]u8))\n\n    fn order(_: const(*[]u8)) -> u8 = 2\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39429,7 +39448,7 @@ test "findInstance: keeps an exact generic instance ahead of a more specific ins
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T)\n\n    fn show(value: T) -> u32\ninstance(type A) Show(*[]A)\n\n    fn show(_: *[]A) -> u32 = 1\ninstance Show(*const([]u8))\n\n    fn show(_: *const([]u8)) -> u32 = 2\nfn run() -> u32\n    var bytes: [2]u8 = { 1, 2 }\n    bytes[0] = 3\n    const writable: *[]u8 = bytes[..]\n    const constant: *const([]u8) = bytes[..]\n    return Show::show(writable) * 10 + Show::show(constant)\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Show(type T)\n\n    fn show(value: T) -> u32\ninstance(type A) Show(*[]A)\n\n    fn show(_: *[]A) -> u32 = 1\ninstance Show(const(*[]u8))\n\n    fn show(_: const(*[]u8)) -> u32 = 2\nfn run() -> u32\n    var bytes: [2]u8 = { 1, 2 }\n    bytes[0] = 3\n    const writable: *[]u8 = bytes[..]\n    const constant: const(*[]u8) = bytes[..]\n    return Show::show(writable) * 10 + Show::show(constant)\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39451,7 +39470,7 @@ test "findEarlierInstance: rejects the same form twice beside the other form" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*[]u8)\n\n    fn name(_: *[]u8) -> u8 = 1\ninstance Name(*const([]u8))\n\n    fn name(_: *const([]u8)) -> u8 = 2\ninstance Name(*const([]u8))\n\n    fn name(_: *const([]u8)) -> u8 = 3\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Name(type T)\n\n    fn name(value: T) -> u8\ninstance Name(*[]u8)\n\n    fn name(_: *[]u8) -> u8 = 1\ninstance Name(const(*[]u8))\n\n    fn name(_: const(*[]u8)) -> u8 = 2\ninstance Name(const(*[]u8))\n\n    fn name(_: const(*[]u8)) -> u8 = 3\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39565,7 +39584,7 @@ test "integration: rejects the default placeholder with a byte slice in text::fo
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::text\nstruct Data\n    value: u8\nfn main -> !void\n    const bytes: *const([]u8) = \"b\"\n    const found = try text::format(\"{}\", { bytes })\n    memory::free(found)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::text\nstruct Data\n    value: u8\nfn main -> !void\n    const bytes: const(*[]u8) = \"b\"\n    const found = try text::format(\"{}\", { bytes })\n    memory::free(found)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39698,7 +39717,7 @@ test "checkImplicitArgument: takes a read-only pointer for an instance that only
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Count(type C)\n\n    fn count(value: *C) -> u8\n    fn twice(value: *C) -> u8 = Count::count(value) * 2\n    fn first(value: *C, comptime extra: u8) -> u8 = Count::count(value) + extra\n\nstruct Reading\n    number: u8\n\nstruct Writing\n    number: u8\n\ninstance Count(Reading)\n\n    fn count(value: *const(Reading)) -> u8 = value.number\n\ninstance Count(Writing)\n\n    fn count(value: *Writing) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Count) -> u8 = Count::count(counter)\nfn through_default(counter: *Count) -> u8 = counter.twice()\nconst READING = Reading{ number = 3 }\nfn run() -> u8\n    const fixed = Reading{ number = 4 }\n    var changing = Reading{ number = 5 }\n    var writing = Writing{ number = 6 }\n    return fixed.count() + changing.count() + writing.count()\nconst DIRECT = run()\nfn run_generic() -> u8\n    const fixed = Reading{ number = 4 }\n    var changing = Reading{ number = 5 }\n    var writing = Writing{ number = 6 }\n    return through(&fixed) + through(&changing) + through(&writing)\nconst GENERIC = run_generic()\nfn run_default() -> u8\n    const fixed = Reading{ number = 4 }\n    return fixed.twice() + fixed.first(1) + through_default(&fixed)\nconst DEFAULT = run_default()\nfn run_pointer() -> u8\n    const fixed = Reading{ number = 4 }\n    const pointer: *const(Reading) = &fixed\n    return pointer.count() + through(pointer) + pointer.twice()\nconst POINTER = run_pointer()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Count(type C)\n\n    fn count(value: *C) -> u8\n    fn twice(value: *C) -> u8 = Count::count(value) * 2\n    fn first(value: *C, comptime extra: u8) -> u8 = Count::count(value) + extra\n\nstruct Reading\n    number: u8\n\nstruct Writing\n    number: u8\n\ninstance Count(Reading)\n\n    fn count(value: const(*Reading)) -> u8 = value.number\n\ninstance Count(Writing)\n\n    fn count(value: *Writing) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Count) -> u8 = Count::count(counter)\nfn through_default(counter: *Count) -> u8 = counter.twice()\nconst READING = Reading{ number = 3 }\nfn run() -> u8\n    const fixed = Reading{ number = 4 }\n    var changing = Reading{ number = 5 }\n    var writing = Writing{ number = 6 }\n    return fixed.count() + changing.count() + writing.count()\nconst DIRECT = run()\nfn run_generic() -> u8\n    const fixed = Reading{ number = 4 }\n    var changing = Reading{ number = 5 }\n    var writing = Writing{ number = 6 }\n    return through(&fixed) + through(&changing) + through(&writing)\nconst GENERIC = run_generic()\nfn run_default() -> u8\n    const fixed = Reading{ number = 4 }\n    return fixed.twice() + fixed.first(1) + through_default(&fixed)\nconst DEFAULT = run_default()\nfn run_pointer() -> u8\n    const fixed = Reading{ number = 4 }\n    const pointer: const(*Reading) = &fixed\n    return pointer.count() + through(pointer) + pointer.twice()\nconst POINTER = run_pointer()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39738,7 +39757,7 @@ test "checkImplicitArgument: rejects a read-only pointer at the call for an inst
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Count(type C)\n\n    fn count(value: *C) -> u8\n    fn twice(value: *C) -> u8 = Count::count(value) * 2\n    fn first(value: *C, comptime extra: u8) -> u8 = Count::count(value) + extra\n\nstruct Reading\n    number: u8\n\nstruct Writing\n    number: u8\n\ninstance Count(Reading)\n\n    fn count(value: *const(Reading)) -> u8 = value.number\n\ninstance Count(Writing)\n\n    fn count(value: *Writing) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Count) -> u8 = Count::count(counter)\nfn through_default(counter: *Count) -> u8 = counter.twice()\nfn run() -> u8\n    const fixed = Writing{ number = 4 }\n    return through(&fixed)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Count(type C)\n\n    fn count(value: *C) -> u8\n    fn twice(value: *C) -> u8 = Count::count(value) * 2\n    fn first(value: *C, comptime extra: u8) -> u8 = Count::count(value) + extra\n\nstruct Reading\n    number: u8\n\nstruct Writing\n    number: u8\n\ninstance Count(Reading)\n\n    fn count(value: const(*Reading)) -> u8 = value.number\n\ninstance Count(Writing)\n\n    fn count(value: *Writing) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Count) -> u8 = Count::count(counter)\nfn through_default(counter: *Count) -> u8 = counter.twice()\nfn run() -> u8\n    const fixed = Writing{ number = 4 }\n    return through(&fixed)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39757,7 +39776,7 @@ test "checkImplicitArgument: rejects a read-only pointer held in a variable for 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Count(type C)\n\n    fn count(value: *C) -> u8\n    fn twice(value: *C) -> u8 = Count::count(value) * 2\n    fn first(value: *C, comptime extra: u8) -> u8 = Count::count(value) + extra\n\nstruct Reading\n    number: u8\n\nstruct Writing\n    number: u8\n\ninstance Count(Reading)\n\n    fn count(value: *const(Reading)) -> u8 = value.number\n\ninstance Count(Writing)\n\n    fn count(value: *Writing) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Count) -> u8 = Count::count(counter)\nfn through_default(counter: *Count) -> u8 = counter.twice()\nfn run(pointer: *const(Writing)) -> u8 = through(pointer)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Count(type C)\n\n    fn count(value: *C) -> u8\n    fn twice(value: *C) -> u8 = Count::count(value) * 2\n    fn first(value: *C, comptime extra: u8) -> u8 = Count::count(value) + extra\n\nstruct Reading\n    number: u8\n\nstruct Writing\n    number: u8\n\ninstance Count(Reading)\n\n    fn count(value: const(*Reading)) -> u8 = value.number\n\ninstance Count(Writing)\n\n    fn count(value: *Writing) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Count) -> u8 = Count::count(counter)\nfn through_default(counter: *Count) -> u8 = counter.twice()\nfn run(pointer: const(*Writing)) -> u8 = through(pointer)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39776,7 +39795,7 @@ test "resolveTypeclassCall: rejects a read-only pointer for an instance that wri
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Count(type C)\n\n    fn count(value: *C) -> u8\n    fn twice(value: *C) -> u8 = Count::count(value) * 2\n    fn first(value: *C, comptime extra: u8) -> u8 = Count::count(value) + extra\n\nstruct Reading\n    number: u8\n\nstruct Writing\n    number: u8\n\ninstance Count(Reading)\n\n    fn count(value: *const(Reading)) -> u8 = value.number\n\ninstance Count(Writing)\n\n    fn count(value: *Writing) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Count) -> u8 = Count::count(counter)\nfn through_default(counter: *Count) -> u8 = counter.twice()\nfn run(pointer: *const(Writing)) -> u8 = Count::count(pointer)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Count(type C)\n\n    fn count(value: *C) -> u8\n    fn twice(value: *C) -> u8 = Count::count(value) * 2\n    fn first(value: *C, comptime extra: u8) -> u8 = Count::count(value) + extra\n\nstruct Reading\n    number: u8\n\nstruct Writing\n    number: u8\n\ninstance Count(Reading)\n\n    fn count(value: const(*Reading)) -> u8 = value.number\n\ninstance Count(Writing)\n\n    fn count(value: *Writing) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Count) -> u8 = Count::count(counter)\nfn through_default(counter: *Count) -> u8 = counter.twice()\nfn run(pointer: const(*Writing)) -> u8 = Count::count(pointer)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39795,7 +39814,7 @@ test "buildReceiver: rejects a method on a constant for an instance that writes"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Count(type C)\n\n    fn count(value: *C) -> u8\n    fn twice(value: *C) -> u8 = Count::count(value) * 2\n    fn first(value: *C, comptime extra: u8) -> u8 = Count::count(value) + extra\n\nstruct Reading\n    number: u8\n\nstruct Writing\n    number: u8\n\ninstance Count(Reading)\n\n    fn count(value: *const(Reading)) -> u8 = value.number\n\ninstance Count(Writing)\n\n    fn count(value: *Writing) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Count) -> u8 = Count::count(counter)\nfn through_default(counter: *Count) -> u8 = counter.twice()\nfn run() -> u8\n    const fixed = Writing{ number = 4 }\n    return fixed.count()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Count(type C)\n\n    fn count(value: *C) -> u8\n    fn twice(value: *C) -> u8 = Count::count(value) * 2\n    fn first(value: *C, comptime extra: u8) -> u8 = Count::count(value) + extra\n\nstruct Reading\n    number: u8\n\nstruct Writing\n    number: u8\n\ninstance Count(Reading)\n\n    fn count(value: const(*Reading)) -> u8 = value.number\n\ninstance Count(Writing)\n\n    fn count(value: *Writing) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Count) -> u8 = Count::count(counter)\nfn through_default(counter: *Count) -> u8 = counter.twice()\nfn run() -> u8\n    const fixed = Writing{ number = 4 }\n    return fixed.count()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39814,7 +39833,7 @@ test "buildReceiver: rejects a default on a constant for an instance that writes
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Count(type C)\n\n    fn count(value: *C) -> u8\n    fn twice(value: *C) -> u8 = Count::count(value) * 2\n    fn first(value: *C, comptime extra: u8) -> u8 = Count::count(value) + extra\n\nstruct Reading\n    number: u8\n\nstruct Writing\n    number: u8\n\ninstance Count(Reading)\n\n    fn count(value: *const(Reading)) -> u8 = value.number\n\ninstance Count(Writing)\n\n    fn count(value: *Writing) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Count) -> u8 = Count::count(counter)\nfn through_default(counter: *Count) -> u8 = counter.twice()\nfn run() -> u8\n    const fixed = Writing{ number = 4 }\n    return fixed.twice()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Count(type C)\n\n    fn count(value: *C) -> u8\n    fn twice(value: *C) -> u8 = Count::count(value) * 2\n    fn first(value: *C, comptime extra: u8) -> u8 = Count::count(value) + extra\n\nstruct Reading\n    number: u8\n\nstruct Writing\n    number: u8\n\ninstance Count(Reading)\n\n    fn count(value: const(*Reading)) -> u8 = value.number\n\ninstance Count(Writing)\n\n    fn count(value: *Writing) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Count) -> u8 = Count::count(counter)\nfn through_default(counter: *Count) -> u8 = counter.twice()\nfn run() -> u8\n    const fixed = Writing{ number = 4 }\n    return fixed.twice()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39833,7 +39852,7 @@ test "checkImplicitArgument: rejects a read-only pointer for an instance where o
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Both(type C)\n\n    fn reads(value: *C) -> u8\n    fn writes(value: *C) -> u8\n    fn more(value: *C) -> u8 = Both::reads(value)\n\nstruct Mixed\n    number: u8\n\ninstance Both(Mixed)\n\n    fn reads(value: *const(Mixed)) -> u8 = value.number\n    fn writes(value: *Mixed) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Both) -> u8 = Both::reads(counter)\nfn run() -> u8\n    const fixed = Mixed{ number = 4 }\n    return through(&fixed)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Both(type C)\n\n    fn reads(value: *C) -> u8\n    fn writes(value: *C) -> u8\n    fn more(value: *C) -> u8 = Both::reads(value)\n\nstruct Mixed\n    number: u8\n\ninstance Both(Mixed)\n\n    fn reads(value: const(*Mixed)) -> u8 = value.number\n    fn writes(value: *Mixed) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Both) -> u8 = Both::reads(counter)\nfn run() -> u8\n    const fixed = Mixed{ number = 4 }\n    return through(&fixed)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39852,7 +39871,7 @@ test "resolveInstance: lets each function of an instance choose a read-only poin
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Both(type C)\n\n    fn reads(value: *C) -> u8\n    fn writes(value: *C) -> u8\n    fn more(value: *C) -> u8 = Both::reads(value)\n\nstruct Mixed\n    number: u8\n\ninstance Both(Mixed)\n\n    fn reads(value: *const(Mixed)) -> u8 = value.number\n    fn writes(value: *Mixed) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Both) -> u8 = Both::reads(counter)\nfn run() -> u8\n    const fixed = Mixed{ number = 4 }\n    var changing = Mixed{ number = 5 }\n    return fixed.reads() + changing.writes() + changing.more()\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Both(type C)\n\n    fn reads(value: *C) -> u8\n    fn writes(value: *C) -> u8\n    fn more(value: *C) -> u8 = Both::reads(value)\n\nstruct Mixed\n    number: u8\n\ninstance Both(Mixed)\n\n    fn reads(value: const(*Mixed)) -> u8 = value.number\n    fn writes(value: *Mixed) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Both) -> u8 = Both::reads(counter)\nfn run() -> u8\n    const fixed = Mixed{ number = 4 }\n    var changing = Mixed{ number = 5 }\n    return fixed.reads() + changing.writes() + changing.more()\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39880,7 +39899,7 @@ test "buildReceiver: keeps a default writable on a constant where only some func
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Both(type C)\n\n    fn reads(value: *C) -> u8\n    fn writes(value: *C) -> u8\n    fn more(value: *C) -> u8 = Both::reads(value)\n\nstruct Mixed\n    number: u8\n\ninstance Both(Mixed)\n\n    fn reads(value: *const(Mixed)) -> u8 = value.number\n    fn writes(value: *Mixed) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Both) -> u8 = Both::reads(counter)\nfn run() -> u8\n    const fixed = Mixed{ number = 4 }\n    return fixed.more()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Both(type C)\n\n    fn reads(value: *C) -> u8\n    fn writes(value: *C) -> u8\n    fn more(value: *C) -> u8 = Both::reads(value)\n\nstruct Mixed\n    number: u8\n\ninstance Both(Mixed)\n\n    fn reads(value: const(*Mixed)) -> u8 = value.number\n    fn writes(value: *Mixed) -> u8\n        value.number += 1\n        return value.number\n\nfn through(counter: *Both) -> u8 = Both::reads(counter)\nfn run() -> u8\n    const fixed = Mixed{ number = 4 }\n    return fixed.more()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39899,7 +39918,7 @@ test "resolveInstance: rejects a writable pointer where the typeclass says read-
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Peek(type C)\n\n    fn peek(value: *const(C)) -> u8\nstruct Data\n    number: u8\ninstance Peek(Data)\n\n    fn peek(value: *Data) -> u8 = value.number\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Peek(type C)\n\n    fn peek(value: const(*C)) -> u8\nstruct Data\n    number: u8\ninstance Peek(Data)\n\n    fn peek(value: *Data) -> u8 = value.number\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -39937,7 +39956,7 @@ test "resolveInstance: rejects a read-only pointer where the typeclass names a f
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Peek(type C)\n\n    fn peek(value: C, other: *u8) -> u8\nstruct Data\n    number: u8\ninstance Peek(Data)\n\n    fn peek(value: Data, other: *const(u8)) -> u8 = value.number + other.*\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Peek(type C)\n\n    fn peek(value: C, other: *u8) -> u8\nstruct Data\n    number: u8\ninstance Peek(Data)\n\n    fn peek(value: Data, other: const(*u8)) -> u8 = value.number + other.*\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -40013,7 +40032,7 @@ test "integration: rejects a read-only pointer to a list for a generic writer th
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container\nimport mn::stream::Writer\nfn emit(writer: *Writer) -> !void\n    try writer.write(\"x\")\nfn run(text: *const(mn::container::ArrayList(u8))) -> !void = emit(text)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container\nimport mn::stream::Writer\nfn emit(writer: *Writer) -> !void\n    try writer.write(\"x\")\nfn run(text: const(*mn::container::ArrayList(u8))) -> !void = emit(text)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
