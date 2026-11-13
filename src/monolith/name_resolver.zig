@@ -15757,6 +15757,25 @@ test "resolveImport: binds the names after as in a group" {
     try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 1, .declaration = 0 } }, body[1].kind.call.kind.call.callee.path_expression.resolution.?);
 }
 
+test "resolveImport: imports each name of a group after private as crossing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "private fn helper() -> u8 = 1\n\n\nprivate struct Slot\n    value: u8\n\n\nfn open() -> u8 = helper() + Slot{ value = 1 }.value\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import things::private::{ helper, Slot as Place }\n\nfn main\n    const slot: Place = { value = helper() }\n    _ = slot.value\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
 test "resolveImport: binds a name in the whole module" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

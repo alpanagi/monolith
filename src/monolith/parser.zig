@@ -1783,10 +1783,11 @@ pub const Parser = struct {
             offset.* = position;
             return try allocator.dupe(ast.Declaration, &.{.{ .kind = .{ .import = import }, .location = keyword.location }});
         }
+        const crossing = try self.matchCrossing(&position, .double_colon);
         _ = try self.expect(&position, .left_brace, error.ExpectedLeftBrace);
         var declarations: std.ArrayList(ast.Declaration) = .empty;
         while (true) {
-            try declarations.append(allocator, try self.parseImportItem(allocator, &position, prefix));
+            try declarations.append(allocator, try self.parseImportItem(allocator, &position, prefix, crossing));
             if (self.match(&position, .comma) == null) break;
         }
         _ = try self.expect(&position, .right_brace, error.ExpectedRightBrace);
@@ -1800,6 +1801,7 @@ pub const Parser = struct {
         allocator: std.mem.Allocator,
         offset: *usize,
         prefix: ast.PathExpression,
+        crossing: bool,
     ) ParseError!ast.Declaration {
         var position = offset.*;
         const start = position;
@@ -1807,13 +1809,17 @@ pub const Parser = struct {
         if (item.kind == .keyword_private) return self.fail(start, error.MisplacedPrivate);
         const written: ast.PathExpression = written: {
             if (item.kind == .identifier and std.mem.eql(u8, item.kind.identifier, "self")) {
+                if (crossing) return self.fail(start, error.MisplacedPrivate);
                 position += 1;
                 break :written prefix;
             }
             const name = try self.expectName(&position);
             const path = try std.mem.concat(allocator, []const u8, &.{ prefix.path, &.{name} });
-            if (prefix.crossings.len == 0) break :written .{ .path = path };
-            const crossings = try std.mem.concat(allocator, bool, &.{ prefix.crossings, &.{false} });
+            if (!crossing and prefix.crossings.len == 0) break :written .{ .path = path };
+            const crossings = try allocator.alloc(bool, path.len);
+            @memset(crossings, false);
+            @memcpy(crossings[0..prefix.crossings.len], prefix.crossings);
+            crossings[prefix.path.len] = crossing;
             break :written .{ .path = path, .crossings = crossings };
         };
         const import = try self.parseImportName(&position, start, written);
@@ -2568,7 +2574,7 @@ pub const Parser = struct {
         try path.append(allocator, first);
         try crossings.append(allocator, false);
         while (self.tokens[position].kind == .double_colon) {
-            if (before_group and self.tokens[position + 1].kind == .left_brace) break;
+            if (before_group and self.isGroupStart(position + 1)) break;
             position += 1;
             const crossing = try self.matchCrossing(&position, .double_colon);
             crossed = crossed or crossing;
@@ -2578,6 +2584,12 @@ pub const Parser = struct {
 
         offset.* = position;
         return .{ .path = path.items, .crossings = if (crossed) crossings.items else &.{} };
+    }
+
+    fn isGroupStart(self: *const Parser, offset: usize) bool {
+        if (self.tokens[offset].kind == .left_brace) return true;
+        if (self.tokens[offset].kind != .keyword_private or self.tokens[offset + 1].kind != .double_colon) return false;
+        return self.tokens[offset + 2].kind == .left_brace;
     }
 
     fn matchCrossing(self: *Parser, offset: *usize, separator: std.meta.Tag(token.TokenKind)) ParseError!bool {
@@ -7223,6 +7235,17 @@ test "parseImport: rejects a group nested in a group" {
 
     try std.testing.expectError(error.ExpectedRightBrace, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
+}
+
+test "parseImport: rejects self in a group after private as private without a name after it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("import mn::filesystem::private::{ self }");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedPrivate, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 35 }, parser.failure.?.location.?);
 }
 
 test "parseImport: rejects a path as an item of a group" {
