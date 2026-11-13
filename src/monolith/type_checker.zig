@@ -25514,6 +25514,30 @@ test "resolveMethodCall: calls a function of a typeclass imported under another 
     try type_checker.check();
 }
 
+test "resolveMethodCall: calls a function of a typeclass imported through a group" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "typeclass Shape(type T)\n\n    fn area(self: T) -> i32\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes::{ self, Shape }\nstruct Square\n    side: i32\ninstance shapes::Shape(Square)\n\n    fn area(self: Square) -> i32 = return self.side\nfn show(square: Square) -> i32 = return square.area()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("name_resolver.zig").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    var type_checker = TypeChecker.init(&arena, .{ .modules = loader.modules.items, .types = &type_registry });
+    try type_checker.check();
+
+    const body = loader.modules.items[0].declarations[5].kind.function_definition.body;
+    const callee = body[0].kind.@"return".?.kind.call.callee.identifier;
+    try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 0, .declaration = 4 } }, callee.resolution.?);
+}
+
 test "resolveMethodCall: calls the function of the struct's block over a typeclass's function" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

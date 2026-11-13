@@ -2,6 +2,8 @@
 
 - A module starts with its imports, then its external functions, then its constants, then its other declarations.
 - Imports come in two groups, separated by a blank line: first those from `mn`, then the program's own, e.g. `import mn::process::stdout` before `import cards::Card`. Each group is in alphabetical order, with uppercase before lowercase, e.g. `mn::process::Stdout` before `mn::process::stdin`.
+- Two or more imports from one module are written as one group, the module itself included as `self`, e.g. `import mn::codec::{ self, Decode, Decoder }` instead of `import mn::codec`, `import mn::codec::Decode` and `import mn::codec::Decoder`. A single import is written without braces, e.g. `import mn::compare::Equal`, not `import mn::compare::{ Equal }`.
+- Inside the braces `self` comes first, then the names in the order imports have, e.g. `{ self, Decode, Decoder, Encode, Encoder }`. A group stands where its path would, e.g. `import mn::codec::{ self, Decode }` before `import mn::compare::Equal`.
 - External functions and constants are each in alphabetical order.
 - Declarations that belong together stay together, the module's main ones first, and a helper comes after the first declaration that uses it.
 - A module is named after its topic, in the singular, e.g. `container`, `iterator`, `memory`. The name is a whole word, e.g. `filesystem`, not `fs`. The name says what the module is about, not what it holds, so it stays right when the module grows.

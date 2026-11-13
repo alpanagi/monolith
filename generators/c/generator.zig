@@ -11517,6 +11517,35 @@ test "integration: parses bytes in base64 through the standard library" {
     try std.testing.expectEqual(0, result.term.exited);
 }
 
+test "integration: generates the same C for a group as for single imports through the standard library" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    const sources = [_][]const u8{
+        "import mn::text::{ self as words, Parser as TextParser }\nfn main -> !void\n    const value = try words::strip(\" 12 \").parse(u8)\n    _ = value\n",
+        "import mn::text as words\nimport mn::text::Parser as TextParser\nfn main -> !void\n    const value = try words::strip(\" 12 \").parse(u8)\n    _ = value\n",
+    };
+    var generated: [sources.len][]const File = undefined;
+    for (sources, &generated) |source, *files| {
+        var loader = @import("monolith").Loader.init(program_path, "library");
+        try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = source });
+        try loader.loadMainModule(&arena, std.testing.io, "main");
+        var type_registry: types.Registry = .{};
+        var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+        var generator = Generator.init(try analyzer.analyze());
+        files.* = try generator.generateFiles(allocator);
+    }
+
+    try std.testing.expectEqual(generated[1].len, generated[0].len);
+    for (generated[0], generated[1]) |group, single| {
+        try std.testing.expectEqualStrings(single.path, group.path);
+        try std.testing.expectEqualStrings(single.contents, group.contents);
+    }
+}
+
 test "Generator.generate: builds an executable that formats into a list of bytes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

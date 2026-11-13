@@ -6940,6 +6940,26 @@ test "resolveModule: rejects two imports with the same name" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, name_resolver.failure.?.location.?);
 }
 
+test "resolveModule: rejects an item of a group named like another declaration at the item's name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn add() = noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn add() = noop\nimport utils::{ self, add }" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.DuplicateImport, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 23 }, name_resolver.failure.?.location.?);
+}
+
 test "resolveModule: rejects a declaration named like a module in the directory of its module" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -15671,6 +15691,70 @@ test "resolveImport: leaves the last name of the path unbound after as" {
 
     try std.testing.expectError(error.UnknownName, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 13 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveImport: binds the path and each name of a group with self" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn add() = noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils::{ self, add }\nfn main()\n    add()\n    utils::add()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[2].kind.function_definition.body;
+    try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 1, .declaration = 0 } }, body[0].kind.call.kind.call.callee.identifier.resolution.?);
+    try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 1, .declaration = 0 } }, body[1].kind.call.kind.call.callee.path_expression.resolution.?);
+}
+
+test "resolveImport: leaves the path of a group without self unbound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn add() = noop\nfn subtract() = noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils::{ add, subtract }\nfn main() = utils::add()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnknownName, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 13 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveImport: binds the names after as in a group" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "utils.mn", .data = "fn add() = noop" });
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import utils::{ self as tools, add as plus }\nfn main()\n    plus()\n    tools::add()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const body = loader.modules.items[0].declarations[2].kind.function_definition.body;
+    try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 1, .declaration = 0 } }, body[0].kind.call.kind.call.callee.identifier.resolution.?);
+    try std.testing.expectEqual(ast.Resolution{ .function = .{ .module = 1, .declaration = 0 } }, body[1].kind.call.kind.call.callee.path_expression.resolution.?);
 }
 
 test "resolveImport: binds a name in the whole module" {
