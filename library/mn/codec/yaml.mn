@@ -5,6 +5,7 @@ import mn::codec::Decoder
 import mn::codec::Encode
 import mn::codec::Encoder
 import mn::container::ArrayList
+import mn::convert::View
 import mn::memory
 import mn::memory::Deinit
 import mn::stream::Reader
@@ -112,13 +113,13 @@ fn YamlEncoder(type W: Writer) -> type
         private fn find_top(self: *Self) -> *EncodeFrame
             const length = self.frames.length()
             if (length == 0) return &self.document
-            const frames = self.frames.items()
+            const frames = self.frames.view([]EncodeFrame)
             return &frames[length - 1]
 
 
         private fn close_finished_frames(self: *Self)
             while self.frames.length() > 0
-                const frame = self.frames.items()[self.frames.length() - 1]
+                const frame = self.frames.view([]const(EncodeFrame))[self.frames.length() - 1]
                 if (frame.remaining != 0 or frame.is_value_next or frame.budget != null) return
                 _ = self.frames.pop()
 
@@ -133,7 +134,7 @@ fn YamlEncoder(type W: Writer) -> type
 
         private fn close_value(self: *Self, mark: Mark) -> !void
             while self.frames.length() > mark.depth
-                const open = self.frames.items()[self.frames.length() - 1]
+                const open = self.frames.view([]const(EncodeFrame))[self.frames.length() - 1]
                 if (open.remaining != 0 or open.is_value_next) return Error::MissingPart
                 _ = self.frames.pop()
             const frame = self.find_top()
@@ -145,7 +146,7 @@ fn YamlEncoder(type W: Writer) -> type
         private fn settle(self: *Self) -> !void
             const frame = self.find_top()
             if (frame.budget != null or frame.is_value_next or self.pending.length() == 0) return
-            try Writer::write(self.writer, self.pending.items())
+            try Writer::write(self.writer, self.pending.view([]const(u8)))
             self.discard_pending()
 
 
@@ -222,7 +223,7 @@ struct YamlDecoder
         try read_input(reader, &input)
         var own decoder: Self = { nodes = ::init(), contents = ::init(), frames = ::init(), document = { kind = ::Document, node = 0, next = 0, remaining = 1, selected = null, budget = null }, has_unread_part = false }
         errdefer decoder.deinit(own)
-        var parser: Parser = { input = input.items(), position = 0, line_start = 0, depth = 0, nodes = &decoder.nodes, contents = &decoder.contents }
+        var parser: Parser = { input = input.view([]const(u8)), position = 0, line_start = 0, depth = 0, nodes = &decoder.nodes, contents = &decoder.contents }
         const root = try parser.parse_document()
         decoder.document.node = root
         decoder.document.next = root
@@ -240,7 +241,7 @@ struct YamlDecoder
 
     private fn open_collection(self: *Self, kind: NodeKind, frame_kind: FrameKind) -> (codec::Error || memory::Error)!usize
         const index = try self.take_part()
-        const node = self.nodes.items()[index]
+        const node = self.nodes.view([]const(Node))[index]
         if (node.kind != kind) return codec::Error::Malformed
         try self.frames.append({ kind = frame_kind, node = index, next = node.first, remaining = node.count, selected = null, budget = null })
         return node.count
@@ -248,13 +249,13 @@ struct YamlDecoder
 
     private fn take_scalar(self: *Self) -> codec::Error![]const(u8)
         const index = try self.take_part()
-        if (self.nodes.items()[index].kind != ::Scalar) return codec::Error::Malformed
+        if (self.nodes.view([]const(Node))[index].kind != ::Scalar) return codec::Error::Malformed
         return self.find_text(index)
 
 
     private fn take_plain(self: *Self) -> codec::Error![]const(u8)
         const index = try self.take_part()
-        const node = self.nodes.items()[index]
+        const node = self.nodes.view([]const(Node))[index]
         if (node.kind != ::Scalar or !node.is_plain) return codec::Error::Malformed
         return self.find_text(index)
 
@@ -282,24 +283,24 @@ struct YamlDecoder
         if frame.kind == ::Structure
             frame.selected = null
         else
-            frame.next = self.nodes.items()[frame.next].next
+            frame.next = self.nodes.view([]const(Node))[frame.next].next
 
 
     private fn find_text(self: *const(Self), index: usize) -> []const(u8)
-        const node = self.nodes.items()[index]
-        return self.contents.items()[node.start..node.start + node.length]
+        const node = self.nodes.view([]const(Node))[index]
+        return self.contents.view([]const(u8))[node.start..node.start + node.length]
 
 
     private fn find_top(self: *Self) -> *DecodeFrame
         const length = self.frames.length()
         if (length == 0) return &self.document
-        const frames = self.frames.items()
+        const frames = self.frames.view([]DecodeFrame)
         return &frames[length - 1]
 
 
     private fn close_finished_frames(self: *Self)
         while self.frames.length() > 0
-            const frame = self.frames.items()[self.frames.length() - 1]
+            const frame = self.frames.view([]const(DecodeFrame))[self.frames.length() - 1]
             if (frame.remaining != 0 or frame.selected != null or frame.budget != null) return
             _ = self.frames.pop()
 
@@ -315,7 +316,7 @@ struct YamlDecoder
 
     private fn close_value(self: *Self, mark: Mark)
         while self.frames.length() > mark.depth
-            const open = self.frames.items()[self.frames.length() - 1]
+            const open = self.frames.view([]const(DecodeFrame))[self.frames.length() - 1]
             if (open.remaining != 0 or open.selected != null) self.has_unread_part = true
             _ = self.frames.pop()
         const frame = self.find_top()
@@ -359,7 +360,7 @@ instance Decoder(YamlDecoder)
 
     fn is_present(self: *Self) -> !bool
         const index = try self.find_part()
-        const node = self.nodes.items()[index]
+        const node = self.nodes.view([]const(Node))[index]
         if (node.kind != ::Scalar or !node.is_plain or !is_null_text(self.find_text(index))) return true
         self.consume_part()
         return false
@@ -384,7 +385,7 @@ instance Decoder(YamlDecoder)
         self.close_finished_frames()
         const frame = self.find_top()
         if (frame.kind != ::Structure or frame.remaining == 0 or frame.selected != null) return codec::Error::Malformed
-        const nodes = self.nodes.items()
+        const nodes = self.nodes.view([]const(Node))
         var key = nodes[frame.node].first
         for _ in 0..nodes[frame.node].count / 2
             const value = nodes[key].next
@@ -942,7 +943,7 @@ private struct Parser
 
 
     fn check_new_key(self: *const(Self), mapping: usize, key: usize) -> codec::Error!void
-        const nodes = self.nodes.items()
+        const nodes = self.nodes.view([]const(Node))
         const name = self.find_text(key)
         var index = nodes[mapping].first
         for _ in 0..nodes[mapping].count / 2
@@ -951,8 +952,8 @@ private struct Parser
 
 
     fn find_text(self: *const(Self), index: usize) -> []const(u8)
-        const node = self.nodes.items()[index]
-        return self.contents.items()[node.start..node.start + node.length]
+        const node = self.nodes.view([]const(Node))[index]
+        return self.contents.view([]const(u8))[node.start..node.start + node.length]
 
 
     fn add_collection(self: *Self, kind: NodeKind) -> memory::Error!usize
@@ -969,7 +970,7 @@ private struct Parser
 
 
     fn attach(self: *Self, parent: usize, previous: ?usize, child: usize)
-        const nodes = self.nodes.items()
+        const nodes = self.nodes.view([]Node)
         if previous as index
             nodes[index].next = child
         else

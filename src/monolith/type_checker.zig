@@ -14645,13 +14645,13 @@ test "failMisplacedMove: rejects an element of a slice" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container::ArrayList\nimport mn::memory\nimport mn::memory::Deinit\n\nexternal fn finish(own path: []u8, hash: u64) -> u64\n\nstruct Record\n    own path: []u8\n    hash: u64\n\nstruct Inner\n    own record: Record\n    count: usize\n\nstruct Owner\n    own inner: Inner\n    size: usize\n\nstruct Pair\n    own one: []u8\n    own two: []u8\n\nfn make(size: usize) -> own memory::Error!Record\n    const own path = try memory::allocate(u8, size)\n    return { path = own path, hash = 0 }\n\nfn find(size: usize) -> own ?Record\n    if (size == 0) return null\n    const own record = make(size) catch return null\n    return record\n\nfn keep(own record: Record) -> u64 = finish(own record.path, record.hash)\n\nfn end(own record: *Record) = memory::free(own record.path)\n\nfn main -> !void\n    with memory::Heap\n    var own list = ArrayList(Record)::init()\n    defer list.deinit(own)\n    try list.append(try make(1))\n    const items = list.items()\n    _ = keep(own items[0])\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container::ArrayList\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\n\nexternal fn finish(own path: []u8, hash: u64) -> u64\n\nstruct Record\n    own path: []u8\n    hash: u64\n\nstruct Inner\n    own record: Record\n    count: usize\n\nstruct Owner\n    own inner: Inner\n    size: usize\n\nstruct Pair\n    own one: []u8\n    own two: []u8\n\nfn make(size: usize) -> own memory::Error!Record\n    const own path = try memory::allocate(u8, size)\n    return { path = own path, hash = 0 }\n\nfn find(size: usize) -> own ?Record\n    if (size == 0) return null\n    const own record = make(size) catch return null\n    return record\n\nfn keep(own record: Record) -> u64 = finish(own record.path, record.hash)\n\nfn end(own record: *Record) = memory::free(own record.path)\n\nfn main -> !void\n    with memory::Heap\n    var own list = ArrayList(Record)::init()\n    defer list.deinit(own)\n    try list.append(try make(1))\n    const items = list.view([]Record)\n    _ = keep(own items[0])\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.OwnMarkerMisplaced, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 43, .column = 14 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 44, .column = 14 }, analyzer.failure.?.location.?);
     try std.testing.expect(std.mem.indexOf(u8, analyzer.failure.?.message, "`items[0]`") != null);
 }
 
@@ -15405,13 +15405,13 @@ test "checkOwnDestination: rejects an element of a list in an own declaration" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Deinit\n\nstruct Record\n    own name: []u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: []u8\n\nfn bytes(size: usize) -> own memory::Error![]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nimport mn::container::ArrayList\n\nfn main -> !void\n    with memory::Heap\n    var own records = ArrayList(Record)::init()\n    defer records.deinit(own)\n    try records.append(Record{ name = {}, size = 1 })\n    const own first = records.items()[0]\n    _ = first\n\nexternal fn finish(own name: []u8, size: usize) -> usize\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\n\nstruct Record\n    own name: []u8\n    size: usize\n\nstruct Holder\n    record: Record\n\nstruct Plain\n    bytes: []u8\n\nfn bytes(size: usize) -> own memory::Error![]u8 = memory::allocate(u8, size)\n\nfn make(size: usize) -> own memory::Error!Record\n    const own name = try bytes(size)\n    return { name = own name, size = size }\n\nfn keep(own record: Record) -> usize = finish(own record.name, record.size)\n\nfn look(record: Record) -> usize = record.size\n\nfn share(holder: *const(Holder)) -> Record = { name = {}, size = holder.record.size }\n\nimport mn::container::ArrayList\n\nfn main -> !void\n    with memory::Heap\n    var own records = ArrayList(Record)::init()\n    defer records.deinit(own)\n    try records.append(Record{ name = {}, size = 1 })\n    const own first = records.view([]const(Record))[0]\n    _ = first\n\nexternal fn finish(own name: []u8, size: usize) -> usize\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.OwnNeedsClone, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 33, .column = 23 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 34, .column = 23 }, analyzer.failure.?.location.?);
 }
 
 test "checkOwnDestination: accepts the result of an own call and a moved name in an assignment to an own variable" {
@@ -16040,6 +16040,25 @@ test "integration: rejects a held value appended to a list through the standard 
     try std.testing.expectEqual(token.Location{ .row = 11, .column = 22 }, analyzer.failure.?.location.?);
 }
 
+test "integration: rejects a writable view of a list declared const own through the standard library" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::container::ArrayList\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\n\nfn main -> !void\n    with memory::Heap\n    const own list = ArrayList(u8)::init()\n    defer list.deinit(own)\n    _ = list.view([]u8)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NoInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 10, .column = 19 }, analyzer.failure.?.location.?);
+}
+
 test "integration: rejects a held key put in a map through the standard library" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -16050,13 +16069,13 @@ test "integration: rejects a held key put in a map through the standard library"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::container::ArrayList\nimport mn::container::HashMap\nimport mn::memory\nimport mn::memory::Deinit\n\nfn main -> !void\n    with memory::Heap\n    var own keys = ArrayList(ArrayList(u8))::init()\n    defer keys.deinit(own)\n    try keys.append(ArrayList(u8)::init())\n    var own map = HashMap([]u8, ArrayList(u8))::init()\n    defer map.deinit(own)\n    const key: []u8 = {}\n    const own previous = try map.put(&key, keys.items()[0])\n    _ = previous\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::container::ArrayList\nimport mn::container::HashMap\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\n\nfn main -> !void\n    with memory::Heap\n    var own keys = ArrayList(ArrayList(u8))::init()\n    defer keys.deinit(own)\n    try keys.append(ArrayList(u8)::init())\n    var own map = HashMap([]u8, ArrayList(u8))::init()\n    defer map.deinit(own)\n    const key: []u8 = {}\n    const own previous = try map.put(&key, keys.view([]const(ArrayList(u8)))[0])\n    _ = previous\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.OwnNeedsClone, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 14, .column = 44 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 15, .column = 44 }, analyzer.failure.?.location.?);
 }
 
 test "integration: rejects a path from text in a declaration that is not own through the standard library" {
@@ -16308,13 +16327,13 @@ test "integration: moves a name whose address deinit takes with own through the 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::container::ArrayList\nimport mn::memory\nimport mn::memory::Deinit\n\nfn main -> !void\n    with memory::Heap\n    var own list = ArrayList(u8)::init()\n    list.deinit(own)\n    _ = list.items()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::container::ArrayList\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\n\nfn main -> !void\n    with memory::Heap\n    var own list = ArrayList(u8)::init()\n    list.deinit(own)\n    _ = list.view([]const(u8))\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.OwnNameMoved, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 9, .column = 9 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 10, .column = 9 }, analyzer.failure.?.location.?);
 }
 
 test "integration: rejects a deferred deinit of a name freed again before the end of its block through the standard library" {
@@ -16346,7 +16365,7 @@ test "integration: frees a name at the end of its block with a deferred deinit t
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::container::ArrayList\nimport mn::memory\nimport mn::memory::Deinit\n\nfn main -> !void\n    with memory::Heap\n    var own list = ArrayList(u8)::init()\n    defer list.deinit(own)\n    try list.append(1)\n    _ = list.items()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::container::ArrayList\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\n\nfn main -> !void\n    with memory::Heap\n    var own list = ArrayList(u8)::init()\n    defer list.deinit(own)\n    try list.append(1)\n    _ = list.view([]const(u8))\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -35949,7 +35968,7 @@ test "integration: formats into a list of bytes that grows as it is written thro
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::stream::Writer\nimport mn::text\nstruct Fixed\n    bytes: [128]u8\n    used: usize\ninstance memory::Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 128) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: []const(T)) = noop\nfn build() -> memory::Error![10]u8\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    var own list = mn::container::ArrayList(u8)::init()\n    defer list.deinit(own) with &fixed\n    const own first = try text::format(\"{}-{x}\", { 12u8, 255u8 }) with &fixed\n    defer memory::free(own first) with &fixed\n    try list.write(first) with &fixed\n    const own second = try text::format(\"{s}\\n\", { \"done\" }) with &fixed\n    defer memory::free(own second) with &fixed\n    try list.write(second) with &fixed\n    var result: [10]u8 = undefined\n    for (index in 0..10) result[index] = list.items()[index]\n    return result\nconst TEXT = build() catch [10]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::stream::Writer\nimport mn::text\nstruct Fixed\n    bytes: [128]u8\n    used: usize\ninstance memory::Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 128) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: []const(T)) = noop\nfn build() -> memory::Error![10]u8\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    var own list = mn::container::ArrayList(u8)::init()\n    defer list.deinit(own) with &fixed\n    const own first = try text::format(\"{}-{x}\", { 12u8, 255u8 }) with &fixed\n    defer memory::free(own first) with &fixed\n    try list.write(first) with &fixed\n    const own second = try text::format(\"{s}\\n\", { \"done\" }) with &fixed\n    defer memory::free(own second) with &fixed\n    try list.write(second) with &fixed\n    var result: [10]u8 = undefined\n    for (index in 0..10) result[index] = list.view([]const(u8))[index]\n    return result\nconst TEXT = build() catch [10]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -35973,7 +35992,7 @@ test "integration: gives out of memory as an error of mn::memory when a list of 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::stream::Writer\nimport mn::text\nstruct Fixed\n    bytes: [4]u8\n    used: usize\ninstance memory::Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 4) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: []const(T)) = noop\nfn build() -> memory::Error![10]u8\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    var own list = mn::container::ArrayList(u8)::init()\n    defer list.deinit(own) with &fixed\n    const own first = try text::format(\"{}-{x}\", { 12u8, 255u8 }) with &fixed\n    defer memory::free(own first) with &fixed\n    try list.write(first) with &fixed\n    var result: [10]u8 = undefined\n    for (index in 0..10) result[index] = list.items()[index]\n    return result\nfn fails() -> bool\n    _ = build() catch return true\n    return false\nconst FAILED = fails()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::stream::Writer\nimport mn::text\nstruct Fixed\n    bytes: [4]u8\n    used: usize\ninstance memory::Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> own memory::Error![]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 4) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*many(T), fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: []T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: []const(T)) = noop\nfn build() -> memory::Error![10]u8\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    var own list = mn::container::ArrayList(u8)::init()\n    defer list.deinit(own) with &fixed\n    const own first = try text::format(\"{}-{x}\", { 12u8, 255u8 }) with &fixed\n    defer memory::free(own first) with &fixed\n    try list.write(first) with &fixed\n    var result: [10]u8 = undefined\n    for (index in 0..10) result[index] = list.view([]const(u8))[index]\n    return result\nfn fails() -> bool\n    _ = build() catch return true\n    return false\nconst FAILED = fails()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);

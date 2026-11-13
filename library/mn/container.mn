@@ -5,7 +5,7 @@ import mn::codec::Decoder
 import mn::codec::Encode
 import mn::codec::Encoder
 import mn::compare::Equal
-import mn::convert::ToOwned
+import mn::convert::{ ToOwned, View }
 import mn::hash::Hash
 import mn::iterator::Zip
 import mn::iterator::Zipped
@@ -24,9 +24,6 @@ fn ArrayList(type T) -> type
 
 
         fn length(self: *const(Self)) -> usize = self.count
-
-
-        fn items(self: *const(Self)) -> []T = self.storage[0..self.count]
 
 
         fn append(self: *Self, own value: T) -> memory::Error!void
@@ -69,6 +66,16 @@ instance(type E) ToOwned(ArrayList(E), []E)
         return list.storage
 
 
+instance(type T) View(*const(ArrayList(T)), []const(T))
+
+    fn view(list: Self, type U) -> U = list.storage[0..list.count]
+
+
+instance(type T) View(*ArrayList(T), []T)
+
+    fn view(list: Self, type U) -> U = list.storage[0..list.count]
+
+
 instance stream::Writer(ArrayList(u8))
 
     fn write(list: *Self, bytes: []const(u8)) -> !void
@@ -80,7 +87,7 @@ instance(type A: Encode(_, E), type E: Encoder) Encode(ArrayList(A), E)
 
     fn encode(list: *const(Self), encoder: *E) -> !void
         try encoder.sequence(list.count)
-        for *element in list.items()
+        for *element in list.view([]const(A))
             try encoder.encode(element)
 
 
