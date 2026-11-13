@@ -1099,8 +1099,8 @@ pub fn renderTypeName(allocator: std.mem.Allocator, modules: []const Module, val
         },
         .@"enum" => |enumeration| enumeration.name,
         .array => |array| std.fmt.allocPrint(allocator, "[{d}]{s}", .{ array.length, try renderTypeName(allocator, modules, array.element) }),
-        .slice => |slice| renderReadOnly(allocator, "[]", slice.constant, try renderTypeName(allocator, modules, slice.element)),
-        .pointer => |pointer| renderReadOnly(allocator, if (pointer.many) "*many" else "*", pointer.constant, try renderTypeName(allocator, modules, pointer.target)),
+        .slice => |slice| renderPointer(allocator, .slice, slice.constant, try renderTypeName(allocator, modules, slice.element)),
+        .pointer => |pointer| renderPointer(allocator, if (pointer.many) .many else .one, pointer.constant, try renderTypeName(allocator, modules, pointer.target)),
         .optional => |optional| std.fmt.allocPrint(allocator, "?{s}", .{try renderTypeName(allocator, modules, optional.child)}),
         .result => |result| std.fmt.allocPrint(allocator, "{s}!{s}", .{ result.error_set.name, try renderTypeName(allocator, modules, result.value) }),
         .tuple => |tuple| name: {
@@ -1112,11 +1112,21 @@ pub fn renderTypeName(allocator: std.mem.Allocator, modules: []const Module, val
     };
 }
 
-fn renderReadOnly(allocator: std.mem.Allocator, prefix: []const u8, constant: bool, target: []const u8) std.mem.Allocator.Error![]const u8 {
-    const inner = if (constant) try std.fmt.allocPrint(allocator, "const({s})", .{target}) else target;
-    if (std.mem.eql(u8, prefix, "*many")) return std.fmt.allocPrint(allocator, "*many({s})", .{inner});
-    return std.mem.concat(allocator, u8, &.{ prefix, inner });
+fn renderPointer(allocator: std.mem.Allocator, form: PointerForm, constant: bool, target: []const u8) std.mem.Allocator.Error![]const u8 {
+    const pointed = switch (form) {
+        .one => target,
+        .many => try std.fmt.allocPrint(allocator, "many({s})", .{target}),
+        .slice => try std.fmt.allocPrint(allocator, "[]{s}", .{target}),
+    };
+    if (constant) return std.fmt.allocPrint(allocator, "*const({s})", .{pointed});
+    return std.fmt.allocPrint(allocator, "*{s}", .{pointed});
 }
+
+const PointerForm = enum {
+    one,
+    many,
+    slice,
+};
 
 pub fn isMain(signature: FunctionSignature) bool {
     return signature.receiver == null and std.mem.eql(u8, signature.name, "main");
@@ -1326,8 +1336,8 @@ fn renderInstanceType(
             break :name std.fmt.allocPrint(allocator, "{s}({s})", .{ constructor, try std.mem.join(allocator, ", ", arguments.items) });
         },
         .optional => |optional| std.fmt.allocPrint(allocator, "?{s}", .{try renderInstanceType(allocator, modules, parameters, optional.child)}),
-        .pointer => |pointer| renderReadOnly(allocator, if (pointer.many) "*many" else "*", pointer.constant, try renderInstanceType(allocator, modules, parameters, pointer.target)),
-        .slice => |slice| renderReadOnly(allocator, "[]", slice.constant, try renderInstanceType(allocator, modules, parameters, slice.element)),
+        .pointer => |pointer| renderPointer(allocator, if (pointer.many) .many else .one, pointer.constant, try renderInstanceType(allocator, modules, parameters, pointer.target)),
+        .slice => |slice| renderPointer(allocator, .slice, slice.constant, try renderInstanceType(allocator, modules, parameters, slice.element)),
         .array => |array| name: {
             const element = try renderInstanceType(allocator, modules, parameters, array.element);
             if (array.length_variable) |variable| break :name std.fmt.allocPrint(allocator, "[{s}]{s}", .{ parameters[variable.index].name, element });
@@ -2408,6 +2418,25 @@ fn cloneArguments(allocator: std.mem.Allocator, arguments: []const Argument) std
         };
     }
     return cloned;
+}
+
+test "renderTypeName: writes every slice and many as a form of pointer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const bytes: types.Slice = .{ .element = .{ .number = .u8 }, .constant = false };
+    const read_only: types.Slice = .{ .element = .{ .number = .u8 }, .constant = true };
+    const to_slice: types.Pointer = .{ .target = .{ .slice = &bytes }, .many = false, .constant = false };
+    const read_only_to_slice: types.Pointer = .{ .target = .{ .slice = &read_only }, .many = false, .constant = true };
+    const many: types.Pointer = .{ .target = .{ .number = .u8 }, .many = true, .constant = true };
+    const lines: types.Slice = .{ .element = .{ .slice = &read_only }, .constant = true };
+
+    try std.testing.expectEqualStrings("*[]u8", try renderTypeName(allocator, &.{}, .{ .slice = &bytes }));
+    try std.testing.expectEqualStrings("*const([]u8)", try renderTypeName(allocator, &.{}, .{ .slice = &read_only }));
+    try std.testing.expectEqualStrings("**[]u8", try renderTypeName(allocator, &.{}, .{ .pointer = &to_slice }));
+    try std.testing.expectEqualStrings("*const(*const([]u8))", try renderTypeName(allocator, &.{}, .{ .pointer = &read_only_to_slice }));
+    try std.testing.expectEqualStrings("*const(many(u8))", try renderTypeName(allocator, &.{}, .{ .pointer = &many }));
+    try std.testing.expectEqualStrings("*const([]*const([]u8))", try renderTypeName(allocator, &.{}, .{ .slice = &lines }));
 }
 
 test "extractBlocks: finds the body and the else block of a loop" {

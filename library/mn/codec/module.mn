@@ -30,15 +30,15 @@ typeclass Encoder(type E)
     fn f64(self: *E, value: f64) -> !void
     fn f128(self: *E, value: f128) -> !void
     fn bool(self: *E, value: bool) -> !void
-    fn bytes(self: *E, value: []const(u8)) -> !void
+    fn bytes(self: *E, value: *const([]u8)) -> !void
     fn absent(self: *E) -> !void
     fn present(self: *E) -> !void
     fn sequence(self: *E, count: usize) -> !void
     fn map(self: *E, count: usize) -> !void
     fn structure(self: *E, count: usize) -> !void
-    fn field(self: *E, name: []const(u8)) -> !void
+    fn field(self: *E, name: *const([]u8)) -> !void
     fn tuple(self: *E, count: usize) -> !void
-    fn variant(self: *E, name: []const(u8), number: usize) -> !void
+    fn variant(self: *E, name: *const([]u8), number: usize) -> !void
     fn(type T: Encode(_, E)) encode(self: *E, value: *const(T)) -> !void
 
 
@@ -66,14 +66,14 @@ typeclass Decoder(type D)
     fn f64(self: *D) -> !f64
     fn f128(self: *D) -> !f128
     fn bool(self: *D) -> !bool
-    fn bytes(self: *D) -> own ![]u8
+    fn bytes(self: *D) -> own !*[]u8
     fn is_present(self: *D) -> !bool
     fn sequence(self: *D) -> !usize
     fn map(self: *D) -> !usize
     fn structure(self: *D, count: usize) -> !void
-    fn field(self: *D, name: []const(u8)) -> !void
+    fn field(self: *D, name: *const([]u8)) -> !void
     fn tuple(self: *D, count: usize) -> !void
-    fn variant(self: *D, names: []const([]const(u8))) -> !usize
+    fn variant(self: *D, names: *const([]*const([]u8))) -> !usize
     fn decode(self: *D, type T: Decode(_, D)) -> own !T
 
 
@@ -247,17 +247,17 @@ instance(type D: Decoder) Decode(bool, D)
     fn decode(decoder: *D) -> own !Self = decoder.bool()
 
 
-instance(type E: Encoder) Encode([]const(u8), E)
+instance(type E: Encoder) Encode(*const([]u8), E)
 
     fn encode(value: *const(Self), encoder: *E) -> !void = encoder.bytes(value.*)
 
 
-instance(type E: Encoder) Encode([]u8, E)
+instance(type E: Encoder) Encode(*[]u8, E)
 
     fn encode(value: *const(Self), encoder: *E) -> !void = encoder.bytes(value.*)
 
 
-instance(type D: Decoder) Decode([]u8, D)
+instance(type D: Decoder) Decode(*[]u8, D)
 
     fn decode(decoder: *D) -> own !Self = decoder.bytes()
 

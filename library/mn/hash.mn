@@ -91,12 +91,12 @@ instance Hash(bool)
     fn hash(value: *const(Self)) -> u64 = splitmix64(if (value.*) 1 else 0)
 
 
-instance Hash([]const(u8))
+instance Hash(*const([]u8))
 
     fn hash(value: *const(Self)) -> u64 = splitmix64(fnv1a64(value.*))
 
 
-instance Hash([]u8)
+instance Hash(*[]u8)
 
     fn hash(value: *const(Self)) -> u64 = splitmix64(fnv1a64(value.*))
 
@@ -117,7 +117,7 @@ fn splitmix64(number: u64) -> u64
     return value ^ (value >> 31)
 
 
-fn fnv1a64(bytes: []const(u8)) -> u64
+fn fnv1a64(bytes: *const([]u8)) -> u64
     var state: u64 = 0xcbf29ce484222325
     for byte in bytes
         state = math::multiply_wrapping(state ^ mn::convert(u64, byte), 0x100000001b3)
@@ -156,7 +156,7 @@ fn sha256(reader: *Reader) -> ![32]u8
     return digest
 
 
-fn compress(state: *[8]u32, block: []const(u8))
+fn compress(state: *[8]u32, block: *const([]u8))
     var schedule: [64]u32 = undefined
     for index in 0..16
         const start = index * 4

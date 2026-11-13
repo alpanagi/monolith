@@ -2318,7 +2318,7 @@ test "evaluateFieldAccess: reads the pointer and the length of a slice at compil
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn second(values: []const(u8)) -> u8\n    const pointer = values.pointer\n    return pointer[1] + mn::convert(u8, values.length)\nconst VALUES: [3]u8 = { 1, 2, 3 }\nconst SECOND = second(&VALUES)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn second(values: *const([]u8)) -> u8\n    const pointer = values.pointer\n    return pointer[1] + mn::convert(u8, values.length)\nconst VALUES: [3]u8 = { 1, 2, 3 }\nconst SECOND = second(&VALUES)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2472,7 +2472,7 @@ test "Allocator: creates through the allocate of an instance that takes the elem
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Counting\n    storage: [16]u8\n    used: usize\n    allocations: usize\n    frees: usize\ninstance Allocator(Counting)\n\n    fn allocate(counting: *Counting, type T, count: usize) -> own memory::Error![]T\n        const size = mn::size(T) * count\n        if (counting.used + size > 16) return memory::Error::OutOfMemory\n        const start = counting.used\n        counting.used += size\n        counting.allocations += 1\n        return mn::cast(*many(T), counting.storage[start..counting.used].pointer)[0..count]\n    fn(type T) resize(_: *Counting, items: []T, count: usize) -> bool = count <= items.length\n    fn(type T) free(counting: *Counting, own _: []const(T)) = counting.frees += 1\nfn run() -> memory::Error![4]usize\n    var counting: Counting = undefined\n    counting.used = 0\n    counting.allocations = 0\n    counting.frees = 0\n    const own value = try counting.create(u8)\n    defer counting.destroy(own value)\n    value.* = 7\n    const stored = mn::convert(usize, counting.storage[0])\n    const own items = try counting.allocate(u8, 4)\n    const grown = counting.resize(items, 8)\n    counting.free(own items)\n    return { stored, counting.allocations, counting.frees, if (grown) 1 else 0 }\nconst RESULT = run() catch [4]usize{ 0, 0, 0, 0 }\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Counting\n    storage: [16]u8\n    used: usize\n    allocations: usize\n    frees: usize\ninstance Allocator(Counting)\n\n    fn allocate(counting: *Counting, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (counting.used + size > 16) return memory::Error::OutOfMemory\n        const start = counting.used\n        counting.used += size\n        counting.allocations += 1\n        return mn::cast(*many(T), counting.storage[start..counting.used].pointer)[0..count]\n    fn(type T) resize(_: *Counting, items: *[]T, count: usize) -> bool = count <= items.length\n    fn(type T) free(counting: *Counting, own _: *const([]T)) = counting.frees += 1\nfn run() -> memory::Error![4]usize\n    var counting: Counting = undefined\n    counting.used = 0\n    counting.allocations = 0\n    counting.frees = 0\n    const own value = try counting.create(u8)\n    defer counting.destroy(own value)\n    value.* = 7\n    const stored = mn::convert(usize, counting.storage[0])\n    const own items = try counting.allocate(u8, 4)\n    const grown = counting.resize(items, 8)\n    counting.free(own items)\n    return { stored, counting.allocations, counting.frees, if (grown) 1 else 0 }\nconst RESULT = run() catch [4]usize{ 0, 0, 0, 0 }\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2496,7 +2496,7 @@ test "ArrayList: grows in place or by moving and reports running out of memory a
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Allocator\nimport mn::memory::Deinit\nstruct Buffer\n    bytes: []u8\n    used: usize\n    last: usize\n    resizes: usize\n    frees: usize\ninstance Allocator(Buffer)\n\n    fn allocate(buffer: *Buffer, type T, count: usize) -> own memory::Error![]T\n        const size = mn::size(T) * count\n        if (buffer.used + size > buffer.bytes.length) return memory::Error::OutOfMemory\n        buffer.last = buffer.used\n        buffer.used += size\n        return mn::cast(*many(T), buffer.bytes[buffer.last..buffer.used].pointer)[0..count]\n    fn(type T) resize(buffer: *Buffer, items: []T, count: usize) -> bool\n        const size = mn::size(T) * count\n        if (items.length * mn::size(T) != buffer.used - buffer.last or buffer.last + size > buffer.bytes.length) return false\n        buffer.used = buffer.last + size\n        buffer.resizes += 1\n        return true\n    fn(type T) free(buffer: *Buffer, own _: []const(T)) = buffer.frees += 1\nfn grow() -> memory::Error![4]usize\n    var storage: [256]u8 = undefined\n    var buffer = Buffer{ bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0 }\n    var own list = mn::container::ArrayList(u8)::init()\n    errdefer list.deinit(own) with &buffer\n    for (index in 0..20) try list.append(mn::truncate(u8, index)) with &buffer\n    const in_place = buffer.resizes\n    const own ignored_30 = try buffer.allocate(u8, 4)\n    defer buffer.free(own ignored_30)\n    for (index in 20..40) try list.append(mn::truncate(u8, index)) with &buffer\n    var sum: usize = 0\n    for (item in list.view([]const(u8))) sum += mn::convert(usize, item)\n    const length = list.length()\n    list.deinit(own) with &buffer\n    return { in_place, buffer.frees, length, sum }\nfn fill(list: *mn::container::ArrayList(u8), buffer: *Buffer, count: usize) -> memory::Error!u8\n    for (_ in 0..count) try list.append(3) with buffer\n    return 0\nfn exhaust() -> u8\n    var storage: [8]u8 = undefined\n    var buffer = Buffer{ bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0 }\n    var own list = mn::container::ArrayList(u8)::init()\n    defer list.deinit(own) with &buffer\n    const filled = fill(&list, &buffer, 8) catch return 1\n    const more = fill(&list, &buffer, 1) catch return 2\n    return filled + more\nconst GROW = grow() catch { 0, 0, 0, 0 }\nconst EXHAUST = exhaust()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Allocator\nimport mn::memory::Deinit\nstruct Buffer\n    bytes: *[]u8\n    used: usize\n    last: usize\n    resizes: usize\n    frees: usize\ninstance Allocator(Buffer)\n\n    fn allocate(buffer: *Buffer, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (buffer.used + size > buffer.bytes.length) return memory::Error::OutOfMemory\n        buffer.last = buffer.used\n        buffer.used += size\n        return mn::cast(*many(T), buffer.bytes[buffer.last..buffer.used].pointer)[0..count]\n    fn(type T) resize(buffer: *Buffer, items: *[]T, count: usize) -> bool\n        const size = mn::size(T) * count\n        if (items.length * mn::size(T) != buffer.used - buffer.last or buffer.last + size > buffer.bytes.length) return false\n        buffer.used = buffer.last + size\n        buffer.resizes += 1\n        return true\n    fn(type T) free(buffer: *Buffer, own _: *const([]T)) = buffer.frees += 1\nfn grow() -> memory::Error![4]usize\n    var storage: [256]u8 = undefined\n    var buffer = Buffer{ bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0 }\n    var own list = mn::container::ArrayList(u8)::init()\n    errdefer list.deinit(own) with &buffer\n    for (index in 0..20) try list.append(mn::truncate(u8, index)) with &buffer\n    const in_place = buffer.resizes\n    const own ignored_30 = try buffer.allocate(u8, 4)\n    defer buffer.free(own ignored_30)\n    for (index in 20..40) try list.append(mn::truncate(u8, index)) with &buffer\n    var sum: usize = 0\n    for (item in list.view(*const([]u8))) sum += mn::convert(usize, item)\n    const length = list.length()\n    list.deinit(own) with &buffer\n    return { in_place, buffer.frees, length, sum }\nfn fill(list: *mn::container::ArrayList(u8), buffer: *Buffer, count: usize) -> memory::Error!u8\n    for (_ in 0..count) try list.append(3) with buffer\n    return 0\nfn exhaust() -> u8\n    var storage: [8]u8 = undefined\n    var buffer = Buffer{ bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0 }\n    var own list = mn::container::ArrayList(u8)::init()\n    defer list.deinit(own) with &buffer\n    const filled = fill(&list, &buffer, 8) catch return 1\n    const more = fill(&list, &buffer, 1) catch return 2\n    return filled + more\nconst GROW = grow() catch { 0, 0, 0, 0 }\nconst EXHAUST = exhaust()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2667,7 +2667,7 @@ test "evaluateBuiltin: rejects aligning a pointer at compile time" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn move(values: []const(u8)) -> usize\n    const aligned = mn::align(values.pointer, 4)\n    _ = aligned\n    return 0\nconst VALUES: [2]u8 = { 1, 2 }\nconst MOVED = move(&VALUES)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nfn move(values: *const([]u8)) -> usize\n    const aligned = mn::align(values.pointer, 4)\n    _ = aligned\n    return 0\nconst VALUES: [2]u8 = { 1, 2 }\nconst MOVED = move(&VALUES)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3161,7 +3161,7 @@ test "evaluateCompositeLiteral: gives empty braces where a slice is expected a s
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count() -> usize\n    const items: []i32 = {}\n    var bytes: []u8 = {}\n    bytes = bytes[0..0]\n    return items.length + bytes.length\nconst COUNT = count()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count() -> usize\n    const items: *[]i32 = {}\n    var bytes: *[]u8 = {}\n    bytes = bytes[0..0]\n    return items.length + bytes.length\nconst COUNT = count()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3180,7 +3180,7 @@ test "evaluateCompositeLiteral: makes a read-only slice from braces with element
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const WORDS: []const(u8) = { 104, 105 }\nfn local() -> usize\n    const values: []const(usize) = { 7, 8, 9 }\n    return values.length + values[2]\nconst FIRST = WORDS[1]\nconst LOCAL = local()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "const WORDS: *const([]u8) = { 104, 105 }\nfn local() -> usize\n    const values: *const([]usize) = { 7, 8, 9 }\n    return values.length + values[2]\nconst FIRST = WORDS[1]\nconst LOCAL = local()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -3221,7 +3221,7 @@ test "evaluateSlice: rejects bounds outside the length" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn outside() -> []const(i32)\n    const values = [3]i32{ 1, 2, 3 }\n    return values[1..4]\nconst OUTSIDE = outside()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn outside() -> *const([]i32)\n    const values = [3]i32{ 1, 2, 3 }\n    return values[1..4]\nconst OUTSIDE = outside()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4074,7 +4074,7 @@ test "executeIteration: zips iterators until the shortest ends" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Zip\nfn sum(cards: []u32, count: usize) -> u32\n    var total: u32 = 0\n    for { card, index } in Zip::zip({ cards, 0..count })\n        total += card * mn::convert(u32, index)\n    return total\nfn run(count: usize) -> u32\n    var cards = [3]u32{ 1, 2, 3 }\n    return sum(cards[..], count)\nconst ALL = run(5)\nconst SHORT = run(2)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Zip\nfn sum(cards: *[]u32, count: usize) -> u32\n    var total: u32 = 0\n    for { card, index } in Zip::zip({ cards, 0..count })\n        total += card * mn::convert(u32, index)\n    return total\nfn run(count: usize) -> u32\n    var cards = [3]u32{ 1, 2, 3 }\n    return sum(cards[..], count)\nconst ALL = run(5)\nconst SHORT = run(2)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4095,7 +4095,7 @@ test "executeIteration: zips a read-only slice and a range" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Zip\nfn sum(cards: []const(u32)) -> u32\n    var total: u32 = 0\n    for { card, index } in Zip::zip({ cards, 0.. })\n        total += card * mn::convert(u32, index)\n    return total\nconst CARDS = [3]u32{ 1, 2, 3 }\nconst SUM = sum(CARDS[..])" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Zip\nfn sum(cards: *const([]u32)) -> u32\n    var total: u32 = 0\n    for { card, index } in Zip::zip({ cards, 0.. })\n        total += card * mn::convert(u32, index)\n    return total\nconst CARDS = [3]u32{ 1, 2, 3 }\nconst SUM = sum(CARDS[..])" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4115,7 +4115,7 @@ test "executeIteration: steps the cursor of a read-only slice through pointers t
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Iterable\nimport mn::iterator::Iterator\nfn take() -> [u32, u32]\n    const cards = [3]u32{ 7, 8, 9 }\n    var cursor = Iterable::iterator(cards[..])\n    const first = Iterator::next(&cursor)\n    const second = Iterator::next(&cursor)\n    return { first.?[0].*, second.?[0].* }\nconst TAKEN = take()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Iterable\nimport mn::iterator::Iterator\nfn take() -> [u32, u32]\n    const cards = [3]u32{ 7, 8, 9 }\n    var cursor = Iterable::iterator(cards[..])\n    const first = Iterator::next(&cursor)\n    const second = Iterator::next(&cursor)\n    return { first.?.*, second.?.* }\nconst TAKEN = take()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4136,7 +4136,7 @@ test "executeIteration: steps the cursor of a slice through pointers to its elem
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Iterable\nimport mn::iterator::Iterator\nfn take() -> [u32, u32]\n    var cards = [3]u32{ 7, 8, 9 }\n    var cursor = Iterable::iterator(cards[..])\n    const first = Iterator::next(&cursor)\n    const second = Iterator::next(&cursor)\n    return { first.?[0].*, second.?[0].* }\nconst TAKEN = take()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Iterable\nimport mn::iterator::Iterator\nfn take() -> [u32, u32]\n    var cards = [3]u32{ 7, 8, 9 }\n    var cursor = Iterable::iterator(cards[..])\n    const first = Iterator::next(&cursor)\n    const second = Iterator::next(&cursor)\n    return { first.?.*, second.?.* }\nconst TAKEN = take()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4386,7 +4386,7 @@ test "makeString: decodes the escapes of a string" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count(text: []const(u8)) -> usize\n    var total = 0usize\n    for (_ in text) total += 1\n    return total\nconst LENGTH = count(\"a\\n\\u{e9}\")" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn count(text: *const([]u8)) -> usize\n    var total = 0usize\n    for (_ in text) total += 1\n    return total\nconst LENGTH = count(\"a\\n\\u{e9}\")" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);

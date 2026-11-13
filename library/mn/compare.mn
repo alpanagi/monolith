@@ -71,12 +71,12 @@ instance Equal(bool)
     fn equal(one: *const(Self), two: *const(Self)) -> bool = one.* == two.*
 
 
-instance Equal([]const(u8))
+instance Equal(*const([]u8))
 
     fn equal(one: *const(Self), two: *const(Self)) -> bool = memory::equal(one.*, two.*)
 
 
-instance Equal([]u8)
+instance Equal(*[]u8)
 
     fn equal(one: *const(Self), two: *const(Self)) -> bool = memory::equal(one.*, two.*)
 
@@ -202,17 +202,17 @@ instance Order(usize)
         return ::Equal
 
 
-instance Order([]const(u8))
+instance Order(*const([]u8))
 
     fn order(one: *const(Self), two: *const(Self)) -> Ordering = order_bytes(one.*, two.*)
 
 
-instance Order([]u8)
+instance Order(*[]u8)
 
     fn order(one: *const(Self), two: *const(Self)) -> Ordering = order_bytes(one.*, two.*)
 
 
-private fn order_bytes(one: []const(u8), two: []const(u8)) -> Ordering
+private fn order_bytes(one: *const([]u8), two: *const([]u8)) -> Ordering
     const length = if (one.length < two.length) one.length else two.length
     for index in 0..length
         if (one[index] < two[index]) return ::Less

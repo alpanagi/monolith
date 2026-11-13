@@ -12,14 +12,14 @@ typeclass Iterable(type T, type I)
     fn iterator(value: T) -> I
 
 
-instance(type T) Iterable([]T, SliceIterator([]T))
+instance(type T) Iterable(*[]T, SliceIterator(*[]T))
 
-    fn iterator(items: Self) -> SliceIterator([]T) = { remaining = items }
+    fn iterator(items: Self) -> SliceIterator(*[]T) = { remaining = items }
 
 
-instance(type T) Iterable([]const(T), SliceIterator([]const(T)))
+instance(type T) Iterable(*const([]T), SliceIterator(*const([]T)))
 
-    fn iterator(items: Self) -> SliceIterator([]const(T)) = { remaining = items }
+    fn iterator(items: Self) -> SliceIterator(*const([]T)) = { remaining = items }
 
 
 fn SliceIterator(type S) -> type
@@ -27,7 +27,7 @@ fn SliceIterator(type S) -> type
         remaining: S
 
 
-instance(type T) Iterator(SliceIterator([]T), *T)
+instance(type T) Iterator(SliceIterator(*[]T), *T)
 
     fn next(iterator: *Self) -> ?*T
         if (iterator.remaining.length == 0) return null
@@ -36,7 +36,7 @@ instance(type T) Iterator(SliceIterator([]T), *T)
         return element
 
 
-instance(type T) Iterator(SliceIterator([]const(T)), *const(T))
+instance(type T) Iterator(SliceIterator(*const([]T)), *const(T))
 
     fn next(iterator: *Self) -> ?*const(T)
         if (iterator.remaining.length == 0) return null
@@ -45,14 +45,14 @@ instance(type T) Iterator(SliceIterator([]const(T)), *const(T))
         return element
 
 
-instance(type T) Iterable(SliceIterator([]T), SliceIterator([]T))
+instance(type T) Iterable(SliceIterator(*[]T), SliceIterator(*[]T))
 
-    fn iterator(slice_iterator: Self) -> SliceIterator([]T) = slice_iterator
+    fn iterator(slice_iterator: Self) -> SliceIterator(*[]T) = slice_iterator
 
 
-instance(type T) Iterable(SliceIterator([]const(T)), SliceIterator([]const(T)))
+instance(type T) Iterable(SliceIterator(*const([]T)), SliceIterator(*const([]T)))
 
-    fn iterator(slice_iterator: Self) -> SliceIterator([]const(T)) = slice_iterator
+    fn iterator(slice_iterator: Self) -> SliceIterator(*const([]T)) = slice_iterator
 
 
 typeclass Zip(type T)
