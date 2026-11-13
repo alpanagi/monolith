@@ -40070,13 +40070,13 @@ test "integration: rejects an option that the options type of the chosen instanc
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::text::Parser\nfn main -> !void\n    const value = try \"0.5\".parse(f64, { base = ::Base16 })\n    if (value == 0.0) return\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::text::Parser\nfn main -> !void\n    const value = try \"0.5\".parse_as(f64, { base = ::Base16 })\n    if (value == 0.0) return\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.NotAStruct, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 40 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 43 }, analyzer.failure.?.location.?);
 }
 
 test "integration: rejects a base that bytes are not parsed in through the standard library" {
@@ -40089,11 +40089,11 @@ test "integration: rejects a base that bytes are not parsed in through the stand
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::text::Parser\nfn main -> !void\n    with memory::Heap\n    const own bytes = try \"ff\".parse(*[]u8, { base = ::Base10 })\n    memory::free(own bytes)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::text::Parser\nfn main -> !void\n    with memory::Heap\n    const own bytes = try \"ff\".parse_as(*[]u8, { base = ::Base10 })\n    memory::free(own bytes)\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.UnknownCase, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 5, .column = 54 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 57 }, analyzer.failure.?.location.?);
 }

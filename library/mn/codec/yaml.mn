@@ -1229,7 +1229,7 @@ private fn parse_digits(type T, digits: const(*[]u8), base: u8) -> codec::Error!
 
 
 private fn parse_number_text(type T, digits: const(*[]u8)) -> codec::Error!T
-    const value = digits.parse(T) catch return codec::Error::Malformed
+    const value = digits.parse_as(T) catch return codec::Error::Malformed
     return value
 
 

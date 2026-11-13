@@ -39,7 +39,7 @@ error Error
 
 typeclass Parser(type T, type U, type O)
 
-    fn parse(text: T, type U, options: O = {}) -> own !U
+    fn parse_as(text: T, type U, options: O = {}) -> own !U
 
 
 struct IntegerOptions
@@ -101,87 +101,87 @@ enum BytesBase
 
 instance Parser(const(*[]u8), i8, IntegerOptions)
 
-    fn parse(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), i16, IntegerOptions)
 
-    fn parse(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), i32, IntegerOptions)
 
-    fn parse(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), i64, IntegerOptions)
 
-    fn parse(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), i128, IntegerOptions)
 
-    fn parse(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), isize, IntegerOptions)
 
-    fn parse(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), u8, IntegerOptions)
 
-    fn parse(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), u16, IntegerOptions)
 
-    fn parse(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), u32, IntegerOptions)
 
-    fn parse(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), u64, IntegerOptions)
 
-    fn parse(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), u128, IntegerOptions)
 
-    fn parse(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), usize, IntegerOptions)
 
-    fn parse(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), f16, [])
 
-    fn parse(text: Self, type U, _: []) -> own !U = parse_float(U, text)
+    fn parse_as(text: Self, type U, _: []) -> own !U = parse_float(U, text)
 
 
 instance Parser(const(*[]u8), f32, [])
 
-    fn parse(text: Self, type U, _: []) -> own !U = parse_float(U, text)
+    fn parse_as(text: Self, type U, _: []) -> own !U = parse_float(U, text)
 
 
 instance Parser(const(*[]u8), f64, [])
 
-    fn parse(text: Self, type U, _: []) -> own !U = parse_float(U, text)
+    fn parse_as(text: Self, type U, _: []) -> own !U = parse_float(U, text)
 
 
 instance Parser(const(*[]u8), f128, [])
 
-    fn parse(text: Self, type U, _: []) -> own !U = parse_float(U, text)
+    fn parse_as(text: Self, type U, _: []) -> own !U = parse_float(U, text)
 
 
 instance Parser(const(*[]u8), *[]u8, BytesOptions)
 
-    fn parse(text: Self, type U, options: BytesOptions) -> own !U
+    fn parse_as(text: Self, type U, options: BytesOptions) -> own !U
         if options.base as base
             return parse_bytes(text, base)
         const own bytes = try memory::allocate(u8, text.length)
