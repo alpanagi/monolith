@@ -9094,7 +9094,7 @@ test "parseConstantPointer: rejects const around a read-only pointer" {
 test "parseConstantPointer: parses a read-only pointer in a constant, as the value of a function that gives a type and as a type argument" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("const Alias = const(*u8)\nfn Bytes -> type = const(*[]u8)\nfn Run -> type\n    return const(*[many]u8)\nfn main()\n    _ = bytes.view(const(*[]u8))");
+    var lexer = @import("lexer.zig").Lexer.init("const Alias = const(*u8)\nfn Bytes -> type = const(*[]u8)\nfn Run -> type\n    return const(*[many]u8)\nfn main()\n    _ = bytes.view_as(const(*[]u8))");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);

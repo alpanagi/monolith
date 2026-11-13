@@ -10,4 +10,4 @@ typeclass ToOwned(type T, type U)
 
 typeclass View(type T, type U)
 
-    fn view(value: T, type U) -> U
+    fn view_as(value: T, type U) -> U

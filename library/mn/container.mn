@@ -68,12 +68,12 @@ instance(type E) ToOwned(ArrayList(E), *[]E)
 
 instance(type T) View(const(*ArrayList(T)), const(*[]T))
 
-    fn view(list: Self, type U) -> U = list.storage[0..list.count]
+    fn view_as(list: Self, type U) -> U = list.storage[0..list.count]
 
 
 instance(type T) View(*ArrayList(T), *[]T)
 
-    fn view(list: Self, type U) -> U = list.storage[0..list.count]
+    fn view_as(list: Self, type U) -> U = list.storage[0..list.count]
 
 
 instance stream::Writer(ArrayList(u8))
@@ -87,7 +87,7 @@ instance(type A: Encode(_, E), type E: Encoder) Encode(ArrayList(A), E)
 
     fn encode(list: const(*Self), encoder: *E) -> !void
         try encoder.sequence(list.count)
-        for *element in list.view(const(*[]A))
+        for *element in list.view_as(const(*[]A))
             try encoder.encode(element)
 
 
