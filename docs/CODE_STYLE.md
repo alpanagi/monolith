@@ -12,6 +12,7 @@
 - A function that builds a value of its type is named `init`, e.g. `ArrayList(u8)::init()`.
 - Inside a struct's block and an instance's block, the type the block is about is written `Self`, e.g. `fn init -> own Self` and `fn encode(record: *const(Self), encoder: *Encoder) -> !void`. A type that only happens to equal it stays written, e.g. the `u64` every `hash` returns in `instance Hash(u64)`.
 - A parameter that takes any type with an instance has the typeclass as its type, e.g. `encoder: *Encoder`. A type parameter is named only when the type is written a second time, e.g. `fn decode(self: *D, type T: Decode) -> own !T`.
+- A declaration can shadow an earlier one, which is useful when the new value replaces the old, e.g. `const home = process::environment::variable("HOME")` followed by `const home = home orelse return Error::MissingHome`. This avoids a name made up only to tell the two apart, e.g. `maybe_home`.
 
 ## Layout
 
