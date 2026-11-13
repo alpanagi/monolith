@@ -239,6 +239,11 @@ instance View(const(*[]u8), Path)
     fn view_as(text: Self, type U) -> U = { bytes = text }
 
 
+instance View(Path, const(*[]u8))
+
+    fn view_as(path: Self, type U) -> U = path.bytes
+
+
 instance(type E: Encoder) Encode(Path, E)
 
     fn encode(path: const(*Self), encoder: *E) -> !void = encoder.bytes(path.bytes)
