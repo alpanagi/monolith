@@ -12,54 +12,47 @@ typeclass Iterable(type T, type I)
     fn iterator(value: T) -> I
 
 
-instance(type T) Iterable([]T, SliceCursor(T))
+instance(type T) Iterable([]T, SliceIterator([]T))
 
-    fn iterator(items: Self) -> SliceCursor(T) = { items = items, index = 0 }
-
-
-instance(type T) Iterable([]const(T), ConstSliceCursor(T))
-
-    fn iterator(items: Self) -> ConstSliceCursor(T) = { items = items, index = 0 }
+    fn iterator(items: Self) -> SliceIterator([]T) = { remaining = items }
 
 
-fn SliceCursor(type T) -> type
-    return struct
-        items: []T
-        index: usize
+instance(type T) Iterable([]const(T), SliceIterator([]const(T)))
+
+    fn iterator(items: Self) -> SliceIterator([]const(T)) = { remaining = items }
 
 
-instance(type T) Iterator(SliceCursor(T), *T)
+fn SliceIterator(type S) -> type
+    return inline struct
+        remaining: S
 
-    fn next(cursor: *Self) -> ?*T
-        if (cursor.index == cursor.items.length) return null
-        const element = &cursor.items[cursor.index]
-        cursor.index += 1
+
+instance(type T) Iterator(SliceIterator([]T), *T)
+
+    fn next(iterator: *Self) -> ?*T
+        if (iterator.remaining.length == 0) return null
+        const element = &iterator.remaining[0]
+        iterator.remaining = iterator.remaining[1..]
         return element
 
 
-instance(type T) Iterable(SliceCursor(T), SliceCursor(T))
+instance(type T) Iterator(SliceIterator([]const(T)), *const(T))
 
-    fn iterator(cursor: Self) -> SliceCursor(T) = cursor
-
-
-fn ConstSliceCursor(type T) -> type
-    return struct
-        items: []const(T)
-        index: usize
-
-
-instance(type T) Iterator(ConstSliceCursor(T), *const(T))
-
-    fn next(cursor: *Self) -> ?*const(T)
-        if (cursor.index == cursor.items.length) return null
-        const element = &cursor.items[cursor.index]
-        cursor.index += 1
+    fn next(iterator: *Self) -> ?*const(T)
+        if (iterator.remaining.length == 0) return null
+        const element = &iterator.remaining[0]
+        iterator.remaining = iterator.remaining[1..]
         return element
 
 
-instance(type T) Iterable(ConstSliceCursor(T), ConstSliceCursor(T))
+instance(type T) Iterable(SliceIterator([]T), SliceIterator([]T))
 
-    fn iterator(cursor: Self) -> ConstSliceCursor(T) = cursor
+    fn iterator(slice_iterator: Self) -> SliceIterator([]T) = slice_iterator
+
+
+instance(type T) Iterable(SliceIterator([]const(T)), SliceIterator([]const(T)))
+
+    fn iterator(slice_iterator: Self) -> SliceIterator([]const(T)) = slice_iterator
 
 
 typeclass Zip(type T)

@@ -10,7 +10,8 @@
 
 ## Naming
 
-- A boolean's name reads as a yes or no question, e.g. `is_absolute`, `has_value`.
+- A boolean that states a fact reads as a yes or no question, e.g. `is_absolute`, `has_value`.
+- A boolean option is named as the command, e.g. `create_ancestors` in `create_directory(path, { create_ancestors = true })`. An option that is one of a list of choices is named as an adjective, e.g. `Prefixed` in `{ base = ::Prefixed }`.
 - A function that builds a value of its type is named `init`, e.g. `ArrayList(u8)::init()`.
 - Inside a struct's block and an instance's block, the type the block is about is written `Self`, e.g. `fn init -> own Self` and `fn encode(record: *const(Self), encoder: *Encoder) -> !void`. A type that only happens to equal it stays written, e.g. the `u64` every `hash` returns in `instance Hash(u64)`.
 - A parameter that takes any type with an instance has the typeclass as its type, e.g. `encoder: *Encoder`. A type parameter is named only when the type is written a second time, e.g. `fn decode(self: *D, type T: Decode) -> own !T`.

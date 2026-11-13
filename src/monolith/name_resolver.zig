@@ -914,7 +914,7 @@ pub const NameResolver = struct {
             for (parameter.resolved_requirements) |requirement| {
                 const decided = try ast.decideRequirement(allocator, self.types, requirement, argument, assigned, .typeclass) orelse continue;
                 if (containsInstanceVariable(decided)) continue;
-                switch (try ast.findInstance(allocator, self.loader.modules.items, self.types, requirement.typeclass, decided)) {
+                switch (try ast.findInstance(allocator, self.loader.modules.items, self.types, null, requirement.typeclass, decided)) {
                     .missing, .missing_requirement => return self.fail(location, error.MissingRequiredInstance),
                     .found, .ambiguous, .undecided => {},
                 }
@@ -1406,7 +1406,11 @@ pub const NameResolver = struct {
     ) ResolveError!?ast.Resolution.Function {
         try self.resolveAllInstanceArguments();
         const modules = self.loader.modules.items;
-        const found = switch (try ast.findInstance(self.arena.allocator(), modules, self.types, typeclass, decided)) {
+        var evaluation: TypeCallEvaluation = .{ .name_resolver = self, .location = location };
+        const evaluator: ?ast.TypeEvaluator = if (self.type_checker != null) evaluation.build() else null;
+        const search = try ast.findInstance(self.arena.allocator(), modules, self.types, evaluator, typeclass, decided);
+        if (evaluation.failure) |failure| return failure;
+        const found = switch (search) {
             .missing => return null,
             .missing_requirement => return self.failIn(module_index, location, error.MissingRequiredInstance),
             .ambiguous => |pair| return self.failAmbiguous(module_index, location, pair),
@@ -1417,6 +1421,11 @@ pub const NameResolver = struct {
         const instance_declaration = modules[found.reference.module].declarations[found.reference.declaration];
         if (instance_declaration.kind.instance_declaration.parameters.len == 0) return function;
         return try self.instantiateInstanceFunction(function, found.assigned);
+    }
+
+    fn evaluateTypeCall(self: *NameResolver, location: token.Location, call: *const types.Application) ResolveError!types.Type {
+        var expression = try ast.buildTypeCall(self.arena.allocator(), self.loader.modules.items, call, location);
+        return self.evaluateType(&expression);
     }
 
     fn instantiateInstanceFunction(
@@ -2266,7 +2275,7 @@ pub const NameResolver = struct {
         };
         const name = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ struct_type.prefix, number });
         const fields = try reserveFields(allocator, struct_type.fields);
-        return .{ .@"struct" = .{ .module = struct_type.module, .name = name, .fields = fields } };
+        return .{ .@"struct" = .{ .module = struct_type.module, .name = name, .@"inline" = struct_type.@"inline", .fields = fields } };
     }
 
     fn finishStructForChecker(
@@ -4759,6 +4768,28 @@ pub const NameError = error{
     PrivateExternalField,
     PrivateInSignature,
     NeedlessPrivate,
+};
+
+const TypeCallEvaluation = struct {
+    name_resolver: *NameResolver,
+    location: token.Location,
+    failure: ?ResolveError = null,
+
+    fn build(self: *TypeCallEvaluation) ast.TypeEvaluator {
+        return .{ .context = self, .evaluate = evaluate };
+    }
+
+    fn evaluate(context: *anyopaque, call: *const types.Application) std.mem.Allocator.Error!?types.Type {
+        const self: *TypeCallEvaluation = @ptrCast(@alignCast(context));
+        if (self.failure != null) return null;
+        return self.name_resolver.evaluateTypeCall(self.location, call) catch |failure| switch (failure) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => {
+                self.failure = failure;
+                return null;
+            },
+        };
+    }
 };
 
 const StructCount = struct {
@@ -8960,6 +8991,28 @@ test "resolveInstanceFunction: names each of two instances for one type that dif
         if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
     } else unreachable;
     try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 3 } }, known);
+}
+
+test "resolveInstanceFunction: names an instance whose header gives a type by a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Iterator\nimport mn::iterator::Zip\nfn run() -> u8\n    const names: []const([]const(u8)) = { \"Anna\", \"Ben\" }\n    const ages: []const(u8) = { 31, 25 }\n    var pairs = Zip::zip({ names, ages })\n    return Iterator(mn::iterator::Zipped([[]const([]const(u8)), []const(u8)]), [*const([]const(u8)), *const(u8)])::next(&pairs).?[1].*\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 31 } }, known);
 }
 
 test "resolveInstanceFunction: finds a function that is not a method through a named instance" {

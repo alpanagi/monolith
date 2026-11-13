@@ -689,6 +689,7 @@ pub const FieldAccess = struct {
 };
 
 pub const StructType = struct {
+    @"inline": bool = false,
     fields: []Field,
     functions: []Declaration,
     types: []Declaration = &.{},
@@ -761,6 +762,7 @@ pub fn decideThroughRequirement(
     allocator: std.mem.Allocator,
     modules: []const Module,
     registry: *types.Registry,
+    evaluator: ?TypeEvaluator,
     requirement: Requirement,
     value: types.Argument,
     assigned: []?types.Argument,
@@ -770,14 +772,14 @@ pub fn decideThroughRequirement(
     for (decided) |argument| {
         if (argument == null) break;
     } else return null;
-    const found = switch (try findInstance(allocator, modules, registry, requirement.typeclass, decided)) {
+    const found = switch (try findInstance(allocator, modules, registry, evaluator, requirement.typeclass, decided)) {
         .missing => return .missing,
         .missing_requirement => return .missing_requirement,
         .ambiguous => |pair| return .{ .ambiguous = pair },
         .undecided => return .undecided,
         .found => |found| found,
     };
-    const arguments = try substituteInstanceArguments(allocator, modules, registry, found);
+    const arguments = (try substituteInstanceArguments(allocator, modules, registry, evaluator, found)) orelse return .missing;
     for (requirement.arguments, decided, arguments) |pattern, argument, instance_argument| {
         if (argument != null) continue;
         if (!types.matchArgument(pattern, instance_argument, scope, assigned, false)) return .missing;
@@ -785,17 +787,22 @@ pub fn decideThroughRequirement(
     return .decided;
 }
 
-pub fn substituteInstanceArguments(
+fn substituteInstanceArguments(
     allocator: std.mem.Allocator,
     modules: []const Module,
     registry: *types.Registry,
+    evaluator: ?TypeEvaluator,
     found: FoundInstance,
-) std.mem.Allocator.Error![]types.Argument {
+) std.mem.Allocator.Error!?[]types.Argument {
     const instance_declaration = modules[found.reference.module].declarations[found.reference.declaration].kind.instance_declaration;
     const arguments = try allocator.alloc(types.Argument, instance_declaration.resolved_arguments.len);
     for (instance_declaration.resolved_arguments, arguments) |pattern, *argument| {
         argument.* = switch (pattern) {
-            .type => |value_type| .{ .type = try types.substitute(allocator, registry, value_type, found.assigned, .instance) },
+            .type => |value_type| argument: {
+                const substituted = try types.substitute(allocator, registry, value_type, found.assigned, .instance);
+                const one = evaluator orelse break :argument .{ .type = substituted };
+                break :argument .{ .type = (try evaluateTypeCalls(allocator, registry, one, substituted)) orelse return null };
+            },
             .constructor => |constructor| constructor: {
                 if (constructor != .variable or constructor.variable.scope != .instance) break :constructor pattern;
                 break :constructor found.assigned[constructor.variable.index];
@@ -815,10 +822,7 @@ fn decideRequirementArguments(
     scope: types.Scope,
 ) std.mem.Allocator.Error![]?types.Argument {
     if (requirement.arguments.len == 0) return allocator.dupe(?types.Argument, &.{value});
-    const known = try allocator.alloc(types.Argument, assigned.len);
-    for (assigned, known, 0..) |optional_argument, *argument, index| {
-        argument.* = optional_argument orelse .{ .type = .{ .variable = .{ .scope = scope, .index = index } } };
-    }
+    const known = try fillUnassigned(allocator, assigned, scope);
     const decided = try allocator.alloc(?types.Argument, requirement.arguments.len);
     for (requirement.arguments, decided, 0..) |argument, *slot, position| {
         if (position == requirement.unknown_position) {
@@ -836,6 +840,106 @@ fn decideRequirementArguments(
     }
     return decided;
 }
+
+fn fillUnassigned(allocator: std.mem.Allocator, assigned: []const ?types.Argument, scope: types.Scope) std.mem.Allocator.Error![]types.Argument {
+    const known = try allocator.alloc(types.Argument, assigned.len);
+    for (assigned, known, 0..) |optional_argument, *argument, index| {
+        argument.* = optional_argument orelse .{ .type = .{ .variable = .{ .scope = scope, .index = index } } };
+    }
+    return known;
+}
+
+pub fn evaluateTypeCalls(
+    allocator: std.mem.Allocator,
+    registry: *types.Registry,
+    evaluator: TypeEvaluator,
+    value_type: types.Type,
+) std.mem.Allocator.Error!?types.Type {
+    if (!containsTypeCall(value_type)) return value_type;
+    for ([_]types.Scope{ .typeclass, .instance, .function, .declared }) |scope| {
+        if (types.containsVariable(value_type, scope)) return value_type;
+    }
+    return switch (value_type) {
+        .application => |application| {
+            const arguments = try allocator.alloc(types.Type, application.arguments.len);
+            for (application.arguments, arguments) |argument, *evaluated| {
+                evaluated.* = (try evaluateTypeCalls(allocator, registry, evaluator, argument)) orelse return null;
+            }
+            const call = try registry.addApplication(allocator, application.constructor, arguments);
+            if (application.constructor != .function) return .{ .application = call };
+            return evaluator.evaluate(evaluator.context, call);
+        },
+        .pointer => |pointer| .{ .pointer = try registry.addPointer(allocator, .{
+            .target = (try evaluateTypeCalls(allocator, registry, evaluator, pointer.target)) orelse return null,
+            .many = pointer.many,
+            .constant = pointer.constant,
+        }) },
+        .slice => |slice| .{ .slice = try registry.addSlice(allocator, (try evaluateTypeCalls(allocator, registry, evaluator, slice.element)) orelse return null, slice.constant) },
+        .array => |array| .{ .array = try registry.addArray(allocator, array.length, (try evaluateTypeCalls(allocator, registry, evaluator, array.element)) orelse return null) },
+        .optional => |optional| .{ .optional = try registry.addOptional(allocator, (try evaluateTypeCalls(allocator, registry, evaluator, optional.child)) orelse return null) },
+        .result => |result| .{ .result = try registry.addResult(allocator, result.error_set, (try evaluateTypeCalls(allocator, registry, evaluator, result.value)) orelse return null) },
+        .tuple => |tuple| {
+            const elements = try allocator.alloc(types.Type, tuple.elements.len);
+            for (tuple.elements, elements) |element, *evaluated| {
+                evaluated.* = (try evaluateTypeCalls(allocator, registry, evaluator, element)) orelse return null;
+            }
+            return .{ .tuple = try registry.addTuple(allocator, elements) };
+        },
+        .function => |function| {
+            const parameters = try allocator.alloc(types.Type, function.parameters.len);
+            for (function.parameters, parameters) |parameter, *evaluated| {
+                evaluated.* = (try evaluateTypeCalls(allocator, registry, evaluator, parameter)) orelse return null;
+            }
+            const return_type = (try evaluateTypeCalls(allocator, registry, evaluator, function.return_type)) orelse return null;
+            return .{ .function = try registry.addFunction(allocator, parameters, return_type) };
+        },
+        .number, .boolean, .void, .type, .@"struct", .@"enum", .variable => value_type,
+    };
+}
+
+fn containsTypeCall(value_type: types.Type) bool {
+    return switch (value_type) {
+        .application => |application| application.constructor == .function or for (application.arguments) |argument| {
+            if (containsTypeCall(argument)) break true;
+        } else false,
+        .pointer => |pointer| containsTypeCall(pointer.target),
+        .slice => |slice| containsTypeCall(slice.element),
+        .array => |array| containsTypeCall(array.element),
+        .optional => |optional| containsTypeCall(optional.child),
+        .result => |result| containsTypeCall(result.value),
+        .tuple => |tuple| for (tuple.elements) |element| {
+            if (containsTypeCall(element)) break true;
+        } else false,
+        .function => |function| containsTypeCall(function.return_type) or for (function.parameters) |parameter| {
+            if (containsTypeCall(parameter)) break true;
+        } else false,
+        .number, .boolean, .void, .type, .@"struct", .@"enum", .variable => false,
+    };
+}
+
+pub fn buildTypeCall(
+    allocator: std.mem.Allocator,
+    modules: []const Module,
+    call: *const types.Application,
+    location: token.Location,
+) std.mem.Allocator.Error!Expression {
+    const function = call.constructor.function;
+    const arguments = try allocator.alloc(Argument, call.arguments.len);
+    for (call.arguments, arguments) |argument, *slot| {
+        const value: Expression = .{ .kind = .{ .identifier = .{ .name = "_", .resolution = .{ .type = argument } } }, .location = location };
+        slot.* = .{ .name = null, .value = value, .location = location };
+    }
+    const name = extractFunctionSignature(findDeclaration(modules[function.module], function.declaration).*).name;
+    return .{
+        .kind = .{ .call = .{ .callee = .{ .identifier = .{ .name = name, .resolution = .{ .function = function } } }, .arguments = arguments } },
+        .location = location,
+    };
+}
+
+pub const TypeEvaluator = struct {
+    context: *anyopaque,
+    evaluate: *const fn (context: *anyopaque, call: *const types.Application) std.mem.Allocator.Error!?types.Type,
+};
 
 pub const RequirementDecision = union(enum) {
     decided,
@@ -1022,12 +1126,13 @@ pub fn findInstance(
     allocator: std.mem.Allocator,
     modules: []const Module,
     registry: *types.Registry,
+    evaluator: ?TypeEvaluator,
     typeclass: Resolution.Typeclass,
     decided: []const ?types.Argument,
 ) std.mem.Allocator.Error!InstanceSearch {
-    const exact = try searchInstance(allocator, modules, registry, typeclass, decided, false);
+    const exact = try searchInstance(allocator, modules, registry, evaluator, typeclass, decided, false);
     if (exact != .missing) return exact;
-    const relaxed = try searchInstance(allocator, modules, registry, typeclass, decided, true);
+    const relaxed = try searchInstance(allocator, modules, registry, evaluator, typeclass, decided, true);
     if (relaxed != .missing) return relaxed;
     return findNothingOwningInstance(allocator, modules, typeclass, decided);
 }
@@ -1068,6 +1173,7 @@ fn searchInstance(
     allocator: std.mem.Allocator,
     modules: []const Module,
     registry: *types.Registry,
+    evaluator: ?TypeEvaluator,
     typeclass: Resolution.Typeclass,
     decided: []const ?types.Argument,
     relaxed: bool,
@@ -1088,15 +1194,23 @@ fn searchInstance(
             if (isNothingOwningInstance(modules, module_index, instance_declaration)) continue;
             const assigned = try allocator.alloc(?types.Argument, instance_declaration.parameters.len);
             @memset(assigned, null);
-            const fits = for (instance_declaration.resolved_arguments, decided, 0..) |pattern, optional_argument, position| {
+            const earlier = try allocator.alloc(?types.Argument, instance_declaration.parameters.len);
+            const deferred = try allocator.alloc(bool, decided.len);
+            @memset(deferred, false);
+            const fits = for (instance_declaration.resolved_arguments, decided, deferred, 0..) |pattern, optional_argument, *later, position| {
                 const argument = optional_argument orelse continue;
                 const reads_only = relaxed and !isTargetParameter(modules, typeclass, position);
-                if (!types.matchArgument(pattern, argument, .instance, assigned, reads_only)) break false;
+                @memcpy(earlier, assigned);
+                if (types.matchArgument(pattern, argument, .instance, assigned, reads_only)) continue;
+                if (evaluator == null or pattern != .type or !containsTypeCall(pattern.type)) break false;
+                @memcpy(assigned, earlier);
+                later.* = true;
             } else true;
             if (!fits) continue;
-            const decision = try decideFromRequirements(allocator, modules, registry, instance_declaration, assigned);
+            const decision = try decideFromRequirements(allocator, modules, registry, evaluator, instance_declaration, assigned);
             if (decision == .missing) continue;
-            if (!try satisfiesRequirements(allocator, modules, registry, instance_declaration, assigned)) continue;
+            if (!try matchDeferredArguments(allocator, modules, registry, evaluator, typeclass, instance_declaration, decided, deferred, assigned, relaxed)) continue;
+            if (!try satisfiesRequirements(allocator, modules, registry, evaluator, instance_declaration, assigned)) continue;
             const ambiguous: ?[2]InstanceReference = if (decision == .ambiguous) decision.ambiguous else null;
             try candidates.append(allocator, .{ .reference = .{ .module = module_index, .declaration = index }, .assigned = assigned, .ambiguous = ambiguous });
         }
@@ -1109,13 +1223,37 @@ fn searchInstance(
     if (chosen.ambiguous) |pair| return .{ .ambiguous = pair };
     const instance_declaration = modules[chosen.reference.module].declarations[chosen.reference.declaration].kind.instance_declaration;
     if (instance_declaration.parameters.len > 0) {
-        if (!try hasRequiredInstances(allocator, modules, registry, typeclass, decided)) return .missing_requirement;
+        if (!try hasRequiredInstances(allocator, modules, registry, evaluator, typeclass, decided)) return .missing_requirement;
     }
     const assigned = try allocator.alloc(types.Argument, chosen.assigned.len);
     for (chosen.assigned, assigned) |optional_argument, *argument| {
         argument.* = optional_argument orelse return .undecided;
     }
     return .{ .found = .{ .reference = chosen.reference, .assigned = assigned } };
+}
+
+fn matchDeferredArguments(
+    allocator: std.mem.Allocator,
+    modules: []const Module,
+    registry: *types.Registry,
+    evaluator: ?TypeEvaluator,
+    typeclass: Resolution.Typeclass,
+    instance_declaration: InstanceDeclaration,
+    decided: []const ?types.Argument,
+    deferred: []const bool,
+    assigned: []?types.Argument,
+    relaxed: bool,
+) std.mem.Allocator.Error!bool {
+    for (instance_declaration.resolved_arguments, decided, deferred, 0..) |pattern, optional_argument, later, position| {
+        if (!later) continue;
+        const known = try fillUnassigned(allocator, assigned, .instance);
+        const substituted = try types.substitute(allocator, registry, pattern.type, known, .instance);
+        if (types.containsVariable(substituted, .instance)) return false;
+        const evaluated = (try evaluateTypeCalls(allocator, registry, evaluator.?, substituted)) orelse return false;
+        const reads_only = relaxed and !isTargetParameter(modules, typeclass, position);
+        if (!types.matchArgument(.{ .type = evaluated }, optional_argument.?, .instance, assigned, reads_only)) return false;
+    }
+    return true;
 }
 
 fn chooseMostSpecific(allocator: std.mem.Allocator, modules: []const Module, candidates: []const Candidate) std.mem.Allocator.Error!Choice {
@@ -1272,6 +1410,7 @@ fn hasRequiredInstances(
     allocator: std.mem.Allocator,
     modules: []const Module,
     registry: *types.Registry,
+    evaluator: ?TypeEvaluator,
     typeclass: Resolution.Typeclass,
     decided: []const ?types.Argument,
 ) std.mem.Allocator.Error!bool {
@@ -1280,7 +1419,7 @@ fn hasRequiredInstances(
         const argument = optional_argument orelse continue;
         for (parameter.resolved_requirements) |requirement| {
             const required = try decideRequirement(allocator, registry, requirement, argument, decided, .typeclass) orelse continue;
-            if (try findInstance(allocator, modules, registry, requirement.typeclass, required) != .found) return false;
+            if (try findInstance(allocator, modules, registry, evaluator, requirement.typeclass, required) != .found) return false;
         }
     }
     return true;
@@ -1290,6 +1429,7 @@ fn decideFromRequirements(
     allocator: std.mem.Allocator,
     modules: []const Module,
     registry: *types.Registry,
+    evaluator: ?TypeEvaluator,
     instance_declaration: InstanceDeclaration,
     assigned: []?types.Argument,
 ) std.mem.Allocator.Error!RequirementDecision {
@@ -1299,7 +1439,7 @@ fn decideFromRequirements(
         for (instance_declaration.parameters, 0..) |parameter, index| {
             const argument = assigned[index] orelse continue;
             for (parameter.resolved_requirements) |requirement| {
-                const decision = try decideThroughRequirement(allocator, modules, registry, requirement, argument, assigned, .instance) orelse continue;
+                const decision = try decideThroughRequirement(allocator, modules, registry, evaluator, requirement, argument, assigned, .instance) orelse continue;
                 switch (decision) {
                     .decided => progress = true,
                     .missing, .missing_requirement => return .missing,
@@ -1316,6 +1456,7 @@ fn satisfiesRequirements(
     allocator: std.mem.Allocator,
     modules: []const Module,
     registry: *types.Registry,
+    evaluator: ?TypeEvaluator,
     instance_declaration: InstanceDeclaration,
     assigned: []const ?types.Argument,
 ) std.mem.Allocator.Error!bool {
@@ -1323,7 +1464,7 @@ fn satisfiesRequirements(
         const argument = optional_argument orelse continue;
         for (parameter.resolved_requirements) |requirement| {
             const decided = try decideRequirement(allocator, registry, requirement, argument, assigned, .instance) orelse continue;
-            switch (try findInstance(allocator, modules, registry, requirement.typeclass, decided)) {
+            switch (try findInstance(allocator, modules, registry, evaluator, requirement.typeclass, decided)) {
                 .missing, .missing_requirement => return false,
                 .found, .ambiguous, .undecided => {},
             }
@@ -1993,7 +2134,7 @@ pub fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std
         .range => |range| .{ .range = try cloneRange(allocator, range) },
         .struct_type => |struct_type| kind: {
             const cloned = try allocator.create(StructType);
-            cloned.* = .{ .fields = struct_type.fields, .functions = struct_type.functions, .types = struct_type.types };
+            cloned.* = .{ .@"inline" = struct_type.@"inline", .fields = struct_type.fields, .functions = struct_type.functions, .types = struct_type.types };
             break :kind .{ .struct_type = cloned };
         },
         .jump => |statement| .{ .jump = try cloneNestedStatement(allocator, statement) },

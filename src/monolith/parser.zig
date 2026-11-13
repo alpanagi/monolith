@@ -2245,6 +2245,9 @@ pub const Parser = struct {
         offset: *usize,
     ) ParseError!?ast.Expression {
         var position = offset.*;
+        const start = position;
+        const inlined = self.match(&position, .keyword_inline) != null;
+        if (inlined and self.tokens[position].kind == .keyword_external) return self.fail(position, error.InlineExternalStruct);
         const keyword = self.match(&position, .keyword_struct) orelse return null;
         if (!try self.opensHeaderBlock(position)) return self.fail(position, error.ExpectedBlock);
         try self.expectHeaderEnd(position);
@@ -2253,8 +2256,9 @@ pub const Parser = struct {
         var nested: std.ArrayList(ast.Declaration) = .empty;
         const outer = self.findLineIndentation(offset.*);
         const fields = try self.parseMembers(allocator, &position, receiver, outer, .{ .list = &nested, .base = 0 }, null, &functions);
+        if (inlined) try self.expectInlineField(start, fields);
         const struct_type = try allocator.create(ast.StructType);
-        struct_type.* = .{ .fields = fields, .functions = functions.items, .types = nested.items };
+        struct_type.* = .{ .@"inline" = inlined, .fields = fields, .functions = functions.items, .types = nested.items };
 
         offset.* = position;
         return .{ .kind = .{ .struct_type = struct_type }, .location = keyword.location };
@@ -6586,6 +6590,17 @@ test "expectInlineField: rejects an inline struct with two fields" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
 }
 
+test "expectInlineField: rejects an inline struct with two fields that a function gives" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn Pair(type T) -> type\n    return inline struct\n        first: T\n        second: T");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.InlineStructFieldCount, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, parser.failure.?.location.?);
+}
+
 test "expectInlineField: rejects an inline struct without fields" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -8170,6 +8185,20 @@ test "parseStructType: gives the block of a return line to a struct without a na
     try std.testing.expectEqualStrings("items", struct_type.fields[0].name);
 }
 
+test "parseStructType: parses an inline struct that a function gives" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn Wrapped(type T) -> type\n    return inline struct\n        value: T\nfn Plain(type T) -> type\n    return struct\n        value: T");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const wrapped = module.declarations[0].kind.function_definition.body[0].kind.@"return".?.kind.struct_type;
+    try std.testing.expect(wrapped.@"inline");
+    try std.testing.expectEqualStrings("value", wrapped.fields[0].name);
+    try std.testing.expect(!module.declarations[1].kind.function_definition.body[0].kind.@"return".?.kind.struct_type.@"inline");
+}
+
 test "parseCompositeLiteral: parses an array literal over several lines" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -9192,7 +9221,7 @@ test "parseArguments: accepts a trailing comma" {
 test "parseArguments: parses arguments over several lines with a trailing comma" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    try filesystem::create_directory(\n        directory,\n\n        { should_create_parents = true },\n    )");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    try filesystem::create_directory(\n        directory,\n\n        { create_ancestors = true },\n    )");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);

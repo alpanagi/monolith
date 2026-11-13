@@ -319,7 +319,7 @@ fn write(path: Path, bytes: []const(u8)) -> !void
 fn create_directory(path: Path, options: CreateDirectoryOptions = {}) -> Error!void
     var name: [maximum_path_length]u8 = undefined
     const filled = try fill_name(path, &name)
-    if options.should_create_parents
+    if options.create_ancestors
         for index in 0..path.bytes.length
             if index > 0 and name[index] == separator and name[index - 1] != separator
                 name[index] = 0
@@ -332,7 +332,7 @@ fn create_directory(path: Path, options: CreateDirectoryOptions = {}) -> Error!v
 
 
 struct CreateDirectoryOptions
-    should_create_parents: bool = false
+    create_ancestors: bool = false
 
 
 private fn create_single_directory(name: []const(u8)) -> Error!void
