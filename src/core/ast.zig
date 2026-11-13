@@ -750,7 +750,71 @@ pub fn decideRequirement(
     assigned: []const ?types.Argument,
     scope: types.Scope,
 ) std.mem.Allocator.Error!?[]const ?types.Argument {
-    if (requirement.arguments.len == 0) return try allocator.dupe(?types.Argument, &.{value});
+    const decided = try decideRequirementArguments(allocator, registry, requirement, value, assigned, scope);
+    for (decided) |argument| {
+        if (argument == null) return null;
+    }
+    return decided;
+}
+
+pub fn decideThroughRequirement(
+    allocator: std.mem.Allocator,
+    modules: []const Module,
+    registry: *types.Registry,
+    requirement: Requirement,
+    value: types.Argument,
+    assigned: []?types.Argument,
+    scope: types.Scope,
+) std.mem.Allocator.Error!?RequirementDecision {
+    const decided = try decideRequirementArguments(allocator, registry, requirement, value, assigned, scope);
+    for (decided) |argument| {
+        if (argument == null) break;
+    } else return null;
+    const found = switch (try findInstance(allocator, modules, registry, requirement.typeclass, decided)) {
+        .missing => return .missing,
+        .missing_requirement => return .missing_requirement,
+        .ambiguous => |pair| return .{ .ambiguous = pair },
+        .undecided => return .undecided,
+        .found => |found| found,
+    };
+    const arguments = try substituteInstanceArguments(allocator, modules, registry, found);
+    for (requirement.arguments, decided, arguments) |pattern, argument, instance_argument| {
+        if (argument != null) continue;
+        if (!types.matchArgument(pattern, instance_argument, scope, assigned, false)) return .missing;
+    }
+    return .decided;
+}
+
+pub fn substituteInstanceArguments(
+    allocator: std.mem.Allocator,
+    modules: []const Module,
+    registry: *types.Registry,
+    found: FoundInstance,
+) std.mem.Allocator.Error![]types.Argument {
+    const instance_declaration = modules[found.reference.module].declarations[found.reference.declaration].kind.instance_declaration;
+    const arguments = try allocator.alloc(types.Argument, instance_declaration.resolved_arguments.len);
+    for (instance_declaration.resolved_arguments, arguments) |pattern, *argument| {
+        argument.* = switch (pattern) {
+            .type => |value_type| .{ .type = try types.substitute(allocator, registry, value_type, found.assigned, .instance) },
+            .constructor => |constructor| constructor: {
+                if (constructor != .variable or constructor.variable.scope != .instance) break :constructor pattern;
+                break :constructor found.assigned[constructor.variable.index];
+            },
+            .length => pattern,
+        };
+    }
+    return arguments;
+}
+
+fn decideRequirementArguments(
+    allocator: std.mem.Allocator,
+    registry: *types.Registry,
+    requirement: Requirement,
+    value: types.Argument,
+    assigned: []const ?types.Argument,
+    scope: types.Scope,
+) std.mem.Allocator.Error![]?types.Argument {
+    if (requirement.arguments.len == 0) return allocator.dupe(?types.Argument, &.{value});
     const known = try allocator.alloc(types.Argument, assigned.len);
     for (assigned, known, 0..) |optional_argument, *argument, index| {
         argument.* = optional_argument orelse .{ .type = .{ .variable = .{ .scope = scope, .index = index } } };
@@ -764,7 +828,7 @@ pub fn decideRequirement(
         slot.* = switch (argument) {
             .type => |value_type| decided: {
                 const substituted = try types.substitute(allocator, registry, value_type, known, scope);
-                if (types.containsVariable(substituted, scope)) return null;
+                if (types.containsVariable(substituted, scope)) break :decided null;
                 break :decided .{ .type = substituted };
             },
             .constructor, .length => argument,
@@ -772,6 +836,14 @@ pub fn decideRequirement(
     }
     return decided;
 }
+
+pub const RequirementDecision = union(enum) {
+    decided,
+    missing,
+    missing_requirement,
+    ambiguous: [2]InstanceReference,
+    undecided,
+};
 
 pub const ParameterKind = enum {
     run_time,
@@ -1022,8 +1094,11 @@ fn searchInstance(
                 if (!types.matchArgument(pattern, argument, .instance, assigned, reads_only)) break false;
             } else true;
             if (!fits) continue;
+            const decision = try decideFromRequirements(allocator, modules, registry, instance_declaration, assigned);
+            if (decision == .missing) continue;
             if (!try satisfiesRequirements(allocator, modules, registry, instance_declaration, assigned)) continue;
-            try candidates.append(allocator, .{ .reference = .{ .module = module_index, .declaration = index }, .assigned = assigned });
+            const ambiguous: ?[2]InstanceReference = if (decision == .ambiguous) decision.ambiguous else null;
+            try candidates.append(allocator, .{ .reference = .{ .module = module_index, .declaration = index }, .assigned = assigned, .ambiguous = ambiguous });
         }
     }
     if (candidates.items.len == 0) return .missing;
@@ -1031,6 +1106,7 @@ fn searchInstance(
         .chosen => |chosen| chosen,
         .ambiguous => |pair| return .{ .ambiguous = pair },
     };
+    if (chosen.ambiguous) |pair| return .{ .ambiguous = pair };
     const instance_declaration = modules[chosen.reference.module].declarations[chosen.reference.declaration].kind.instance_declaration;
     if (instance_declaration.parameters.len > 0) {
         if (!try hasRequiredInstances(allocator, modules, registry, typeclass, decided)) return .missing_requirement;
@@ -1126,6 +1202,7 @@ fn renderInstanceType(
 const Candidate = struct {
     reference: InstanceReference,
     assigned: []?types.Argument,
+    ambiguous: ?[2]InstanceReference = null,
 };
 
 const Choice = union(enum) {
@@ -1207,6 +1284,32 @@ fn hasRequiredInstances(
         }
     }
     return true;
+}
+
+fn decideFromRequirements(
+    allocator: std.mem.Allocator,
+    modules: []const Module,
+    registry: *types.Registry,
+    instance_declaration: InstanceDeclaration,
+    assigned: []?types.Argument,
+) std.mem.Allocator.Error!RequirementDecision {
+    var progress = true;
+    while (progress) {
+        progress = false;
+        for (instance_declaration.parameters, 0..) |parameter, index| {
+            const argument = assigned[index] orelse continue;
+            for (parameter.resolved_requirements) |requirement| {
+                const decision = try decideThroughRequirement(allocator, modules, registry, requirement, argument, assigned, .instance) orelse continue;
+                switch (decision) {
+                    .decided => progress = true,
+                    .missing, .missing_requirement => return .missing,
+                    .ambiguous => return decision,
+                    .undecided => {},
+                }
+            }
+        }
+    }
+    return .decided;
 }
 
 fn satisfiesRequirements(
@@ -1568,10 +1671,16 @@ pub fn extractElementType(sequence: Sequence) types.Type {
     };
 }
 
-pub fn isCopiedElement(iteration: Iteration, name: ElementName, position: usize) bool {
-    if (name.pointer) return false;
-    const element = iteration.element.tuple.elements[position];
+pub fn isCopiedElement(loop: For, position: usize) bool {
+    if (loop.names[position].pointer) return false;
+    const element = findIterationPart(loop, position);
     return element == .pointer and !element.pointer.many;
+}
+
+pub fn findIterationPart(loop: For, position: usize) types.Type {
+    const element = loop.iterator.?.element;
+    if (!loop.tuple) return element;
+    return element.tuple.elements[position];
 }
 
 pub fn extractElementNames(statement: Statement) []ElementName {

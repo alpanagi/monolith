@@ -1588,8 +1588,8 @@ pub const TypeChecker = struct {
                         if (range.end) |*end| try self.checkOwnValue(end, .plain);
                     },
                 }
-                if (loop.iterator) |iteration| {
-                    try self.checkCopiedElements(iteration, loop.names);
+                if (loop.iterator != null) {
+                    try self.checkCopiedElements(loop.*);
                 } else try self.checkOwnBindings(loop.names);
                 try self.checkOwnStatements(loop.body, .plain);
                 if (loop.else_body) |body| try self.checkOwnStatements(body, value_place);
@@ -1818,9 +1818,9 @@ pub const TypeChecker = struct {
         }
     }
 
-    fn checkCopiedElements(self: *TypeChecker, iteration: ast.Iteration, names: []const ast.ElementName) TypeError!void {
-        for (names, 0..) |name, position| {
-            if (ast.isDiscardedName(name.name) or !ast.isCopiedElement(iteration, name, position)) continue;
+    fn checkCopiedElements(self: *TypeChecker, loop: ast.For) TypeError!void {
+        for (loop.names, 0..) |name, position| {
+            if (ast.isDiscardedName(name.name) or !ast.isCopiedElement(loop, position)) continue;
             if (self.isOwningType(name.type.?)) return self.fail(name.location, error.OwnValueCopied);
         }
     }
@@ -3477,33 +3477,29 @@ pub const TypeChecker = struct {
     ) TypeError!void {
         const sequence_location = loop.sequence.value.location;
         const iterable = self.findLanguageTypeclass("iterator", "Iterable") orelse return self.fail(sequence_location, error.NotSequence);
-        const iterable_decided = [_]?types.Argument{.{ .type = value_type }};
+        const iterable_decided = [_]?types.Argument{ .{ .type = value_type }, null };
         const iterator = (try self.findInstanceFunction(location, iterable, &iterable_decided, "iterator")) orelse {
             return self.fail(sequence_location, error.NotSequence);
         };
-        const cursor_function = (try self.findInstanceFunction(location, iterable, &iterable_decided, "Cursor")).?;
         try self.prepareFunction(iterator);
-        const cursor_type = try self.evaluateFunctionType(location, cursor_function);
+        const cursor_type = ast.extractType(self.extractSignature(.{ .function = iterator }).return_type);
         const typeclass = self.findLanguageTypeclass("iterator", "Iterator") orelse return self.fail(sequence_location, error.NotSequence);
-        const decided = [_]?types.Argument{.{ .type = cursor_type }};
+        const decided = [_]?types.Argument{ .{ .type = cursor_type }, null };
         const next = (try self.findInstanceFunction(location, typeclass, &decided, "next")) orelse {
             return self.fail(sequence_location, error.CursorNotIterator);
         };
-        const element_function = (try self.findInstanceFunction(location, typeclass, &decided, "Element")).?;
         try self.prepareFunction(next);
-        const element_type = try self.evaluateFunctionType(location, element_function);
-        if (element_type != .tuple) return self.fail(location, error.ElementNotTuple);
-        const elements = element_type.tuple.elements;
-        const iteration: ast.Iteration = .{ .iterator = iterator, .cursor = cursor_type, .next = next, .element = element_type };
-        loop.iterator = iteration;
-        const count: usize = if (loop.tuple) loop.names.len else 1;
-        if (count != elements.len or (!loop.tuple and loop.names.len != 1)) {
-            return self.fail(loop.names[0].location, error.WrongNameCount);
-        }
-        for (loop.names, elements[0..loop.names.len], 0..) |*name, element, position| {
+        const element_type = ast.extractType(self.extractSignature(.{ .function = next }).return_type).optional.child;
+        loop.iterator = .{ .iterator = iterator, .cursor = cursor_type, .next = next, .element = element_type };
+        if (loop.tuple) {
+            if (element_type != .tuple) return self.fail(sequence_location, error.NotTuple);
+            if (loop.names.len != element_type.tuple.elements.len) return self.fail(loop.names[0].location, error.WrongNameCount);
+        } else if (loop.names.len != 1) return self.fail(loop.names[0].location, error.WrongNameCount);
+        for (loop.names, 0..) |*name, position| {
+            const element = ast.findIterationPart(loop.*, position);
             const pointer = element == .pointer and !element.pointer.many;
             if (name.pointer and !pointer) return self.fail(name.location, error.PointerOverIterator);
-            name.type = if (ast.isCopiedElement(iteration, name.*, position)) element.pointer.target else element;
+            name.type = if (ast.isCopiedElement(loop.*, position)) element.pointer.target else element;
         }
         try self.checkBlock(signature, loop.body);
         if (loop.else_body) |else_body| try self.checkBlock(signature, else_body);
@@ -3519,22 +3515,6 @@ pub const TypeChecker = struct {
             }
         }
         return null;
-    }
-
-    fn evaluateFunctionType(
-        self: *TypeChecker,
-        location: token.Location,
-        function: ast.Resolution.Function,
-    ) TypeError!types.Type {
-        const signature = ast.extractFunctionSignature(ast.findDeclaration(self.program.modules[function.module], function.declaration).*);
-        var call: ast.Expression = .{
-            .kind = .{ .call = .{ .callee = .{ .identifier = .{ .name = signature.name, .resolution = .{ .function = function } } }, .arguments = &.{} } },
-            .type = .type,
-            .location = location,
-        };
-        const value = try self.evaluateValue(&call);
-        _ = &call;
-        return value.type;
     }
 
     fn checkSequence(
@@ -4424,8 +4404,55 @@ pub const TypeChecker = struct {
         const function = ast.findInstanceMember(modules, found.reference, name) orelse return null;
         const instance_declaration = modules[found.reference.module].declarations[found.reference.declaration];
         if (instance_declaration.kind.instance_declaration.parameters.len == 0) return function;
+        const assigned = try self.arena.allocator().alloc(types.Argument, found.assigned.len);
+        for (found.assigned, assigned) |argument, *concrete| {
+            concrete.* = if (argument == .type) .{ .type = try self.concretizeType(location, argument.type) } else argument;
+        }
         const resolver = &self.resolver.?;
-        return try resolver.instantiateInstanceFunction(resolver.context, function, found.assigned);
+        return try resolver.instantiateInstanceFunction(resolver.context, function, assigned);
+    }
+
+    fn concretizeType(self: *TypeChecker, location: token.Location, value_type: types.Type) TypeError!types.Type {
+        const allocator = self.arena.allocator();
+        const registry = self.program.types;
+        if (containsAnyVariable(value_type)) return value_type;
+        return switch (value_type) {
+            .application => |application| {
+                if (application.constructor != .function) return value_type;
+                const function = application.constructor.function;
+                const arguments = try allocator.alloc(ast.Argument, application.arguments.len);
+                for (application.arguments, arguments) |argument, *slot| {
+                    const concrete = try self.concretizeType(location, argument);
+                    const value: ast.Expression = .{ .kind = .{ .identifier = .{ .name = "_", .resolution = .{ .type = concrete } } }, .location = location };
+                    slot.* = .{ .name = null, .value = value, .location = location };
+                }
+                const name = self.extractSignature(.{ .function = function }).name;
+                var call: ast.Expression = .{
+                    .kind = .{ .call = .{ .callee = .{ .identifier = .{ .name = name, .resolution = .{ .function = function } } }, .arguments = arguments } },
+                    .location = location,
+                };
+                const caller_compile_time = self.compile_time;
+                self.compile_time = true;
+                defer self.compile_time = caller_compile_time;
+                try self.checkExpression(&.{}, &call, .type);
+                return (try self.evaluateValue(&call)).type;
+            },
+            .pointer => |pointer| .{ .pointer = try registry.addPointer(allocator, .{
+                .target = try self.concretizeType(location, pointer.target),
+                .many = pointer.many,
+                .constant = pointer.constant,
+            }) },
+            .slice => |slice| .{ .slice = try registry.addSlice(allocator, try self.concretizeType(location, slice.element), slice.constant) },
+            .array => |array| .{ .array = try registry.addArray(allocator, array.length, try self.concretizeType(location, array.element)) },
+            .optional => |optional| .{ .optional = try registry.addOptional(allocator, try self.concretizeType(location, optional.child)) },
+            .result => |result| .{ .result = try registry.addResult(allocator, result.error_set, try self.concretizeType(location, result.value)) },
+            .tuple => |tuple| {
+                const elements = try allocator.alloc(types.Type, tuple.elements.len);
+                for (tuple.elements, elements) |element, *concrete| concrete.* = try self.concretizeType(location, element);
+                return .{ .tuple = try registry.addTuple(allocator, elements) };
+            },
+            .number, .boolean, .void, .type, .@"struct", .@"enum", .function, .variable => value_type,
+        };
     }
 
     fn buildHandedReceiver(self: *TypeChecker, parameters: []const ast.TypedName, receiver: *ast.Expression, dereferenced: bool) TypeError!ast.Expression {
@@ -5086,6 +5113,7 @@ pub const TypeChecker = struct {
             const pattern = try resolver.resolveDeclaredPattern(resolver.context, template, position, bounds.items);
             try self.matchDeclaredArgument(parameters, argument, pattern, decided, found);
         }
+        try self.decideFromRequirements(expression, signature, bounds.items, decided);
         for (signature.declared, decided) |declared, one| {
             const argument = one orelse return self.fail(expression.location, error.TypeMismatch);
             for (declared.resolved_requirements) |requirement| {
@@ -5093,6 +5121,51 @@ pub const TypeChecker = struct {
             }
             try bounds.append(allocator, .{ .type = .type, .value = .{ .type = argument.type } });
         }
+    }
+
+    fn decideFromRequirements(
+        self: *TypeChecker,
+        expression: *const ast.Expression,
+        signature: ast.FunctionSignature,
+        bounds: []const Bound,
+        decided: []?types.Argument,
+    ) TypeError!void {
+        const allocator = self.arena.allocator();
+        const parameter_count = signature.parameters.len;
+        const assigned = try allocator.alloc(?types.Argument, parameter_count + signature.declared.len);
+        @memset(assigned, null);
+        var bound_index: usize = 0;
+        for (signature.parameters, 0..) |parameter, index| {
+            if (parameter.kind == .run_time) continue;
+            if (parameter.kind == .type) assigned[index] = .{ .type = bounds[bound_index].value.type };
+            bound_index += 1;
+        }
+        @memcpy(assigned[parameter_count..], decided);
+        var progress = true;
+        while (progress) {
+            progress = false;
+            for (assigned, 0..) |one, index| {
+                const value = one orelse continue;
+                const declared = index >= parameter_count;
+                const requirements = if (declared) signature.declared[index - parameter_count].resolved_requirements else signature.parameters[index].resolved_requirements;
+                const location = if (declared) expression.location else expression.kind.call.arguments[index].location;
+                for (requirements) |requirement| {
+                    const decision = try ast.decideThroughRequirement(allocator, self.program.modules, self.program.types, requirement, value, assigned, .function) orelse continue;
+                    switch (decision) {
+                        .decided => progress = true,
+                        .missing => return self.fail(location, error.NoInstance),
+                        .missing_requirement => return self.fail(location, error.MissingRequiredInstance),
+                        .ambiguous => |pair| return self.failAmbiguous(location, pair),
+                        .undecided => return self.fail(location, error.UndecidedInstance),
+                    }
+                    for (assigned[parameter_count..]) |*slot| {
+                        const argument = slot.* orelse continue;
+                        if (argument == .type) slot.* = .{ .type = try self.concretizeType(location, argument.type) };
+                    }
+                }
+            }
+        }
+        @memcpy(decided, assigned[parameter_count..]);
     }
 
     fn matchDeclaredArgument(
@@ -6607,7 +6680,6 @@ pub const CheckError = error{
     ExpectedNumber,
     ExpectedInteger,
     NotTupleType,
-    ElementNotTuple,
     PointerOverIterator,
     CursorNotIterator,
 };
@@ -6768,7 +6840,6 @@ fn describeError(check_error: CheckError) []const u8 {
         error.ExpectedNumber => "expected a number",
         error.ExpectedInteger => "expected an integer",
         error.NotTupleType => "only tuple types can be indexed",
-        error.ElementNotTuple => "an iterator's elements must be tuples",
         error.PointerOverIterator => "this element of the iterator is not a pointer, so it cannot be named by pointer; name it without *",
         error.CursorNotIterator => "the cursor that this value's Iterable instance gives has no instance of Iterator, so for cannot go over it",
         error.NoInstance => "type has no instance of the typeclass",
@@ -22517,13 +22588,13 @@ test "checkSequence: rejects a tuple whose type has an instance of Iterator" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\ninstance Iterator([i32, i32])\n\n    fn Element() -> type = [i32]\n\n    fn next(iterator: *[i32, i32]) -> ?Element()\n        _ = iterator\n        return null\nfn take(value: i32) = _ = value\nfn show(pair: [i32, i32]) = for (item in pair) take(item)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\ninstance Iterator([i32, i32], [i32])\n\n    fn next(iterator: *[i32, i32]) -> ?[i32]\n        _ = iterator\n        return null\nfn take(value: i32) = _ = value\nfn show(pair: [i32, i32]) = for (item in pair) take(item)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.NotSequence, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 10, .column = 42 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 8, .column = 42 }, analyzer.failure.?.location.?);
 }
 
 test "checkSequence: rejects a tuple in the instance of a generic function" {
@@ -22593,16 +22664,16 @@ test "checkIteratorLoop: rejects a pointer to an element of an iterator" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Countdown\n    count: u32\ninstance mn::iterator::Iterator(Countdown)\n\n    fn Element() -> type = return [u32]\n    fn next(iterator: *Countdown) -> ?Element()\n        if (iterator.count == 0) return null\n        iterator.count -= 1\n        return { iterator.count + 1 }\ninstance mn::iterator::Iterable(Countdown)\n\n    fn Cursor() -> type = Countdown\n    fn iterator(countdown: Countdown) -> Cursor() = countdown\nfn total() -> u32\n    var sum: u32 = 0\n    for (*value in Countdown{ count = 3 }) sum += value.*\n    return sum" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Countdown\n    count: u32\ninstance mn::iterator::Iterator(Countdown, u32)\n\n    fn next(iterator: *Countdown) -> ?u32\n        if (iterator.count == 0) return null\n        iterator.count -= 1\n        return iterator.count + 1\ninstance mn::iterator::Iterable(Countdown, Countdown)\n\n    fn iterator(countdown: Countdown) -> Countdown = countdown\nfn total() -> u32\n    var sum: u32 = 0\n    for (*value in Countdown{ count = 3 }) sum += value.*\n    return sum" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.PointerOverIterator, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 18, .column = 10 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 16, .column = 10 }, analyzer.failure.?.location.?);
 }
 
-test "checkIteratorLoop: rejects a single name over elements of several values" {
+test "checkIteratorLoop: binds an element of several values to a single name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -22612,16 +22683,34 @@ test "checkIteratorLoop: rejects a single name over elements of several values" 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Pairs\n    count: u32\ninstance mn::iterator::Iterator(Pairs)\n\n    fn Element() -> type = return [u32, bool]\n    fn next(_: *Pairs) -> ?Element() = return null\ninstance mn::iterator::Iterable(Pairs)\n\n    fn Cursor() -> type = Pairs\n    fn iterator(pairs: Pairs) -> Cursor() = pairs\nfn total() -> u32\n    for (value in Pairs{ count = 3 }) _ = value\n    return 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Pairs\n    count: u32\ninstance mn::iterator::Iterator(Pairs, [u32, bool])\n\n    fn next(_: *Pairs) -> ?[u32, bool] = return null\ninstance mn::iterator::Iterable(Pairs, Pairs)\n\n    fn iterator(pairs: Pairs) -> Pairs = pairs\nfn first() -> bool\n    for (pair in Pairs{ count = 3 }) return pair[1]\n    return false" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "checkIteratorLoop: rejects another number of names in braces than parts of the element" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Pairs\n    count: u32\ninstance mn::iterator::Iterator(Pairs, [u32, bool])\n\n    fn next(_: *Pairs) -> ?[u32, bool] = return null\ninstance mn::iterator::Iterable(Pairs, Pairs)\n\n    fn iterator(pairs: Pairs) -> Pairs = pairs\nfn total() -> u32\n    for ({ value, flag, other } in Pairs{ count = 3 }) _ = { value, flag, other }\n    return 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.WrongNameCount, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 14, .column = 10 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 12, .column = 12 }, analyzer.failure.?.location.?);
 }
 
-test "checkIteratorLoop: rejects elements that are not tuples" {
+test "checkIteratorLoop: rejects names in braces over an element that is not a tuple" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -22631,13 +22720,13 @@ test "checkIteratorLoop: rejects elements that are not tuples" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Numbers\n    count: u32\ninstance mn::iterator::Iterator(Numbers)\n\n    fn Element() -> type = return u32\n    fn next(_: *Numbers) -> ?Element() = return null\ninstance mn::iterator::Iterable(Numbers)\n\n    fn Cursor() -> type = Numbers\n    fn iterator(numbers: Numbers) -> Cursor() = numbers\nfn total() -> u32\n    for (value in Numbers{ count = 3 }) _ = value\n    return 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Numbers\n    count: u32\ninstance mn::iterator::Iterator(Numbers, u32)\n\n    fn next(_: *Numbers) -> ?u32 = return null\ninstance mn::iterator::Iterable(Numbers, Numbers)\n\n    fn iterator(numbers: Numbers) -> Numbers = numbers\nfn total() -> u32\n    for ({ value } in Numbers{ count = 3 }) _ = value\n    return 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
-    try std.testing.expectError(error.ElementNotTuple, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 14, .column = 5 }, analyzer.failure.?.location.?);
+    try std.testing.expectError(error.NotTuple, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 12, .column = 23 }, analyzer.failure.?.location.?);
 }
 
 test "checkIteratorLoop: rejects an iterator whose type has no instance of Iterable" {
@@ -22650,13 +22739,13 @@ test "checkIteratorLoop: rejects an iterator whose type has no instance of Itera
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Iterable\n\nstruct Countdown\n    count: u32\n\n\ninstance mn::iterator::Iterator(Countdown)\n\n    fn Element() -> type = [u32]\n\n\n    fn next(countdown: *Countdown) -> ?Element()\n        if (countdown.count == 0) return null\n        countdown.count -= 1\n        return { countdown.count + 1 }\n\n\nfn total() -> u32\n    var sum: u32 = 0\n    for (value in Countdown{ count = 3 }) sum += value\n    return sum\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Iterable\n\nstruct Countdown\n    count: u32\n\n\ninstance mn::iterator::Iterator(Countdown, u32)\n\n    fn next(countdown: *Countdown) -> ?u32\n        if (countdown.count == 0) return null\n        countdown.count -= 1\n        return countdown.count + 1\n\n\nfn total() -> u32\n    var sum: u32 = 0\n    for (value in Countdown{ count = 3 }) sum += value\n    return sum\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.NotSequence, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 21, .column = 19 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 18, .column = 19 }, analyzer.failure.?.location.?);
 }
 
 test "checkIteratorLoop: rejects an Iterable whose cursor has no instance of Iterator" {
@@ -22669,13 +22758,13 @@ test "checkIteratorLoop: rejects an Iterable whose cursor has no instance of Ite
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\n\nstruct Deck\n    count: u32\n\n\ninstance mn::iterator::Iterable(Deck)\n\n    fn Cursor() -> type = u32\n    fn iterator(deck: Deck) -> Cursor() = deck.count\n\n\nfn total() -> u32\n    var sum: u32 = 0\n    for (value in Deck{ count = 3 }) sum += value\n    return sum\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\n\nstruct Deck\n    count: u32\n\n\ninstance mn::iterator::Iterable(Deck, u32)\n\n    fn iterator(deck: Deck) -> u32 = deck.count\n\n\nfn total() -> u32\n    var sum: u32 = 0\n    for (value in Deck{ count = 3 }) sum += value\n    return sum\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.CursorNotIterator, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 16, .column = 19 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 15, .column = 19 }, analyzer.failure.?.location.?);
     try std.testing.expect(std.mem.indexOf(u8, analyzer.failure.?.message, "cursor") != null);
 }
 
@@ -26364,6 +26453,47 @@ test "findInstanceFunction: rejects a method call that two instances differing o
     try std.testing.expectEqual(token.Location{ .row = 14, .column = 20 }, analyzer.failure.?.location.?);
 }
 
+test "findInstanceFunction: decides a parameter of a generic instance named only in a requirement by the single instance that meets it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Iterator\nstruct Countdown\n    count: u32\ninstance Iterator(Countdown, u32)\n\n    fn next(countdown: *Countdown) -> ?u32\n        if (countdown.count == 0) return null\n        countdown.count -= 1\n        return countdown.count + 10\nfn Numbered(type I) -> type\n    return struct\n        inner: I\n        index: usize\ninstance(type I: Iterator(_, E), type E) Iterator(Numbered(I), [usize, E])\n\n    fn next(numbered: *Self) -> ?[usize, E]\n        const value = numbered.inner.next() orelse return null\n        numbered.index += 1\n        return { numbered.index, value }\nfn run() -> usize\n    var numbered = Numbered(Countdown){ inner = { count = 2 }, index = 0 }\n    var sum: usize = 0\n    while numbered.next() as { index, value }\n        sum += index * 100 + mn::convert(usize, value)\n    return sum\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 321 } }, known);
+}
+
+test "findInstanceFunction: rejects a method call that two instances differing only in the element fit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\nstruct Random\n    state: u32\ninstance Iterator(Random, u32)\n\n    fn next(random: *Random) -> ?u32\n        random.state += 1\n        return random.state\ninstance Iterator(Random, f64)\n\n    fn next(random: *Random) -> ?f64\n        random.state += 2\n        return 0.5\nfn run() -> u32\n    var random = Random{ state = 0 }\n    _ = random.next()\n    return random.state\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.AmbiguousInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 16, .column = 16 }, analyzer.failure.?.location.?);
+}
+
 test "resolveTypeclassCall: matches a type constructor parameter against a struct a call gives" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -27450,6 +27580,47 @@ test "expectArgumentRequirements: rejects a type argument without the instance i
     try std.testing.expectEqual(token.Location{ .row = 11, .column = 18 }, analyzer.failure.?.location.?);
 }
 
+test "expectArgumentRequirements: accepts an iterator whose element is the type its requirement writes out" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\nstruct Countdown\n    count: u32\ninstance Iterator(Countdown, u32)\n\n    fn next(countdown: *Countdown) -> ?u32\n        if (countdown.count == 0) return null\n        countdown.count -= 1\n        return countdown.count + 10\nstruct Letters\n    count: u8\ninstance Iterator(Letters, u8)\n\n    fn next(letters: *Letters) -> ?u8\n        if (letters.count == 0) return null\n        letters.count -= 1\n        return letters.count\nfn(type I: Iterator(_, u32)) first(iterator: *I) -> ?u32 = iterator.next()\nfn run() -> u32\n    var countdown = Countdown{ count = 4 }\n    return first(&countdown).?\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 13 } }, known);
+}
+
+test "expectArgumentRequirements: rejects an iterator whose element is another type than its requirement writes out" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\nstruct Countdown\n    count: u32\ninstance Iterator(Countdown, u32)\n\n    fn next(countdown: *Countdown) -> ?u32\n        if (countdown.count == 0) return null\n        countdown.count -= 1\n        return countdown.count + 10\nstruct Letters\n    count: u8\ninstance Iterator(Letters, u8)\n\n    fn next(letters: *Letters) -> ?u8\n        if (letters.count == 0) return null\n        letters.count -= 1\n        return letters.count\nfn(type I: Iterator(_, u32)) first(iterator: *I) -> ?u32 = iterator.next()\nfn run() -> u32\n    var letters = Letters{ count = 4 }\n    return first(&letters).?\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NoInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 21, .column = 12 }, analyzer.failure.?.location.?);
+}
+
 test "instantiateCall: rejects a type without an instance of one of several required typeclasses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -27878,6 +28049,47 @@ test "inferDeclaredTypes: frees read-only slices, array pointers and read-only p
     _ = try analyzer.analyze();
 
     try std.testing.expectEqual(null, analyzer.failure);
+}
+
+test "decideFromRequirements: decides a declared type named only in a requirement by the single instance that meets it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\nstruct Countdown\n    count: u32\ninstance Iterator(Countdown, u32)\n\n    fn next(countdown: *Countdown) -> ?u32\n        if (countdown.count == 0) return null\n        countdown.count -= 1\n        return countdown.count + 10\nfn(type I: Iterator(_, E), type E) last(iterator: *I) -> ?E\n    var found: ?E = null\n    while iterator.next() as value\n        found = value\n    return found\nfn run() -> u32\n    var countdown = Countdown{ count = 4 }\n    return last(&countdown).?\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 10 } }, known);
+}
+
+test "decideFromRequirements: rejects a declared type named only in a requirement that two instances meet" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\nstruct Random\n    state: u32\ninstance Iterator(Random, u32)\n\n    fn next(random: *Random) -> ?u32\n        random.state += 1\n        return random.state\ninstance Iterator(Random, f64)\n\n    fn next(random: *Random) -> ?f64\n        random.state += 2\n        return 0.5\nfn(type I: Iterator(_, E), type E) last(iterator: *I) -> ?E = iterator.next()\nfn run() -> u32\n    var random = Random{ state = 0 }\n    _ = last(&random)\n    return random.state\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.AmbiguousInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 17, .column = 9 }, analyzer.failure.?.location.?);
 }
 
 test "checkImplicitArgument: takes a pointer to a value of each type with an instance" {

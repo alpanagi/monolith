@@ -7,10 +7,9 @@ struct Range
     end: ?usize
 
 
-instance Iterable(Range)
+instance Iterable(Range, RangeCursor)
 
-    fn Cursor -> type = RangeCursor
-    fn iterator(range: Self) -> Cursor() = { position = range.start, end = range.end }
+    fn iterator(range: Self) -> RangeCursor = { position = range.start, end = range.end }
 
 
 struct RangeCursor
@@ -18,19 +17,15 @@ struct RangeCursor
     end: ?usize
 
 
-instance Iterator(RangeCursor)
+instance Iterator(RangeCursor, usize)
 
-    fn Element -> type = [usize]
-
-
-    fn next(cursor: *Self) -> ?Element()
+    fn next(cursor: *Self) -> ?usize
         if (cursor.end != null and cursor.position >= cursor.end.?) return null
         const value = cursor.position
         cursor.position += 1
-        return { value }
+        return value
 
 
-instance Iterable(RangeCursor)
+instance Iterable(RangeCursor, RangeCursor)
 
-    fn Cursor -> type = Self
-    fn iterator(cursor: Self) -> Cursor() = cursor
+    fn iterator(cursor: Self) -> RangeCursor = cursor

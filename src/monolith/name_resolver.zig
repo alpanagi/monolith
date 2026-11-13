@@ -1161,13 +1161,22 @@ pub const NameResolver = struct {
         var names: std.ArrayList([]const u8) = .empty;
         for (signature.parameters) |parameter| {
             if (parameter.kind == .run_time) try collectExpressionNames(allocator, &names, parameter.type);
+            if (parameter.kind != .type) continue;
+            for (parameter.requirements) |requirement| try collectExpressionNames(allocator, &names, requirement);
         }
         const caller_bindings = self.bindings;
         defer self.bindings = caller_bindings;
         self.bindings = try self.addOwnTypeBindings(caller_bindings, signature.*);
         const declared_types = try allocator.dupe(ast.InstanceParameter, signature.declared);
-        for (declared_types) |*declared| {
-            if (!containsName(names.items, declared.name)) return self.fail(declared.location, error.UnusedDeclaredType);
+        for (declared_types, 0..) |*declared, position| {
+            var required: std.ArrayList([]const u8) = .empty;
+            for (declared_types, 0..) |other, other_position| {
+                if (other_position == position) continue;
+                for (other.requirements) |requirement| try collectExpressionNames(allocator, &required, requirement);
+            }
+            if (!containsName(names.items, declared.name) and !containsName(required.items, declared.name)) {
+                return self.fail(declared.location, error.UnusedDeclaredType);
+            }
             declared.resolved_requirements = try self.resolveRequirements(declared.requirements);
         }
         signature.declared = declared_types;
@@ -7691,13 +7700,13 @@ test "resolveInstance: compares next with the Element of the same instance" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Countdown\n    count: u32\ninstance mn::iterator::Iterator(Countdown)\n\n    fn Element() -> type = return [u32]\n    fn next(iterator: *Countdown) -> ?Element()\n        if (iterator.count == 0) return null\n        iterator.count -= 1\n        return { iterator.count + 1 }\nconst Element = mn::iterator::Iterator(Countdown)::Element()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Countdown\n    count: u32\ntypeclass Source(type S)\n\n    fn Element() -> type\n    fn next(source: *S) -> ?Element()\ninstance Source(Countdown)\n\n    fn Element() -> type = return [u32]\n    fn next(iterator: *Countdown) -> ?Element()\n        if (iterator.count == 0) return null\n        iterator.count -= 1\n        return { iterator.count + 1 }\nconst Element = Source(Countdown)::Element()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     _ = try analyzer.analyze();
 
-    const element = loader.modules.items[0].declarations[6].kind.constant_declaration.known.?.type;
+    const element = loader.modules.items[0].declarations[5].kind.constant_declaration.known.?.type;
     try std.testing.expectEqual(types.Type{ .number = .u32 }, element.tuple.elements[0]);
 }
 
@@ -7711,13 +7720,13 @@ test "resolveInstance: rejects next with another type than Element" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Countdown\n    count: u32\ninstance mn::iterator::Iterator(Countdown)\n\n    fn Element() -> type = return [u32]\n    fn next(_: *Countdown) -> ?[u8] = return null" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Countdown\n    count: u32\ntypeclass Source(type S)\n\n    fn Element() -> type\n    fn next(source: *S) -> ?Element()\ninstance Source(Countdown)\n\n    fn Element() -> type = return [u32]\n    fn next(_: *Countdown) -> ?[u8] = return null" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.MismatchedTypeclassFunction, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 8, .column = 5 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 10, .column = 5 }, analyzer.failure.?.location.?);
 }
 
 test "resolveInstance: rejects an instance of mn::reflection::Tuple" {
@@ -8929,6 +8938,28 @@ test "resolveInstanceFunction: names an instance of a typeclass with several par
 
     const known = loader.modules.items[0].declarations[7].kind.constant_declaration.known.?.*;
     try std.testing.expectEqual(Value{ .integer = .{ .signed = 100 } }, known);
+}
+
+test "resolveInstanceFunction: names each of two instances for one type that differ only in a later argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\nstruct Random\n    state: u32\ninstance Iterator(Random, u32)\n\n    fn next(random: *Random) -> ?u32\n        random.state += 1\n        return random.state\ninstance Iterator(Random, f64)\n\n    fn next(random: *Random) -> ?f64\n        random.state += 2\n        return 0.5\nfn run() -> u32\n    var random = Random{ state = 0 }\n    const half = Iterator(Random, f64)::next(&random).?\n    const whole = Iterator(Random, u32)::next(&random).?\n    if (half == 0.5) return whole\n    return 0\nconst RESULT = run()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const known = for (loader.modules.items[0].declarations) |declaration| {
+        if (declaration.kind == .constant_declaration and std.mem.eql(u8, declaration.kind.constant_declaration.name, "RESULT")) break declaration.kind.constant_declaration.known.?.*;
+    } else unreachable;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 3 } }, known);
 }
 
 test "resolveInstanceFunction: finds a function that is not a method through a named instance" {
