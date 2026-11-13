@@ -236,7 +236,7 @@ instance To(Path, []u8)
 
 instance View([]const(u8), Path)
 
-    fn as_view(text: Self, type U) -> U = { bytes = text }
+    fn view(text: Self, type U) -> U = { bytes = text }
 
 
 instance(type E: Encoder) Encode(Path, E)
