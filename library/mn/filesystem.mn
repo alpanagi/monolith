@@ -5,6 +5,7 @@ import mn::codec::Encode
 import mn::codec::Encoder
 import mn::compare::Equal
 import mn::convert::To
+import mn::convert::View
 import mn::hash
 import mn::hash::Hash
 import mn::memory
@@ -176,19 +177,16 @@ inline struct Path
     fn is_absolute(self: Self) -> bool = self.bytes.length > 0 and self.bytes[0] == separator
 
 
-    fn join(self: Self, other: Path) -> own memory::Error!Self = self.append(other.bytes)
-
-
-    fn append(self: Self, name: []const(u8)) -> own memory::Error!Self
+    fn join(self: Self, other: Path) -> own memory::Error!Self
         const length = self.bytes.length
         const is_separated = length > 0 and self.bytes[length - 1] != separator
         const start = if (is_separated) length + 1 else length
-        const total = start + name.length
+        const total = start + other.bytes.length
         if (start < length or total < start) return memory::Error::OutOfMemory
         const own bytes = try memory::allocate(u8, total)
         memory::copy(bytes, self.bytes)
         if (is_separated) bytes[length] = separator
-        memory::copy(bytes[start..], name)
+        memory::copy(bytes[start..], other.bytes)
         return { bytes = own bytes }
 
 
@@ -234,6 +232,11 @@ instance To(Path, []u8)
         const own text = try memory::allocate(u8, path.bytes.length)
         memory::copy(text, path.bytes)
         return text
+
+
+instance View([]const(u8), Path)
+
+    fn as_view(text: Self, type U) -> U = { bytes = text }
 
 
 instance(type E: Encoder) Encode(Path, E)
