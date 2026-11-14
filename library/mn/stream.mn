@@ -2,6 +2,10 @@ import mn::iterator::SliceIterator
 import mn::memory
 
 
+error Error
+    LineTooLong
+
+
 typeclass Reader(type R)
 
     fn read(reader: *R, buffer: *[]u8) -> !usize
@@ -40,6 +44,28 @@ fn BufferedReader(type R: Reader) -> type
         private end: usize
 
         fn init(reader: *R, buffer: *[]u8) -> Self = { reader = reader, buffer = buffer, start = 0, end = 0 }
+
+
+        fn read_line(self: *Self) -> !const(*[]u8)
+            var line_end = self.start
+            while true
+                while line_end < self.end and self.buffer[line_end] != '\n'
+                    line_end += 1
+                if line_end < self.end
+                    line_end += 1
+                    break
+                if (self.start == 0 and self.end == self.buffer.length) return Error::LineTooLong
+                const pending = self.end - self.start
+                memory::copy(self.buffer[..pending], self.buffer[self.start..self.end])
+                self.start = 0
+                self.end = pending
+                line_end = pending
+                const filled = try Reader::read(self.reader, self.buffer[pending..])
+                if (filled == 0) break
+                self.end += filled
+            const line = self.buffer[self.start..line_end]
+            self.start = line_end
+            return line
 
 
 instance(type R: Reader) Reader(BufferedReader(R))

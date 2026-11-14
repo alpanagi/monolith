@@ -2,6 +2,7 @@ import mn
 import mn::compare::Ordering
 import mn::container
 import mn::convert::ToOwned
+import mn::iterator::Iterator
 import mn::memory
 import mn::memory::Deinit
 import mn::reflection
@@ -33,6 +34,26 @@ fn is_whitespace(byte: u8) -> bool = match byte
 
 
 fn has_prefix(bytes: const(*[]u8), prefix: const(*[]u8)) -> bool = prefix.length <= bytes.length and memory::equal(bytes[..prefix.length], prefix)
+
+
+fn split(bytes: const(*[]u8), separator: const(*[]u8)) -> SplitIterator = { remaining = bytes, separator = separator }
+
+
+struct SplitIterator
+    private remaining: ?const(*[]u8)
+    private separator: const(*[]u8)
+
+
+instance Iterator(SplitIterator, const(*[]u8))
+
+    fn next(iterator: *Self) -> ?const(*[]u8)
+        const remaining = iterator.remaining orelse return null
+        for index in 0..remaining.length
+            if has_prefix(remaining[index..], iterator.separator)
+                iterator.remaining = remaining[index + iterator.separator.length..]
+                return remaining[..index]
+        iterator.remaining = null
+        return remaining
 
 
 error Error

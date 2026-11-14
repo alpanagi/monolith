@@ -201,6 +201,13 @@ inline struct Path
     fn parent(self: Self) -> memory::Error!Self = build_path(self.bytes[..find_parent_length(self.bytes)])
 
 
+    fn name(self: Self) -> const(*[]u8)
+        var start = self.bytes.length
+        while start > 0 and self.bytes[start - 1] != separator
+            start -= 1
+        return self.bytes[start..]
+
+
     fn absolute(self: Self) -> (Error || memory::Error)!Self
         var name: [maximum_path_length]u8 = undefined
         var resolved: [maximum_path_length]u8 = undefined
