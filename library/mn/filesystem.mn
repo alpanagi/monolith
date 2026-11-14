@@ -25,6 +25,7 @@ private external fn mn_runtime_filesystem_metadata(name: const(*[]u8), kind: *i3
 private external fn mn_runtime_filesystem_next_entry(handle: *void, entry: *Directory::RawEntry) -> i32
 private external fn mn_runtime_filesystem_open(name: const(*[]u8), mode: i32) -> i32
 private external fn mn_runtime_filesystem_open_directory(name: const(*[]u8), code: *i32) -> ?*void
+private external fn mn_runtime_filesystem_rename(from: const(*[]u8), to: const(*[]u8)) -> i32
 private external fn mn_runtime_filesystem_size(descriptor: i32) -> isize
 private external fn mn_runtime_io_read(descriptor: i32, buffer: *[]u8) -> isize
 private external fn mn_runtime_io_write(descriptor: i32, bytes: const(*[]u8)) -> isize
@@ -353,3 +354,10 @@ private fn is_directory(name: const(*[]u8)) -> bool
     var nanoseconds: u32 = 0
     const code = mn_runtime_filesystem_metadata(name, &kind, &size, &seconds, &nanoseconds)
     return code == 0 and find_kind(kind) == File::Kind::Directory
+
+
+fn rename(from: Path, to: Path) -> Error!void
+    var from_name: [maximum_path_length]u8 = undefined
+    var to_name: [maximum_path_length]u8 = undefined
+    const code = mn_runtime_filesystem_rename(try fill_name(from, &from_name), try fill_name(to, &to_name))
+    if (code < 0) return find_error(code)

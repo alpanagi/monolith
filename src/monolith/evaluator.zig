@@ -3672,6 +3672,27 @@ test "executeStatement: returns the last line of a function and of each block at
     try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, declarations[5].kind.constant_declaration.known.?.*);
 }
 
+test "executeExpressionStatement: runs a caught call once and its fallback only for an error at compile time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure\n    Bad\nfn check(value: i32, calls: *i32) -> Failure!void\n    calls.* += 1\n    if (value < 0) return Failure::Bad\nfn run(value: i32) -> i32\n    var calls: i32 = 0\n    check(value, &calls) catch return calls * 10\n    return calls\nconst PASSED = run(1)\nconst FAILED = run(-1)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 10 } }, declarations[4].kind.constant_declaration.known.?.*);
+}
+
 test "executeTupleDeclaration: takes a tuple apart" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3692,6 +3713,25 @@ test "executeTupleDeclaration: takes a tuple apart" {
     try std.testing.expectEqual(2, elements.len);
     try std.testing.expectEqual(Value{ .boolean = true }, elements[0]);
     try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, elements[1]);
+}
+
+test "executeTupleDeclaration: writes through a pointer name after var and writes the name beside it without writing the tuple" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn bump(start: [i64, i64]) -> i64\n    var value = start\n    var { count, *total } = value\n    count += 10\n    total.* += count\n    const { first, second } = value\n    return first * 100 + second\nconst BUMPED = bump({ 1, 2 })" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 113 } }, loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*);
 }
 
 test "executeMatch: runs the branch of the case and binds its value" {
@@ -4177,6 +4217,25 @@ test "enterCondition: writes a name after as var without writing the tested opti
     const declarations = loader.modules.items[0].declarations;
     try std.testing.expectEqual(Value{ .integer = .{ .signed = 1101 } }, declarations[3].kind.constant_declaration.known.?.*);
     try std.testing.expectEqual(Value{ .integer = .{ .signed = 6 } }, declarations[4].kind.constant_declaration.known.?.*);
+}
+
+test "enterCondition: writes through a pointer name after as var and writes the name beside it without writing the optional" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn bump(start: ?[i64, i64]) -> i64\n    var value = start\n    if value as var { count, *total }\n        count += 10\n        total.* += count\n    if value as { first, second }\n        return first * 100 + second\n    return 0\nconst BUMPED = bump({ 1, 2 })" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 113 } }, loader.modules.items[0].declarations[1].kind.constant_declaration.known.?.*);
 }
 
 test "enterCondition: evaluates the optional of a while loop before each run" {

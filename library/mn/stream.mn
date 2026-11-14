@@ -30,3 +30,30 @@ instance Reader(SliceIterator(*[]u8))
         memory::copy(buffer[..count], source.remaining[..count])
         source.remaining = source.remaining[count..]
         return count
+
+
+fn BufferedReader(type R: Reader) -> type
+    return struct
+        private reader: *R
+        private buffer: *[]u8
+        private start: usize
+        private end: usize
+
+        fn init(reader: *R, buffer: *[]u8) -> Self = { reader = reader, buffer = buffer, start = 0, end = 0 }
+
+
+instance(type R: Reader) Reader(BufferedReader(R))
+
+    fn read(self: *Self, destination: *[]u8) -> !usize
+        if (destination.length == 0) return 0
+        if self.start == self.end
+            if (destination.length >= self.buffer.length) return Reader::read(self.reader, destination)
+            const filled = try Reader::read(self.reader, self.buffer)
+            if (filled == 0) return 0
+            self.start = 0
+            self.end = filled
+        var count = self.end - self.start
+        if (destination.length < count) count = destination.length
+        memory::copy(destination[..count], self.buffer[self.start..self.start + count])
+        self.start += count
+        return count

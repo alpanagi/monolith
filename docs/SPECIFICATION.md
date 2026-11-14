@@ -229,6 +229,7 @@
 - An unused local constant or variable is a compile-time error.
 - A variable that is never modified is a compile-time error.
 - `const` or `var` followed by names in braces takes a tuple apart, e.g. `const { name, score } = pair` or `var { count, flag } = pair`. Each name holds the element at its position, a constant after `const` and a variable after `var`, e.g. `count += 1`. Names in parentheses are a compile-time error, e.g. `const (name, score) = pair`.
+- Names in braces after `var` or `as var` are a compile-time error only when none of them is modified, e.g. `while map.pop() as var { key, value }` with only `key` written is allowed.
 - The number of names must match the number of elements of the tuple.
 - A name `_` leaves its element without a name.
 - `*name` holds a pointer to the element instead of a copy, e.g. `const { name, *score } = pair`. It is allowed only where `&` is allowed, and the pointer is read-only when the element cannot be modified (see Pointer Operations).
@@ -359,6 +360,7 @@
 ### Calls
 
 - A call can be a statement. A call whose result is not `void` must be used or discarded.
+- A call with `catch` can be a statement when its result has no value (see Errors).
 - A comma after the last argument is allowed, e.g. `log(1, 2,)`.
 
 ### Discards
@@ -404,8 +406,7 @@
 - `as name` declares a constant and `as var name` a variable, e.g. `if found as var card` followed by `card.score += 1`.
 - When the optional is a variable, a constant, a parameter, an element or a field, the name holds a copy of its value, so writing a name declared with `as var` leaves the optional unchanged. `as *name` holds a pointer to the value inside the optional instead, e.g. `if (found as *card) card.score += 1`.
 - When the optional is the result of a call, the name is the value inside the result and nothing is copied, e.g. `while list.pop() as var element` followed by `element.deinit()` ends the element `pop` gave. `as *name` is a compile-time error there, since only a variable, a constant, a parameter, an element or a field has an address (see Pointer Operations).
-- `var` together with a pointer name is a compile-time error, since a pointer name is a pointer to the value and not a variable, e.g. `as var *card` or `as var { name, *score }`.
-- Names in braces after `as` take a value that is a tuple apart, as in a declaration (see Variables and Constants), e.g. `if found as { name, score }` or `if found as var { name, score }`. Each name holds its element as a single name holds the whole value. A name `_` leaves its element without a name, and `*name` holds a pointer to its element.
+- Names in braces after `as` take a value that is a tuple apart, as in a declaration (see Variables and Constants), e.g. `if found as { name, score }` or `if found as var { name, *score }`. Each name holds its element as a single name holds the whole value. After `as var`, they are a compile-time error only when none of them is modified. A name `_` leaves its element without a name, and `*name` holds a pointer to its element.
 
 ### While
 
@@ -447,7 +448,6 @@
 - On an optional, a case is `null`, or the value's type, which takes the value, e.g. `case Card as card` for a `?Card`.
 - `as name` names the value and a value's type without `as` leaves it without a name. `as name` declares a constant and `as var name` a variable, as in `if`, e.g. `case Card as var card`.
 - When the matched value is a variable, a constant, a parameter, an element or a field, the name holds a copy, and `as *name` holds a pointer to the value inside it instead. When it is the result of a call, the name is the value inside the result and nothing is copied, and `as *name` is a compile-time error, as in `if`. The same holds for the names in braces after a case of an enum.
-- `var` together with a pointer name is a compile-time error, e.g. `case Card as var *card`.
 - Names in braces after `as` take a value that is a tuple apart, as in `if`, e.g. `case [K, V] as { key, value }`, `case [K, V] as var { key, value }` or `else _ as { key, value }`. `*name` among the names after `else` is a compile-time error.
 - On a result or an error set, `as name` in a case that is an error names the error, e.g. `case (NotFound as failure) failure` or `case NotFound as failure` before an indented block. Its type holds only that case and any data the case carries. `as *name` is a compile-time error there.
 - On an integer, a case is a value known at compile time or a range, e.g. `case 0` or `case 3..10`. Cases cannot overlap.
@@ -510,6 +510,8 @@
 - `try` can be written directly before a `match` that starts a statement or its value, e.g. `const file = try match open(path)`. The `match` ends the statement. Anywhere else, a `match` after `try` is a compile-time error, e.g. `1 + try match open(path)`.
 - An error handled by a `match` is not part of the remaining errors, so it does not enter an inferred set through them, e.g. after `case (NotFound) create(path)` and `else (_ as rest) rest`.
 - `result catch fallback` gives the result's value, or `fallback` if it holds an error. `fallback` is evaluated only when needed.
+- `catch` on a call whose result has no value can stand as a statement, e.g. `file.write(line) catch return`. The call runs once, and `fallback` is a `return`, `break` or `continue` or an expression of type `void`, e.g. `file.write(line) catch report()`.
+- `catch` on a result with a value cannot stand as a statement, e.g. `parse(text) catch 0` on its own line is a compile-time error, as an unused call result is.
 - An error that is not caught during compile-time evaluation is a compile-time error.
 
 ## Modules

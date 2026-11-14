@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -61,6 +62,7 @@ static int32_t mn_runtime_filesystem_error_code(int number) {
     case ENOMEM:
         return -7;
     case EEXIST:
+    case ENOTEMPTY:
         return -8;
     default:
         return -9;
@@ -183,5 +185,10 @@ void mn_runtime_filesystem_close_directory(void *handle) {
 
 int32_t mn_runtime_filesystem_create_directory(mn_slice_u8 name) {
     if (mkdir((char const *)name.items, 0777) != 0) return mn_runtime_filesystem_error_code(errno);
+    return 0;
+}
+
+int32_t mn_runtime_filesystem_rename(mn_slice_u8 from, mn_slice_u8 to) {
+    if (rename((char const *)from.items, (char const *)to.items) != 0) return mn_runtime_filesystem_error_code(errno);
     return 0;
 }

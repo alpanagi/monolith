@@ -1038,7 +1038,7 @@ pub const TypeChecker = struct {
             return self.fail(expression.location, error.UnusedValue);
         };
         if (production.expected) |expected| recordExpectedType(expression, expected);
-        if (isCallOrTriedCall(expression.*)) {
+        if (isCallStatement(expression.*)) {
             const value_type = try self.inferType(parameters, expression);
             if (value_type == .void) {
                 if (production.result) {
@@ -1479,7 +1479,7 @@ pub const TypeChecker = struct {
         parameters: []const ast.TypedName,
         expression: *ast.Expression,
     ) TypeError!types.Type {
-        if (expression.kind == .@"try") return self.inferType(parameters, expression);
+        if (expression.kind == .@"try" or expression.kind == .binary) return self.inferType(parameters, expression);
         if (ast.isComptimeErrorCall(self.program.modules[self.module_index], expression.*)) {
             return self.checkComptimeError(parameters, expression);
         }
@@ -6063,6 +6063,13 @@ fn isErrorPattern(error_set: *const types.Enum, pattern: ast.Expression) bool {
     };
 }
 
+fn isCallStatement(expression: ast.Expression) bool {
+    if (expression.kind == .binary and expression.kind.binary.operator == .@"catch") {
+        return isCallOrTriedCall(expression.kind.binary.left.*);
+    }
+    return isCallOrTriedCall(expression);
+}
+
 fn isCallOrTriedCall(expression: ast.Expression) bool {
     const call = if (expression.kind == .@"try") expression.kind.@"try".* else expression;
     if (expression.kind == .@"try" and call.kind == .branching) return true;
@@ -8353,6 +8360,27 @@ test "checkFunctionBody: keeps a void call on the last line of a function whose 
 
     const body = loader.modules.items[0].declarations[4].kind.function_definition.body;
     try std.testing.expect(body[1].kind == .call);
+}
+
+test "checkFunctionBody: keeps a caught call on the last line of a function whose result has no value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure\n    Broken\nfn check() -> Failure!void = noop\nfn log() = noop\nfn run() -> Failure!void\n    check() catch log()\nfn stop() -> !void\n    check() catch return" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expect(declarations[3].kind.function_definition.body[0].kind == .call);
+    try std.testing.expect(declarations[4].kind.function_definition.body[0].kind == .call);
 }
 
 test "checkFunctionBody: lets the end of the body give void after a last if without else" {
@@ -11910,6 +11938,65 @@ test "checkStatement: accepts a tried call as a statement" {
     try std.testing.expectEqual(types.Type.void, call.type.?);
 }
 
+test "checkStatement: accepts a caught call to a result without a value as a statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure\n    Bad\nfn save() -> Failure!void = noop\nfn report() = noop\nfn main()\n    save() catch return\n    save() catch report()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[3].kind.function_definition.body;
+    try std.testing.expectEqual(types.Type.void, body[0].kind.call.type.?);
+    try std.testing.expectEqual(types.Type.void, body[1].kind.call.type.?);
+}
+
+test "checkStatement: rejects a caught call to a result with a value as a statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure\n    Bad\nfn parse() -> Failure!u8 = return 1\nfn main()\n    parse() catch 0\n    parse() catch return" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnusedResult, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 5 }, analyzer.failure.?.location.?);
+}
+
+test "checkStatement: checks the fallback of a caught call statement against void" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure\n    Bad\nfn save() -> Failure!void = noop\nfn main()\n    save() catch 1" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 18 }, analyzer.failure.?.location.?);
+}
+
 test "checkStatement: checks the value of a local constant at its statement" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -13107,6 +13194,32 @@ test "checkConditionNames: gives the name of an if the value of the optional or 
     try std.testing.expectEqual(types.Type{ .number = .i64 }, pointer.target);
     try std.testing.expect(!pointer.constant);
     try std.testing.expectEqual(types.Type{ .number = .i64 }, body[2].kind.@"if".names[0].type.?);
+}
+
+test "checkConditionNames: gives a pointer name in braces after as var the writability of the optional" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?[i64, bool]) -> i64\n    var stored = value\n    const fixed = value\n    if stored as var { one, *two }\n        one += 1\n        two.* = true\n        return one\n    if fixed as var { three, *four }\n        three += 1\n        if (four.*) return three\n    return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
+    const variable_names = body[2].kind.@"if".names;
+    try std.testing.expectEqual(types.Type{ .number = .i64 }, variable_names[0].type.?);
+    try std.testing.expectEqual(types.Type.boolean, variable_names[1].type.?.pointer.target);
+    try std.testing.expect(!variable_names[1].type.?.pointer.constant);
+    const constant_names = body[3].kind.@"if".names;
+    try std.testing.expectEqual(types.Type{ .number = .i64 }, constant_names[0].type.?);
+    try std.testing.expect(constant_names[1].type.?.pointer.constant);
 }
 
 test "checkConditionNames: rejects a condition that is not an optional" {

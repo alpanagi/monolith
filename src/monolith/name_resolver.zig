@@ -2725,10 +2725,14 @@ pub const NameResolver = struct {
             const local = (try self.resolveNamesInStatement(block, statement)) orelse continue;
             try block.locals.append(self.arena.allocator(), local);
         }
-        for (block.locals.items[start..]) |local| {
+        const locals = block.locals.items[start..];
+        for (locals, 0..) |local, index| {
             if (local.deferred) {
                 local.statement.kind.variable_declaration.deferred_use = local.use;
                 continue;
+            }
+            if (local.statement.kind == .tuple_declaration and (index == 0 or locals[index - 1].statement != local.statement)) {
+                try self.expectModifiedGroup(extractStatementLocals(locals[index..]));
             }
             if (self.isDroppedName(local.name)) continue;
             if (local.statement.kind == .constant_declaration and local.statement.kind.constant_declaration.context) continue;
@@ -2893,9 +2897,9 @@ pub const NameResolver = struct {
         const start = block.locals.items.len;
         try self.declareElements(block, statement);
         try self.resolveNamesInBlock(block, statement.kind.@"if".body);
+        try self.expectModifiedGroup(block.locals.items[start..]);
         for (block.locals.items[start..]) |local| {
             if (self.isDroppedName(local.name)) continue;
-            if (isUnmodifiedVariableName(local)) return self.fail(local.location, error.NeverModified);
             try self.expectUsed(local.use, local.location, error.UnusedValueName);
         }
         block.locals.shrinkRetainingCapacity(start);
@@ -2929,9 +2933,9 @@ pub const NameResolver = struct {
             else => unreachable,
         };
         try self.resolveNamesInBlock(block, body);
+        try self.expectModifiedGroup(block.locals.items[start..]);
         for (block.locals.items[start..]) |local| {
             if (self.isDroppedName(local.name)) continue;
-            if (isUnmodifiedVariableName(local)) return self.fail(local.location, error.NeverModified);
             try self.expectUsed(local.use, local.location, error.UnusedLoopName);
         }
         block.locals.shrinkRetainingCapacity(start);
@@ -2980,9 +2984,9 @@ pub const NameResolver = struct {
                 });
             }
             try self.resolveNamesInBlock(block, branch.body);
+            try self.expectModifiedGroup(block.locals.items[start..]);
             for (block.locals.items[start..]) |local| {
                 if (self.isDroppedName(local.name)) continue;
-                if (isUnmodifiedVariableName(local)) return self.fail(local.location, error.NeverModified);
                 try self.expectUsed(local.use, local.location, error.UnusedValueName);
             }
             block.locals.shrinkRetainingCapacity(start);
@@ -3308,6 +3312,17 @@ pub const NameResolver = struct {
         } else if (!use.used) {
             return self.fail(location, unused_error);
         }
+    }
+
+    fn expectModifiedGroup(self: *NameResolver, locals: []const Local) NameError!void {
+        var first: ?Local = null;
+        for (locals) |local| {
+            if (self.isDroppedName(local.name) or !isVariableElement(local)) continue;
+            if (local.use.modified) return;
+            if (first == null) first = local;
+        }
+        const unmodified = first orelse return;
+        return self.fail(unmodified.location, error.NeverModified);
     }
 
     fn resolveNamesInExpression(
@@ -6062,9 +6077,16 @@ fn recordModifiedVariable(scope: Scope, expression: ast.Expression) void {
     }
 }
 
-fn isUnmodifiedVariableName(local: Local) bool {
+fn extractStatementLocals(locals: []const Local) []const Local {
+    for (locals, 0..) |local, index| {
+        if (local.statement != locals[0].statement) return locals[0..index];
+    }
+    return locals;
+}
+
+fn isVariableElement(local: Local) bool {
     if (local.target != .element) return false;
-    return ast.findElementName(local.target.element).variable and !local.use.modified;
+    return ast.isWritableElement(local.target.element);
 }
 
 fn recordReadVariable(scope: Scope, expression: ast.Expression) void {
@@ -10286,6 +10308,44 @@ test "resolveNamesInBlock: rejects a variable that is never modified" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, name_resolver.failure.?.location.?);
 }
 
+test "resolveNamesInBlock: rejects names in braces after var when none of them is modified" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: [i64, i64]) -> i64\n    var { one, two } = value\n    return one + two" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeverModified, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 11 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveNamesInBlock: accepts names in braces after var when one of them is modified" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: [i64, i64]) -> i64\n    var { one, two } = value\n    one += 1\n    return one + two" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    try std.testing.expectEqual(null, name_resolver.failure);
+}
+
 test "resolveNamesInBlock: rejects a variable that is only assigned" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -11056,6 +11116,82 @@ test "resolveNamedBody: rejects a name after as var that is never modified" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 22 }, name_resolver.failure.?.location.?);
 }
 
+test "resolveNamedBody: rejects a pointer name after as var that is only written through" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?i64) -> i64\n    if value as var *found\n        found.* += 1\n        return found.*\n    return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeverModified, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 21 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveNamedBody: rejects names in braces after as var when none of them is modified" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?[i64, i64]) -> i64\n    if value as var { one, two }\n        return one + two\n    return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeverModified, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 23 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveNamedBody: accepts names in braces after as var when one of them is modified" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?[i64, i64]) -> i64\n    if value as var { one, two }\n        one += 1\n        return one + two\n    return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    try std.testing.expectEqual(null, name_resolver.failure);
+}
+
+test "resolveNamedBody: accepts a pointer name in braces after as var when another name is modified" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?[i64, i64]) -> i64\n    if value as var { one, *two }\n        one += 1\n        return one + two.*\n    return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    try std.testing.expectEqual(null, name_resolver.failure);
+}
+
 test "resolveSequence: resolves a sequence outside the names of its loop" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -11256,7 +11392,26 @@ test "resolveLoop: rejects an unused name of a for loop" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 38 }, name_resolver.failure.?.location.?);
 }
 
-test "resolveLoop: rejects a name in braces after as var that is never modified" {
+test "resolveLoop: rejects names in braces after as var when none of them is modified" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?[i64, i64]) -> i64\n    while value as var { one, two }\n        return one + two\n    return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeverModified, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 26 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveLoop: accepts names in braces after as var when one of them is modified" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -11270,9 +11425,9 @@ test "resolveLoop: rejects a name in braces after as var that is never modified"
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
 
-    try std.testing.expectError(error.NeverModified, name_resolver.resolve());
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 31 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqual(null, name_resolver.failure);
 }
 
 test "resolveLoop: accepts an underscore in place of a name of a for loop" {
@@ -11497,6 +11652,44 @@ test "resolveBranches: rejects an unused value name" {
 
     try std.testing.expectError(error.UnusedValueName, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 6, .column = 23 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveBranches: rejects names in braces after as var when none of them is modified" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?[i64, i64]) -> i64\n    match value\n        case [i64, i64] as var { one, two }\n            return one + two\n        else\n            return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeverModified, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 34 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveBranches: accepts names in braces after as var when one of them is modified" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?[i64, i64]) -> i64\n    match value\n        case [i64, i64] as var { one, two }\n            one += 1\n            return one + two\n        else\n            return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    try std.testing.expectEqual(null, name_resolver.failure);
 }
 
 test "resolveBranches: keeps a value name inside its branch" {

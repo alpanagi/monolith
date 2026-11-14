@@ -784,10 +784,7 @@ pub const Parser = struct {
         else
             try allocator.dupe(ast.ElementName, &.{try self.parseValueName(&position)});
         if (variable) {
-            for (names) |*name| {
-                if (name.pointer) return self.failAt(name.location, error.PointerVariableName);
-                name.variable = true;
-            }
+            for (names) |*name| name.variable = true;
         }
 
         offset.* = position;
@@ -1199,7 +1196,7 @@ pub const Parser = struct {
     ) ParseError!?ast.Statement {
         var position = offset.*;
         const call = (try self.parseExpression(allocator, &position)) orelse return null;
-        if (!isCallOrTriedCall(call)) return null;
+        if (!isCallStatement(call)) return null;
 
         offset.* = position;
         return .{ .kind = .{ .call = call }, .location = call.location };
@@ -2880,7 +2877,6 @@ pub const ParseError = error{
     InlineSignature,
     RangeOperand,
     DiscardedValueName,
-    PointerVariableName,
     ExpectedDeferredStatement,
     ParenthesizedPattern,
     MisplacedPrivate,
@@ -2989,6 +2985,13 @@ fn buildReceiverExpression(allocator: std.mem.Allocator, name: []const u8, locat
     return .{ .kind = .{ .path_expression = .{ .path = path } }, .location = location };
 }
 
+fn isCallStatement(expression: ast.Expression) bool {
+    if (expression.kind == .binary and expression.kind.binary.operator == .@"catch") {
+        return isCallOrTriedCall(expression.kind.binary.left.*);
+    }
+    return isCallOrTriedCall(expression);
+}
+
 fn isCallOrTriedCall(expression: ast.Expression) bool {
     const call = if (expression.kind == .@"try") expression.kind.@"try".* else expression;
     return call.kind == .call or call.kind == .method_call;
@@ -3077,7 +3080,6 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.InlineSignature => "a typeclass function without a body cannot be inline",
         error.RangeOperand => "a range cannot be an operand",
         error.DiscardedValueName => "'as' needs a name, leave it out to leave the value without a name",
-        error.PointerVariableName => "a name after 'as var' is a variable and cannot be a pointer, use 'as *name' for a pointer to the value",
         error.ExpectedDeferredStatement => "expected a call, an assignment or a discard",
         error.ParenthesizedPattern => "names that take a value apart are written in braces, not parentheses, e.g. `const { name, score } = pair`, `for { card, index } in Zip::zip({ cards, 0.. })` or `while map.pop() as { key, value }`",
         error.MisplacedPrivate => "private is written only before a top-level declaration other than an import or instance, before a function or type in the block of a struct, an enum or a typeclass, or before a struct field, e.g. `private fn build_text` or `private storage: *[]T`; at a use it is written between `.` or `::` and the name it crosses to, or before a field of a struct literal, e.g. `list.private.count`, `filesystem::private::build_path` or `{ private.bytes = text }`",
@@ -4853,26 +4855,41 @@ test "parseValueNames: parses variable names in braces after as var" {
     try std.testing.expect(loop.names[1].variable);
 }
 
-test "parseValueNames: rejects a pointer name after as var" {
+test "parseValueNames: parses a variable pointer name after as var" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while map.pop() as var { key, *value }\n        noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if (found as var *value) noop\n    match found\n        case (i64 as var *count) noop\n        else noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
 
-    try std.testing.expectError(error.PointerVariableName, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 35 }, parser.failure.?.location.?);
+    const body = module.declarations[0].kind.function_definition.body;
+    const name = body[0].kind.@"if".names[0];
+    try std.testing.expectEqualStrings("value", name.name);
+    try std.testing.expect(name.variable);
+    try std.testing.expect(name.pointer);
+    const case_name = body[1].kind.match.names[0];
+    try std.testing.expectEqualStrings("count", case_name.name);
+    try std.testing.expect(case_name.variable);
+    try std.testing.expect(case_name.pointer);
 }
 
-test "parseValueNames: rejects a pointer name after as var in a case" {
+test "parseValueNames: parses a variable pointer name in braces after as var" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match value\n        case (i64 as var *count) noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while found as var { one, *two }\n        noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
 
-    try std.testing.expectError(error.PointerVariableName, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 26 }, parser.failure.?.location.?);
+    const loop = module.declarations[0].kind.function_definition.body[0].kind.@"while";
+    try std.testing.expect(loop.tuple);
+    try std.testing.expectEqualStrings("one", loop.names[0].name);
+    try std.testing.expect(loop.names[0].variable);
+    try std.testing.expect(!loop.names[0].pointer);
+    try std.testing.expectEqualStrings("two", loop.names[1].name);
+    try std.testing.expect(loop.names[1].variable);
+    try std.testing.expect(loop.names[1].pointer);
 }
 
 test "parseFor: parses a name, a sequence and an indented body" {
@@ -5947,6 +5964,47 @@ test "parseCallStatement: parses a tried call as a statement" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, statement.location);
 }
 
+test "parseCallStatement: parses a caught call as a statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    save() catch return\n    step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const statement = module.declarations[0].kind.function_definition.body[0];
+    const caught = statement.kind.call.kind.binary;
+    try std.testing.expectEqual(ast.BinaryOperator.@"catch", caught.operator);
+    try std.testing.expectEqualStrings("save", caught.left.kind.call.callee.identifier.name);
+    try std.testing.expectEqual(null, caught.right.kind.jump.kind.@"return");
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, statement.location);
+}
+
+test "parseCallStatement: parses a caught call as the one-line body of an if" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if (ready) save() catch return\n    step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body[0].kind.@"if".body;
+    const caught = body[0].kind.call.kind.binary;
+    try std.testing.expectEqualStrings("save", caught.left.kind.call.callee.identifier.name);
+    try std.testing.expectEqual(null, caught.right.kind.jump.kind.@"return");
+}
+
+test "parseCallStatement: rejects a caught name that is not called as a statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    value catch return\n    step()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedStatement, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, parser.failure.?.location.?);
+}
+
 test "parseCallStatement: rejects a name that is not called" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6023,6 +6081,22 @@ test "parseTupleDeclaration: parses variable names and constant names in braces"
     const constant = body[1].kind.tuple_declaration;
     try std.testing.expect(!constant.variable);
     try std.testing.expectEqualStrings("record", constant.names[1].name);
+}
+
+test "parseTupleDeclaration: parses a pointer name among variable names in braces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = var { *one, two } = value");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const declaration = module.declarations[0].kind.function_definition.body[0].kind.tuple_declaration;
+    try std.testing.expect(declaration.variable);
+    try std.testing.expectEqualStrings("one", declaration.names[0].name);
+    try std.testing.expect(declaration.names[0].pointer);
+    try std.testing.expectEqualStrings("two", declaration.names[1].name);
+    try std.testing.expect(!declaration.names[1].pointer);
 }
 
 test "parseTupleDeclaration: rejects names in parentheses" {
