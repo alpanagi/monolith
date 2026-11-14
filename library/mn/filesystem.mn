@@ -178,6 +178,13 @@ inline struct Path
     fn is_absolute(self: Self) -> bool = self.bytes.length > 0 and self.bytes[0] == separator
 
 
+    fn has_ancestor(self: Self, ancestor: Path) -> bool
+        const length = ancestor.bytes.length
+        if (length == 0 or length >= self.bytes.length) return false
+        if (!memory::equal(self.bytes[..length], ancestor.bytes)) return false
+        return ancestor.bytes[length - 1] == separator or self.bytes[length] == separator
+
+
     fn join(self: Self, other: Path) -> memory::Error!Self
         const length = self.bytes.length
         const is_separated = length > 0 and self.bytes[length - 1] != separator

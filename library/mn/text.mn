@@ -32,6 +32,9 @@ fn is_whitespace(byte: u8) -> bool = match byte
     else false
 
 
+fn has_prefix(bytes: const(*[]u8), prefix: const(*[]u8)) -> bool = prefix.length <= bytes.length and memory::equal(bytes[..prefix.length], prefix)
+
+
 error Error
     Malformed
     OutOfRange
