@@ -1,5 +1,6 @@
 #define _DARWIN_C_SOURCE
 #define _DEFAULT_SOURCE
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include <dirent.h>
@@ -188,7 +189,21 @@ int32_t mn_runtime_filesystem_create_directory(mn_slice_u8 name) {
     return 0;
 }
 
-int32_t mn_runtime_filesystem_rename(mn_slice_u8 from, mn_slice_u8 to) {
-    if (rename((char const *)from.items, (char const *)to.items) != 0) return mn_runtime_filesystem_error_code(errno);
+static int mn_runtime_filesystem_move_exclusive(char const *from, char const *to) {
+#if defined(__APPLE__)
+    return renamex_np(from, to, RENAME_EXCL);
+#elif defined(RENAME_NOREPLACE)
+    return renameat2(AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+int32_t mn_runtime_filesystem_move(mn_slice_u8 from, mn_slice_u8 to, bool overwrite) {
+    char const *source = (char const *)from.items;
+    char const *target = (char const *)to.items;
+    int status = overwrite ? rename(source, target) : mn_runtime_filesystem_move_exclusive(source, target);
+    if (status != 0) return mn_runtime_filesystem_error_code(errno);
     return 0;
 }

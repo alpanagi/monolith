@@ -22,10 +22,10 @@ private external fn mn_runtime_filesystem_close(descriptor: i32)
 private external fn mn_runtime_filesystem_close_directory(handle: *void)
 private external fn mn_runtime_filesystem_create_directory(name: const(*[]u8)) -> i32
 private external fn mn_runtime_filesystem_metadata(name: const(*[]u8), kind: *i32, size: *usize, seconds: *i64, nanoseconds: *u32) -> i32
+private external fn mn_runtime_filesystem_move(from: const(*[]u8), to: const(*[]u8), overwrite: bool) -> i32
 private external fn mn_runtime_filesystem_next_entry(handle: *void, entry: *Directory::RawEntry) -> i32
 private external fn mn_runtime_filesystem_open(name: const(*[]u8), mode: i32) -> i32
 private external fn mn_runtime_filesystem_open_directory(name: const(*[]u8), code: *i32) -> ?*void
-private external fn mn_runtime_filesystem_rename(from: const(*[]u8), to: const(*[]u8)) -> i32
 private external fn mn_runtime_filesystem_size(descriptor: i32) -> isize
 private external fn mn_runtime_io_read(descriptor: i32, buffer: *[]u8) -> isize
 private external fn mn_runtime_io_write(descriptor: i32, bytes: const(*[]u8)) -> isize
@@ -66,7 +66,7 @@ struct File
         return mn::convert(usize, byte_count)
 
 
-    fn close(self: Self) = mn_runtime_filesystem_close(self.descriptor)
+    fn close(self: *Self) = mn_runtime_filesystem_close(self.descriptor)
 
     struct Options
         mode: Mode = ::Read
@@ -150,7 +150,7 @@ struct Directory
         return { name = entry.name[0..entry.length], kind = find_kind(entry.kind) }
 
 
-    fn close(self: Self) = mn_runtime_filesystem_close_directory(self.handle)
+    fn close(self: *Self) = mn_runtime_filesystem_close_directory(self.handle)
 
     private external struct RawEntry
         name: const(*[many]u8)
@@ -297,7 +297,7 @@ fn exists(path: Path) -> Error!bool = match metadata(path)
 
 
 fn read(path: Path) -> !*[]u8
-    const file = try File::open(path)
+    var file = try File::open(path)
     defer file.close()
     const size = try file.size()
     var bytes = try memory::allocate(u8, size)
@@ -317,7 +317,7 @@ fn read(path: Path) -> !*[]u8
 
 
 fn write(path: Path, bytes: const(*[]u8)) -> !void
-    const file = try File::open(path, { mode = ::Write })
+    var file = try File::open(path, { mode = ::Write })
     defer file.close()
     try file.write(bytes)
 
@@ -356,8 +356,12 @@ private fn is_directory(name: const(*[]u8)) -> bool
     return code == 0 and find_kind(kind) == File::Kind::Directory
 
 
-fn rename(from: Path, to: Path) -> Error!void
+fn move(from: Path, to: Path, options: MoveOptions = {}) -> Error!void
     var from_name: [maximum_path_length]u8 = undefined
     var to_name: [maximum_path_length]u8 = undefined
-    const code = mn_runtime_filesystem_rename(try fill_name(from, &from_name), try fill_name(to, &to_name))
+    const code = mn_runtime_filesystem_move(try fill_name(from, &from_name), try fill_name(to, &to_name), options.overwrite)
     if (code < 0) return find_error(code)
+
+
+struct MoveOptions
+    overwrite: bool = false

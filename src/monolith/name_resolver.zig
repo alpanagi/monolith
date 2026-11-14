@@ -8062,7 +8062,7 @@ test "resolveFunctionSignature: resolves Self in a method of mn::filesystem reac
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::filesystem\nimport mn::stream::Reader\n\nfn measure(path: filesystem::Path) -> filesystem::Error!usize\n    const file = filesystem::File::open(path) catch return 0\n    defer file.close()\n    var buffer: [64]u8 = undefined\n    const count = try file.read(&buffer)\n    return count + try file.size()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::filesystem\nimport mn::stream::Reader\n\nfn measure(path: filesystem::Path) -> filesystem::Error!usize\n    var file = filesystem::File::open(path) catch return 0\n    defer file.close()\n    var buffer: [64]u8 = undefined\n    const count = try file.read(&buffer)\n    return count + try file.size()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);

@@ -29832,7 +29832,7 @@ test "integration: lists files with a generic function that calls itself and kee
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::convert::To\nimport mn::convert::View\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::process::stdout\nimport mn::stream::Writer\nimport mn::text\n\nconst root = \".\"\n\nfn main -> !void\n    var heap = memory::Heap::init()\n    var path = try root.to(filesystem::Path) with &heap\n    defer path.deinit() with &heap\n    try print_files(path) with &heap\n\nfn print_files(path: filesystem::Path) -> !void\n    var buffer: [filesystem::maximum_path_length]u8 = undefined\n    const bytes = try path.to(*[]u8)\n    defer memory::free(bytes)\n    for (index in 0..bytes.length) buffer[index] = bytes[index]\n\n    const directory = try filesystem::Directory::open(path)\n    defer directory.close()\n\n    while try directory.next() as entry\n        match entry.kind\n            case File\n                try text::print(&stdout, \"{s}/{s}\\n\", { buffer[..bytes.length], entry.name })\n            case Directory\n                var inner_path = try path.join(entry.name.view_as(filesystem::Path))\n                defer inner_path.deinit()\n                try print_files(inner_path)\n            else noop" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::convert::To\nimport mn::convert::View\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::process::stdout\nimport mn::stream::Writer\nimport mn::text\n\nconst root = \".\"\n\nfn main -> !void\n    var heap = memory::Heap::init()\n    var path = try root.to(filesystem::Path) with &heap\n    defer path.deinit() with &heap\n    try print_files(path) with &heap\n\nfn print_files(path: filesystem::Path) -> !void\n    var buffer: [filesystem::maximum_path_length]u8 = undefined\n    const bytes = try path.to(*[]u8)\n    defer memory::free(bytes)\n    for (index in 0..bytes.length) buffer[index] = bytes[index]\n\n    var directory = try filesystem::Directory::open(path)\n    defer directory.close()\n\n    while try directory.next() as entry\n        match entry.kind\n            case File\n                try text::print(&stdout, \"{s}/{s}\\n\", { buffer[..bytes.length], entry.name })\n            case Directory\n                var inner_path = try path.join(entry.name.view_as(filesystem::Path))\n                defer inner_path.deinit()\n                try print_files(inner_path)\n            else noop" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31209,7 +31209,7 @@ test "resolveAllocatorCall: rejects with on opening a file through the standard 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: const(*[]T)) = noop\nfn run(path: filesystem::Path) -> !void\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const file = try filesystem::File::open(path) with &fixed\n    file.close()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: const(*[]T)) = noop\nfn run(path: filesystem::Path) -> !void\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    var file = try filesystem::File::open(path) with &fixed\n    file.close()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -31227,7 +31227,7 @@ test "resolveAllocatorCall: rejects with on opening a directory through the stan
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: const(*[]T)) = noop\nfn run(path: filesystem::Path) -> !void\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    const directory = try filesystem::Directory::open(path) with &fixed\n    directory.close()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::filesystem\nimport mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    bytes: [32]u8\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(fixed: *Fixed, type T, count: usize) -> memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (fixed.used + size > 32) return memory::Error::OutOfMemory\n        const start = fixed.used\n        fixed.used += size\n        return mn::cast(*[many]T, fixed.bytes[start..fixed.used].pointer)[0..count]\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: const(*[]T)) = noop\nfn run(path: filesystem::Path) -> !void\n    var fixed: Fixed = undefined\n    fixed.used = 0\n    var directory = try filesystem::Directory::open(path) with &fixed\n    directory.close()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -33771,6 +33771,25 @@ test "buildReceiver: keeps a default writable on a constant where only some func
     try std.testing.expectEqual(token.Location{ .row = 20, .column = 12 }, analyzer.failure.?.location.?);
 }
 
+test "buildReceiver: rejects closing a constant file and accepts closing a variable one through the standard library" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::filesystem\nfn accept(path: filesystem::Path) -> !void\n    var file = try filesystem::File::open(path)\n    file.close()\nfn reject(path: filesystem::Path) -> !void\n    const file = try filesystem::File::open(path)\n    file.close()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NotWritable, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 7, .column = 5 }, analyzer.failure.?.location.?);
+}
+
 test "resolveInstance: rejects a writable pointer where the typeclass says read-only" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -33914,13 +33933,13 @@ test "integration: rejects a pointer to a path passed to open through the standa
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::filesystem\nfn run(path: filesystem::Path) -> !void\n    const file = try filesystem::File::open(&path)\n    file.close()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::filesystem\nfn run(path: filesystem::Path) -> !void\n    var file = try filesystem::File::open(&path)\n    file.close()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 45 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 43 }, analyzer.failure.?.location.?);
 }
 
 test "integration: rejects an option that the options type of the chosen instance does not have through the standard library" {
