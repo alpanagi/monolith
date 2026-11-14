@@ -27,11 +27,11 @@ fn YamlEncoder(type W: Writer) -> type
     return struct
         private writer: *W
         private document: EncodeFrame
-        private own frames: ArrayList(EncodeFrame)
-        private own pending: ArrayList(u8)
+        private frames: ArrayList(EncodeFrame)
+        private pending: ArrayList(u8)
         private is_line_open: bool
 
-        fn init(writer: *W) -> own Self = { writer = writer, document = { kind = ::Document, remaining = 1, indentation = 0, is_value_next = false, budget = null }, frames = ::init(), pending = ::init(), is_line_open = false }
+        fn init(writer: *W) -> Self = { writer = writer, document = { kind = ::Document, remaining = 1, indentation = 0, is_value_next = false, budget = null }, frames = ::init(), pending = ::init(), is_line_open = false }
 
 
         private fn write_number(self: *Self, type T, value: T) -> !void
@@ -205,24 +205,24 @@ instance(type W: Writer) Encoder(YamlEncoder(W))
 
 instance(type W: Writer) Deinit(YamlEncoder(W))
 
-    fn deinit(own encoder: *Self)
-        encoder.frames.deinit(own)
-        encoder.pending.deinit(own)
+    fn deinit(encoder: *Self)
+        encoder.frames.deinit()
+        encoder.pending.deinit()
 
 
 struct YamlDecoder
-    private own nodes: ArrayList(Node)
-    private own contents: ArrayList(u8)
-    private own frames: ArrayList(DecodeFrame)
+    private nodes: ArrayList(Node)
+    private contents: ArrayList(u8)
+    private frames: ArrayList(DecodeFrame)
     private document: DecodeFrame
     private has_unread_part: bool
 
-    fn(type R: Reader) init(reader: *R) -> own !Self
-        var own input = ArrayList(u8)::init()
-        defer input.deinit(own)
+    fn(type R: Reader) init(reader: *R) -> !Self
+        var input = ArrayList(u8)::init()
+        defer input.deinit()
         try read_input(reader, &input)
-        var own decoder: Self = { nodes = ::init(), contents = ::init(), frames = ::init(), document = { kind = ::Document, node = 0, next = 0, remaining = 1, selected = null, budget = null }, has_unread_part = false }
-        errdefer decoder.deinit(own)
+        var decoder: Self = { nodes = ::init(), contents = ::init(), frames = ::init(), document = { kind = ::Document, node = 0, next = 0, remaining = 1, selected = null, budget = null }, has_unread_part = false }
+        errdefer decoder.deinit()
         var parser: Parser = { input = input.view_as(const(*[]u8)), position = 0, line_start = 0, depth = 0, nodes = &decoder.nodes, contents = &decoder.contents }
         const root = try parser.parse_document()
         decoder.document.node = root
@@ -351,9 +351,9 @@ instance Decoder(YamlDecoder)
         return codec::Error::Malformed
 
 
-    fn bytes(self: *Self) -> own !*[]u8
+    fn bytes(self: *Self) -> !*[]u8
         const scalar = try self.take_scalar()
-        const own bytes = try memory::allocate(u8, scalar.length)
+        const bytes = try memory::allocate(u8, scalar.length)
         memory::copy(bytes, scalar)
         return bytes
 
@@ -407,19 +407,19 @@ instance Decoder(YamlDecoder)
         return codec::Error::Malformed
 
 
-    fn decode(self: *Self, type T: Decode(_, Self)) -> own !T
+    fn decode(self: *Self, type T: Decode(_, Self)) -> !T
         const mark = try self.open_value()
-        const own value = try Decode(T, Self)::decode(self)
+        const value = try Decode(T, Self)::decode(self)
         self.close_value(mark)
         return value
 
 
 instance Deinit(YamlDecoder)
 
-    fn deinit(own decoder: *Self)
-        decoder.nodes.deinit(own)
-        decoder.contents.deinit(own)
-        decoder.frames.deinit(own)
+    fn deinit(decoder: *Self)
+        decoder.nodes.deinit()
+        decoder.contents.deinit()
+        decoder.frames.deinit()
 
 
 private struct EncodeFrame
@@ -1249,8 +1249,8 @@ private fn parse_float(type T, scalar: const(*[]u8)) -> (codec::Error || memory:
     if (is_infinity_text(scalar)) return parse_number_text(T, if (scalar[0] == '-') "-inf" else "inf")
     if (!is_float_text(scalar)) return codec::Error::Malformed
     if (is_normalized_float(scalar)) return parse_number_text(T, scalar)
-    const own normalized = try memory::allocate(u8, scalar.length + 2)
-    defer memory::free(own normalized)
+    const normalized = try memory::allocate(u8, scalar.length + 2)
+    defer memory::free(normalized)
     const length = fill_normalized_float(normalized, scalar)
     return parse_number_text(T, normalized[..length])
 

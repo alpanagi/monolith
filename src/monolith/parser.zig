@@ -39,7 +39,6 @@ pub const Parser = struct {
     has_range: bool = false,
     same_line_block: ?usize = null,
     line_if: ?usize = null,
-    branch_block: bool = false,
     failure: ?Failure = null,
 
     pub fn init(tokens: []const token.Token) Parser {
@@ -226,14 +225,7 @@ pub const Parser = struct {
         }
         var inferred_error_set: ?token.Location = null;
         var return_type: ast.Expression = undefined;
-        const return_own = self.tokens[position].kind == .arrow and self.tokens[position + 1].kind == .keyword_own;
-        if (return_own) position += 1;
-        if (return_own and self.tokens[position + 1].kind != .exclamation_mark) {
-            position += 1;
-            return_type = (try self.parseExpression(allocator, &position)) orelse {
-                return self.fail(position, error.ExpectedType);
-            };
-        } else if ((return_own or self.tokens[position].kind == .arrow) and self.tokens[position + 1].kind == .exclamation_mark) {
+        if (self.tokens[position].kind == .arrow and self.tokens[position + 1].kind == .exclamation_mark) {
             inferred_error_set = self.tokens[position + 1].location;
             position += 2;
             return_type = (try self.parseExpression(allocator, &position)) orelse {
@@ -251,7 +243,6 @@ pub const Parser = struct {
             .parameters = parameters,
             .return_type = return_type,
             .inferred_error_set = inferred_error_set,
-            .return_own = return_own,
         };
     }
 
@@ -289,7 +280,6 @@ pub const Parser = struct {
         var position = offset.*;
         var parameter = (try self.parseParameterForm(allocator, &position)) orelse return null;
         if (self.tokens[position].kind == .equals) {
-            if (parameter.own) return self.fail(position, error.OwnParameterDefault);
             if (parameter.kind == .type) return self.fail(position, error.TypeParameterDefault);
             if (parameter.kind == .compile_time) return self.fail(position, error.ComptimeParameterDefault);
             parameter.default = try self.parseDefault(allocator, &position);
@@ -315,19 +305,17 @@ pub const Parser = struct {
         offset: *usize,
     ) ParseError!?ast.TypedName {
         var position = offset.*;
-        const owned = self.match(&position, .keyword_own);
         const marker = self.match(&position, .keyword_comptime);
         const underscore = self.match(&position, .underscore);
         var parameter = if (underscore) |discarded|
             try self.parseNameType(allocator, &position, "_", discarded.location)
         else if (try self.parseTypedName(allocator, &position)) |typed_name|
             typed_name
-        else if (marker != null or owned != null)
+        else if (marker != null)
             return self.fail(position, error.ExpectedIdentifier)
         else
             return null;
         if (marker != null) parameter.kind = .compile_time;
-        parameter.own = owned != null;
 
         offset.* = position;
         return parameter;
@@ -531,29 +519,12 @@ pub const Parser = struct {
         depth: usize,
         owner: bool,
     ) ParseError!ast.Statement {
-        if (try self.parseHandedValue(allocator, offset)) |statement| return statement;
         if (try self.parseStatement(allocator, offset, depth, owner)) |statement| return statement;
         var position = offset.*;
         const value = (try self.parseExpression(allocator, &position)) orelse {
             return self.fail(offset.*, error.ExpectedStatement);
         };
         if (!self.endsValueLine(position)) return self.fail(offset.*, error.ExpectedStatement);
-
-        offset.* = position;
-        return .{ .kind = .{ .value = value }, .location = value.location };
-    }
-
-    fn parseHandedValue(
-        self: *Parser,
-        allocator: std.mem.Allocator,
-        offset: *usize,
-    ) ParseError!?ast.Statement {
-        if (!self.branch_block) return null;
-        var position = offset.*;
-        _ = self.match(&position, .keyword_own) orelse return null;
-        var value = (try self.parseExpression(allocator, &position)) orelse return null;
-        if (isCallOrTriedCall(value) or !self.endsValueLine(position)) return null;
-        value.handed = true;
 
         offset.* = position;
         return .{ .kind = .{ .value = value }, .location = value.location };
@@ -707,12 +678,8 @@ pub const Parser = struct {
         var position = offset.*;
         const start = position;
         const keyword = self.match(&position, .keyword_if) orelse return null;
-        const caller_branch_block = self.branch_block;
-        defer self.branch_block = caller_branch_block;
-        self.branch_block = true;
         const block = owner and self.opensBlock(position);
         if (!block) try self.openSameLineHeader(&position, start);
-        const marker = self.match(&position, .keyword_own);
         const condition = (try self.parseExpression(allocator, &position)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
@@ -739,9 +706,7 @@ pub const Parser = struct {
         offset.* = position;
         const conditional: ast.If = .{
             .condition = condition,
-            .marker = if (marker) |own| own.location else null,
             .names = naming.names,
-            .own = naming.own,
             .tuple = naming.tuple,
             .body = body,
             .else_body = else_body,
@@ -768,12 +733,8 @@ pub const Parser = struct {
         const label = self.parseLabel(&position);
         const keyword = position;
         if (self.match(&position, .keyword_while) == null) return null;
-        const caller_branch_block = self.branch_block;
-        defer self.branch_block = caller_branch_block;
-        self.branch_block = false;
         const block = owner and self.opensBlock(position);
         if (!block) try self.openSameLineHeader(&position, keyword);
-        const marker = self.match(&position, .keyword_own);
         const condition = (try self.parseExpression(allocator, &position)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
@@ -792,9 +753,7 @@ pub const Parser = struct {
         const loop: ast.While = .{
             .label = label,
             .condition = condition,
-            .marker = if (marker) |own| own.location else null,
             .names = naming.names,
-            .own = naming.own,
             .tuple = naming.tuple,
             .body = body,
             .else_body = else_body,
@@ -817,22 +776,15 @@ pub const Parser = struct {
         offset: *usize,
     ) ParseError!ValueNames {
         var position = offset.*;
-        const own = self.match(&position, .keyword_own) != null;
-        const start = position;
         if (self.tokens[position].kind == .left_parenthesis) return self.fail(position, error.ParenthesizedPattern);
         const tuple = self.tokens[position].kind == .left_brace;
         const names = if (tuple)
             try self.parseElementNames(allocator, &position)
         else
             try allocator.dupe(ast.ElementName, &.{try self.parseValueName(&position)});
-        if (own) {
-            for (self.tokens[start..position], start..) |item, index| {
-                if (item.kind == .asterisk) return self.fail(index, error.ExpectedIdentifier);
-            }
-        }
 
         offset.* = position;
-        return .{ .names = names, .own = own, .tuple = tuple };
+        return .{ .names = names, .tuple = tuple };
     }
 
     fn parseFor(
@@ -848,9 +800,6 @@ pub const Parser = struct {
         const label = self.parseLabel(&position);
         const keyword = position;
         if (self.match(&position, .keyword_for) == null) return null;
-        const caller_branch_block = self.branch_block;
-        defer self.branch_block = caller_branch_block;
-        self.branch_block = false;
         const block = owner and self.opensBlock(position);
         if (!block) try self.openSameLineHeader(&position, keyword);
         const tuple = self.tokens[position].kind == .left_brace;
@@ -944,10 +893,6 @@ pub const Parser = struct {
     ) ParseError!?ast.Statement {
         var position = offset.*;
         const keyword = self.match(&position, .keyword_match) orelse return null;
-        const caller_branch_block = self.branch_block;
-        defer self.branch_block = caller_branch_block;
-        self.branch_block = true;
-        const marker = self.match(&position, .keyword_own);
         const value = (try self.parseExpression(allocator, &position)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
@@ -967,7 +912,7 @@ pub const Parser = struct {
         }
 
         offset.* = position;
-        const matching: ast.Match = .{ .value = value, .marker = if (marker) |own| own.location else null, .branches = branches.items, .names = names.items };
+        const matching: ast.Match = .{ .value = value, .branches = branches.items, .names = names.items };
         return .{ .kind = .{ .match = matching }, .location = keyword.location };
     }
 
@@ -1020,7 +965,6 @@ pub const Parser = struct {
         return .{
             .cases = cases.items,
             .naming = naming,
-            .own = value_names.own,
             .tuple = value_names.tuple,
             .first_name = first_name,
             .name_count = value_names.names.len,
@@ -1082,25 +1026,15 @@ pub const Parser = struct {
         var position = offset.*;
         _ = try self.expect(&position, .left_brace, error.ExpectedLeftBrace);
         var names: std.ArrayList(ast.ElementName) = .empty;
-        var owned: ?bool = null;
         while (true) {
-            const start = position;
-            const own = self.match(&position, .keyword_own) != null;
             const name = try self.parseElementName(&position);
-            if (own and name.pointer) return self.fail(start + 1, error.ExpectedIdentifier);
-            if (!ast.isDiscardedName(name.name)) {
-                if (owned) |previous| {
-                    if (previous != own) return self.fail(start, error.MixedOwnNames);
-                }
-                owned = own;
-            }
             try names.append(allocator, name);
             if (self.match(&position, .comma) == null) break;
         }
         _ = try self.expect(&position, .right_brace, error.ExpectedRightBrace);
 
         offset.* = position;
-        return .{ .names = names.items, .own = owned orelse false };
+        return .{ .names = names.items };
     }
 
     fn parseValueName(self: *Parser, offset: *usize) ParseError!ast.ElementName {
@@ -1211,17 +1145,15 @@ pub const Parser = struct {
     ) ParseError!?ast.VariableDeclaration {
         var position = offset.*;
         _ = self.match(&position, .keyword_var) orelse return null;
-        const owned = self.match(&position, .keyword_own);
         const name = try self.expect(&position, .identifier, error.ExpectedIdentifier);
         const written_type = try self.parseWrittenType(allocator, &position);
         _ = try self.expect(&position, .equals, error.ExpectedEquals);
-        const moved = self.match(&position, .keyword_own);
         const value = (try self.parseValue(allocator, &position, depth)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
 
         offset.* = position;
-        return .{ .name = name.kind.identifier, .type = written_type, .value = value, .own = owned != null, .moved = moved != null };
+        return .{ .name = name.kind.identifier, .type = written_type, .value = value };
     }
 
     fn parseAssignment(
@@ -1244,13 +1176,12 @@ pub const Parser = struct {
             .case_literal => return self.fail(offset.*, error.CaseWithoutEnum),
             else => return self.fail(offset.*, error.ExpectedTarget),
         }
-        const moved = self.match(&position, .keyword_own);
         const value = (try self.parseValue(allocator, &position, depth)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
 
         offset.* = position;
-        const assignment: ast.Assignment = .{ .target = target, .operator = operator, .value = value, .moved = moved != null };
+        const assignment: ast.Assignment = .{ .target = target, .operator = operator, .value = value };
         return .{ .kind = .{ .assignment = assignment }, .location = target.location };
     }
 
@@ -1260,7 +1191,6 @@ pub const Parser = struct {
         offset: *usize,
     ) ParseError!?ast.Statement {
         var position = offset.*;
-        if (self.tokens[position].kind == .keyword_own) return self.fail(position, error.MisplacedOwn);
         const call = (try self.parseExpression(allocator, &position)) orelse return null;
         if (!isCallOrTriedCall(call)) return null;
 
@@ -1279,19 +1209,17 @@ pub const Parser = struct {
         if (keyword != .keyword_const and keyword != .keyword_var) return null;
         if (self.isConstantPointerStart(position)) return null;
         position += 1;
-        const own = self.match(&position, .keyword_own) != null;
         const opening = self.tokens[position].kind;
         if (opening == .left_parenthesis) return self.fail(position, error.ParenthesizedPattern);
         if (opening != .left_brace) return null;
         const names = try self.parseElementNames(allocator, &position);
         _ = try self.expect(&position, .equals, error.ExpectedEquals);
-        const moved = self.match(&position, .keyword_own) != null;
         const value = (try self.parseValue(allocator, &position, depth)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
 
         offset.* = position;
-        return .{ .names = names, .value = value, .variable = keyword == .keyword_var, .own = own, .moved = moved };
+        return .{ .names = names, .value = value, .variable = keyword == .keyword_var };
     }
 
     fn parseConstantDeclaration(
@@ -1303,17 +1231,15 @@ pub const Parser = struct {
         var position = offset.*;
         if (self.isConstantPointerStart(position)) return null;
         _ = self.match(&position, .keyword_const) orelse return null;
-        const owned = self.match(&position, .keyword_own);
         const name = try self.expect(&position, .identifier, error.ExpectedIdentifier);
         const written_type = try self.parseWrittenType(allocator, &position);
         _ = try self.expect(&position, .equals, error.ExpectedEquals);
-        const moved = self.match(&position, .keyword_own);
         const value = (try self.parseValue(allocator, &position, depth)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
 
         offset.* = position;
-        return .{ .name = name.kind.identifier, .type = written_type, .value = value, .own = owned != null, .moved = moved != null };
+        return .{ .name = name.kind.identifier, .type = written_type, .value = value };
     }
 
     fn parseWrittenType(
@@ -1363,7 +1289,6 @@ pub const Parser = struct {
 
     fn expectInlineField(self: *Parser, offset: usize, fields: []const ast.Field) ParseError!void {
         if (fields.len != 1) return self.fail(offset, error.InlineStructFieldCount);
-        if (fields[0].own) return self.failAt(fields[0].location, error.InlineStructOwnField);
     }
 
     fn parseEnumDefinition(
@@ -1517,9 +1442,8 @@ pub const Parser = struct {
     ) ParseError!?ast.Field {
         var position = offset.*;
         const private = self.match(&position, .keyword_private);
-        const owned = self.match(&position, .keyword_own);
         const typed_name = (try self.parseTypedName(allocator, &position)) orelse {
-            if (owned != null or private != null) return self.fail(position, error.ExpectedIdentifier);
+            if (private != null) return self.fail(position, error.ExpectedIdentifier);
             return null;
         };
         var default: ?ast.Expression = null;
@@ -1535,7 +1459,6 @@ pub const Parser = struct {
             .type = typed_name.type,
             .default = default,
             .location = typed_name.location,
-            .own = owned != null,
             .private = private != null,
         };
     }
@@ -2128,9 +2051,6 @@ pub const Parser = struct {
         offset: *usize,
     ) ParseError!?ast.Expression {
         var position = offset.*;
-        if (self.tokens[position].kind == .left_parenthesis and self.tokens[position + 1].kind == .keyword_own) {
-            return self.fail(position, error.ParenthesizedOwnReceiver);
-        }
         var expression = (try self.parseOperand(allocator, &position)) orelse return null;
         if (expression.kind == .range and isPostfixStart(self.tokens[position].kind)) return self.fail(offset.*, error.RangeOperand);
         while (true) {
@@ -2714,17 +2634,12 @@ pub const Parser = struct {
             name = first.kind.identifier;
             position += 2;
         }
-        const owned = self.match(&position, .keyword_own);
-        if (owned != null and (self.tokens[position].kind == .comma or self.tokens[position].kind == .right_parenthesis)) {
-            return self.fail(position - 1, error.MisplacedOwnReceiver);
-        }
-        var value = (try self.parseExpression(allocator, &position)) orelse {
+        const value = (try self.parseExpression(allocator, &position)) orelse {
             return self.fail(position, error.ExpectedExpression);
         };
-        value.handed = owned != null and value.kind == .address_of;
 
         offset.* = position;
-        return .{ .name = name, .value = value, .location = first.location, .own = owned != null };
+        return .{ .name = name, .value = value, .location = first.location };
     }
 
     fn parseMemberCall(
@@ -2768,7 +2683,6 @@ pub const Parser = struct {
         const crossing = try self.matchCrossing(offset, .dot);
         const field = try self.expect(offset, .identifier, error.ExpectedIdentifier);
         if (self.match(offset, .left_parenthesis) != null) {
-            const receiver_own = self.matchOwnReceiver(offset);
             const arguments = try self.parseArguments(allocator, offset);
             _ = try self.expect(offset, .right_parenthesis, error.ExpectedRightParenthesis);
             const call: ast.MethodCall = .{
@@ -2777,7 +2691,6 @@ pub const Parser = struct {
                 .name_location = field.location,
                 .crossing = crossing,
                 .arguments = arguments,
-                .receiver_own = receiver_own,
             };
             return .{ .kind = .{ .method_call = call }, .location = value.location };
         }
@@ -2788,19 +2701,6 @@ pub const Parser = struct {
             .crossing = crossing,
         };
         return .{ .kind = .{ .field_access = access }, .location = value.location };
-    }
-
-    fn matchOwnReceiver(self: *Parser, offset: *usize) bool {
-        const position = offset.*;
-        if (self.tokens[position].kind != .keyword_own) return false;
-        const next = self.tokens[position + 1].kind;
-        if (next == .right_parenthesis) {
-            offset.* = position + 1;
-            return true;
-        }
-        if (next != .comma) return false;
-        offset.* = position + 2;
-        return true;
     }
 
     fn parseSubscript(
@@ -2950,7 +2850,6 @@ pub const ParseError = error{
     ExpectedRightBrace,
     ExpectedField,
     ParameterDefaultNotTrailing,
-    OwnParameterDefault,
     TypeParameterDefault,
     ComptimeParameterDefault,
     BranchCaseWithColons,
@@ -2971,16 +2870,11 @@ pub const ParseError = error{
     InlineExternal,
     InlineExternalStruct,
     InlineStructFieldCount,
-    InlineStructOwnField,
     InlineSignature,
     RangeOperand,
     DiscardedValueName,
     ExpectedDeferredStatement,
-    MisplacedOwn,
-    MisplacedOwnReceiver,
-    ParenthesizedOwnReceiver,
     ParenthesizedPattern,
-    MixedOwnNames,
     MisplacedPrivate,
     RepeatedPrivate,
     PrivateInstance,
@@ -2998,7 +2892,6 @@ const OperatorToken = struct {
 
 const ValueNames = struct {
     names: []ast.ElementName = &.{},
-    own: bool = false,
     tuple: bool = false,
 };
 
@@ -3153,7 +3046,6 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.ExpectedRightBrace => "expected '}'",
         error.ExpectedField => "expected a field or a function",
         error.ParameterDefaultNotTrailing => "a parameter after one with a default needs a default too, since only trailing arguments can be left out",
-        error.OwnParameterDefault => "an own parameter cannot have a default, since a default is a constant and an own argument hands over a value the caller owns",
         error.TypeParameterDefault => "a type parameter cannot have a default",
         error.ComptimeParameterDefault => "a comptime parameter cannot have a default",
         error.BranchCaseWithColons => "a case of a match is written without a leading ::",
@@ -3174,19 +3066,14 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.InlineExternal => "an external function cannot be inline",
         error.InlineExternalStruct => "an external struct cannot be inline, since C gives it its layout",
         error.InlineStructFieldCount => "an inline struct has exactly one field, which it is in the generated program",
-        error.InlineStructOwnField => "the field of an inline struct cannot be own, since the struct takes the ownership class of its field and has nothing of its own to hold it with",
         error.InlineSignature => "a typeclass function without a body cannot be inline",
         error.RangeOperand => "a range cannot be an operand",
         error.DiscardedValueName => "'as' needs a name, leave it out to leave the value without a name",
         error.ExpectedDeferredStatement => "expected a call, an assignment or a discard",
-        error.MisplacedOwn => "own goes before a value that a call takes over, e.g. `list.append(own key)`; a method that takes over its receiver is called with own as its first argument, e.g. `key.deinit(own)`",
-        error.MixedOwnNames => "own is written before every name in a case's braces or before none, e.g. `case Pair{ own left, own right }`",
-        error.ParenthesizedPattern => "names that take a value apart are written in braces, not parentheses, e.g. `const { name, score } = pair`, `for { card, index } in Zip::zip({ cards, 0.. })` or `while map.pop() as own { key, value }`",
-        error.MisplacedPrivate => "private is written only before a top-level declaration other than an import or instance, before a function or type in the block of a struct, an enum or a typeclass, or before a struct field, e.g. `private fn build_text` or `private own storage: *[]T`; at a use it is written between `.` or `::` and the name it crosses to, or before a field of a struct literal, e.g. `list.private.count`, `filesystem::private::build_path` or `{ private.bytes = text }`",
+        error.ParenthesizedPattern => "names that take a value apart are written in braces, not parentheses, e.g. `const { name, score } = pair`, `for { card, index } in Zip::zip({ cards, 0.. })` or `while map.pop() as { key, value }`",
+        error.MisplacedPrivate => "private is written only before a top-level declaration other than an import or instance, before a function or type in the block of a struct, an enum or a typeclass, or before a struct field, e.g. `private fn build_text` or `private storage: *[]T`; at a use it is written between `.` or `::` and the name it crosses to, or before a field of a struct literal, e.g. `list.private.count`, `filesystem::private::build_path` or `{ private.bytes = text }`",
         error.RepeatedPrivate => "private is written once before a declaration, a field or a name",
         error.PrivateInstance => "an instance cannot be private, since instances are always visible wherever their typeclass and type are",
-        error.MisplacedOwnReceiver => "own alone hands a method its receiver, so it is only the first argument of a method call, e.g. `key.deinit(own)` or `builder.finish(own, path)`; own before a value moves that value, e.g. `list.append(own key)`",
-        error.ParenthesizedOwnReceiver => "a method that takes over its receiver is called with own as its first argument, not with the receiver in parentheses after own, e.g. `key.deinit(own)` or `builder.finish(own, path)`",
     };
 }
 
@@ -4012,17 +3899,6 @@ test "parseParameter: parses a default value of an external function" {
     try std.testing.expectEqualStrings("1", default.kind.integer_literal.text);
 }
 
-test "parseParameter: rejects a default of an own parameter" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn keep(own data: *[]u8 = undefined) = noop");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.OwnParameterDefault, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 25 }, parser.failure.?.location.?);
-}
-
 test "parseParameter: rejects a default of a type parameter" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4239,57 +4115,6 @@ test "parseBlockLine: parses an expression on the last line of a block as a valu
     try std.testing.expectEqual(2, body.len);
     try std.testing.expectEqualStrings("one", body[1].kind.value.kind.binary.left.kind.identifier.name);
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, body[1].location);
-}
-
-test "parseHandedValue: parses own before a name as the value of a branch of an if" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn pick(flag: bool) -> i32\n    if flag\n        own one\n    else two");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-
-    const conditional = module.declarations[0].kind.function_definition.body[0].kind.@"if";
-    try std.testing.expectEqualStrings("one", conditional.body[0].kind.value.kind.identifier.name);
-    try std.testing.expect(conditional.body[0].kind.value.handed);
-    try std.testing.expect(!conditional.else_body.?[0].kind.value.handed);
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 13 }, conditional.body[0].location);
-}
-
-test "parseHandedValue: parses own before a name as the value of a match branch on one line" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn pick(choice: Choice) -> i32\n    match choice\n        case (One) own one\n        else two");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-
-    const matching = module.declarations[0].kind.function_definition.body[0].kind.match;
-    try std.testing.expectEqualStrings("one", matching.branches[0].body[0].kind.value.kind.identifier.name);
-    try std.testing.expect(matching.branches[0].body[0].kind.value.handed);
-    try std.testing.expect(!matching.branches[1].body[0].kind.value.handed);
-}
-
-test "parseHandedValue: rejects own before a name on the last line of a function body" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn pick() -> i32\n    own one");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.MisplacedOwn, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, parser.failure.?.location.?);
-}
-
-test "parseHandedValue: rejects own before a name in the body of a loop inside a branch of an if" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn pick(flag: bool)\n    if flag\n        while true\n            own one");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.MisplacedOwn, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 4, .column = 13 }, parser.failure.?.location.?);
 }
 
 test "parseInlineBlock: rejects line that is not a statement" {
@@ -4798,21 +4623,6 @@ test "parseIf: rejects a same-line condition without parentheses" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 16 }, parser.failure.?.location.?);
 }
 
-test "parseIf: records own written before the tested value of an if, a while and a match" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if own found as own entry\n        noop\n    while own found as own entry\n        noop\n    match own found\n        else noop\n    if found as own entry\n        noop");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-
-    const body = module.declarations[0].kind.function_definition.body;
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 8 }, body[0].kind.@"if".marker.?);
-    try std.testing.expectEqual(token.Location{ .row = 4, .column = 11 }, body[1].kind.@"while".marker.?);
-    try std.testing.expectEqual(token.Location{ .row = 6, .column = 11 }, body[2].kind.match.marker.?);
-    try std.testing.expectEqual(null, body[3].kind.@"if".marker);
-}
-
 test "parseWhile: parses a condition and an indented body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4977,48 +4787,24 @@ test "parseConditionNames: leaves a condition without as unnamed" {
     try std.testing.expectEqual(0, module.declarations[0].kind.function_definition.body[0].kind.@"if".names.len);
 }
 
-test "parseConditionNames: parses own names in parentheses" {
+test "parseConditionNames: parses names in braces" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while found as own { key, _ }\n        noop\n    if (found as { key }) noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while found as { key, _ }\n        noop\n    if (found as { key }) noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const body = module.declarations[0].kind.function_definition.body;
     const loop = body[0].kind.@"while";
-    try std.testing.expect(loop.own);
     try std.testing.expect(loop.tuple);
     try std.testing.expectEqualStrings("found", loop.condition.kind.identifier.name);
     try std.testing.expectEqual(2, loop.names.len);
     try std.testing.expectEqualStrings("key", loop.names[0].name);
     try std.testing.expectEqualStrings("_", loop.names[1].name);
     const conditional = body[1].kind.@"if";
-    try std.testing.expect(!conditional.own);
     try std.testing.expect(conditional.tuple);
     try std.testing.expectEqual(1, conditional.names.len);
-}
-
-test "parseValueNames: rejects a pointer name after own" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    if (found as own *card) noop");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 22 }, parser.failure.?.location.?);
-}
-
-test "parseValueNames: rejects a pointer name inside own names in parentheses" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while map.pop() as own { key, *value }\n        noop");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 35 }, parser.failure.?.location.?);
 }
 
 test "parseFor: parses a name, a sequence and an indented body" {
@@ -5168,12 +4954,12 @@ test "parseElementNames: rejects a missing closing brace" {
 test "parseElementNames: rejects names in parentheses after for and as" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while map.pop() as own (key, value)\n        noop\n");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while map.pop() as (key, value)\n        noop\n");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ParenthesizedPattern, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 28 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 24 }, parser.failure.?.location.?);
 }
 
 test "parseElementName: parses an underscore" {
@@ -5402,10 +5188,10 @@ test "parseBranch: parses cases in parentheses over several lines before a same-
     try std.testing.expectEqualStrings("stop", branches[1].body[0].kind.call.kind.call.callee.identifier.name);
 }
 
-test "parseBranch: numbers the names of each branch and parses own names in parentheses after a case and after else" {
+test "parseBranch: numbers the names of each branch and parses names in braces after a case and after else" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match found\n        case Pair as own { key, value }\n            noop\n        case null\n            noop\n    match pair\n        case (Pair as { one, two }) noop\n        else (_ as own { three, four }) noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match found\n        case Pair as { key, value }\n            noop\n        case null\n            noop\n    match pair\n        case (Pair as { one, two }) noop\n        else (_ as { three, four }) noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5413,16 +5199,16 @@ test "parseBranch: numbers the names of each branch and parses own names in pare
     const body = module.declarations[0].kind.function_definition.body;
     const first = body[0].kind.match;
     try std.testing.expectEqual(3, first.names.len);
-    try std.testing.expect(first.branches[0].own and first.branches[0].tuple);
+    try std.testing.expect(first.branches[0].tuple);
     try std.testing.expectEqual(0, first.branches[0].first_name);
     try std.testing.expectEqual(2, first.branches[0].name_count);
     try std.testing.expectEqualStrings("value", first.names[1].name);
-    try std.testing.expect(!first.branches[1].own and !first.branches[1].tuple);
+    try std.testing.expect(!first.branches[1].tuple);
     try std.testing.expectEqual(2, first.branches[1].first_name);
     try std.testing.expectEqual(1, first.branches[1].name_count);
     const second = body[1].kind.match;
-    try std.testing.expect(!second.branches[0].own and second.branches[0].tuple);
-    try std.testing.expect(second.branches[1].own and second.branches[1].tuple);
+    try std.testing.expect(second.branches[0].tuple);
+    try std.testing.expect(second.branches[1].tuple);
     try std.testing.expectEqual(2, second.branches[1].first_name);
     try std.testing.expectEqualStrings("four", second.names[3].name);
 }
@@ -5667,10 +5453,10 @@ test "parseBranchCase: parses a type with a value name, null, values and ranges"
     try std.testing.expectEqual(.value, match.branches[4].naming);
 }
 
-test "parseCaseNames: parses a case's names in braces with a pointer, a discarded name and own" {
+test "parseCaseNames: parses a case's names in braces with a pointer and a discarded name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match data\n        case Pair{ *left, _ }\n            noop\n        case (Bytes{ own bytes }) noop\n        case (Point{ x, y }) noop\n        else noop");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match data\n        case Pair{ *left, _ }\n            noop\n        case (Bytes{ bytes }) noop\n        case (Point{ x, y }) noop\n        else noop");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -5680,33 +5466,9 @@ test "parseCaseNames: parses a case's names in braces with a pointer, a discarde
     try std.testing.expectEqual(2, match.branches[0].name_count);
     try std.testing.expect(match.names[0].pointer);
     try std.testing.expectEqualStrings("_", match.names[1].name);
-    try std.testing.expect(!match.branches[0].own);
-    try std.testing.expect(match.branches[1].own);
     try std.testing.expectEqualStrings("bytes", match.names[2].name);
     try std.testing.expectEqualStrings("Point", match.branches[2].cases[0].pattern.kind.identifier.name);
     try std.testing.expectEqualStrings("y", match.names[4].name);
-}
-
-test "parseCaseNames: rejects own before some names and not others" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match data\n        case (Pair{ own left, right }) noop\n        else noop");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.MixedOwnNames, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 31 }, parser.failure.?.location.?);
-}
-
-test "parseCaseNames: rejects a pointer name after own" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match data\n        case (Bytes{ own *bytes }) noop\n        else noop");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 26 }, parser.failure.?.location.?);
 }
 
 test "parseValueName: rejects a discarded name after as" {
@@ -6139,17 +5901,6 @@ test "parseCallStatement: rejects a field access as a statement" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, parser.failure.?.location.?);
 }
 
-test "parseCallStatement: rejects own before a method call as a statement" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    own list.deinit()\n");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.MisplacedOwn, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, parser.failure.?.location.?);
-}
-
 test "parseTupleDeclaration: parses names in parentheses and a value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6189,32 +5940,32 @@ test "parseTupleDeclaration: rejects names in braces inside names in braces" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 27 }, parser.failure.?.location.?);
 }
 
-test "parseTupleDeclaration: parses variable names and own names in braces" {
+test "parseTupleDeclaration: parses variable names and constant names in braces" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    var { name, score } = pair\n    const own { path, record } = own entry\n");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    var { name, score } = pair\n    const { path, record } = entry\n");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const body = module.declarations[0].kind.function_definition.body;
     const variable = body[0].kind.tuple_declaration;
-    try std.testing.expect(variable.variable and !variable.own and !variable.moved);
+    try std.testing.expect(variable.variable);
     try std.testing.expectEqualStrings("score", variable.names[1].name);
-    const owned = body[1].kind.tuple_declaration;
-    try std.testing.expect(!owned.variable and owned.own and owned.moved);
-    try std.testing.expectEqualStrings("record", owned.names[1].name);
+    const constant = body[1].kind.tuple_declaration;
+    try std.testing.expect(!constant.variable);
+    try std.testing.expectEqualStrings("record", constant.names[1].name);
 }
 
 test "parseTupleDeclaration: rejects names in parentheses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main() = const own (path, record) = entry");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = const (path, record) = entry");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
     try std.testing.expectError(error.ParenthesizedPattern, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, parser.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
 }
 
 test "parseTupleDeclaration: rejects names in parentheses after const" {
@@ -6601,17 +6352,6 @@ test "expectInlineField: rejects an inline struct without fields" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 13 }, parser.failure.?.location.?);
 }
 
-test "expectInlineField: rejects an own field" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("inline struct Path\n    private own bytes: const(*[]u8)");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.InlineStructOwnField, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 17 }, parser.failure.?.location.?);
-}
-
 test "parseEnumDefinition: parses cases with and without values and the functions of the block" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6797,29 +6537,17 @@ test "parseField: parses a default value" {
     try std.testing.expectEqual(null, fields[1].default);
 }
 
-test "parseField: marks a field written after private, before own" {
+test "parseField: marks a field written after private" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct List\n    private own storage: *[]u8\n    length: usize");
+    var lexer = @import("lexer.zig").Lexer.init("struct List\n    private storage: *[]u8\n    length: usize");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const fields = module.declarations[0].kind.struct_definition.fields;
     try std.testing.expect(fields[0].private);
-    try std.testing.expect(fields[0].own);
     try std.testing.expect(!fields[1].private);
-}
-
-test "parseField: rejects private after own" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct List\n    own private storage: *[]u8");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.MisplacedPrivate, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 9 }, parser.failure.?.location.?);
 }
 
 test "parseField: rejects an equals sign without a value" {
@@ -7559,48 +7287,6 @@ test "parseWithStatement: sets the context from a name other than allocator" {
     try std.testing.expectEqualStrings("arena", constant.value.kind.identifier.name);
 }
 
-test "parseFunctionSignature: reads own on a return type, a parameter, a field, a declaration and an argument" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("struct Holder\n    own path: Path\n    size: usize\nfn make(own path: Path, size: usize) -> own Error!Holder\n    const own kept = path\n    var own other = path\n    const plain = size\n    return { path = own kept, size = plain }\nfn infer() -> own !Holder = make(own other, 1)");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-
-    const fields = module.declarations[0].kind.struct_definition.fields;
-    try std.testing.expect(fields[0].own);
-    try std.testing.expect(!fields[1].own);
-    const function = module.declarations[1].kind.function_definition;
-    try std.testing.expect(function.signature.return_own);
-    try std.testing.expect(function.signature.parameters[0].own);
-    try std.testing.expect(!function.signature.parameters[1].own);
-    try std.testing.expect(function.body[0].kind.constant_declaration.own);
-    try std.testing.expect(function.body[1].kind.variable_declaration.own);
-    try std.testing.expect(!function.body[2].kind.constant_declaration.own);
-    const elements = function.body[3].kind.@"return".?.kind.composite_literal.elements;
-    try std.testing.expect(elements[0].own);
-    try std.testing.expect(!elements[1].own);
-    const inferred = module.declarations[2].kind.function_definition;
-    try std.testing.expect(inferred.signature.return_own);
-    try std.testing.expect(inferred.signature.inferred_error_set != null);
-    try std.testing.expect(inferred.body[0].kind.call.kind.call.arguments[0].own);
-}
-
-test "parseConstantDeclaration: reads own before the value of a declaration and an assignment" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f()\n    const own one = own two\n    var own three = own one\n    three = own four\n    const plain = five");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-
-    const body = module.declarations[0].kind.function_definition.body;
-    try std.testing.expect(body[0].kind.constant_declaration.moved);
-    try std.testing.expect(body[1].kind.variable_declaration.moved);
-    try std.testing.expect(body[2].kind.assignment.moved);
-    try std.testing.expect(!body[3].kind.constant_declaration.moved);
-}
-
 test "parseComparison: binds bitwise operators tighter than a comparison" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -8131,17 +7817,6 @@ test "parsePostfix: binds an unwrap tighter than a prefix operator and before a 
     try std.testing.expectEqualStrings("value", access.value.kind.unwrap.kind.identifier.name);
 }
 
-test "parsePostfix: rejects a receiver in parentheses after own" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    defer (own list).deinit()\n");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.ParenthesizedOwnReceiver, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 2, .column = 11 }, parser.failure.?.location.?);
-}
-
 test "parseStructType: parses the fields and functions of a struct without a name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -8382,17 +8057,16 @@ test "parseCompositeLiteral: parses a name without a value after a named value" 
     try std.testing.expectEqualStrings("two", literal.elements[1].value.kind.identifier.name);
 }
 
-test "parseCompositeLiteral: parses an own name without a value before a named value" {
+test "parseCompositeLiteral: parses a name without a value before a named value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn make() -> Data = return { own one, two = 2 }");
+    var lexer = @import("lexer.zig").Lexer.init("fn make() -> Data = return { one, two = 2 }");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
 
     const literal = module.declarations[0].kind.function_definition.body[0].kind.@"return".?.kind.composite_literal;
     try std.testing.expectEqual(null, literal.elements[0].name);
-    try std.testing.expect(literal.elements[0].own);
     try std.testing.expectEqualStrings("one", literal.elements[0].value.kind.identifier.name);
     try std.testing.expectEqualStrings("two", literal.elements[1].name.?);
 }
@@ -9519,28 +9193,6 @@ test "parseArgument: rejects a name without a value" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 28 }, parser.failure.?.location.?);
 }
 
-test "parseArgument: rejects own alone after the first argument" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main() = builder.finish(path, own)");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.MisplacedOwnReceiver, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 34 }, parser.failure.?.location.?);
-}
-
-test "parseArgument: rejects own alone in a call that is not a method call" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main() = release(own)");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-
-    try std.testing.expectError(error.MisplacedOwnReceiver, parser.parse(&arena));
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 21 }, parser.failure.?.location.?);
-}
-
 test "parseArgument: rejects private before an argument of a call" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -9687,49 +9339,6 @@ test "parseMember: rejects a dot without a name" {
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 23 }, parser.failure.?.location.?);
-}
-
-test "matchOwnReceiver: hands the receiver to a method with own as its first argument" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    defer store.list.deinit(own)\n");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-
-    const call = module.declarations[0].kind.function_definition.body[0].kind.@"defer".statement.kind.call.kind.method_call;
-    try std.testing.expect(call.receiver_own);
-    try std.testing.expectEqual(0, call.arguments.len);
-    try std.testing.expectEqualStrings("list", call.receiver.kind.field_access.field);
-}
-
-test "matchOwnReceiver: passes the arguments after own to the method" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    try builder.finish(own, path)\n");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-
-    const call = module.declarations[0].kind.function_definition.body[0].kind.call.kind.@"try".kind.method_call;
-    try std.testing.expect(call.receiver_own);
-    try std.testing.expectEqual(1, call.arguments.len);
-    try std.testing.expect(!call.arguments[0].own);
-    try std.testing.expectEqualStrings("path", call.arguments[0].value.kind.identifier.name);
-}
-
-test "matchOwnReceiver: leaves own before a name as a moved argument" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    try list.append(own record)\n");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-
-    const call = module.declarations[0].kind.function_definition.body[0].kind.call.kind.@"try".kind.method_call;
-    try std.testing.expect(!call.receiver_own);
-    try std.testing.expect(call.arguments[0].own);
-    try std.testing.expectEqualStrings("record", call.arguments[0].value.kind.identifier.name);
 }
 
 test "parseSubscript: parses an index" {
@@ -9893,10 +9502,10 @@ test "parseCaseLiteral: reads a case with its value in braces" {
     try std.testing.expectEqualStrings("cards", value.kind.case_literal.arguments[0].value.kind.string_literal);
 }
 
-test "parseCaseLiteral: reads the parts of a tuple and an owned value in braces" {
+test "parseCaseLiteral: reads the parts of a tuple and a value in braces" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    take(::Pair{ 1, 2 }, ::Bytes{ own bytes })");
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    take(::Pair{ 1, 2 }, ::Bytes{ bytes })");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
     const module = try parser.parse(&arena);
@@ -9906,7 +9515,6 @@ test "parseCaseLiteral: reads the parts of a tuple and an owned value in braces"
     try std.testing.expectEqual(2, pair.arguments.len);
     try std.testing.expectEqualStrings("2", pair.arguments[1].value.kind.integer_literal.text);
     const bytes = arguments[1].value.kind.case_literal;
-    try std.testing.expect(bytes.arguments[0].own);
     try std.testing.expectEqualStrings("bytes", bytes.arguments[0].value.kind.identifier.name);
 }
 

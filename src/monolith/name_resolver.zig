@@ -812,7 +812,6 @@ pub const NameResolver = struct {
             if (!try matchesSignature(self.arena.allocator(), resolved, reduced, expected, instance_arguments)) {
                 return self.fail(function.location, error.MismatchedTypeclassFunction);
             }
-            if (expected.return_own and !signature.return_own) return self.fail(function.location, error.OwnReturnMissing);
         }
         for (signatures, required.kind.typeclass_definition.defaults) |expected, default| {
             if (default != null or findDefinition(functions, expected.name) != null) continue;
@@ -4721,7 +4720,6 @@ pub const NameError = error{
     TypeclassUsedAsValue,
     NotInTypeclass,
     MismatchedTypeclassFunction,
-    OwnReturnMissing,
     MissingRequiredInstance,
     TypeclassArgumentCount,
     UnknownTypeCount,
@@ -5016,7 +5014,6 @@ fn describeError(name_error: NameError) []const u8 {
         error.TypeclassUsedAsValue => "a typeclass cannot be used here",
         error.NotInTypeclass => "function is not in the typeclass",
         error.MismatchedTypeclassFunction => "function does not match the typeclass",
-        error.OwnReturnMissing => "the typeclass marks this function's return own; mark it own here too",
         error.MissingRequiredInstance => "type has no instance of a typeclass that the typeclass requires",
         error.TypeclassArgumentCount => "wrong number of typeclass arguments",
         error.UnknownTypeCount => "a typeclass as the type of a parameter leaves exactly one type unknown, written _",
@@ -5865,7 +5862,7 @@ fn findSignaturePosition(signatures: []const ast.FunctionSignature, name: []cons
 fn reserveFields(allocator: std.mem.Allocator, fields: []const ast.Field) std.mem.Allocator.Error![]types.Field {
     const reserved = try allocator.alloc(types.Field, fields.len);
     for (fields, reserved) |field, *placeholder| {
-        placeholder.* = .{ .name = field.name, .type = .void, .location = field.location, .own = field.own, .private = field.private };
+        placeholder.* = .{ .name = field.name, .type = .void, .location = field.location, .private = field.private };
     }
     return reserved;
 }
@@ -5935,7 +5932,6 @@ fn describeFields(fields: []ast.Field, resolved: []types.Field) void {
             .default = if (field.default) |*default| default else null,
             .default_value = if (field.default != null) &field.default_value else null,
             .location = field.location,
-            .own = field.own,
             .private = field.private,
         };
     }
@@ -7608,43 +7604,6 @@ test "resolveInstance: rejects an instance function whose own type parameters do
     try std.testing.expectEqual(token.Location{ .row = 9, .column = 5 }, analyzer.failure.?.location.?);
 }
 
-test "resolveInstance: rejects an instance function without own where the typeclass marks the return own" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\ntypeclass Make(type T)\n\n    fn make(value: T) -> own memory::Error!*[]u8\n\nstruct Plain\n\ninstance Make(Plain)\n\n    fn make(_: Plain) -> memory::Error!*[]u8 = {}\n" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try std.testing.expectError(error.OwnReturnMissing, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 11, .column = 5 }, analyzer.failure.?.location.?);
-}
-
-test "resolveInstance: lets each instance decide own where the typeclass leaves it out" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\ntypeclass Make(type T)\n\n    fn make(value: T) -> memory::Error!*[]u8\n\nstruct Owning\n\nstruct Plain\n\ninstance Make(Owning)\n\n    fn make(_: Owning) -> own memory::Error!*[]u8 = memory::allocate(u8, 1)\n\ninstance Make(Plain)\n\n    fn make(_: Plain) -> memory::Error!*[]u8 = {}\n\nfn main -> !void\n    with memory::Heap\n    const own one = try Make::make(Owning{})\n    memory::free(own one)\n    _ = try Make::make(Plain{})\n" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
-
-    _ = try analyzer.analyze();
-}
-
 test "resolveInstance: rejects an instance without an instance of a required typeclass" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -8092,7 +8051,7 @@ test "dropResultLines: lets a generic function whose return type depends on its 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(_: *Fixed, type T, _: usize) -> own memory::Error!*[]T = memory::Error::OutOfMemory\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, own _: const(*[]T)) = noop\nfn run() -> usize\n    var fixed = Fixed{ used = 0 }\n    const own items = fixed.allocate(u8, 1) catch return 7\n    defer fixed.free(own items)\n    return items.length\nconst RESULT = run()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\nimport mn::memory::Allocator\nstruct Fixed\n    used: usize\ninstance Allocator(Fixed)\n\n    fn allocate(_: *Fixed, type T, _: usize) -> memory::Error!*[]T = memory::Error::OutOfMemory\n    fn(type T) resize(_: *Fixed, _: *[]T, _: usize) -> bool = false\n    fn(type T) free(_: *Fixed, _: const(*[]T)) = noop\nfn run() -> usize\n    var fixed = Fixed{ used = 0 }\n    const items = fixed.allocate(u8, 1) catch return 7\n    defer fixed.free(items)\n    return items.length\nconst RESULT = run()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -12299,24 +12258,6 @@ test "resolveTarget: rejects assigning to a name of a for loop" {
 
     try std.testing.expectError(error.NotAssignable, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 53 }, name_resolver.failure.?.location.?);
-}
-
-test "resolveTarget: assigns a name as own gives" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?i32) -> i32\n    if value as own number\n        number = 2\n        return number\n    return 0" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
-
-    try name_resolver.resolve();
 }
 
 test "resolveTarget: rejects an unknown name" {

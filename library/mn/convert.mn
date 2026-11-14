@@ -5,7 +5,7 @@ typeclass To(type T, type U)
 
 typeclass ToOwned(type T, type U)
 
-    fn to_owned(own value: *T) -> own !U
+    fn to_owned(value: *T) -> !U
 
 
 typeclass View(type T, type U)

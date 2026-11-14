@@ -33,7 +33,7 @@ instance(type W: Writer) Encode(WallTime, binary::BinaryEncoder(W))
 
 instance(type R: Reader) Decode(WallTime, binary::BinaryDecoder(R))
 
-    fn decode(decoder: *binary::BinaryDecoder(R)) -> own !Self
+    fn decode(decoder: *binary::BinaryDecoder(R)) -> !Self
         const seconds = try decoder.i64()
         const nanoseconds = try decoder.u32()
         return { seconds = seconds, nanoseconds = nanoseconds }
@@ -51,7 +51,7 @@ instance(type W: Writer) Encode(WallTime, yaml::YamlEncoder(W))
 
 instance Decode(WallTime, yaml::YamlDecoder)
 
-    fn decode(decoder: *yaml::YamlDecoder) -> own !Self
+    fn decode(decoder: *yaml::YamlDecoder) -> !Self
         try decoder.structure(2)
         try decoder.field("seconds")
         const seconds = try decoder.decode(i64)

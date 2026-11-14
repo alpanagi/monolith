@@ -12,11 +12,11 @@ import mn::stream::Writer
 fn print(writer: *Writer, comptime format: const(*[]u8), values: Tuple) -> !void = write_format(writer, format, 0, find_brace(format, 0), 0, values)
 
 
-fn format(comptime pattern: const(*[]u8), values: Tuple) -> own memory::Error!*[]u8
-    var own list = container::ArrayList(u8)::init()
-    errdefer list.deinit(own)
+fn format(comptime pattern: const(*[]u8), values: Tuple) -> memory::Error!*[]u8
+    var list = container::ArrayList(u8)::init()
+    errdefer list.deinit()
     try print(&list, pattern, values)
-    return list.to_owned(own)
+    return list.to_owned()
 
 
 fn strip(bytes: const(*[]u8)) -> const(*[]u8)
@@ -39,7 +39,7 @@ error Error
 
 typeclass Parser(type T, type U, type O)
 
-    fn parse_as(text: T, type U, options: O = {}) -> own !U
+    fn parse_as(text: T, type U, options: O = {}) -> !U
 
 
 struct IntegerOptions
@@ -101,90 +101,90 @@ enum BytesBase
 
 instance Parser(const(*[]u8), i8, IntegerOptions)
 
-    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), i16, IntegerOptions)
 
-    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), i32, IntegerOptions)
 
-    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), i64, IntegerOptions)
 
-    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), i128, IntegerOptions)
 
-    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), isize, IntegerOptions)
 
-    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), u8, IntegerOptions)
 
-    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), u16, IntegerOptions)
 
-    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), u32, IntegerOptions)
 
-    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), u64, IntegerOptions)
 
-    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), u128, IntegerOptions)
 
-    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), usize, IntegerOptions)
 
-    fn parse_as(text: Self, type U, options: IntegerOptions) -> own !U = parse_integer(U, text, options.base)
+    fn parse_as(text: Self, type U, options: IntegerOptions) -> !U = parse_integer(U, text, options.base)
 
 
 instance Parser(const(*[]u8), f16, [])
 
-    fn parse_as(text: Self, type U, _: []) -> own !U = parse_float(U, text)
+    fn parse_as(text: Self, type U, _: []) -> !U = parse_float(U, text)
 
 
 instance Parser(const(*[]u8), f32, [])
 
-    fn parse_as(text: Self, type U, _: []) -> own !U = parse_float(U, text)
+    fn parse_as(text: Self, type U, _: []) -> !U = parse_float(U, text)
 
 
 instance Parser(const(*[]u8), f64, [])
 
-    fn parse_as(text: Self, type U, _: []) -> own !U = parse_float(U, text)
+    fn parse_as(text: Self, type U, _: []) -> !U = parse_float(U, text)
 
 
 instance Parser(const(*[]u8), f128, [])
 
-    fn parse_as(text: Self, type U, _: []) -> own !U = parse_float(U, text)
+    fn parse_as(text: Self, type U, _: []) -> !U = parse_float(U, text)
 
 
 instance Parser(const(*[]u8), *[]u8, BytesOptions)
 
-    fn parse_as(text: Self, type U, options: BytesOptions) -> own !U
+    fn parse_as(text: Self, type U, options: BytesOptions) -> !U
         if options.base as base
             return parse_bytes(text, base)
-        const own bytes = try memory::allocate(u8, text.length)
+        const bytes = try memory::allocate(u8, text.length)
         memory::copy(bytes, text)
         return bytes
 
@@ -518,7 +518,7 @@ private fn find_radix(base: Base) -> u8 = match base
     case (Prefixed) 10
 
 
-private fn parse_bytes(text: const(*[]u8), base: BytesBase) -> own (Error || memory::Error)!*[]u8
+private fn parse_bytes(text: const(*[]u8), base: BytesBase) -> (Error || memory::Error)!*[]u8
     if find_bytes_radix(base) as radix
         if (radix == 64) return decode_base64(text)
         return decode_bytes(text, radix)
@@ -537,7 +537,7 @@ private fn find_bytes_radix(base: BytesBase) -> ?u8 = match base
     case (Prefixed) null
 
 
-private fn decode_base64(text: const(*[]u8)) -> own (Error || memory::Error)!*[]u8
+private fn decode_base64(text: const(*[]u8)) -> (Error || memory::Error)!*[]u8
     if (text.length % 4 != 0) return Error::Malformed
     var padding: usize = 0
     if text.length > 0 and text[text.length - 1] == '='
@@ -545,15 +545,15 @@ private fn decode_base64(text: const(*[]u8)) -> own (Error || memory::Error)!*[]
     return fill_bytes(text[..text.length - padding], 64)
 
 
-private fn decode_bytes(text: const(*[]u8), radix: u8) -> own (Error || memory::Error)!*[]u8
+private fn decode_bytes(text: const(*[]u8), radix: u8) -> (Error || memory::Error)!*[]u8
     if (text.length * find_width(radix) % 8 != 0) return Error::Malformed
     return fill_bytes(text, radix)
 
 
-private fn fill_bytes(digits: const(*[]u8), radix: u8) -> own (Error || memory::Error)!*[]u8
+private fn fill_bytes(digits: const(*[]u8), radix: u8) -> (Error || memory::Error)!*[]u8
     const width = find_width(radix)
-    const own bytes = try memory::allocate(u8, digits.length * width / 8)
-    errdefer memory::free(own bytes)
+    const bytes = try memory::allocate(u8, digits.length * width / 8)
+    errdefer memory::free(bytes)
     var buffer: u16 = 0
     var count: usize = 0
     var position: usize = 0

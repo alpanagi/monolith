@@ -41,7 +41,7 @@ pub const Analyzer = struct {
             self.recordFailure(self.name_resolver.failure orelse self.type_checker.failure);
             return resolve_error;
         };
-        var program: ast.Program = .{ .modules = self.loader.modules.items, .types = self.type_checker.program.types };
+        const program: ast.Program = .{ .modules = self.loader.modules.items, .types = self.type_checker.program.types };
         self.type_checker.program = program;
         self.type_checker.failure = null;
         self.type_checker.check() catch |type_error| {
@@ -49,7 +49,6 @@ pub const Analyzer = struct {
             return type_error;
         };
         try self.appendInstances();
-        program.skipped_defers = self.type_checker.skipped_defers.items;
         return program;
     }
 

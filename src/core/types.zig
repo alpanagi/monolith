@@ -81,7 +81,6 @@ pub const Origin = struct {
 pub const Field = struct {
     name: []const u8,
     type: Type,
-    own: bool = false,
     private: bool = false,
     default: ?*ast.Expression = null,
     default_value: ?*?Value = null,
@@ -683,7 +682,12 @@ pub fn renameScope(
 pub fn canOwn(value_type: Type) bool {
     return switch (value_type) {
         .pointer, .slice, .variable, .application => true,
-        .@"struct" => |struct_type| if (struct_type.@"inline") canOwn(struct_type.fields[0].type) else isOwning(value_type),
+        .@"struct" => |struct_type| {
+            for (struct_type.fields) |field| {
+                if (canOwn(field.type)) return true;
+            }
+            return false;
+        },
         .optional => |optional| canOwn(optional.child),
         .result => |result| canOwn(result.value),
         .array => |array| canOwn(array.element),
@@ -701,37 +705,7 @@ pub fn canOwn(value_type: Type) bool {
             }
             return false;
         },
-        else => isOwning(value_type),
-    };
-}
-
-pub fn isOwning(value_type: Type) bool {
-    return switch (value_type) {
-        .@"struct" => |struct_type| {
-            if (struct_type.@"inline") return isOwning(struct_type.fields[0].type);
-            for (struct_type.fields) |field| {
-                if (field.own or isOwning(field.type)) return true;
-            }
-            return false;
-        },
-        .array => |array| isOwning(array.element),
-        .tuple => |tuple| {
-            for (tuple.elements) |element| {
-                if (isOwning(element)) return true;
-            }
-            return false;
-        },
-        .optional => |optional| isOwning(optional.child),
-        .result => |result| isOwning(result.value),
-        .@"enum" => |enumeration| {
-            for (enumeration.cases) |case| {
-                if (case.type) |payload| {
-                    if (isOwning(payload)) return true;
-                }
-            }
-            return false;
-        },
-        .number, .boolean, .void, .type, .slice, .pointer, .function, .variable, .application => false,
+        .number, .boolean, .void, .type, .function => false,
     };
 }
 
@@ -1338,37 +1312,6 @@ test "findBuiltInType: finds nothing for other names" {
     try std.testing.expectEqual(null, findBuiltInType("Integer"));
     try std.testing.expectEqual(null, findBuiltInType("char"));
     try std.testing.expectEqual(null, findBuiltInType("string"));
-}
-
-test "canOwn: gives an inline struct the ownership class of its field" {
-    const location: token.Location = .{ .row = 1, .column = 1 };
-    const slice: Slice = .{ .element = .{ .number = .u8 }, .constant = true };
-    const field: Field = .{ .name = "bytes", .type = .{ .slice = &slice }, .location = location };
-    const inlined: Type = .{ .@"struct" = .{ .module = 0, .name = "DataOne", .@"inline" = true, .fields = &.{field} } };
-    const plain: Type = .{ .@"struct" = .{ .module = 0, .name = "DataTwo", .fields = &.{field} } };
-    const outer_field: Field = .{ .name = "data", .type = inlined, .location = location };
-    const nested: Type = .{ .@"struct" = .{ .module = 0, .name = "Type", .@"inline" = true, .fields = &.{outer_field} } };
-    const number_field: Field = .{ .name = "value", .type = .{ .number = .u32 }, .location = location };
-    const number: Type = .{ .@"struct" = .{ .module = 0, .name = "Component", .@"inline" = true, .fields = &.{number_field} } };
-
-    try std.testing.expect(canOwn(inlined));
-    try std.testing.expect(!canOwn(plain));
-    try std.testing.expect(canOwn(nested));
-    try std.testing.expect(!canOwn(number));
-}
-
-test "isOwning: gives an inline struct the ownership class of its field" {
-    const location: token.Location = .{ .row = 1, .column = 1 };
-    const slice: Slice = .{ .element = .{ .number = .u8 }, .constant = true };
-    const owned_field: Field = .{ .name = "bytes", .type = .{ .slice = &slice }, .own = true, .location = location };
-    const owning: Type = .{ .@"struct" = .{ .module = 0, .name = "DataOne", .fields = &.{owned_field} } };
-    const owning_field: Field = .{ .name = "data", .type = owning, .location = location };
-    const inlined_owning: Type = .{ .@"struct" = .{ .module = 0, .name = "Type", .@"inline" = true, .fields = &.{owning_field} } };
-    const view_field: Field = .{ .name = "bytes", .type = .{ .slice = &slice }, .location = location };
-    const inlined_view: Type = .{ .@"struct" = .{ .module = 0, .name = "DataTwo", .@"inline" = true, .fields = &.{view_field} } };
-
-    try std.testing.expect(isOwning(inlined_owning));
-    try std.testing.expect(!isOwning(inlined_view));
 }
 
 test "findNumberType: finds only number types" {

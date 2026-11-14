@@ -171,29 +171,29 @@ private fn find_kind(code: i32) -> File::Kind = match code
 inline struct Path
     private bytes: const(*[]u8)
 
-    fn init -> own Self = { bytes = {} }
+    fn init -> Self = { bytes = {} }
 
 
     fn is_absolute(self: Self) -> bool = self.bytes.length > 0 and self.bytes[0] == separator
 
 
-    fn join(self: Self, other: Path) -> own memory::Error!Self
+    fn join(self: Self, other: Path) -> memory::Error!Self
         const length = self.bytes.length
         const is_separated = length > 0 and self.bytes[length - 1] != separator
         const start = if (is_separated) length + 1 else length
         const total = start + other.bytes.length
         if (start < length or total < start) return memory::Error::OutOfMemory
-        const own bytes = try memory::allocate(u8, total)
+        const bytes = try memory::allocate(u8, total)
         memory::copy(bytes, self.bytes)
         if (is_separated) bytes[length] = separator
         memory::copy(bytes[start..], other.bytes)
-        return { bytes = own bytes }
+        return { bytes = bytes }
 
 
-    fn parent(self: Self) -> own memory::Error!Self = build_path(self.bytes[..find_parent_length(self.bytes)])
+    fn parent(self: Self) -> memory::Error!Self = build_path(self.bytes[..find_parent_length(self.bytes)])
 
 
-    fn absolute(self: Self) -> own (Error || memory::Error)!Self
+    fn absolute(self: Self) -> (Error || memory::Error)!Self
         var name: [maximum_path_length]u8 = undefined
         var resolved: [maximum_path_length]u8 = undefined
         const length = mn_runtime_filesystem_absolute(try fill_name(self, &name), &resolved)
@@ -213,23 +213,23 @@ instance Equal(Path)
 
 instance Clone(Path)
 
-    fn clone(path: const(*Self)) -> own memory::Error!Self = { bytes = try path.bytes.clone() }
+    fn clone(path: const(*Self)) -> memory::Error!Self = { bytes = try path.bytes.clone() }
 
 
 instance Deinit(Path)
 
-    fn deinit(own path: *Self) = memory::free(own path.bytes)
+    fn deinit(path: *Self) = memory::free(path.bytes)
 
 
 instance To(const(*[]u8), Path)
 
-    fn to(text: Self, type U) -> own !U = build_path(text)
+    fn to(text: Self, type U) -> !U = build_path(text)
 
 
 instance To(Path, *[]u8)
 
-    fn to(path: Self, type U) -> own !U
-        const own text = try memory::allocate(u8, path.bytes.length)
+    fn to(path: Self, type U) -> !U
+        const text = try memory::allocate(u8, path.bytes.length)
         memory::copy(text, path.bytes)
         return text
 
@@ -251,15 +251,15 @@ instance(type E: Encoder) Encode(Path, E)
 
 instance(type D: Decoder) Decode(Path, D)
 
-    fn decode(decoder: *D) -> own !Self
-        const own bytes = try decoder.bytes()
-        return { bytes = own bytes }
+    fn decode(decoder: *D) -> !Self
+        const bytes = try decoder.bytes()
+        return { bytes = bytes }
 
 
-private fn build_path(bytes: const(*[]u8)) -> own memory::Error!Path
-    const own copied = try memory::allocate(u8, bytes.length)
+private fn build_path(bytes: const(*[]u8)) -> memory::Error!Path
+    const copied = try memory::allocate(u8, bytes.length)
     memory::copy(copied, bytes)
-    return { bytes = own copied }
+    return { bytes = copied }
 
 
 private fn find_parent_length(bytes: const(*[]u8)) -> usize
@@ -295,12 +295,12 @@ fn exists(path: Path) -> Error!bool = match metadata(path)
     else (_ as rest) rest
 
 
-fn read(path: Path) -> own !*[]u8
+fn read(path: Path) -> !*[]u8
     const file = try File::open(path)
     defer file.close()
     const size = try file.size()
-    var own bytes = try memory::allocate(u8, size)
-    errdefer memory::free(own bytes)
+    var bytes = try memory::allocate(u8, size)
+    errdefer memory::free(bytes)
     var filled: usize = 0
     while filled < size
         const count = try file.read(bytes[filled..])
@@ -308,7 +308,7 @@ fn read(path: Path) -> own !*[]u8
         filled += count
     if filled < size
         if filled == 0
-            memory::free(own bytes)
+            memory::free(bytes)
             return {}
         if (!memory::resize(bytes, filled)) return memory::Error::OutOfMemory
         memory::refit(&bytes, filled)

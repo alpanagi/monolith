@@ -40,7 +40,6 @@ pub const keywords = std.StaticStringMap(token.TokenKind).initComptime(.{
     .{ "defer", .keyword_defer },
     .{ "errdefer", .keyword_errdefer },
     .{ "with", .keyword_with },
-    .{ "own", .keyword_own },
     .{ "many", .keyword_many },
     .{ "private", .keyword_private },
     .{ "_", .underscore },

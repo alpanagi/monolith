@@ -883,15 +883,6 @@ pub const Evaluator = struct {
     }
 
     fn evaluateCall(self: *Evaluator, location: token.Location, call: *const ast.Call) EvaluateError!Value {
-        const result = try self.evaluateCalled(location, call);
-        if (result == .failure) return result;
-        for (call.arguments) |*argument| {
-            if (argument.own) try self.recordMoved(&argument.value);
-        }
-        return result;
-    }
-
-    fn evaluateCalled(self: *Evaluator, location: token.Location, call: *const ast.Call) EvaluateError!Value {
         var frame: Frame = undefined;
         try self.prepareFrame(&frame, location, call);
         const cached = isCacheable(frame.definition);
@@ -1118,40 +1109,9 @@ pub const Evaluator = struct {
         while (index > 0) {
             index -= 1;
             if (deferred[index].on_error) {
-                if (!failed or try self.isHandedOver(deferred[index].statement)) continue;
+                if (!failed) continue;
             }
             _ = try self.executeStatement(deferred[index].statement);
-        }
-    }
-
-    fn isHandedOver(self: *Evaluator, statement: *const ast.Statement) EvaluateError!bool {
-        const frame = self.frame orelse return false;
-        const allocator = self.arena.allocator();
-        var moves: std.ArrayList(*const ast.Expression) = .empty;
-        try ast.collectStatementMoves(allocator, statement, &moves);
-        for (moves.items) |expression| {
-            const place = try ast.findSyntacticPlace(allocator, expression.*) orelse continue;
-            for (frame.moved.items) |moved| {
-                if (moved.contains(place)) return true;
-            }
-        }
-        return false;
-    }
-
-    fn recordMoved(self: *Evaluator, expression: *const ast.Expression) EvaluateError!void {
-        const frame = self.frame orelse return;
-        const allocator = self.arena.allocator();
-        const place = try ast.findSyntacticPlace(allocator, expression.*) orelse return;
-        try frame.moved.append(allocator, place);
-    }
-
-    fn restoreMoved(self: *Evaluator, place: ast.Place) void {
-        const frame = self.frame orelse return;
-        var index: usize = 0;
-        while (index < frame.moved.items.len) {
-            if (place.contains(frame.moved.items[index])) {
-                _ = frame.moved.swapRemove(index);
-            } else index += 1;
         }
     }
 
@@ -1219,8 +1179,6 @@ pub const Evaluator = struct {
                 if (ast.isAlias(constant.*)) return;
                 const declared = ast.extractDeclaredType(constant.type, constant.value);
                 try self.declareLocal(statement, try self.evaluateConverted(&constant.value, declared));
-                if (constant.moved) try self.recordMoved(&constant.value);
-                self.restoreMoved(.{ .root = .{ .local = statement } });
             },
             .variable_declaration => |*variable| {
                 const declared = ast.extractDeclaredType(variable.type, variable.value);
@@ -1229,8 +1187,6 @@ pub const Evaluator = struct {
                 } else {
                     try self.declareLocal(statement, try self.evaluateConverted(&variable.value, declared));
                 }
-                if (variable.moved) try self.recordMoved(&variable.value);
-                self.restoreMoved(.{ .root = .{ .local = statement } });
             },
             else => unreachable,
         }
@@ -1292,12 +1248,6 @@ pub const Evaluator = struct {
     }
 
     fn executeAssignment(self: *Evaluator, assignment: *const ast.Assignment) EvaluateError!void {
-        try self.assignValue(assignment);
-        if (assignment.moved) try self.recordMoved(&assignment.value);
-        if (try ast.findSyntacticPlace(self.arena.allocator(), assignment.target)) |place| self.restoreMoved(place);
-    }
-
-    fn assignValue(self: *Evaluator, assignment: *const ast.Assignment) EvaluateError!void {
         const target = assignment.target;
         const place = try self.findPlace(target);
         const target_type = target.type.?;
@@ -1640,7 +1590,6 @@ const Frame = struct {
     result: Value = .void,
     locals: std.AutoHashMapUnmanaged(*const ast.Statement, *Value) = .empty,
     elements: std.AutoHashMapUnmanaged(ast.Resolution.Element, *Value) = .empty,
-    moved: std.ArrayList(ast.Place) = .empty,
 };
 
 const Flow = union(enum) {
@@ -2472,7 +2421,7 @@ test "Allocator: creates through the allocate of an instance that takes the elem
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Counting\n    storage: [16]u8\n    used: usize\n    allocations: usize\n    frees: usize\ninstance Allocator(Counting)\n\n    fn allocate(counting: *Counting, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (counting.used + size > 16) return memory::Error::OutOfMemory\n        const start = counting.used\n        counting.used += size\n        counting.allocations += 1\n        return mn::cast(*[many]T, counting.storage[start..counting.used].pointer)[0..count]\n    fn(type T) resize(_: *Counting, items: *[]T, count: usize) -> bool = count <= items.length\n    fn(type T) free(counting: *Counting, own _: const(*[]T)) = counting.frees += 1\nfn run() -> memory::Error![4]usize\n    var counting: Counting = undefined\n    counting.used = 0\n    counting.allocations = 0\n    counting.frees = 0\n    const own value = try counting.create(u8)\n    defer counting.destroy(own value)\n    value.* = 7\n    const stored = mn::convert(usize, counting.storage[0])\n    const own items = try counting.allocate(u8, 4)\n    const grown = counting.resize(items, 8)\n    counting.free(own items)\n    return { stored, counting.allocations, counting.frees, if (grown) 1 else 0 }\nconst RESULT = run() catch [4]usize{ 0, 0, 0, 0 }\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nstruct Counting\n    storage: [16]u8\n    used: usize\n    allocations: usize\n    frees: usize\ninstance Allocator(Counting)\n\n    fn allocate(counting: *Counting, type T, count: usize) -> memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (counting.used + size > 16) return memory::Error::OutOfMemory\n        const start = counting.used\n        counting.used += size\n        counting.allocations += 1\n        return mn::cast(*[many]T, counting.storage[start..counting.used].pointer)[0..count]\n    fn(type T) resize(_: *Counting, items: *[]T, count: usize) -> bool = count <= items.length\n    fn(type T) free(counting: *Counting, _: const(*[]T)) = counting.frees += 1\nfn run() -> memory::Error![4]usize\n    var counting: Counting = undefined\n    counting.used = 0\n    counting.allocations = 0\n    counting.frees = 0\n    const value = try counting.create(u8)\n    defer counting.destroy(value)\n    value.* = 7\n    const stored = mn::convert(usize, counting.storage[0])\n    const items = try counting.allocate(u8, 4)\n    const grown = counting.resize(items, 8)\n    counting.free(items)\n    return { stored, counting.allocations, counting.frees, if (grown) 1 else 0 }\nconst RESULT = run() catch [4]usize{ 0, 0, 0, 0 }\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -2496,7 +2445,7 @@ test "ArrayList: grows in place or by moving and reports running out of memory a
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Allocator\nimport mn::memory::Deinit\nstruct Buffer\n    bytes: *[]u8\n    used: usize\n    last: usize\n    resizes: usize\n    frees: usize\ninstance Allocator(Buffer)\n\n    fn allocate(buffer: *Buffer, type T, count: usize) -> own memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (buffer.used + size > buffer.bytes.length) return memory::Error::OutOfMemory\n        buffer.last = buffer.used\n        buffer.used += size\n        return mn::cast(*[many]T, buffer.bytes[buffer.last..buffer.used].pointer)[0..count]\n    fn(type T) resize(buffer: *Buffer, items: *[]T, count: usize) -> bool\n        const size = mn::size(T) * count\n        if (items.length * mn::size(T) != buffer.used - buffer.last or buffer.last + size > buffer.bytes.length) return false\n        buffer.used = buffer.last + size\n        buffer.resizes += 1\n        return true\n    fn(type T) free(buffer: *Buffer, own _: const(*[]T)) = buffer.frees += 1\nfn grow() -> memory::Error![4]usize\n    var storage: [256]u8 = undefined\n    var buffer = Buffer{ bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0 }\n    var own list = mn::container::ArrayList(u8)::init()\n    errdefer list.deinit(own) with &buffer\n    for (index in 0..20) try list.append(mn::truncate(u8, index)) with &buffer\n    const in_place = buffer.resizes\n    const own ignored_30 = try buffer.allocate(u8, 4)\n    defer buffer.free(own ignored_30)\n    for (index in 20..40) try list.append(mn::truncate(u8, index)) with &buffer\n    var sum: usize = 0\n    for (item in list.view_as(const(*[]u8))) sum += mn::convert(usize, item)\n    const length = list.length()\n    list.deinit(own) with &buffer\n    return { in_place, buffer.frees, length, sum }\nfn fill(list: *mn::container::ArrayList(u8), buffer: *Buffer, count: usize) -> memory::Error!u8\n    for (_ in 0..count) try list.append(3) with buffer\n    return 0\nfn exhaust() -> u8\n    var storage: [8]u8 = undefined\n    var buffer = Buffer{ bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0 }\n    var own list = mn::container::ArrayList(u8)::init()\n    defer list.deinit(own) with &buffer\n    const filled = fill(&list, &buffer, 8) catch return 1\n    const more = fill(&list, &buffer, 1) catch return 2\n    return filled + more\nconst GROW = grow() catch { 0, 0, 0, 0 }\nconst EXHAUST = exhaust()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::container\nimport mn::convert::View\nimport mn::memory\nimport mn::memory::Allocator\nimport mn::memory::Deinit\nstruct Buffer\n    bytes: *[]u8\n    used: usize\n    last: usize\n    resizes: usize\n    frees: usize\ninstance Allocator(Buffer)\n\n    fn allocate(buffer: *Buffer, type T, count: usize) -> memory::Error!*[]T\n        const size = mn::size(T) * count\n        if (buffer.used + size > buffer.bytes.length) return memory::Error::OutOfMemory\n        buffer.last = buffer.used\n        buffer.used += size\n        return mn::cast(*[many]T, buffer.bytes[buffer.last..buffer.used].pointer)[0..count]\n    fn(type T) resize(buffer: *Buffer, items: *[]T, count: usize) -> bool\n        const size = mn::size(T) * count\n        if (items.length * mn::size(T) != buffer.used - buffer.last or buffer.last + size > buffer.bytes.length) return false\n        buffer.used = buffer.last + size\n        buffer.resizes += 1\n        return true\n    fn(type T) free(buffer: *Buffer, _: const(*[]T)) = buffer.frees += 1\nfn grow() -> memory::Error![4]usize\n    var storage: [256]u8 = undefined\n    var buffer = Buffer{ bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0 }\n    var list = mn::container::ArrayList(u8)::init()\n    errdefer list.deinit() with &buffer\n    for (index in 0..20) try list.append(mn::truncate(u8, index)) with &buffer\n    const in_place = buffer.resizes\n    const ignored_30 = try buffer.allocate(u8, 4)\n    defer buffer.free(ignored_30)\n    for (index in 20..40) try list.append(mn::truncate(u8, index)) with &buffer\n    var sum: usize = 0\n    for (item in list.view_as(const(*[]u8))) sum += mn::convert(usize, item)\n    const length = list.length()\n    list.deinit() with &buffer\n    return { in_place, buffer.frees, length, sum }\nfn fill(list: *mn::container::ArrayList(u8), buffer: *Buffer, count: usize) -> memory::Error!u8\n    for (_ in 0..count) try list.append(3) with buffer\n    return 0\nfn exhaust() -> u8\n    var storage: [8]u8 = undefined\n    var buffer = Buffer{ bytes = &storage, used = 0, last = 0, resizes = 0, frees = 0 }\n    var list = mn::container::ArrayList(u8)::init()\n    defer list.deinit() with &buffer\n    const filled = fill(&list, &buffer, 8) catch return 1\n    const more = fill(&list, &buffer, 1) catch return 2\n    return filled + more\nconst GROW = grow() catch { 0, 0, 0, 0 }\nconst EXHAUST = exhaust()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);

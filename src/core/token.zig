@@ -41,7 +41,6 @@ pub const TokenKind = union(enum) {
     keyword_defer,
     keyword_errdefer,
     keyword_with,
-    keyword_own,
     keyword_many,
     keyword_private,
     underscore,

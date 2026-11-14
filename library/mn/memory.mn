@@ -14,21 +14,21 @@ error Error
 
 typeclass Allocator(type A)
 
-    fn allocate(allocator: *A, type T, count: usize) -> own Error!*[]T
+    fn allocate(allocator: *A, type T, count: usize) -> Error!*[]T
     fn(type T) resize(allocator: *A, items: *[]T, count: usize) -> bool
-    fn(type T) free(allocator: *A, own items: const(*[]T))
+    fn(type T) free(allocator: *A, items: const(*[]T))
 
 
-    fn create(allocator: *A, type T) -> own Error!*T
-        const own items = try Allocator::allocate(allocator, T, 1)
+    fn create(allocator: *A, type T) -> Error!*T
+        const items = try Allocator::allocate(allocator, T, 1)
         return &items[0]
 
 
-    fn(type T) destroy(allocator: *A, own pointer: const(*T))
+    fn(type T) destroy(allocator: *A, pointer: const(*T))
         Allocator::free(allocator, mn::cast(const(*[many]T), pointer)[0..1])
 
 
-fn allocate(type T, count: usize) -> own Error!*[]T
+fn allocate(type T, count: usize) -> Error!*[]T
     with allocator
     return allocator.allocate(T, count)
 
@@ -38,19 +38,19 @@ fn(type T) resize(items: *[]T, count: usize) -> bool
     return allocator.resize(items, count)
 
 
-fn(type T) free(own items: const(*[]T))
+fn(type T) free(items: const(*[]T))
     with allocator
-    allocator.free(own items)
+    allocator.free(items)
 
 
-fn create(type T) -> own Error!*T
+fn create(type T) -> Error!*T
     with allocator
     return allocator.create(T)
 
 
-fn(type T) destroy(own pointer: const(*T))
+fn(type T) destroy(pointer: const(*T))
     with allocator
-    allocator.destroy(own pointer)
+    allocator.destroy(pointer)
 
 
 struct Heap
@@ -60,7 +60,7 @@ struct Heap
 
 instance Allocator(Heap)
 
-    fn allocate(_: *Self, type T, count: usize) -> own Error!*[]T
+    fn allocate(_: *Self, type T, count: usize) -> Error!*[]T
         if (count == 0) return {}
         if mn::size(T) == 0
             const empty: *[]T = {}
@@ -71,7 +71,7 @@ instance Allocator(Heap)
 
     fn(type T) resize(_: *Self, items: *[]T, count: usize) -> bool = count <= items.length
 
-    fn(type T) free(_: *Self, own items: const(*[]T))
+    fn(type T) free(_: *Self, items: const(*[]T))
         if (items.length == 0) return
         mn_runtime_memory_free(mn::cast(*[many]u8, items.pointer))
 
@@ -82,12 +82,12 @@ struct None
 fn Arena(type P: Allocator) -> type
     return struct
         private parent: P
-        private own block: ?*[many]u8
+        private block: ?*[many]u8
         used: usize
         capacity: usize
         last: usize
 
-        fn init(parent: P) -> own Self = { parent = parent, block = null, used = 0, capacity = 0, last = 0 }
+        fn init(parent: P) -> Self = { parent = parent, block = null, used = 0, capacity = 0, last = 0 }
 
 
         fn free_all(self: *Self)
@@ -107,7 +107,7 @@ struct ArenaBlock
 
 instance(type P: Allocator) Allocator(Arena(P))
 
-    fn allocate(arena: *Self, type T, count: usize) -> own Error!*[]T
+    fn allocate(arena: *Self, type T, count: usize) -> Error!*[]T
         const size = mn::size(T) * count
         const alignment = mn::alignment(T)
         if arena.block as block
@@ -120,7 +120,7 @@ instance(type P: Allocator) Allocator(Arena(P))
         const header_size = mn::size(ArenaBlock)
         var capacity = header_size + size + alignment
         if (capacity < arena_block_size) capacity = arena_block_size
-        const own blocks = try arena.parent.allocate(ArenaBlock, (capacity + header_size - 1) / header_size)
+        const blocks = try arena.parent.allocate(ArenaBlock, (capacity + header_size - 1) / header_size)
         capacity = blocks.length * header_size
         const bytes = mn::cast(*[many]u8, blocks.pointer)
         blocks[0] = { previous = arena.block, size = capacity }
@@ -142,12 +142,12 @@ instance(type P: Allocator) Allocator(Arena(P))
         return true
 
 
-    fn(type T) free(_: *Self, own _: const(*[]T)) = noop
+    fn(type T) free(_: *Self, _: const(*[]T)) = noop
 
 
 instance(type P: Allocator) Deinit(Arena(P))
 
-    fn deinit(own arena: *Self) = arena.free_all()
+    fn deinit(arena: *Self) = arena.free_all()
 
 
 fn(type T) copy(destination: *[]T, source: const(*[]T))
@@ -167,27 +167,18 @@ fn(type T) swap(one: *T, two: *T)
     copy(mn::cast(*[many]T, two)[0..1], spare[..])
 
 
-fn(type T) replace(target: *T, own value: T) -> own T
-    var own spare: T = undefined
+fn(type T) replace(target: *T, value: T) -> T
+    var spare: T = undefined
     copy(mn::cast(*[many]T, &spare)[0..1], mn::cast(const(*[many]T), target)[0..1])
     copy(mn::cast(*[many]T, target)[0..1], mn::cast(const(*[many]T), &value)[0..1])
     return spare
 
 
-fn(type T) take(target: *?T) -> own ?T
-    var own spare: ?T = undefined
+fn(type T) take(target: *?T) -> ?T
+    var spare: ?T = undefined
     copy(mn::cast(*[many]?T, &spare)[0..1], mn::cast(const(*[many]?T), target)[0..1])
     target.* = null
     return spare
-
-
-fn(type T) move(source: *T) -> own T
-    var own spare: T = undefined
-    copy(mn::cast(*[many]T, &spare)[0..1], mn::cast(const(*[many]T), source)[0..1])
-    return spare
-
-
-inline fn(type T) forget(own _: T) = noop
 
 
 fn equal(one: const(*[]u8), two: const(*[]u8)) -> bool
@@ -199,35 +190,35 @@ fn equal(one: const(*[]u8), two: const(*[]u8)) -> bool
 
 typeclass Deinit(type T)
 
-    fn deinit(own value: *T)
+    fn deinit(value: *T)
 
 
 instance(type T) Deinit(T)
 
-    inline fn deinit(own _: *Self) = noop
+    inline fn deinit(_: *Self) = noop
 
 
 typeclass Clone(type T)
 
-    fn clone(value: const(*T)) -> own Error!T
+    fn clone(value: const(*T)) -> Error!T
 
 
 instance(type T) Clone(T)
 
-    inline fn clone(value: const(*Self)) -> own Error!Self = value.*
+    inline fn clone(value: const(*Self)) -> Error!Self = value.*
 
 
 instance Clone(const(*[]u8))
 
-    fn clone(value: const(*Self)) -> own Error!Self
-        const own bytes = try allocate(u8, value.*.length)
+    fn clone(value: const(*Self)) -> Error!Self
+        const bytes = try allocate(u8, value.*.length)
         copy(bytes, value.*)
         return bytes
 
 
 instance Clone(*[]u8)
 
-    fn clone(value: const(*Self)) -> own Error!Self
-        const own bytes = try allocate(u8, value.*.length)
+    fn clone(value: const(*Self)) -> Error!Self
+        const bytes = try allocate(u8, value.*.length)
         copy(bytes, value.*)
         return bytes

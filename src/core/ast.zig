@@ -12,13 +12,6 @@ pub const case_without_known_enum_message = "a leading :: names a case or a func
 pub const Program = struct {
     modules: []Module,
     types: *types.Registry,
-    skipped_defers: []const SkippedDefer = &.{},
-};
-
-pub const SkippedDefer = struct {
-    statement: *const Statement,
-    exit: *const Expression,
-    sources: []const *const Expression = &.{},
 };
 
 pub const Module = struct {
@@ -121,7 +114,6 @@ pub const FunctionSignature = struct {
     @"inline": bool = false,
     inferred_error_set: ?token.Location = null,
     error_set: ?*types.Enum = null,
-    return_own: bool = false,
     private: bool = false,
 };
 
@@ -166,8 +158,6 @@ pub const ConstantDeclaration = struct {
     bound: bool = false,
     measured: bool = false,
     with: bool = false,
-    own: bool = false,
-    moved: bool = false,
     context: bool = false,
     context_used: bool = false,
     called_early: bool = false,
@@ -177,8 +167,6 @@ pub const TupleDeclaration = struct {
     names: []ElementName,
     value: Expression,
     variable: bool = false,
-    own: bool = false,
-    moved: bool = false,
 };
 
 pub const ElementName = struct {
@@ -274,8 +262,6 @@ pub const VariableDeclaration = struct {
     value: Expression,
     deferred_use: ?Use = null,
     measured: bool = false,
-    own: bool = false,
-    moved: bool = false,
 };
 
 pub const Use = struct {
@@ -288,7 +274,6 @@ pub const Assignment = struct {
     target: Expression,
     operator: ?CompoundOperator = null,
     value: Expression,
-    moved: bool = false,
 };
 
 pub const CompoundOperator = struct {
@@ -298,10 +283,7 @@ pub const CompoundOperator = struct {
 
 pub const If = struct {
     condition: Expression,
-    marker: ?token.Location = null,
-    moved: bool = false,
     names: []ElementName = &.{},
-    own: bool = false,
     tuple: bool = false,
     body: []Statement,
     else_body: ?[]Statement = null,
@@ -313,10 +295,7 @@ pub const If = struct {
 pub const While = struct {
     label: ?[]const u8 = null,
     condition: Expression,
-    marker: ?token.Location = null,
-    moved: bool = false,
     names: []ElementName = &.{},
-    own: bool = false,
     tuple: bool = false,
     body: []Statement,
     else_body: ?[]Statement = null,
@@ -346,8 +325,6 @@ pub const Defer = struct {
 
 pub const Match = struct {
     value: Expression,
-    marker: ?token.Location = null,
-    moved: bool = false,
     branches: []Branch,
     names: []ElementName,
     produces: bool = false,
@@ -357,7 +334,6 @@ pub const Match = struct {
 pub const Branch = struct {
     cases: []BranchCase,
     naming: Naming = .none,
-    own: bool = false,
     tuple: bool = false,
     first_name: usize = 0,
     name_count: usize = 1,
@@ -410,7 +386,6 @@ pub const Expression = struct {
     type: ?types.Type = null,
     denoted: ?types.Type = null,
     location: token.Location,
-    handed: bool = false,
     implicit: bool = false,
 };
 
@@ -515,7 +490,6 @@ pub const MethodCall = struct {
     crossing: bool = false,
     arguments: []Argument,
     with_value: ?*Expression = null,
-    receiver_own: bool = false,
 };
 
 pub const Resolution = union(enum) {
@@ -676,9 +650,7 @@ pub const Argument = struct {
     name: ?[]const u8,
     value: Expression,
     location: token.Location,
-    own: bool = false,
     crossing: bool = false,
-    receiver: bool = false,
 };
 
 pub const FieldAccess = struct {
@@ -710,7 +682,6 @@ pub const TypedName = struct {
     unknown_position: usize = 0,
     measured: bool = false,
     hidden: bool = false,
-    own: bool = false,
     default: ?*Expression = null,
     default_constant: ?Resolution.Constant = null,
     inherited_default: ?InheritedDefault = null,
@@ -963,7 +934,6 @@ pub const Field = struct {
     default: ?Expression = null,
     default_value: ?Value = null,
     location: token.Location,
-    own: bool = false,
     private: bool = false,
 };
 
@@ -1879,112 +1849,10 @@ pub fn findNameBranch(matching: Match, position: usize) usize {
     unreachable;
 }
 
-pub const Place = struct {
-    root: Resolution,
-    steps: []const PartStep = &.{},
-
-    pub fn extend(self: Place, allocator: std.mem.Allocator, step: PartStep) std.mem.Allocator.Error!Place {
-        const steps = try allocator.alloc(PartStep, self.steps.len + 1);
-        @memcpy(steps[0..self.steps.len], self.steps);
-        steps[self.steps.len] = step;
-        return .{ .root = self.root, .steps = steps };
-    }
-
-    pub fn contains(self: Place, other: Place) bool {
-        if (!std.meta.eql(self.root, other.root)) return false;
-        if (self.steps.len > other.steps.len) return false;
-        for (self.steps, other.steps[0..self.steps.len]) |one, two| {
-            if (!one.eql(two)) return false;
-        }
-        return true;
-    }
-
-    pub fn eql(self: Place, other: Place) bool {
-        return self.steps.len == other.steps.len and self.contains(other);
-    }
-};
-
-pub const PartStep = union(enum) {
-    field: []const u8,
-    element: u64,
-    value,
-
-    pub fn eql(self: PartStep, other: PartStep) bool {
-        return switch (self) {
-            .field => |name| other == .field and std.mem.eql(u8, name, other.field),
-            .element => |position| other == .element and position == other.element,
-            .value => other == .value,
-        };
-    }
-};
-
-pub fn findSyntacticPlace(allocator: std.mem.Allocator, expression: Expression) std.mem.Allocator.Error!?Place {
-    switch (expression.kind) {
-        .identifier => |identifier| {
-            const resolution = identifier.resolution orelse return null;
-            return switch (resolution) {
-                .local, .parameter, .element => .{ .root = resolution },
-                else => null,
-            };
-        },
-        .address_of => |operand| return findSyntacticPlace(allocator, operand.*),
-        .field_access => |access| {
-            const base = try findSyntacticPlace(allocator, access.value.*) orelse return null;
-            return try base.extend(allocator, .{ .field = access.field });
-        },
-        .index => |indexing| {
-            const position = indexing.position orelse return null;
-            const base = try findSyntacticPlace(allocator, indexing.value.*) orelse return null;
-            return try base.extend(allocator, .{ .element = position });
-        },
-        .unwrap => |operand| {
-            const base = try findSyntacticPlace(allocator, operand.*) orelse return null;
-            return try base.extend(allocator, .value);
-        },
-        else => return null,
-    }
-}
-
-pub fn collectStatementMoves(allocator: std.mem.Allocator, statement: *const Statement, moved: *std.ArrayList(*const Expression)) std.mem.Allocator.Error!void {
-    switch (statement.kind) {
-        .discard, .call, .value => |*expression| try collectExpressionMoves(allocator, expression, moved),
-        .assignment => |*assignment| {
-            try collectExpressionMoves(allocator, &assignment.value, moved);
-            if (assignment.moved) try moved.append(allocator, &assignment.value);
-        },
-        else => {},
-    }
-}
-
-fn collectExpressionMoves(allocator: std.mem.Allocator, expression: *const Expression, moved: *std.ArrayList(*const Expression)) std.mem.Allocator.Error!void {
-    const arguments: []const Argument = switch (expression.kind) {
-        .call => |call| call.arguments,
-        .method_call => |call| call.arguments,
-        .composite_literal => |literal| literal.elements,
-        .case_literal => |literal| literal.arguments,
-        .@"try" => |operand| return collectExpressionMoves(allocator, operand, moved),
-        else => return,
-    };
-    for (arguments) |*argument| {
-        try collectExpressionMoves(allocator, &argument.value, moved);
-        if (argument.own) try moved.append(allocator, &argument.value);
-    }
-}
-
-pub fn isOwnElement(element: Resolution.Element) bool {
-    return switch (element.statement.kind) {
-        .@"if" => |conditional| conditional.own,
-        .@"while" => |loop| loop.own,
-        .match => |matching| matching.branches[findNameBranch(matching, element.position)].own,
-        .tuple_declaration => |declaration| declaration.own,
-        else => false,
-    };
-}
-
 pub fn isWritableElement(element: Resolution.Element) bool {
     return switch (element.statement.kind) {
-        .tuple_declaration => |declaration| declaration.variable or declaration.own,
-        else => isOwnElement(element),
+        .tuple_declaration => |declaration| declaration.variable,
+        else => false,
     };
 }
 
@@ -2150,7 +2018,7 @@ pub fn cloneExpression(allocator: std.mem.Allocator, expression: Expression) std
         .jump => |statement| .{ .jump = try cloneNestedStatement(allocator, statement) },
         .branching => |statement| .{ .branching = try cloneNestedStatement(allocator, statement) },
     };
-    return .{ .kind = kind, .location = expression.location, .handed = expression.handed, .implicit = expression.implicit };
+    return .{ .kind = kind, .location = expression.location, .implicit = expression.implicit };
 }
 
 pub fn cloneField(allocator: std.mem.Allocator, field: Field) std.mem.Allocator.Error!Field {
@@ -2159,7 +2027,6 @@ pub fn cloneField(allocator: std.mem.Allocator, field: Field) std.mem.Allocator.
         .type = try cloneExpression(allocator, field.type),
         .default = try cloneOptionalExpression(allocator, field.default),
         .location = field.location,
-        .own = field.own,
         .private = field.private,
     };
 }
@@ -2189,7 +2056,6 @@ fn cloneMethodCall(allocator: std.mem.Allocator, call: *const MethodCall) std.me
         .crossing = call.crossing,
         .arguments = try cloneArguments(allocator, call.arguments),
         .with_value = try cloneWithValue(allocator, call.with_value),
-        .receiver_own = call.receiver_own,
     };
 }
 
@@ -2214,7 +2080,6 @@ fn cloneFunctionSignature(
             .constraint = parameter.constraint,
             .constraint_arguments = parameter.constraint_arguments,
             .unknown_position = parameter.unknown_position,
-            .own = parameter.own,
             .default = parameter.default,
             .default_constant = parameter.default_constant,
             .inherited_default = parameter.inherited_default,
@@ -2230,7 +2095,6 @@ fn cloneFunctionSignature(
         .self_parameter = signature.self_parameter,
         .@"inline" = signature.@"inline",
         .inferred_error_set = signature.inferred_error_set,
-        .return_own = signature.return_own,
         .private = signature.private,
     };
 }
@@ -2260,36 +2124,26 @@ fn cloneStatement(allocator: std.mem.Allocator, statement: Statement) std.mem.Al
             .type = try cloneOptionalExpression(allocator, constant.type),
             .value = try cloneExpression(allocator, constant.value),
             .with = constant.with,
-            .own = constant.own,
-            .moved = constant.moved,
             .context = constant.context,
         } },
         .tuple_declaration => |declaration| .{ .tuple_declaration = .{
             .names = try allocator.dupe(ElementName, declaration.names),
             .value = try cloneExpression(allocator, declaration.value),
             .variable = declaration.variable,
-            .own = declaration.own,
-            .moved = declaration.moved,
         } },
         .variable_declaration => |variable| .{ .variable_declaration = .{
             .name = variable.name,
             .type = try cloneOptionalExpression(allocator, variable.type),
             .value = try cloneExpression(allocator, variable.value),
-            .own = variable.own,
-            .moved = variable.moved,
         } },
         .assignment => |assignment| .{ .assignment = .{
             .target = try cloneExpression(allocator, assignment.target),
             .operator = assignment.operator,
             .value = try cloneExpression(allocator, assignment.value),
-            .moved = assignment.moved,
         } },
         .@"if" => |conditional| .{ .@"if" = .{
             .condition = try cloneExpression(allocator, conditional.condition),
-            .marker = conditional.marker,
-            .moved = conditional.moved,
             .names = try allocator.dupe(ElementName, conditional.names),
-            .own = conditional.own,
             .tuple = conditional.tuple,
             .body = try cloneStatements(allocator, conditional.body),
             .else_body = try cloneOptionalStatements(allocator, conditional.else_body),
@@ -2297,10 +2151,7 @@ fn cloneStatement(allocator: std.mem.Allocator, statement: Statement) std.mem.Al
         .@"while" => |loop| .{ .@"while" = .{
             .label = loop.label,
             .condition = try cloneExpression(allocator, loop.condition),
-            .marker = loop.marker,
-            .moved = loop.moved,
             .names = try allocator.dupe(ElementName, loop.names),
-            .own = loop.own,
             .tuple = loop.tuple,
             .body = try cloneStatements(allocator, loop.body),
             .else_body = try cloneOptionalStatements(allocator, loop.else_body),
@@ -2321,8 +2172,6 @@ fn cloneStatement(allocator: std.mem.Allocator, statement: Statement) std.mem.Al
         } },
         .match => |matching| .{ .match = .{
             .value = try cloneExpression(allocator, matching.value),
-            .marker = matching.marker,
-            .moved = matching.moved,
             .branches = try cloneBranches(allocator, matching.branches),
             .names = try allocator.dupe(ElementName, matching.names),
         } },
@@ -2369,7 +2218,6 @@ fn cloneBranches(allocator: std.mem.Allocator, branches: []const Branch) std.mem
         copy.* = .{
             .cases = cases,
             .naming = branch.naming,
-            .own = branch.own,
             .tuple = branch.tuple,
             .first_name = branch.first_name,
             .name_count = branch.name_count,
@@ -2412,9 +2260,7 @@ fn cloneArguments(allocator: std.mem.Allocator, arguments: []const Argument) std
             .name = argument.name,
             .value = try cloneExpression(allocator, argument.value),
             .location = argument.location,
-            .own = argument.own,
             .crossing = argument.crossing,
-            .receiver = argument.receiver,
         };
     }
     return cloned;

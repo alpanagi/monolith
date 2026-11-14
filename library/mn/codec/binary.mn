@@ -126,10 +126,10 @@ instance(type R: Reader) Decoder(BinaryDecoder(R))
         else codec::Error::Malformed
 
 
-    fn bytes(self: *Self) -> own !*[]u8
+    fn bytes(self: *Self) -> !*[]u8
         const length = try read_unsigned(self.reader, usize)
-        const own bytes = try memory::allocate(u8, length)
-        errdefer memory::free(own bytes)
+        const bytes = try memory::allocate(u8, length)
+        errdefer memory::free(bytes)
         try read_exact(self.reader, bytes)
         return bytes
 
@@ -161,7 +161,7 @@ instance(type R: Reader) Decoder(BinaryDecoder(R))
         return number
 
 
-    fn decode(self: *Self, type T: Decode(_, Self)) -> own !T = Decode(T, Self)::decode(self)
+    fn decode(self: *Self, type T: Decode(_, Self)) -> !T = Decode(T, Self)::decode(self)
 
 
 private fn(type W: Writer) write_unsigned(writer: *W, type U, value: U) -> !void
