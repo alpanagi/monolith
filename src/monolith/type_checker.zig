@@ -9816,7 +9816,7 @@ test "checkStatement: rejects a defer that needs an allocator under with memory:
     try std.testing.expectEqual(2, trace.len);
     try std.testing.expectEqual(2, loader.modules.items[trace[0].module].path.len);
     try std.testing.expectEqualStrings("container", loader.modules.items[trace[0].module].path[1]);
-    try std.testing.expectEqual(token.Location{ .row = 53, .column = 30 }, trace[0].location);
+    try std.testing.expectEqual(token.Location{ .row = 69, .column = 30 }, trace[0].location);
     try std.testing.expectEqual(0, trace[1].module);
     try std.testing.expectEqual(token.Location{ .row = 11, .column = 11 }, trace[1].location);
 }
@@ -9862,7 +9862,7 @@ test "checkStatement: rejects a defer that needs an allocator where none is set"
     try std.testing.expectEqual(2, trace.len);
     try std.testing.expectEqual(2, loader.modules.items[trace[0].module].path.len);
     try std.testing.expectEqualStrings("container", loader.modules.items[trace[0].module].path[1]);
-    try std.testing.expectEqual(token.Location{ .row = 53, .column = 30 }, trace[0].location);
+    try std.testing.expectEqual(token.Location{ .row = 69, .column = 30 }, trace[0].location);
     try std.testing.expectEqual(0, trace[1].module);
     try std.testing.expectEqual(token.Location{ .row = 6, .column = 11 }, trace[1].location);
 }

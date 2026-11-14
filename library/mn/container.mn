@@ -48,6 +48,22 @@ fn ArrayList(type T) -> type
             return self.storage[self.count]
 
 
+        fn shift_remove(self: *Self, index: usize) -> T
+            const removed = self.storage[index]
+            const last = self.count - 1
+            memory::copy(self.storage[index..last], self.storage[index + 1..self.count])
+            self.count = last
+            return removed
+
+
+        fn swap_remove(self: *Self, index: usize) -> T
+            const removed = self.storage[index]
+            const last = self.count - 1
+            if (index != last) self.storage[index] = self.storage[last]
+            self.count = last
+            return removed
+
+
 instance(type E) Deinit(ArrayList(E))
 
     fn deinit(list: *Self) = memory::free(list.storage)
@@ -143,7 +159,7 @@ fn HashMap(type K: Hash, type V) -> type
             return { key = &self.key_storage[position], value = &self.value_storage[position], found = false }
 
 
-        fn get(self: const(*Self), key: const(*K)) -> ?const(*V)
+        fn get(self: const(*Self), key: const(*K)) -> ?*V
             const slot = find_table_slot(self.table, self.key_storage, key) orelse return null
             return &self.value_storage[self.table[slot] - 1]
 
