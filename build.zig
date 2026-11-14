@@ -52,6 +52,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&exe.step);
     const input_marker = addInputMarker(b);
     for ([_]*std.Build.Module{ core, monolith }) |module| {
         const tests = b.addTest(.{ .root_module = module });

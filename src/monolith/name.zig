@@ -42,6 +42,7 @@ pub const keywords = std.StaticStringMap(token.TokenKind).initComptime(.{
     .{ "with", .keyword_with },
     .{ "many", .keyword_many },
     .{ "private", .keyword_private },
+    .{ "test", .keyword_test },
     .{ "_", .underscore },
 });
 

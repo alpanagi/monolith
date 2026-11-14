@@ -4040,17 +4040,37 @@ test "executeIteration: calls next on a copy of the iterator until it gives null
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Countdown\n    count: u32\ninstance mn::iterator::Iterator(Countdown, u32)\n\n    fn next(iterator: *Countdown) -> ?u32\n        if (iterator.count == 0) return null\n        iterator.count -= 1\n        return iterator.count + 1\ninstance mn::iterator::Iterable(Countdown, Countdown)\n\n    fn iterator(countdown: Countdown) -> Countdown = countdown\nfn total(start: u32) -> [2]u32\n    var sum: u32 = 0\n    var countdown = Countdown{ count = start }\n    for (value in countdown) sum += value\n    countdown.count += 1\n    return { sum, countdown.count }\nfn indexes(count: usize) -> usize\n    var sum: usize = 0\n    const range = 2..count\n    for index in range\n        if (index == 4) continue\n        sum += index\n    return sum\nconst TOTAL = total(3)\nconst INDEXES = indexes(6)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Countdown\n    count: u32\ninstance mn::iterator::Iterator(Countdown, u32)\n\n    fn next(iterator: *Countdown) -> ?u32\n        if (iterator.count == 0) return null\n        iterator.count -= 1\n        return iterator.count + 1\nfn total(start: u32) -> [2]u32\n    var sum: u32 = 0\n    var countdown = Countdown{ count = start }\n    for (value in countdown) sum += value\n    countdown.count += 1\n    return { sum, countdown.count }\nfn indexes(count: usize) -> usize\n    var sum: usize = 0\n    const range = 2..count\n    for index in range\n        if (index == 4) continue\n        sum += index\n    return sum\nconst TOTAL = total(3)\nconst INDEXES = indexes(6)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     _ = try analyzer.analyze();
 
     const declarations = loader.modules.items[0].declarations;
-    const elements = declarations[9].kind.constant_declaration.known.?.aggregate;
+    const elements = declarations[7].kind.constant_declaration.known.?.aggregate;
     try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 6 } }, elements[0]);
     try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 4 } }, elements[1]);
-    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 10 } }, declarations[10].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 10 } }, declarations[8].kind.constant_declaration.known.?.*);
+}
+
+test "executeIteration: goes over the cursor of a written instance of Iterable before the one of mn::iterator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterable\nimport mn::iterator::Iterator\n\nstruct Data\n    count: u32\n\n\ninstance Iterator(Data, u32)\n\n    fn next(data: *Self) -> ?u32\n        if (data.count == 0) return null\n        data.count -= 1\n        return data.count + 1\n\n\ninstance Iterable(Data, Data)\n\n    fn iterator(data: Self) -> Self = { count = data.count - 1 }\n\n\nfn total(start: u32) -> u32\n    var sum: u32 = 0\n    for (value in Data{ count = start }) sum += value\n    return sum\n\n\nconst TOTAL = total(3)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = .{ .unsigned = 3 } }, declarations[8].kind.constant_declaration.known.?.*);
 }
 
 test "executeIteration: zips iterators until the shortest ends" {

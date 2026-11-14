@@ -80,6 +80,7 @@ pub const TypeChecker = struct {
             for (module.declarations, 0..) |declaration, declaration_index| {
                 switch (declaration.kind) {
                     .function_definition => |function| {
+                        if (function.test_text != null) continue;
                         if (function.default_of == null and !ast.isGeneric(function.signature) and !function.pattern) {
                             try self.prepareWithoutAllocator(.{ .module = index, .declaration = declaration_index });
                         } else if (function.default_of == null and !function.pattern and self.resolver != null) {
@@ -131,7 +132,14 @@ pub const TypeChecker = struct {
                 try self.prepareWithoutAllocator(.{ .module = index, .declaration = declaration_index });
             }
         }
-        var created_index: usize = 0;
+        try self.prepareCreated(0);
+        try self.finishNeeds();
+        try self.checkInlineRecursion();
+        try self.checkTests();
+    }
+
+    fn prepareCreated(self: *TypeChecker, start: usize) TypeError!void {
+        var created_index = start;
         while (created_index < self.created.items.len) : (created_index += 1) {
             const function = self.created.items[created_index];
             const declaration = ast.findDeclaration(self.program.modules[function.module], function.declaration);
@@ -146,6 +154,23 @@ pub const TypeChecker = struct {
             const resolver = self.resolver orelse continue;
             try self.prepareCheckCopy(try resolver.createCheckCopy(resolver.context, function));
         }
+    }
+
+    fn checkTests(self: *TypeChecker) TypeError!void {
+        for (self.program.modules) |*module| module.first_test_instance = module.declarations.len + module.instances.items.len;
+        self.program.types.first_test_entry = self.program.types.entries.items.len;
+        const created_start = self.created.items.len;
+        var found = false;
+        for (self.program.modules, 0..) |module, index| {
+            self.module_index = index;
+            for (module.declarations, 0..) |declaration, declaration_index| {
+                if (!ast.isTest(declaration)) continue;
+                found = true;
+                try self.prepareWithoutAllocator(.{ .module = index, .declaration = declaration_index });
+            }
+        }
+        if (!found) return;
+        try self.prepareCreated(created_start);
         try self.finishNeeds();
         try self.checkInlineRecursion();
     }
@@ -163,7 +188,7 @@ pub const TypeChecker = struct {
         if (declaration.kind != .function_definition) return;
         const definition = &declaration.kind.function_definition;
         if (definition.allocator != null or definition.allocator_root or definition.pattern or ast.isGeneric(definition.signature)) return;
-        if (ast.isMain(definition.signature)) {
+        if (ast.isMain(definition.signature) or definition.test_text != null) {
             definition.allocator_root = true;
             definition.need = .no;
             return self.prepareFunction(function);
@@ -5610,6 +5635,11 @@ fn isDataPointer(value_type: types.Type) bool {
 
 fn isReadOnlyMatch(value_type: types.Type, expected: types.Type) bool {
     if (std.meta.eql(value_type, expected)) return true;
+    if (value_type == .optional and expected == .optional) return isReadOnlyPointer(value_type.optional.child, expected.optional.child);
+    return isReadOnlyPointer(value_type, expected);
+}
+
+fn isReadOnlyPointer(value_type: types.Type, expected: types.Type) bool {
     if (value_type == .pointer and expected == .pointer) {
         const pointer = value_type.pointer;
         if (pointer.many != expected.pointer.many) return false;
@@ -7231,6 +7261,85 @@ test "TypeChecker.check: accepts a read of an array that a loop fills element by
     _ = try analyzer.analyze();
 
     try std.testing.expectEqual(Value{ .integer = .{ .signed = 4 } }, loader.modules.items[0].declarations[2].kind.constant_declaration.known.?.*);
+}
+
+test "checkTests: resolves the names in a test to a private declaration of its module and to an imported function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::test::expect\n\nprivate fn double(value: u32) -> u32 = value * 2\n\ntest \"double: doubles\"\n    try expect(double(2) == 4)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[2].kind.function_definition.body;
+    const call = body[0].kind.call.kind.@"try".kind.call;
+    const expect = ast.extractResolution(call.callee).function;
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{ "mn", "test" }), loader.modules.items[expect.module].path);
+    const doubled = call.arguments[0].value.kind.binary.left.kind.call;
+    try std.testing.expectEqual(ast.Resolution.Function{ .module = 0, .declaration = 1 }, ast.extractResolution(doubled.callee).function);
+}
+
+test "checkTests: infers the error set of a test from what it tries and what it returns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ErrorOne\n    Wrong\n\nerror ErrorTwo\n    Other\n\nerror ErrorThree\n    Unused\n\nfn fail() -> ErrorOne!void = return ErrorOne::Wrong\n\ntest \"fail: fails\"\n    try fail()\n    return ErrorTwo::Other\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const signature = loader.modules.items[0].declarations[4].kind.function_definition.signature;
+    const error_set = ast.extractType(signature.return_type).result.error_set;
+    try std.testing.expectEqual(2, error_set.cases.len);
+    try std.testing.expectEqualStrings("Wrong", error_set.cases[0].name);
+    try std.testing.expectEqualStrings("Other", error_set.cases[1].name);
+}
+
+test "checkTests: rejects a test that needs an allocator and sets none with the error main gets" {
+    const take = "import mn\nimport mn::memory\nimport mn::memory::Allocator\nfn take() -> memory::Error!usize\n    with allocator\n    const items = try allocator.allocate(u8, 1)\n    return items.length\n";
+    for ([_][]const u8{ "fn main -> !void\n    _ = try take()", "test \"take: takes\"\n    _ = try take()" }) |caller| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var program_directory = std.testing.tmpDir(.{});
+        defer program_directory.cleanup();
+        const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+        var loader = @import("loader.zig").Loader.init(program_path, "library");
+        try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = try std.mem.concat(arena.allocator(), u8, &.{ take, caller }) });
+        try loader.loadMainModule(&arena, std.testing.io, "main");
+        var type_registry: types.Registry = .{};
+        var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+        try std.testing.expectError(error.MissingAllocator, analyzer.analyze());
+        try std.testing.expectEqual(token.Location{ .row = 5, .column = 5 }, analyzer.failure.?.location.?);
+        const trace = try analyzer.collectCallTrace(arena.allocator(), analyzer.failure.?);
+        try std.testing.expectEqual(1, trace.len);
+        try std.testing.expectEqual(token.Location{ .row = 9, .column = 13 }, trace[0].location);
+    }
+}
+
+test "checkTests: rejects a type error in a test of a program analyzed for a normal build" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main = noop\n\ntest \"main: holds a type error\"\n    const value: u32 = true\n    _ = value\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 24 }, analyzer.failure.?.location.?);
 }
 
 test "prepareFunction: rejects a function that its own check calls at compile time" {
@@ -16649,13 +16758,13 @@ test "checkIteratorLoop: rejects a pointer to an element of an iterator" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Countdown\n    count: u32\ninstance mn::iterator::Iterator(Countdown, u32)\n\n    fn next(iterator: *Countdown) -> ?u32\n        if (iterator.count == 0) return null\n        iterator.count -= 1\n        return iterator.count + 1\ninstance mn::iterator::Iterable(Countdown, Countdown)\n\n    fn iterator(countdown: Countdown) -> Countdown = countdown\nfn total() -> u32\n    var sum: u32 = 0\n    for (*value in Countdown{ count = 3 }) sum += value.*\n    return sum" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Countdown\n    count: u32\ninstance mn::iterator::Iterator(Countdown, u32)\n\n    fn next(iterator: *Countdown) -> ?u32\n        if (iterator.count == 0) return null\n        iterator.count -= 1\n        return iterator.count + 1\nfn total() -> u32\n    var sum: u32 = 0\n    for (*value in Countdown{ count = 3 }) sum += value.*\n    return sum" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.PointerOverIterator, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 16, .column = 10 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 13, .column = 10 }, analyzer.failure.?.location.?);
 }
 
 test "checkIteratorLoop: binds an element of several values to a single name" {
@@ -16668,7 +16777,7 @@ test "checkIteratorLoop: binds an element of several values to a single name" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Pairs\n    count: u32\ninstance mn::iterator::Iterator(Pairs, [u32, bool])\n\n    fn next(_: *Pairs) -> ?[u32, bool] = return null\ninstance mn::iterator::Iterable(Pairs, Pairs)\n\n    fn iterator(pairs: Pairs) -> Pairs = pairs\nfn first() -> bool\n    for (pair in Pairs{ count = 3 }) return pair[1]\n    return false" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Pairs\n    count: u32\ninstance mn::iterator::Iterator(Pairs, [u32, bool])\n\n    fn next(_: *Pairs) -> ?[u32, bool] = return null\nfn first() -> bool\n    for (pair in Pairs{ count = 3 }) return pair[1]\n    return false" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -16686,13 +16795,13 @@ test "checkIteratorLoop: rejects another number of names in braces than parts of
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Pairs\n    count: u32\ninstance mn::iterator::Iterator(Pairs, [u32, bool])\n\n    fn next(_: *Pairs) -> ?[u32, bool] = return null\ninstance mn::iterator::Iterable(Pairs, Pairs)\n\n    fn iterator(pairs: Pairs) -> Pairs = pairs\nfn total() -> u32\n    for ({ value, flag, other } in Pairs{ count = 3 }) _ = { value, flag, other }\n    return 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Pairs\n    count: u32\ninstance mn::iterator::Iterator(Pairs, [u32, bool])\n\n    fn next(_: *Pairs) -> ?[u32, bool] = return null\nfn total() -> u32\n    for ({ value, flag, other } in Pairs{ count = 3 }) _ = { value, flag, other }\n    return 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.WrongNameCount, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 12, .column = 12 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 9, .column = 12 }, analyzer.failure.?.location.?);
 }
 
 test "checkIteratorLoop: rejects names in braces over an element that is not a tuple" {
@@ -16705,16 +16814,16 @@ test "checkIteratorLoop: rejects names in braces over an element that is not a t
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Numbers\n    count: u32\ninstance mn::iterator::Iterator(Numbers, u32)\n\n    fn next(_: *Numbers) -> ?u32 = return null\ninstance mn::iterator::Iterable(Numbers, Numbers)\n\n    fn iterator(numbers: Numbers) -> Numbers = numbers\nfn total() -> u32\n    for ({ value } in Numbers{ count = 3 }) _ = value\n    return 0" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Numbers\n    count: u32\ninstance mn::iterator::Iterator(Numbers, u32)\n\n    fn next(_: *Numbers) -> ?u32 = return null\nfn total() -> u32\n    for ({ value } in Numbers{ count = 3 }) _ = value\n    return 0" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.NotTuple, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 12, .column = 23 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 9, .column = 23 }, analyzer.failure.?.location.?);
 }
 
-test "checkIteratorLoop: rejects an iterator whose type has no instance of Iterable" {
+test "checkIteratorLoop: goes over a value whose type has only an instance of Iterator through the instance of mn::iterator" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -16724,13 +16833,73 @@ test "checkIteratorLoop: rejects an iterator whose type has no instance of Itera
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Iterable\n\nstruct Countdown\n    count: u32\n\n\ninstance mn::iterator::Iterator(Countdown, u32)\n\n    fn next(countdown: *Countdown) -> ?u32\n        if (countdown.count == 0) return null\n        countdown.count -= 1\n        return countdown.count + 1\n\n\nfn total() -> u32\n    var sum: u32 = 0\n    for (value in Countdown{ count = 3 }) sum += value\n    return sum\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\n\nstruct Data\n    count: u32\n\n\ninstance Iterator(Data, u32)\n\n    fn next(data: *Self) -> ?u32\n        if (data.count == 0) return null\n        data.count -= 1\n        return data.count + 1\n\n\nfn total() -> u32\n    var sum: u32 = 0\n    for (value in Data{ count = 3 }) sum += value\n    return sum\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const iteration = loader.modules.items[0].declarations[4].kind.function_definition.body[1].kind.@"for".iterator.?;
+    try std.testing.expectEqualDeep(&[_][]const u8{ "mn", "iterator" }, loader.modules.items[iteration.iterator.module].path);
+}
+
+test "checkIteratorLoop: goes over a value through its written instance of Iterable before the one of mn::iterator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterable\nimport mn::iterator::Iterator\n\nstruct Data\n    count: u32\n\n\ninstance Iterator(Data, u32)\n\n    fn next(data: *Self) -> ?u32\n        if (data.count == 0) return null\n        data.count -= 1\n        return data.count + 1\n\n\ninstance Iterable(Data, Data)\n\n    fn iterator(data: Self) -> Self = { count = data.count - 1 }\n\n\nfn total() -> u32\n    var sum: u32 = 0\n    for (value in Data{ count = 3 }) sum += value\n    return sum\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const iteration = loader.modules.items[0].declarations[7].kind.function_definition.body[1].kind.@"for".iterator.?;
+    try std.testing.expectEqual(ast.Resolution.Function{ .module = 0, .declaration = 6 }, iteration.iterator);
+}
+
+test "checkIteratorLoop: rejects a value whose type has neither an instance of Iterable nor of Iterator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\n\nstruct Data\n    count: u32\n\n\nfn total() -> u32\n    var sum: u32 = 0\n    for (value in Data{ count = 3 }) sum += value\n    return sum\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     try std.testing.expectError(error.NotSequence, analyzer.analyze());
-    try std.testing.expectEqual(token.Location{ .row = 18, .column = 19 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqual(token.Location{ .row = 9, .column = 19 }, analyzer.failure.?.location.?);
+}
+
+test "checkIteratorLoop: rejects a value whose type has instances of Iterator for several elements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\n\nstruct Data\n    count: u32\n\n\ninstance Iterator(Data, u32)\n\n    fn next(_: *Self) -> ?u32 = return null\n\n\ninstance Iterator(Data, bool)\n\n    fn next(_: *Self) -> ?bool = return null\n\n\nfn total() -> u32\n    var sum: u32 = 0\n    for (value in Data{ count = 3 }) sum += value\n    return sum\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.AmbiguousInstance, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 19, .column = 5 }, analyzer.failure.?.location.?);
+    try std.testing.expect(std.mem.indexOf(u8, analyzer.failure.?.message, "`Iterator(Data, u32)` in `main` and `Iterator(Data, bool)` in `main`") != null);
 }
 
 test "checkIteratorLoop: rejects an Iterable whose cursor has no instance of Iterator" {
@@ -18182,6 +18351,215 @@ test "checkExpression: converts a many-value pointer to a read-only one" {
     _ = try analyzer.analyze();
 
     try std.testing.expectEqual(null, analyzer.failure);
+}
+
+test "checkExpression: converts an optional pointer to the optional of its read-only form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: ?const(*i32)) = _ = value\nfn read(value: ?const(*[many]u8)) = _ = value\nfn fill(value: ?const(*[4]u8)) = _ = value\nstruct Holder\n    value: ?const(*i32)\nfn give(value: ?*i32, bytes: ?*[many]u8, buffer: ?*[4]u8) -> ?const(*i32)\n    take(value)\n    read(bytes)\n    fill(buffer)\n    const view: ?const(*i32) = value\n    var other: ?const(*i32) = null\n    other = value\n    const holder = Holder{ value = value }\n    _ = { view, other, holder }\n    return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(null, analyzer.failure);
+}
+
+test "checkExpression: converts an optional slice to the optional of its read-only form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: ?const(*[]u8)) = _ = value\nfn give(value: ?*[]u8) -> ?const(*[]u8)\n    take(value)\n    const view: ?const(*[]u8) = value\n    _ = view\n    return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    try std.testing.expectEqual(null, analyzer.failure);
+}
+
+test "checkExpression: rejects an optional read-only pointer where the optional of a modifiable one is expected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn give(value: ?const(*i32)) -> ?*i32 = return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 48 }, analyzer.failure.?.location.?);
+}
+
+test "checkExpression: rejects an optional read-only slice where the optional of a modifiable one is expected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn give(value: ?const(*[]u8)) -> ?*[]u8 = return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 50 }, analyzer.failure.?.location.?);
+}
+
+test "checkExpression: rejects an optional whose value would change to fit the expected optional" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn give(value: ?u8) -> ?u32 = return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 38 }, analyzer.failure.?.location.?);
+}
+
+test "checkExpression: rejects a pointer in two optionals where the read-only form is expected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn give(value: ??*i32) -> ??const(*i32) = return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 50 }, analyzer.failure.?.location.?);
+}
+
+test "checkExpression: rejects a pointer in a result where the read-only form is expected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure\n    Missing\nfn give(value: Failure!*i32) -> Failure!const(*i32) = return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 62 }, analyzer.failure.?.location.?);
+}
+
+test "checkExpression: rejects an optional pointer in a result where the read-only form is expected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error Failure\n    Missing\nfn give(value: Failure!?*i32) -> Failure!?const(*i32) = return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 64 }, analyzer.failure.?.location.?);
+}
+
+test "checkExpression: rejects a pointer in an optional tuple where the read-only form is expected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn give(value: ?[*i32, u8]) -> ?[const(*i32), u8] = return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 60 }, analyzer.failure.?.location.?);
+}
+
+test "checkExpression: rejects a pointer in an optional array where the read-only form is expected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn give(value: ?[2]*i32) -> ?[2]const(*i32) = return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 54 }, analyzer.failure.?.location.?);
+}
+
+test "checkExpression: rejects a pointer behind an optional pointer where the read-only form is expected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn give(value: ?**i32) -> ?*const(*i32) = return value" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 50 }, analyzer.failure.?.location.?);
 }
 
 test "checkExpression: rejects a pointer to a single value where multiple values are expected" {

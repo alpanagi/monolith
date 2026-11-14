@@ -24,8 +24,3 @@ instance Iterator(RangeCursor, usize)
         const value = cursor.position
         cursor.position += 1
         return value
-
-
-instance Iterable(RangeCursor, RangeCursor)
-
-    fn iterator(cursor: Self) -> RangeCursor = cursor

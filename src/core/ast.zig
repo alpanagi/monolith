@@ -20,6 +20,7 @@ pub const Module = struct {
     paths: []const Path = &.{},
     has_range: bool = false,
     instances: std.ArrayList(*Declaration) = .empty,
+    first_test_instance: ?usize = null,
 };
 
 pub const Declaration = struct {
@@ -61,6 +62,7 @@ pub const FunctionDefinition = struct {
     lenient: bool = false,
     body_progress: Progress = .pending,
     check_progress: Progress = .pending,
+    test_text: ?[]const u8 = null,
 };
 
 pub const NeedReason = struct {
@@ -1101,6 +1103,16 @@ const PointerForm = enum {
 
 pub fn isMain(signature: FunctionSignature) bool {
     return signature.receiver == null and std.mem.eql(u8, signature.name, "main");
+}
+
+pub fn isTest(declaration: Declaration) bool {
+    return declaration.kind == .function_definition and declaration.kind.function_definition.test_text != null;
+}
+
+pub fn isTestOnly(module: Module, index: usize) bool {
+    if (isTest(findDeclaration(module, index).*)) return true;
+    const first = module.first_test_instance orelse return false;
+    return index >= first;
 }
 
 pub fn findInstance(

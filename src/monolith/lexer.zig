@@ -891,6 +891,16 @@ test "lexWord: recognizes the many keyword" {
     try std.testing.expectEqualStrings("Many", lexer.tokens.items[2].kind.identifier);
 }
 
+test "lexWord: recognizes the test keyword" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("test tests");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_test);
+    try std.testing.expectEqualStrings("tests", lexer.tokens.items[2].kind.identifier);
+}
+
 test "lexWord: recognizes the struct keyword" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

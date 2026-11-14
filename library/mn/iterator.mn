@@ -12,6 +12,11 @@ typeclass Iterable(type T, type I)
     fn iterator(value: T) -> I
 
 
+instance(type I: Iterator(_, E), type E) Iterable(I, I)
+
+    fn iterator(iterator: Self) -> Self = iterator
+
+
 instance(type T) Iterable(*[]T, SliceIterator(*[]T))
 
     fn iterator(items: Self) -> SliceIterator(*[]T) = { remaining = items }
@@ -43,16 +48,6 @@ instance(type T) Iterator(SliceIterator(const(*[]T)), const(*T))
         const element = &iterator.remaining[0]
         iterator.remaining = iterator.remaining[1..]
         return element
-
-
-instance(type T) Iterable(SliceIterator(*[]T), SliceIterator(*[]T))
-
-    fn iterator(slice_iterator: Self) -> SliceIterator(*[]T) = slice_iterator
-
-
-instance(type T) Iterable(SliceIterator(const(*[]T)), SliceIterator(const(*[]T)))
-
-    fn iterator(slice_iterator: Self) -> SliceIterator(const(*[]T)) = slice_iterator
 
 
 typeclass Zip(type T)
@@ -95,11 +90,6 @@ instance(type T: Tuple) Iterator(Zipped(T), ZippedElement(T))
         const filled = fill_zipped(Cursors(T, 0), 0, &zipped.cursors, &element)
         if (filled) return element
         return null
-
-
-instance(type T: Tuple) Iterable(Zipped(T), Zipped(T))
-
-    fn iterator(zipped: Self) -> Zipped(T) = zipped
 
 
 fn ZippedElement(type T) -> type = CursorElements(Cursors(T, 0), 0)

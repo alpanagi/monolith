@@ -88,6 +88,10 @@ pub const Parser = struct {
         var kind: ast.DeclarationKind = kind: {
             if (private and self.tokens[offset.*].kind == .keyword_instance) return self.fail(offset.*, error.PrivateInstance);
             if (private and self.tokens[offset.*].kind == .keyword_import) return self.fail(offset.* - 1, error.MisplacedPrivate);
+            if (private and self.tokens[offset.*].kind == .keyword_test) return self.fail(offset.* - 1, error.MisplacedPrivate);
+            if (try self.parseTest(allocator, offset)) |definition| {
+                break :kind .{ .function_definition = definition };
+            }
             if (try self.parseFunctionDeclaration(allocator, offset)) |function_declaration| {
                 break :kind .{ .function_declaration = function_declaration };
             }
@@ -133,6 +137,25 @@ pub const Parser = struct {
         if (next != .keyword_fn and next != .keyword_inline and !self.isTypeDeclaration(offset.* + 1)) return false;
         offset.* += 1;
         return true;
+    }
+
+    fn parseTest(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+    ) ParseError!?ast.FunctionDefinition {
+        var position = offset.*;
+        const keyword = self.match(&position, .keyword_test) orelse return null;
+        const text = self.match(&position, .string_literal) orelse return self.fail(position, error.ExpectedTestText);
+        if (!try self.opensHeaderBlock(position)) return self.fail(position, error.ExpectedBlock);
+        const body = try self.parseHeaderBlock(allocator, &position, 0);
+        offset.* = position;
+        const return_type: ast.Expression = .{ .kind = .{ .identifier = .{ .name = "void" } }, .location = keyword.location };
+        return .{
+            .signature = .{ .name = "", .parameters = &.{}, .return_type = return_type, .inferred_error_set = keyword.location },
+            .body = body,
+            .test_text = text.kind.string_literal,
+        };
     }
 
     fn parseFunctionDeclaration(
@@ -2766,6 +2789,7 @@ pub const Parser = struct {
         }
         const reported = switch (self.tokens[offset].kind) {
             .keyword_private => if (parse_error == error.RepeatedPrivate) parse_error else error.MisplacedPrivate,
+            .keyword_test => if (self.tokens[offset + 1].kind == .string_literal) error.MisplacedTest else parse_error,
             else => parse_error,
         };
         self.failure = .{
@@ -2843,6 +2867,8 @@ pub const ParseError = error{
     MisplacedBranching,
     NestedSameLineIf,
     MisplacedTypeDeclaration,
+    ExpectedTestText,
+    MisplacedTest,
     HeaderColon,
     ExpectedEquals,
     ExpectedStatement,
@@ -3045,6 +3071,8 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.ConstInsidePointer => "write const(*T) instead of *const(T), with const around the whole pointer",
         error.HeaderColon => "a block has no ':' before it; write the header alone with the block indented below, e.g. `if count > limit`, or one statement on the same line, e.g. `if (count > limit) trim(list)`, `else 20` or `fn one -> u8 = 1`",
         error.MisplacedTypeDeclaration => "a struct, enum or error set can be declared only at the top level of a module or in the block of a struct or an enum",
+        error.ExpectedTestText => "expected the text of the test after test, e.g. `test \"append: adds to the end\"`",
+        error.MisplacedTest => "a test can be declared only at the top level of a module",
         error.NestedSameLineIf => "an if with its block on the same line cannot be in the same-line block of another if, an else or a loop; write else if, or put the inner if in parentheses",
         error.MisplacedBranching => "a match, or an if whose blocks are not all on one line, used as a value must end its statement: after = in a declaration or assignment, after return, as the last line of a function body, or as a branch's value",
         error.ExpectedEquals => "expected '='",
@@ -3204,6 +3232,17 @@ test "parseDeclaration: rejects private before an import" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, parser.failure.?.location.?);
 }
 
+test "parseDeclaration: rejects private before a test" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("private test \"one: passes\"\n    noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedPrivate, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, parser.failure.?.location.?);
+}
+
 test "matchPrivate: rejects private written twice" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3213,6 +3252,69 @@ test "matchPrivate: rejects private written twice" {
 
     try std.testing.expectError(error.RepeatedPrivate, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 9 }, parser.failure.?.location.?);
+}
+
+test "parseTest: parses a test with its text and its block as a declaration without a name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn one() = noop\n\ntest \"one: does nothing\"\n    one()\n    one()\ntest \"one: does nothing\"\n    one()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    try std.testing.expectEqual(3, module.declarations.len);
+    const definition = module.declarations[1].kind.function_definition;
+    try std.testing.expectEqualStrings("one: does nothing", definition.test_text.?);
+    try std.testing.expectEqual(2, definition.body.len);
+    try std.testing.expectEqualStrings("", definition.signature.name);
+    try std.testing.expect(definition.signature.inferred_error_set != null);
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 1 }, module.declarations[1].location);
+    try std.testing.expectEqualStrings("one: does nothing", module.declarations[2].kind.function_definition.test_text.?);
+    try std.testing.expectEqual(null, module.declarations[0].kind.function_definition.test_text);
+}
+
+test "parseTest: rejects a test without its text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("test one\n    noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedTestText, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 6 }, parser.failure.?.location.?);
+}
+
+test "parseTest: rejects a test without its block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("test \"one: passes\"\nfn one() = noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedBlock, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
+}
+
+test "parseTest: rejects a test in the body of a function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn one()\n    test \"one: passes\"\n        noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedTest, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, parser.failure.?.location.?);
+}
+
+test "parseTest: rejects a test in the block of a struct" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("struct Data\n    value: u8\n\n    test \"value: passes\"\n        noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedTest, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 5 }, parser.failure.?.location.?);
 }
 
 test "parseFunctionDeclaration: parses an external function" {
@@ -3448,6 +3550,17 @@ test "parseFunctionSignature: rejects a reserved word as the name of a parameter
 
     try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 9 }, parser.failure.?.location.?);
+}
+
+test "parseFunctionSignature: rejects test as the name of a parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn check(test: u8) -> u8 = 1");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 10 }, parser.failure.?.location.?);
 }
 
 test "parseFunctionSignature: rejects parameters without parentheses" {
@@ -5936,6 +6049,17 @@ test "parseStatement: rejects a reserved word as the name of a local" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 11 }, parser.failure.?.location.?);
 }
 
+test "parseStatement: rejects test as the name of a local" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    const test = 1");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedIdentifier, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 11 }, parser.failure.?.location.?);
+}
+
 test "parseCallStatement: parses a call as a statement" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6279,6 +6403,17 @@ test "parseStructDefinition: rejects a reserved word as the name of a field" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("struct Point\n    match: i32");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedField, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 5 }, parser.failure.?.location.?);
+}
+
+test "parseStructDefinition: rejects test as the name of a field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("struct Point\n    test: i32");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 

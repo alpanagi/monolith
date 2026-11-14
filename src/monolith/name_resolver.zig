@@ -447,6 +447,7 @@ pub const NameResolver = struct {
     fn prepareModuleDeclaration(self: *NameResolver, index: usize) ResolveError!ModuleStep {
         const module = self.loader.modules.items[self.module_index];
         const declaration = module.declarations[index];
+        if (ast.isTest(declaration)) return .skip;
         if (isMethod(declaration)) {
             if (declaration.kind.function_definition.signature.typeclass == null) return .function;
             return .skip;

@@ -1,0 +1,6 @@
+error Error
+    Failed
+
+
+fn expect(condition: bool) -> Error!void
+    if (!condition) return Error::Failed

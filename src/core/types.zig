@@ -173,6 +173,7 @@ pub const Registry = struct {
     applications: std.ArrayList(*const Application) = .empty,
     combined: std.ArrayList(*const Enum) = .empty,
     tags: usize = 1,
+    first_test_entry: ?usize = null,
 
     pub fn add(
         self: *Registry,

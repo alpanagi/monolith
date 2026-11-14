@@ -11,6 +11,12 @@ const Value = core.Value;
 const followPointer = types.followPointer;
 const isZeroSized = types.isZeroSized;
 
+const error_report_name = "mn_runtime_error_report";
+const test_failure_name = "mn_runtime_test_failure";
+const test_summary_name = "mn_runtime_test_summary";
+const test_runner_path = "test-runner.c";
+const process_start_declaration = "\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nvoid mn_runtime_process_start(int count, char **values, mn_slice_u8 *arguments);\n";
+
 pub const Generator = struct {
     program: ast.Program,
     runtime_functions: std.ArrayList([]const u8) = .empty,
@@ -38,6 +44,8 @@ pub const Generator = struct {
     module_index: usize = 0,
     depth: usize = 0,
     in_main: bool = false,
+    tests: ?[]const TestModule = null,
+    executable_path: ?[]const u8 = null,
     failure: ?Failure = null,
 
     pub fn init(program: ast.Program) Generator {
@@ -72,7 +80,8 @@ pub const Generator = struct {
             try source_directory.createDirPath(io, std.fs.path.dirname(path).?);
             try generator_directory.copyFile(path, source_directory, path, io, .{});
         }
-        try self.buildExecutable(allocator, io, source_directory, files, runtime_files);
+        const source_path = try std.fs.path.join(allocator, &.{ output_path, "source" });
+        try self.buildExecutable(allocator, io, output_path, source_path, files, runtime_files);
     }
 
     fn collectRuntimeFiles(
@@ -94,7 +103,8 @@ pub const Generator = struct {
         self: *Generator,
         allocator: std.mem.Allocator,
     ) GenerateError![]const File {
-        self.names = try buildCNames(allocator, self.program);
+        if (self.tests == null) hideTests(self.program);
+        self.names = try buildCNames(allocator, self.program, self.tests == null);
         self.addressed = try collectAddressedConstants(allocator, self.program);
         try self.checkNames(allocator);
         try self.checkStructCycles(allocator);
@@ -126,23 +136,92 @@ pub const Generator = struct {
                 .contents = source_contents.written(),
             });
         }
+        if (self.tests) |tests| {
+            var runner_contents: std.Io.Writer.Allocating = .init(allocator);
+            try self.generateTestRunner(allocator, &runner_contents.writer, tests);
+            try files.append(allocator, .{
+                .path = test_runner_path,
+                .contents = runner_contents.written(),
+            });
+        }
         return files.items;
+    }
+
+    fn generateTestRunner(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        tests: []const TestModule,
+    ) GenerateError!void {
+        self.module_index = self.program.modules.len;
+        var reached: Reached = .{};
+        var body: std.Io.Writer.Allocating = .init(allocator);
+        try self.generateMainStart(allocator, &body.writer);
+        try body.writer.writeAll("    size_t passed = 0;\n    size_t failed = 0;\n");
+        for (tests) |test_module| {
+            try self.recordModule(allocator, &reached, test_module.module);
+            const module = self.program.modules[test_module.module];
+            for (module.declarations, 0..) |declaration, index| {
+                if (!ast.isTest(declaration)) continue;
+                try self.generateTestRun(allocator, &reached, &body.writer, test_module, declaration, self.names[test_module.module][index].?);
+            }
+        }
+        try body.writer.print("    {s}(passed, failed);\n    return failed == 0 ? 0 : 1;\n}}\n", .{test_summary_name});
+
+        try writer.writeAll("#include \"runtime/monolith.h\"\n");
+        for (reached.modules.items) |index| {
+            try writer.print("#include \"{s}\"\n", .{try buildModuleInclude(allocator, test_runner_path, self.program, index)});
+        }
+        for (reached.slices.items) |value_type| {
+            try writer.writeByte('\n');
+            try self.generateSliceDefinition(writer, value_type);
+        }
+        for (reached.definitions.items) |value_type| {
+            try writer.writeByte('\n');
+            try self.generateDefinition(writer, value_type);
+        }
+        if (loadsProcessModule(self.program)) try writer.writeAll(process_start_declaration);
+        try writer.print("\nvoid {s}(char const *name);\nvoid {s}(char const *file, size_t row, char const *text);\nvoid {s}(size_t passed, size_t failed);\n", .{ error_report_name, test_failure_name, test_summary_name });
+        for ([_][]const u8{ error_report_name, test_failure_name, test_summary_name }) |name| {
+            if (!containsName(self.runtime_functions.items, name)) try self.runtime_functions.append(allocator, name);
+        }
+        try writer.writeAll(body.written());
+    }
+
+    fn generateTestRun(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        test_module: TestModule,
+        declaration: ast.Declaration,
+        name: []const u8,
+    ) WriteError!void {
+        const function = declaration.kind.function_definition;
+        const return_type = ast.extractType(function.signature.return_type);
+        if (return_type != .result) return writer.print("    {s}();\n    passed += 1;\n", .{name});
+        try self.recordType(allocator, reached, return_type);
+        try writer.writeAll("    {\n        ");
+        try self.generateType(writer, return_type);
+        try writer.print(" result = {s}();\n        if (result.error.tag == 0) {{\n            passed += 1;\n        }} else {{\n            failed += 1;\n            {s}(\"", .{ name, test_failure_name });
+        try generateEscapedText(writer, test_module.file);
+        try writer.print("\", {d}, \"", .{declaration.location.row});
+        try generateText(writer, function.test_text.?);
+        try writer.writeAll("\");\n            switch (result.error.tag) {\n");
+        try generateErrorNames(writer, return_type.result.error_set, "            ");
+        try writer.writeAll("            }\n        }\n    }\n");
     }
 
     fn buildExecutable(
         self: *Generator,
         allocator: std.mem.Allocator,
         io: std.Io,
-        source_directory: std.Io.Dir,
+        output_path: []const u8,
+        source_path: []const u8,
         files: []const File,
         runtime_files: []const []const u8,
     ) GenerateError!void {
-        const main_module = self.program.modules[0];
-        const has_main = for (main_module.declarations) |declaration| {
-            if (declaration.kind != .function_definition) continue;
-            if (ast.isMain(declaration.kind.function_definition.signature)) break true;
-        } else false;
-        if (!has_main) return;
+        if (self.tests == null and !self.hasEntryPoint()) return;
 
         var arguments: std.ArrayList([]const u8) = .empty;
         const flags = &.{
@@ -158,17 +237,16 @@ pub const Generator = struct {
         };
         try arguments.appendSlice(allocator, flags);
         for (files) |file| {
-            if (std.mem.endsWith(u8, file.path, ".c")) try arguments.append(allocator, file.path);
+            if (std.mem.endsWith(u8, file.path, ".c")) try arguments.append(allocator, try std.fs.path.join(allocator, &.{ source_path, file.path }));
         }
         for (runtime_files) |path| {
-            if (std.mem.endsWith(u8, path, ".c")) try arguments.append(allocator, path);
+            if (std.mem.endsWith(u8, path, ".c")) try arguments.append(allocator, try std.fs.path.join(allocator, &.{ source_path, path }));
         }
-        const executable_path = try std.mem.concat(allocator, u8, &.{ "../", main_module.path[0] });
+        const executable_path = self.executable_path orelse try std.fs.path.join(allocator, &.{ output_path, self.program.modules[0].path[0] });
         try arguments.appendSlice(allocator, &.{ "-o", executable_path });
 
         var compiler = std.process.spawn(io, .{
             .argv = arguments.items,
-            .cwd = .{ .dir = source_directory },
             .stdin = .ignore,
         }) catch |spawn_error| {
             const format = "cannot run gcc: {t}";
@@ -181,6 +259,14 @@ pub const Generator = struct {
             self.failure = .{ .message = "gcc could not build the executable" };
             return error.CompilerFailed;
         }
+    }
+
+    fn hasEntryPoint(self: *const Generator) bool {
+        for (self.program.modules[0].declarations) |declaration| {
+            if (declaration.kind != .function_definition) continue;
+            if (ast.isMain(declaration.kind.function_definition.signature)) return true;
+        }
+        return false;
     }
 
     fn checkNames(
@@ -212,8 +298,7 @@ pub const Generator = struct {
             }
         }
 
-        const type_registry = self.program.types;
-        for (type_registry.entries.items) |value_type| {
+        for (self.findTypeEntries()) |value_type| {
             switch (value_type) {
                 .@"struct" => |struct_type| {
                     if (findUnwrappedField(value_type) != null) continue;
@@ -316,8 +401,7 @@ pub const Generator = struct {
         self: *Generator,
         allocator: std.mem.Allocator,
     ) GenerateError!void {
-        const type_registry = self.program.types;
-        for (type_registry.entries.items) |value_type| {
+        for (self.findTypeEntries()) |value_type| {
             const struct_type = findStruct(value_type) orelse continue;
             if (isZeroSized(value_type)) continue;
             for (struct_type.fields) |field| {
@@ -354,6 +438,12 @@ pub const Generator = struct {
             if (try self.reachesModule(allocator, visited, next, to)) return true;
         }
         return false;
+    }
+
+    fn findTypeEntries(self: *const Generator) []const types.Type {
+        const entries = self.program.types.entries.items;
+        if (self.tests != null) return entries;
+        return entries[0 .. self.program.types.first_test_entry orelse entries.len];
     }
 
     fn generateHeader(
@@ -454,8 +544,7 @@ pub const Generator = struct {
         module_index: usize,
     ) std.mem.Allocator.Error![]const types.Type {
         var ordered: std.ArrayList(types.Type) = .empty;
-        const type_registry = self.program.types;
-        for (type_registry.entries.items) |value_type| {
+        for (self.findTypeEntries()) |value_type| {
             const module = switch (value_type) {
                 .@"struct" => |struct_type| struct_type.module,
                 .@"enum" => |enumeration| enumeration.module,
@@ -1073,7 +1162,7 @@ pub const Generator = struct {
     ) WriteError!void {
         for (module.declarations) |declaration| {
             if (!self.isEntryPoint(declaration.kind) or !isResultMain(declaration.kind)) continue;
-            return writer.writeAll("\nvoid mn_runtime_error_report(char const *name);\n");
+            return writer.print("\nvoid {s}(char const *name);\n", .{error_report_name});
         }
     }
 
@@ -1085,7 +1174,7 @@ pub const Generator = struct {
         if (!loadsProcessModule(self.program)) return;
         for (module.declarations) |declaration| {
             if (!self.isEntryPoint(declaration.kind)) continue;
-            return writer.writeAll("\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\nvoid mn_runtime_process_start(int count, char **values, mn_slice_u8 *arguments);\n");
+            return writer.writeAll(process_start_declaration);
         }
     }
 
@@ -1575,6 +1664,17 @@ pub const Generator = struct {
         writer: *std.Io.Writer,
         index: usize,
     ) WriteError!void {
+        try self.generateMainStart(allocator, writer);
+        if (self.return_type != .result) return writer.print("    {s}();\n}}\n", .{self.names[self.module_index][index].?});
+        if (!containsName(self.runtime_functions.items, error_report_name)) try self.runtime_functions.append(allocator, error_report_name);
+        try writer.writeAll("    ");
+        try self.generateType(writer, self.return_type);
+        try writer.print(" result = {s}();\n    if (result.error.tag == 0) return 0;\n    switch (result.error.tag) {{\n", .{self.names[self.module_index][index].?});
+        try generateErrorNames(writer, self.return_type.result.error_set, "    ");
+        try writer.writeAll("    }\n    return 1;\n}\n");
+    }
+
+    fn generateMainStart(self: *Generator, allocator: std.mem.Allocator, writer: *std.Io.Writer) WriteError!void {
         if (loadsProcessModule(self.program)) {
             const start = "mn_runtime_process_start";
             if (!containsName(self.runtime_functions.items, start)) try self.runtime_functions.append(allocator, start);
@@ -1582,16 +1682,6 @@ pub const Generator = struct {
         } else {
             try writer.writeAll("\nint main() {\n");
         }
-        if (self.return_type != .result) return writer.print("    {s}();\n}}\n", .{self.names[self.module_index][index].?});
-        const name = "mn_runtime_error_report";
-        if (!containsName(self.runtime_functions.items, name)) try self.runtime_functions.append(allocator, name);
-        try writer.writeAll("    ");
-        try self.generateType(writer, self.return_type);
-        try writer.print(" result = {s}();\n    if (result.error.tag == 0) return 0;\n    switch (result.error.tag) {{\n", .{self.names[self.module_index][index].?});
-        for (self.return_type.result.error_set.cases) |case| {
-            try writer.print("    case {d}: {s}(\"{s}\"); break;\n", .{ case.tag, name, case.name });
-        }
-        try writer.writeAll("    }\n    return 1;\n}\n");
     }
 
     fn collectSteps(
@@ -5117,6 +5207,7 @@ pub const Generator = struct {
     }
 
     fn isStored(self: *const Generator, module_index: usize, index: usize) bool {
+        if (self.tests == null and ast.isTestOnly(self.program.modules[module_index], index)) return false;
         const declaration = self.program.modules[module_index].declarations[index];
         const constant = switch (declaration.kind) {
             .constant_declaration => |constant| constant,
@@ -5134,13 +5225,18 @@ pub const Generator = struct {
     }
 
     fn isEntryPoint(self: *Generator, kind: ast.DeclarationKind) bool {
-        if (self.module_index != 0 or kind != .function_definition) return false;
+        if (self.tests != null or self.module_index != 0 or kind != .function_definition) return false;
         return ast.isMain(kind.function_definition.signature);
     }
 
     fn isPlainEntryPoint(self: *Generator, kind: ast.DeclarationKind) bool {
         return self.isEntryPoint(kind) and !isResultMain(kind) and !loadsProcessModule(self.program);
     }
+};
+
+pub const TestModule = struct {
+    module: usize,
+    file: []const u8,
 };
 
 pub const GenerateError = std.mem.Allocator.Error ||
@@ -5290,15 +5386,32 @@ const StructChain = struct {
     previous: ?*const StructChain,
 };
 
+fn hideTests(program: ast.Program) void {
+    for (program.modules) |module| {
+        for (0..module.declarations.len + module.instances.items.len) |index| {
+            if (!ast.isTestOnly(module, index)) continue;
+            const declaration = ast.findDeclaration(module, index);
+            if (declaration.kind == .function_definition) declaration.kind.function_definition.check_only = true;
+        }
+    }
+}
+
+fn generateErrorNames(writer: *std.Io.Writer, error_set: *const types.Enum, indentation: []const u8) WriteError!void {
+    for (error_set.cases) |case| {
+        try writer.print("{s}case {d}: {s}(\"{s}\"); break;\n", .{ indentation, case.tag, error_report_name, case.name });
+    }
+}
+
 fn buildCNames(
     allocator: std.mem.Allocator,
     program: ast.Program,
+    has_entry: bool,
 ) std.mem.Allocator.Error![]const []const ?[]const u8 {
     const names = try allocator.alloc([]const ?[]const u8, program.modules.len);
     for (program.modules, 0..) |module, module_index| {
         const module_names = try allocator.alloc(?[]const u8, module.declarations.len);
         for (module.declarations, 0..) |declaration, index| {
-            module_names[index] = try buildCName(allocator, program, module_index, declaration);
+            module_names[index] = try buildCName(allocator, program, module_index, index, declaration, has_entry);
         }
         names[module_index] = module_names;
     }
@@ -5309,14 +5422,20 @@ fn buildCName(
     allocator: std.mem.Allocator,
     program: ast.Program,
     module_index: usize,
+    index: usize,
     declaration: ast.Declaration,
+    has_entry: bool,
 ) std.mem.Allocator.Error!?[]const u8 {
     const module = program.modules[module_index];
     switch (declaration.kind) {
         .function_definition => |function| {
             if (function.check_only) return null;
+            if (function.test_text != null) {
+                const joined = try std.mem.join(allocator, "_", module.path);
+                return try std.fmt.allocPrint(allocator, "mn_test_{d}_{s}", .{ index, joined });
+            }
             const signature = function.signature;
-            if (module_index == 0 and ast.isMain(signature) and !isResultMain(declaration.kind) and !loadsProcessModule(program)) return signature.name;
+            if (has_entry and module_index == 0 and ast.isMain(signature) and !isResultMain(declaration.kind) and !loadsProcessModule(program)) return signature.name;
             if (signature.typeclass) |typeclass| {
                 var parts: std.ArrayList([]const u8) = .empty;
                 for (function.instance_arguments) |argument| {
@@ -6882,6 +7001,16 @@ fn isParenthesized(text: []const u8) bool {
     return false;
 }
 
+fn generateEscapedText(writer: *std.Io.Writer, text: []const u8) WriteError!void {
+    for (text) |byte| {
+        if (byte == '"' or byte == '\\' or !std.ascii.isPrint(byte)) {
+            try writer.print("\\{o:0>3}", .{byte});
+        } else {
+            try writer.writeByte(byte);
+        }
+    }
+}
+
 fn generateText(writer: *std.Io.Writer, text: []const u8) WriteError!void {
     var index: usize = 0;
     while (index < text.len) {
@@ -7171,6 +7300,117 @@ test "Generator.generate: builds an executable when the main module defines main
 
     const executable = try output_directory.dir.statFile(std.testing.io, "build/hello", .{});
     try std.testing.expectEqual(.file, executable.kind);
+}
+
+test "Generator.generate: generates nothing of the tests of a program" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program = "import mn::container::ArrayList\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::process::stdout\nimport mn::text\n\nstruct Data\n    value: u64\n\nerror Failure\n    Wrong\n\nfn double(value: u32) -> u32 = value * 2\n\nfn main -> !void\n    try text::print(&stdout, \"{}\\n\", { double(2) })\n";
+    const tests = "\ntest \"double: doubles\"\n    with memory::Heap\n    var list = ArrayList(Data)::init()\n    defer list.deinit()\n    try list.append({ value = 7 })\n    const marker = \"a text only this test holds\"\n    if (double(2) != 4 or marker.length == 0) return Failure::Wrong\n";
+    var sources: [2][]const u8 = undefined;
+    for ([_][]const u8{ program, try std.mem.concat(allocator, u8, &.{ program, tests }) }, &sources, 0..) |data, *source, index| {
+        var program_directory = std.testing.tmpDir(.{});
+        defer program_directory.cleanup();
+        const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+        var loader = @import("monolith").Loader.init(program_path, "library");
+        try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = data });
+        try loader.loadMainModule(&arena, std.testing.io, "main");
+        var type_registry: types.Registry = .{};
+        var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+        var generator = Generator.init(try analyzer.analyze());
+        const output_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/build_{d}", .{ &output_directory.sub_path, index });
+        try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+        const source_path = try std.fs.path.join(allocator, &.{ output_path, "source" });
+        var source_directory = try std.Io.Dir.cwd().openDir(std.testing.io, source_path, .{ .iterate = true });
+        defer source_directory.close(std.testing.io);
+        var walker = try source_directory.walk(allocator);
+        defer walker.deinit();
+        var contents: std.ArrayList(u8) = .empty;
+        var paths: std.ArrayList([]const u8) = .empty;
+        while (try walker.next(std.testing.io)) |entry| {
+            if (entry.kind == .file) try paths.append(allocator, try allocator.dupe(u8, entry.path));
+        }
+        std.mem.sort([]const u8, paths.items, {}, struct {
+            fn isBefore(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.isBefore);
+        for (paths.items) |path| {
+            try contents.appendSlice(allocator, path);
+            try contents.appendSlice(allocator, try source_directory.readFileAlloc(std.testing.io, path, allocator, .unlimited));
+        }
+        source.* = contents.items;
+    }
+
+    try std.testing.expectEqualStrings(sources[0], sources[1]);
+}
+
+test "Generator.generate: builds a test executable that runs every test of every file under a directory and reports the failing ones" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    try program_directory.dir.createDirPath(std.testing.io, "zone");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "list.mn", .data = "import mn::test::expect\n\nfn double(value: u32) -> u32 = value * 2\n\ntest \"double: doubles one\"\n    try expect(double(1) == 2)\n\ntest \"double: is wrong on purpose\"\n    try expect(double(1) == 3)\n\ntest \"double: doubles one\"\n    try expect(double(2) == 4)\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "zone/extra.mn", .data = "error Failure\n    Missing\n\ntest \"extra: returns its own error\"\n    return Failure::Missing\n\ntest \"extra: passes without an error\"\n    noop\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::process::stdout\nimport mn::text\n\nfn main -> !void\n    try text::print(&stdout, \"main\\n\", {})\n" });
+    var loader = @import("monolith").Loader.init(program_path, "library");
+    const modules = try loader.loadTestModules(&arena, std.testing.io);
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    var generator = Generator.init(try analyzer.analyze());
+    var test_modules: std.ArrayList(TestModule) = .empty;
+    for (modules) |module| {
+        const file = try loader.buildModuleFileName(allocator, std.testing.io, loader.modules.items[module].path);
+        try test_modules.append(allocator, .{ .module = module, .file = file });
+    }
+    generator.tests = test_modules.items;
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    generator.executable_path = try std.fs.path.join(allocator, &.{ output_path, "test" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
+    defer build_directory.close(std.testing.io);
+    const result = try std.process.run(allocator, std.testing.io, .{ .argv = &.{"./test"}, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqual(1, result.term.exited);
+    const expected = try std.fmt.allocPrint(allocator, "{s}/list.mn:8: test \"double: is wrong on purpose\" failed: Failed\n{s}/zone/extra.mn:4: test \"extra: returns its own error\" failed: Missing\n3 passed, 2 failed\n", .{ program_path, program_path });
+    try std.testing.expectEqualStrings(expected, result.stderr);
+    try std.testing.expectEqualStrings("", result.stdout);
+}
+
+test "Generator.generate: builds a test executable that exits with status 0 when every test passes, with the allocator each test sets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "list.mn", .data = "import mn\nimport mn::container::ArrayList\nimport mn::memory\nimport mn::memory::Allocator\nimport mn::memory::Deinit\nimport mn::test::expect\n\nstruct Counting\n    live: usize\n    allocations: usize\n\ninstance Allocator(Counting)\n\n    fn allocate(counting: *Counting, type T, count: usize) -> memory::Error!*[]T\n        counting.live += mn::size(T) * count\n        counting.allocations += 1\n        return memory::allocate(T, count) with memory::Heap\n\n    fn(type T) resize(_: *Counting, _: *[]T, _: usize) -> bool = false\n\n    fn(type T) free(counting: *Counting, items: const(*[]T))\n        counting.live -= mn::size(T) * items.length\n        memory::free(items) with memory::Heap\n\ntest \"append: allocates through the allocator the test sets and frees it all\"\n    var counting: Counting = { live = 0, allocations = 0 }\n    with &counting\n    var list = ArrayList(u32)::init()\n    try list.append(1)\n    try expect(counting.allocations == 1 and counting.live > 0)\n    list.deinit()\n    try expect(counting.live == 0)\n\ntest \"swap_remove: puts the last element in the gap\"\n    with memory::Heap\n    var list = ArrayList(u32)::init()\n    defer list.deinit()\n    try list.append(1)\n    try list.append(2)\n    try list.append(3)\n    try expect(list.swap_remove(0) == 1)\n    try expect(list.length() == 2 and list.swap_remove(0) == 3)\n" });
+    var loader = @import("monolith").Loader.init(program_path, "library");
+    const modules = try loader.loadTestModules(&arena, std.testing.io);
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    var generator = Generator.init(try analyzer.analyze());
+    const file = try loader.buildModuleFileName(allocator, std.testing.io, loader.modules.items[modules[0]].path);
+    generator.tests = &.{.{ .module = modules[0], .file = file }};
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    generator.executable_path = try std.fs.path.join(allocator, &.{ output_path, "test" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
+    defer build_directory.close(std.testing.io);
+    const result = try std.process.run(allocator, std.testing.io, .{ .argv = &.{"./test"}, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqual(0, result.term.exited);
+    try std.testing.expectEqualStrings("2 passed, 0 failed\n", result.stderr);
 }
 
 test "Generator.generate: builds an executable that uses the standard streams and a file" {
@@ -8248,6 +8488,33 @@ test "Generator.generate: builds an executable that decides the element of zippe
 
     const run_0 = try std.process.run(allocator, std.testing.io, .{ .argv = &.{"./main"}, .cwd = .{ .dir = build_directory } });
     try std.testing.expectEqualStrings("2\n", run_0.stdout);
+    try std.testing.expectEqual(0, run_0.term.exited);
+}
+
+test "Generator.generate: builds an executable that goes over a type with only an instance of Iterator, alone and zipped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\nimport mn::iterator::Zip\nimport mn::process::stdout\nimport mn::text\n\nstruct Data\n    count: u32\n\n\ninstance Iterator(Data, u32)\n\n    fn next(data: *Self) -> ?u32\n        if (data.count == 0) return null\n        data.count -= 1\n        return data.count + 1\n\n\nfn main -> !void\n    for value in Data{ count = 3 }\n        try text::print(&stdout, \"{}\\n\", { value })\n    for { value, index } in Zip::zip({ Data{ count = 2 }, 0.. })\n        try text::print(&stdout, \"{} {}\\n\", { value, index })\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
+    defer build_directory.close(std.testing.io);
+
+    const run_0 = try std.process.run(allocator, std.testing.io, .{ .argv = &.{"./main"}, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqualStrings("3\n2\n1\n2 0\n1 1\n", run_0.stdout);
     try std.testing.expectEqual(0, run_0.term.exited);
 }
 
@@ -10503,6 +10770,33 @@ test "Generator.generate: builds an executable that keeps allocated writable sli
         result.stdout,
     );
     try std.testing.expectEqual(0, result.term.exited);
+}
+
+test "Generator.generate: builds an executable that returns a map's get as an optional read-only pointer and reads a field through it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::container::HashMap\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::process::stdout\nimport mn::text\n\nstruct Record\n    count: u32\n\n\nfn find(records: const(*HashMap(u32, Record)), key: u32) -> ?const(*Record) = records.get(&key)\n\n\nfn main -> !void\n    with memory::Heap\n    var records = HashMap(u32, Record)::init()\n    defer records.deinit()\n    _ = try records.put(7, { count = 3 })\n    if find(&records, 7) as record\n        try text::print(&stdout, \"{}\\n\", { record.count })\n    if (find(&records, 8) == null) try text::print(&stdout, \"missing\\n\", {})\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
+    defer build_directory.close(std.testing.io);
+
+    const run_0 = try std.process.run(allocator, std.testing.io, .{ .argv = &.{"./main"}, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqualStrings("3\nmissing\n", run_0.stdout);
+    try std.testing.expectEqual(0, run_0.term.exited);
 }
 
 test "Generator.generate: builds an executable that puts a new path key into a map without allocating and gives back the old value of a present key without allocating while the map keeps its key" {
@@ -18947,7 +19241,7 @@ test "generateIteration: copies the iterator and calls next until it gives null"
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("monolith").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Countdown\n    count: u32\n    flag: bool = false\ninstance mn::iterator::Iterator(Countdown, u32)\n\n    fn next(iterator: *Countdown) -> ?u32\n        if (iterator.count == 0) return null\n        iterator.count -= 1\n        return iterator.count + 1\ninstance mn::iterator::Iterable(Countdown, Countdown)\n\n    fn iterator(countdown: Countdown) -> Countdown = countdown\nfn total(start: u32) -> u32\n    var sum: u32 = 0\n    for (value in Countdown{ count = start }) sum += value\n    return sum\nfn indexes(count: usize) -> usize\n    var sum: usize = 0\n    const range = 2..count\n    for index in range\n        if (index == 4) continue\n        sum += index\n    else sum += 1\n    return sum" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator\nstruct Countdown\n    count: u32\n    flag: bool = false\ninstance mn::iterator::Iterator(Countdown, u32)\n\n    fn next(iterator: *Countdown) -> ?u32\n        if (iterator.count == 0) return null\n        iterator.count -= 1\n        return iterator.count + 1\nfn total(start: u32) -> u32\n    var sum: u32 = 0\n    for (value in Countdown{ count = start }) sum += value\n    return sum\nfn indexes(count: usize) -> usize\n    var sum: usize = 0\n    const range = 2..count\n    for index in range\n        if (index == 4) continue\n        sum += index\n    else sum += 1\n    return sum" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -18956,27 +19250,27 @@ test "generateIteration: copies the iterator and calls next until it gives null"
     const files = try generator.generateFiles(arena.allocator());
 
     try std.testing.expectEqualStrings(
-        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_Countdown {\n    uint32_t count;\n    bool flag;\n} mn_main_Countdown;\n\ntypedef struct mn_optional_u32 mn_optional_u32;\n\nmn_optional_u32 mn_main_Countdown_u32_Iterator_next(struct mn_main_Countdown * iterator);\nmn_main_Countdown mn_main_Countdown_Countdown_Iterable_iterator(mn_main_Countdown countdown);\nuint32_t mn_main_total(uint32_t start);\nsize_t mn_main_indexes(size_t count);\n",
+        "#pragma once\n\n#include \"runtime/monolith.h\"\n\ntypedef struct mn_main_Countdown {\n    uint32_t count;\n    bool flag;\n} mn_main_Countdown;\n\ntypedef struct mn_optional_u32 mn_optional_u32;\n\nmn_optional_u32 mn_main_Countdown_u32_Iterator_next(struct mn_main_Countdown * iterator);\nuint32_t mn_main_total(uint32_t start);\nsize_t mn_main_indexes(size_t count);\n",
         files[0].contents,
     );
     try std.testing.expectEqualStrings(
-        "#include \"main.h\"\n#include \"mn/range.h\"\n\n#ifndef mn_optional_u32_defined\n#define mn_optional_u32_defined\ntypedef struct mn_optional_u32 {\n    uint32_t value;\n    bool present;\n} mn_optional_u32;\n#endif\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\nmn_optional_u32 mn_main_Countdown_u32_Iterator_next(struct mn_main_Countdown * iterator) {\n    if (iterator->count == 0u) {\n        return (mn_optional_u32){ .present = false };\n    }\n    uint32_t * mn_temporary_1;\n    mn_temporary_1 = &iterator->count, (*mn_temporary_1) = ((*mn_temporary_1) - 1u);\n    return (mn_optional_u32){ .value = (iterator->count + 1u), .present = true };\n}\n\nmn_main_Countdown mn_main_Countdown_Countdown_Iterable_iterator(mn_main_Countdown countdown) {\n    return countdown;\n}\n\nuint32_t mn_main_total(uint32_t start) {\n    uint32_t sum = 0u;\n    mn_main_Countdown mn_iterator_1 = mn_main_Countdown_Countdown_Iterable_iterator((mn_main_Countdown){ .count = start, .flag = false });\n    for (;;) {\n        mn_optional_u32 mn_element_1 = mn_main_Countdown_u32_Iterator_next(&mn_iterator_1);\n        if (!mn_element_1.present) break;\n        {\n            const uint32_t value = mn_element_1.value;\n            sum = (sum + value);\n        }\n    }\n    return sum;\n}\n\nsize_t mn_main_indexes(size_t count) {\n    size_t sum = 0u;\n    const mn_mn_range_Range range = (mn_mn_range_Range){ .start = 2u, .end = (mn_optional_usize){ .value = count, .present = true } };\n    mn_mn_range_RangeCursor mn_iterator_1 = mn_mn_range_Range_RangeCursor_Iterable_iterator(range);\n    for (;;) {\n        mn_optional_usize mn_element_1 = mn_mn_range_RangeCursor_usize_Iterator_next(&mn_iterator_1);\n        if (!mn_element_1.present) break;\n        {\n            const size_t index = mn_element_1.value;\n            if (index == 4u) {\n                continue;\n            }\n            sum = (sum + index);\n        }\n    }\n    sum = (sum + 1u);\n    return sum;\n}\n",
+        "#include \"main.h\"\n#include \"mn/iterator.h\"\n#include \"mn/range.h\"\n\n#ifndef mn_optional_u32_defined\n#define mn_optional_u32_defined\ntypedef struct mn_optional_u32 {\n    uint32_t value;\n    bool present;\n} mn_optional_u32;\n#endif\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\nmn_optional_u32 mn_main_Countdown_u32_Iterator_next(struct mn_main_Countdown * iterator) {\n    if (iterator->count == 0u) {\n        return (mn_optional_u32){ .present = false };\n    }\n    uint32_t * mn_temporary_1;\n    mn_temporary_1 = &iterator->count, (*mn_temporary_1) = ((*mn_temporary_1) - 1u);\n    return (mn_optional_u32){ .value = (iterator->count + 1u), .present = true };\n}\n\nuint32_t mn_main_total(uint32_t start) {\n    uint32_t sum = 0u;\n    mn_main_Countdown mn_iterator_1 = mn_mn_iterator_main_Countdown_main_Countdown_Iterable_iterator((mn_main_Countdown){ .count = start, .flag = false });\n    for (;;) {\n        mn_optional_u32 mn_element_1 = mn_main_Countdown_u32_Iterator_next(&mn_iterator_1);\n        if (!mn_element_1.present) break;\n        {\n            const uint32_t value = mn_element_1.value;\n            sum = (sum + value);\n        }\n    }\n    return sum;\n}\n\nsize_t mn_main_indexes(size_t count) {\n    size_t sum = 0u;\n    const mn_mn_range_Range range = (mn_mn_range_Range){ .start = 2u, .end = (mn_optional_usize){ .value = count, .present = true } };\n    mn_mn_range_RangeCursor mn_iterator_1 = mn_mn_range_Range_RangeCursor_Iterable_iterator(range);\n    for (;;) {\n        mn_optional_usize mn_element_1 = mn_mn_range_RangeCursor_usize_Iterator_next(&mn_iterator_1);\n        if (!mn_element_1.present) break;\n        {\n            const size_t index = mn_element_1.value;\n            if (index == 4u) {\n                continue;\n            }\n            sum = (sum + index);\n        }\n    }\n    sum = (sum + 1u);\n    return sum;\n}\n",
         files[1].contents,
     );
     try std.testing.expectEqualStrings(
-        "#pragma once\n\n#include \"../runtime/monolith.h\"\n",
+        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\ntypedef struct mn_main_Countdown mn_main_Countdown;\n\nmn_main_Countdown mn_mn_iterator_main_Countdown_main_Countdown_Iterable_iterator(mn_main_Countdown iterator);\n",
         files[2].contents,
     );
     try std.testing.expectEqualStrings(
-        "#include \"iterator.h\"\n",
+        "#include \"iterator.h\"\n#include \"../main.h\"\n\nmn_main_Countdown mn_mn_iterator_main_Countdown_main_Countdown_Iterable_iterator(mn_main_Countdown iterator) {\n    return iterator;\n}\n",
         files[3].contents,
     );
     try std.testing.expectEqualStrings(
-        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\ntypedef struct mn_mn_range_Range {\n    size_t start;\n    mn_optional_usize end;\n} mn_mn_range_Range;\n\ntypedef struct mn_mn_range_RangeCursor {\n    size_t position;\n    mn_optional_usize end;\n} mn_mn_range_RangeCursor;\n\nmn_mn_range_RangeCursor mn_mn_range_Range_RangeCursor_Iterable_iterator(mn_mn_range_Range range);\nmn_optional_usize mn_mn_range_RangeCursor_usize_Iterator_next(struct mn_mn_range_RangeCursor * cursor);\nmn_mn_range_RangeCursor mn_mn_range_RangeCursor_RangeCursor_Iterable_iterator(mn_mn_range_RangeCursor cursor);\n",
+        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\ntypedef struct mn_mn_range_Range {\n    size_t start;\n    mn_optional_usize end;\n} mn_mn_range_Range;\n\ntypedef struct mn_mn_range_RangeCursor {\n    size_t position;\n    mn_optional_usize end;\n} mn_mn_range_RangeCursor;\n\nmn_mn_range_RangeCursor mn_mn_range_Range_RangeCursor_Iterable_iterator(mn_mn_range_Range range);\nmn_optional_usize mn_mn_range_RangeCursor_usize_Iterator_next(struct mn_mn_range_RangeCursor * cursor);\n",
         files[4].contents,
     );
     try std.testing.expectEqualStrings(
-        "#include \"range.h\"\n\nmn_mn_range_RangeCursor mn_mn_range_Range_RangeCursor_Iterable_iterator(mn_mn_range_Range range) {\n    return (mn_mn_range_RangeCursor){ .position = range.start, .end = range.end };\n}\n\nmn_optional_usize mn_mn_range_RangeCursor_usize_Iterator_next(struct mn_mn_range_RangeCursor * cursor) {\n    if ((cursor->end.present) && (cursor->position >= cursor->end.value)) {\n        return (mn_optional_usize){ .present = false };\n    }\n    const size_t value = cursor->position;\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &cursor->position, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n    return (mn_optional_usize){ .value = value, .present = true };\n}\n\nmn_mn_range_RangeCursor mn_mn_range_RangeCursor_RangeCursor_Iterable_iterator(mn_mn_range_RangeCursor cursor) {\n    return cursor;\n}\n",
+        "#include \"range.h\"\n\nmn_mn_range_RangeCursor mn_mn_range_Range_RangeCursor_Iterable_iterator(mn_mn_range_Range range) {\n    return (mn_mn_range_RangeCursor){ .position = range.start, .end = range.end };\n}\n\nmn_optional_usize mn_mn_range_RangeCursor_usize_Iterator_next(struct mn_mn_range_RangeCursor * cursor) {\n    if ((cursor->end.present) && (cursor->position >= cursor->end.value)) {\n        return (mn_optional_usize){ .present = false };\n    }\n    const size_t value = cursor->position;\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &cursor->position, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n    return (mn_optional_usize){ .value = value, .present = true };\n}\n",
         files[5].contents,
     );
     try std.testing.expectEqualStrings(
@@ -19012,19 +19306,19 @@ test "generateIteration: zips a slice or a read-only slice and a range into one 
         files[1].contents,
     );
     try std.testing.expectEqualStrings(
-        "#pragma once\n\n#include \"../runtime/monolith.h\"\n#include \"range.h\"\n\n#ifndef mn_slice_u32_defined\n#define mn_slice_u32_defined\ntypedef struct mn_slice_u32 {\n    uint32_t *items;\n    size_t length;\n} mn_slice_u32;\n#endif\n\ntypedef struct mn_slice_u32 mn_mn_iterator_SliceIterator_1;\n\n#ifndef mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor_defined\n#define mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor_defined\ntypedef struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor {\n    mn_mn_iterator_SliceIterator_1 _0;\n    mn_mn_range_RangeCursor _1;\n} mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor;\n#endif\n\ntypedef struct mn_mn_iterator_Zipped_1 {\n    mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor cursors;\n} mn_mn_iterator_Zipped_1;\n\ntypedef struct mn_slice_u32 mn_mn_iterator_SliceIterator_2;\n\n#ifndef mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor_defined\n#define mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor_defined\ntypedef struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor {\n    mn_mn_iterator_SliceIterator_2 _0;\n    mn_mn_range_RangeCursor _1;\n} mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor;\n#endif\n\ntypedef struct mn_mn_iterator_Zipped_2 {\n    mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor cursors;\n} mn_mn_iterator_Zipped_2;\n\ntypedef struct mn_tuple_2_slice_u32_mn_range_Range mn_tuple_2_slice_u32_mn_range_Range;\ntypedef struct mn_optional_tuple_2_pointer_u32_usize mn_optional_tuple_2_pointer_u32_usize;\ntypedef struct mn_tuple_2_pointer_u32_usize mn_tuple_2_pointer_u32_usize;\ntypedef struct mn_optional_tuple_2_pointer_const_u32_usize mn_optional_tuple_2_pointer_const_u32_usize;\ntypedef struct mn_tuple_2_pointer_const_u32_usize mn_tuple_2_pointer_const_u32_usize;\n\nmn_mn_iterator_Zipped_1 mn_mn_iterator_tuple_2_slice_u32_mn_range_Range_Zip_zip(mn_tuple_2_slice_u32_mn_range_Range iterables);\nmn_mn_iterator_Zipped_1 mn_mn_iterator_Zipped_1_Zipped_1_Iterable_iterator(mn_mn_iterator_Zipped_1 zipped);\nmn_optional_tuple_2_pointer_u32_usize mn_mn_iterator_Zipped_1_tuple_2_pointer_u32_usize_Iterator_next(struct mn_mn_iterator_Zipped_1 * zipped);\nbool mn_mn_iterator_fill_zipped_1([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_u32_usize * element);\nmn_mn_iterator_Zipped_2 mn_mn_iterator_tuple_2_slice_const_u32_mn_range_Range_Zip_zip(mn_tuple_2_slice_u32_mn_range_Range iterables);\nmn_mn_iterator_Zipped_2 mn_mn_iterator_Zipped_2_Zipped_2_Iterable_iterator(mn_mn_iterator_Zipped_2 zipped);\nmn_optional_tuple_2_pointer_const_u32_usize mn_mn_iterator_Zipped_2_tuple_2_pointer_const_u32_usize_Iterator_next(struct mn_mn_iterator_Zipped_2 * zipped);\nbool mn_mn_iterator_fill_zipped_2([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_const_u32_usize * element);\nvoid mn_mn_iterator_fill_cursors_1([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors);\nuint32_t * mn_mn_iterator_SliceIterator_1_pointer_u32_Iterator_next(struct mn_slice_u32 * iterator);\nbool mn_mn_iterator_fill_zipped_3([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_u32_usize * element);\nvoid mn_mn_iterator_fill_cursors_2([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors);\nuint32_t const * mn_mn_iterator_SliceIterator_2_pointer_const_u32_Iterator_next(struct mn_slice_u32 * iterator);\nbool mn_mn_iterator_fill_zipped_4([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_const_u32_usize * element);\nmn_mn_iterator_SliceIterator_1 mn_mn_iterator_slice_u32_SliceIterator_1_Iterable_iterator(mn_slice_u32 items);\nvoid mn_mn_iterator_fill_cursors_3([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors);\nbool mn_mn_iterator_fill_zipped_5([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_u32_usize * element);\nmn_mn_iterator_SliceIterator_2 mn_mn_iterator_slice_const_u32_SliceIterator_2_Iterable_iterator(mn_slice_u32 items);\nvoid mn_mn_iterator_fill_cursors_4([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors);\nbool mn_mn_iterator_fill_zipped_6([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_const_u32_usize * element);\nvoid mn_mn_iterator_fill_cursors_5([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors);\nvoid mn_mn_iterator_fill_cursors_6([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors);\n",
+        "#pragma once\n\n#include \"../runtime/monolith.h\"\n#include \"range.h\"\n\n#ifndef mn_slice_u32_defined\n#define mn_slice_u32_defined\ntypedef struct mn_slice_u32 {\n    uint32_t *items;\n    size_t length;\n} mn_slice_u32;\n#endif\n\ntypedef struct mn_slice_u32 mn_mn_iterator_SliceIterator_1;\n\n#ifndef mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor_defined\n#define mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor_defined\ntypedef struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor {\n    mn_mn_iterator_SliceIterator_1 _0;\n    mn_mn_range_RangeCursor _1;\n} mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor;\n#endif\n\ntypedef struct mn_mn_iterator_Zipped_1 {\n    mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor cursors;\n} mn_mn_iterator_Zipped_1;\n\ntypedef struct mn_slice_u32 mn_mn_iterator_SliceIterator_2;\n\n#ifndef mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor_defined\n#define mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor_defined\ntypedef struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor {\n    mn_mn_iterator_SliceIterator_2 _0;\n    mn_mn_range_RangeCursor _1;\n} mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor;\n#endif\n\ntypedef struct mn_mn_iterator_Zipped_2 {\n    mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor cursors;\n} mn_mn_iterator_Zipped_2;\n\ntypedef struct mn_tuple_2_slice_u32_mn_range_Range mn_tuple_2_slice_u32_mn_range_Range;\ntypedef struct mn_optional_tuple_2_pointer_u32_usize mn_optional_tuple_2_pointer_u32_usize;\ntypedef struct mn_tuple_2_pointer_u32_usize mn_tuple_2_pointer_u32_usize;\ntypedef struct mn_optional_tuple_2_pointer_const_u32_usize mn_optional_tuple_2_pointer_const_u32_usize;\ntypedef struct mn_tuple_2_pointer_const_u32_usize mn_tuple_2_pointer_const_u32_usize;\n\nmn_mn_iterator_Zipped_1 mn_mn_iterator_tuple_2_slice_u32_mn_range_Range_Zip_zip(mn_tuple_2_slice_u32_mn_range_Range iterables);\nmn_mn_iterator_Zipped_1 mn_mn_iterator_Zipped_1_Zipped_1_Iterable_iterator(mn_mn_iterator_Zipped_1 iterator);\nmn_optional_tuple_2_pointer_u32_usize mn_mn_iterator_Zipped_1_tuple_2_pointer_u32_usize_Iterator_next(struct mn_mn_iterator_Zipped_1 * zipped);\nbool mn_mn_iterator_fill_zipped_1([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_u32_usize * element);\nmn_mn_iterator_Zipped_2 mn_mn_iterator_tuple_2_slice_const_u32_mn_range_Range_Zip_zip(mn_tuple_2_slice_u32_mn_range_Range iterables);\nmn_mn_iterator_Zipped_2 mn_mn_iterator_Zipped_2_Zipped_2_Iterable_iterator(mn_mn_iterator_Zipped_2 iterator);\nmn_optional_tuple_2_pointer_const_u32_usize mn_mn_iterator_Zipped_2_tuple_2_pointer_const_u32_usize_Iterator_next(struct mn_mn_iterator_Zipped_2 * zipped);\nbool mn_mn_iterator_fill_zipped_2([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_const_u32_usize * element);\nvoid mn_mn_iterator_fill_cursors_1([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors);\nuint32_t * mn_mn_iterator_SliceIterator_1_pointer_u32_Iterator_next(struct mn_slice_u32 * iterator);\nbool mn_mn_iterator_fill_zipped_3([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_u32_usize * element);\nvoid mn_mn_iterator_fill_cursors_2([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors);\nuint32_t const * mn_mn_iterator_SliceIterator_2_pointer_const_u32_Iterator_next(struct mn_slice_u32 * iterator);\nbool mn_mn_iterator_fill_zipped_4([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_const_u32_usize * element);\nmn_mn_iterator_SliceIterator_1 mn_mn_iterator_slice_u32_SliceIterator_1_Iterable_iterator(mn_slice_u32 items);\nvoid mn_mn_iterator_fill_cursors_3([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors);\nbool mn_mn_iterator_fill_zipped_5([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_u32_usize * element);\nmn_mn_iterator_SliceIterator_2 mn_mn_iterator_slice_const_u32_SliceIterator_2_Iterable_iterator(mn_slice_u32 items);\nvoid mn_mn_iterator_fill_cursors_4([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors);\nbool mn_mn_iterator_fill_zipped_6([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_const_u32_usize * element);\nvoid mn_mn_iterator_fill_cursors_5([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors);\nvoid mn_mn_iterator_fill_cursors_6([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors);\n",
         files[2].contents,
     );
     try std.testing.expectEqualStrings(
-        "#include \"iterator.h\"\n#include \"range.h\"\n\n#ifndef mn_tuple_2_slice_u32_mn_range_Range_defined\n#define mn_tuple_2_slice_u32_mn_range_Range_defined\ntypedef struct mn_tuple_2_slice_u32_mn_range_Range {\n    mn_slice_u32 _0;\n    mn_mn_range_Range _1;\n} mn_tuple_2_slice_u32_mn_range_Range;\n#endif\n\n#ifndef mn_tuple_2_pointer_u32_usize_defined\n#define mn_tuple_2_pointer_u32_usize_defined\ntypedef struct mn_tuple_2_pointer_u32_usize {\n    uint32_t * _0;\n    size_t _1;\n} mn_tuple_2_pointer_u32_usize;\n#endif\n\n#ifndef mn_optional_tuple_2_pointer_u32_usize_defined\n#define mn_optional_tuple_2_pointer_u32_usize_defined\ntypedef struct mn_optional_tuple_2_pointer_u32_usize {\n    mn_tuple_2_pointer_u32_usize value;\n    bool present;\n} mn_optional_tuple_2_pointer_u32_usize;\n#endif\n\n#ifndef mn_tuple_2_pointer_const_u32_usize_defined\n#define mn_tuple_2_pointer_const_u32_usize_defined\ntypedef struct mn_tuple_2_pointer_const_u32_usize {\n    uint32_t const * _0;\n    size_t _1;\n} mn_tuple_2_pointer_const_u32_usize;\n#endif\n\n#ifndef mn_optional_tuple_2_pointer_const_u32_usize_defined\n#define mn_optional_tuple_2_pointer_const_u32_usize_defined\ntypedef struct mn_optional_tuple_2_pointer_const_u32_usize {\n    mn_tuple_2_pointer_const_u32_usize value;\n    bool present;\n} mn_optional_tuple_2_pointer_const_u32_usize;\n#endif\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\nmn_mn_iterator_Zipped_1 mn_mn_iterator_tuple_2_slice_u32_mn_range_Range_Zip_zip(mn_tuple_2_slice_u32_mn_range_Range iterables) {\n    mn_mn_iterator_Zipped_1 zipped;\n    mn_mn_iterator_fill_cursors_1(iterables, &zipped.cursors);\n    return zipped;\n}\n\nmn_mn_iterator_Zipped_1 mn_mn_iterator_Zipped_1_Zipped_1_Iterable_iterator(mn_mn_iterator_Zipped_1 zipped) {\n    return zipped;\n}\n\nmn_optional_tuple_2_pointer_u32_usize mn_mn_iterator_Zipped_1_tuple_2_pointer_u32_usize_Iterator_next(struct mn_mn_iterator_Zipped_1 * zipped) {\n    mn_tuple_2_pointer_u32_usize element;\n    const bool filled = mn_mn_iterator_fill_zipped_1(&zipped->cursors, &element);\n    if (filled) {\n        return (mn_optional_tuple_2_pointer_u32_usize){ .value = element, .present = true };\n    }\n    return (mn_optional_tuple_2_pointer_u32_usize){ .present = false };\n}\n\nbool mn_mn_iterator_fill_zipped_1([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_u32_usize * element) {\n    {\n        uint32_t * const item = mn_mn_iterator_SliceIterator_1_pointer_u32_Iterator_next(&(*cursors)._0);\n        if (item == NULL) {\n            return false;\n        }\n        (*element)._0 = item;\n        return mn_mn_iterator_fill_zipped_3(cursors, element);\n    }\n}\n\nmn_mn_iterator_Zipped_2 mn_mn_iterator_tuple_2_slice_const_u32_mn_range_Range_Zip_zip(mn_tuple_2_slice_u32_mn_range_Range iterables) {\n    mn_mn_iterator_Zipped_2 zipped;\n    mn_mn_iterator_fill_cursors_2(iterables, &zipped.cursors);\n    return zipped;\n}\n\nmn_mn_iterator_Zipped_2 mn_mn_iterator_Zipped_2_Zipped_2_Iterable_iterator(mn_mn_iterator_Zipped_2 zipped) {\n    return zipped;\n}\n\nmn_optional_tuple_2_pointer_const_u32_usize mn_mn_iterator_Zipped_2_tuple_2_pointer_const_u32_usize_Iterator_next(struct mn_mn_iterator_Zipped_2 * zipped) {\n    mn_tuple_2_pointer_const_u32_usize element;\n    const bool filled = mn_mn_iterator_fill_zipped_2(&zipped->cursors, &element);\n    if (filled) {\n        return (mn_optional_tuple_2_pointer_const_u32_usize){ .value = element, .present = true };\n    }\n    return (mn_optional_tuple_2_pointer_const_u32_usize){ .present = false };\n}\n\nbool mn_mn_iterator_fill_zipped_2([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_const_u32_usize * element) {\n    {\n        uint32_t const * const item = mn_mn_iterator_SliceIterator_2_pointer_const_u32_Iterator_next(&(*cursors)._0);\n        if (item == NULL) {\n            return false;\n        }\n        (*element)._0 = item;\n        return mn_mn_iterator_fill_zipped_4(cursors, element);\n    }\n}\n\nvoid mn_mn_iterator_fill_cursors_1([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors) {\n    {\n        (*cursors)._0 = mn_mn_iterator_slice_u32_SliceIterator_1_Iterable_iterator(iterables._0);\n        mn_mn_iterator_fill_cursors_3(iterables, cursors);\n    }\n}\n\nuint32_t * mn_mn_iterator_SliceIterator_1_pointer_u32_Iterator_next(struct mn_slice_u32 * iterator) {\n    if ((*iterator).length == 0u) {\n        return NULL;\n    }\n    uint32_t * const element = &(*iterator).items[0u];\n    (*iterator) = (mn_slice_u32){ .items = (*iterator).items + 1u, .length = (*iterator).length - 1u };\n    return element;\n}\n\nbool mn_mn_iterator_fill_zipped_3([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_u32_usize * element) {\n    {\n        const mn_optional_usize item = mn_mn_range_RangeCursor_usize_Iterator_next(&(*cursors)._1);\n        if (!item.present) {\n            return false;\n        }\n        (*element)._1 = item.value;\n        return mn_mn_iterator_fill_zipped_5(cursors, element);\n    }\n}\n\nvoid mn_mn_iterator_fill_cursors_2([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors) {\n    {\n        (*cursors)._0 = mn_mn_iterator_slice_const_u32_SliceIterator_2_Iterable_iterator(iterables._0);\n        mn_mn_iterator_fill_cursors_4(iterables, cursors);\n    }\n}\n\nuint32_t const * mn_mn_iterator_SliceIterator_2_pointer_const_u32_Iterator_next(struct mn_slice_u32 * iterator) {\n    if ((*iterator).length == 0u) {\n        return NULL;\n    }\n    uint32_t const * const element = &(*iterator).items[0u];\n    (*iterator) = (mn_slice_u32){ .items = (*iterator).items + 1u, .length = (*iterator).length - 1u };\n    return element;\n}\n\nbool mn_mn_iterator_fill_zipped_4([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_const_u32_usize * element) {\n    {\n        const mn_optional_usize item = mn_mn_range_RangeCursor_usize_Iterator_next(&(*cursors)._1);\n        if (!item.present) {\n            return false;\n        }\n        (*element)._1 = item.value;\n        return mn_mn_iterator_fill_zipped_6(cursors, element);\n    }\n}\n\nmn_mn_iterator_SliceIterator_1 mn_mn_iterator_slice_u32_SliceIterator_1_Iterable_iterator(mn_slice_u32 items) {\n    return items;\n}\n\nvoid mn_mn_iterator_fill_cursors_3([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors) {\n    {\n        (*cursors)._1 = mn_mn_range_Range_RangeCursor_Iterable_iterator(iterables._1);\n        mn_mn_iterator_fill_cursors_5(iterables, cursors);\n    }\n}\n\nbool mn_mn_iterator_fill_zipped_5([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_u32_usize * element) {\n    {\n        return true;\n    }\n}\n\nmn_mn_iterator_SliceIterator_2 mn_mn_iterator_slice_const_u32_SliceIterator_2_Iterable_iterator(mn_slice_u32 items) {\n    return items;\n}\n\nvoid mn_mn_iterator_fill_cursors_4([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors) {\n    {\n        (*cursors)._1 = mn_mn_range_Range_RangeCursor_Iterable_iterator(iterables._1);\n        mn_mn_iterator_fill_cursors_6(iterables, cursors);\n    }\n}\n\nbool mn_mn_iterator_fill_zipped_6([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_const_u32_usize * element) {\n    {\n        return true;\n    }\n}\n\nvoid mn_mn_iterator_fill_cursors_5([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors) {\n    {}\n}\n\nvoid mn_mn_iterator_fill_cursors_6([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors) {\n    {}\n}\n",
+        "#include \"iterator.h\"\n#include \"range.h\"\n\n#ifndef mn_tuple_2_slice_u32_mn_range_Range_defined\n#define mn_tuple_2_slice_u32_mn_range_Range_defined\ntypedef struct mn_tuple_2_slice_u32_mn_range_Range {\n    mn_slice_u32 _0;\n    mn_mn_range_Range _1;\n} mn_tuple_2_slice_u32_mn_range_Range;\n#endif\n\n#ifndef mn_tuple_2_pointer_u32_usize_defined\n#define mn_tuple_2_pointer_u32_usize_defined\ntypedef struct mn_tuple_2_pointer_u32_usize {\n    uint32_t * _0;\n    size_t _1;\n} mn_tuple_2_pointer_u32_usize;\n#endif\n\n#ifndef mn_optional_tuple_2_pointer_u32_usize_defined\n#define mn_optional_tuple_2_pointer_u32_usize_defined\ntypedef struct mn_optional_tuple_2_pointer_u32_usize {\n    mn_tuple_2_pointer_u32_usize value;\n    bool present;\n} mn_optional_tuple_2_pointer_u32_usize;\n#endif\n\n#ifndef mn_tuple_2_pointer_const_u32_usize_defined\n#define mn_tuple_2_pointer_const_u32_usize_defined\ntypedef struct mn_tuple_2_pointer_const_u32_usize {\n    uint32_t const * _0;\n    size_t _1;\n} mn_tuple_2_pointer_const_u32_usize;\n#endif\n\n#ifndef mn_optional_tuple_2_pointer_const_u32_usize_defined\n#define mn_optional_tuple_2_pointer_const_u32_usize_defined\ntypedef struct mn_optional_tuple_2_pointer_const_u32_usize {\n    mn_tuple_2_pointer_const_u32_usize value;\n    bool present;\n} mn_optional_tuple_2_pointer_const_u32_usize;\n#endif\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\nmn_mn_iterator_Zipped_1 mn_mn_iterator_tuple_2_slice_u32_mn_range_Range_Zip_zip(mn_tuple_2_slice_u32_mn_range_Range iterables) {\n    mn_mn_iterator_Zipped_1 zipped;\n    mn_mn_iterator_fill_cursors_1(iterables, &zipped.cursors);\n    return zipped;\n}\n\nmn_mn_iterator_Zipped_1 mn_mn_iterator_Zipped_1_Zipped_1_Iterable_iterator(mn_mn_iterator_Zipped_1 iterator) {\n    return iterator;\n}\n\nmn_optional_tuple_2_pointer_u32_usize mn_mn_iterator_Zipped_1_tuple_2_pointer_u32_usize_Iterator_next(struct mn_mn_iterator_Zipped_1 * zipped) {\n    mn_tuple_2_pointer_u32_usize element;\n    const bool filled = mn_mn_iterator_fill_zipped_1(&zipped->cursors, &element);\n    if (filled) {\n        return (mn_optional_tuple_2_pointer_u32_usize){ .value = element, .present = true };\n    }\n    return (mn_optional_tuple_2_pointer_u32_usize){ .present = false };\n}\n\nbool mn_mn_iterator_fill_zipped_1([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_u32_usize * element) {\n    {\n        uint32_t * const item = mn_mn_iterator_SliceIterator_1_pointer_u32_Iterator_next(&(*cursors)._0);\n        if (item == NULL) {\n            return false;\n        }\n        (*element)._0 = item;\n        return mn_mn_iterator_fill_zipped_3(cursors, element);\n    }\n}\n\nmn_mn_iterator_Zipped_2 mn_mn_iterator_tuple_2_slice_const_u32_mn_range_Range_Zip_zip(mn_tuple_2_slice_u32_mn_range_Range iterables) {\n    mn_mn_iterator_Zipped_2 zipped;\n    mn_mn_iterator_fill_cursors_2(iterables, &zipped.cursors);\n    return zipped;\n}\n\nmn_mn_iterator_Zipped_2 mn_mn_iterator_Zipped_2_Zipped_2_Iterable_iterator(mn_mn_iterator_Zipped_2 iterator) {\n    return iterator;\n}\n\nmn_optional_tuple_2_pointer_const_u32_usize mn_mn_iterator_Zipped_2_tuple_2_pointer_const_u32_usize_Iterator_next(struct mn_mn_iterator_Zipped_2 * zipped) {\n    mn_tuple_2_pointer_const_u32_usize element;\n    const bool filled = mn_mn_iterator_fill_zipped_2(&zipped->cursors, &element);\n    if (filled) {\n        return (mn_optional_tuple_2_pointer_const_u32_usize){ .value = element, .present = true };\n    }\n    return (mn_optional_tuple_2_pointer_const_u32_usize){ .present = false };\n}\n\nbool mn_mn_iterator_fill_zipped_2([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_const_u32_usize * element) {\n    {\n        uint32_t const * const item = mn_mn_iterator_SliceIterator_2_pointer_const_u32_Iterator_next(&(*cursors)._0);\n        if (item == NULL) {\n            return false;\n        }\n        (*element)._0 = item;\n        return mn_mn_iterator_fill_zipped_4(cursors, element);\n    }\n}\n\nvoid mn_mn_iterator_fill_cursors_1([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors) {\n    {\n        (*cursors)._0 = mn_mn_iterator_slice_u32_SliceIterator_1_Iterable_iterator(iterables._0);\n        mn_mn_iterator_fill_cursors_3(iterables, cursors);\n    }\n}\n\nuint32_t * mn_mn_iterator_SliceIterator_1_pointer_u32_Iterator_next(struct mn_slice_u32 * iterator) {\n    if ((*iterator).length == 0u) {\n        return NULL;\n    }\n    uint32_t * const element = &(*iterator).items[0u];\n    (*iterator) = (mn_slice_u32){ .items = (*iterator).items + 1u, .length = (*iterator).length - 1u };\n    return element;\n}\n\nbool mn_mn_iterator_fill_zipped_3([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_u32_usize * element) {\n    {\n        const mn_optional_usize item = mn_mn_range_RangeCursor_usize_Iterator_next(&(*cursors)._1);\n        if (!item.present) {\n            return false;\n        }\n        (*element)._1 = item.value;\n        return mn_mn_iterator_fill_zipped_5(cursors, element);\n    }\n}\n\nvoid mn_mn_iterator_fill_cursors_2([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors) {\n    {\n        (*cursors)._0 = mn_mn_iterator_slice_const_u32_SliceIterator_2_Iterable_iterator(iterables._0);\n        mn_mn_iterator_fill_cursors_4(iterables, cursors);\n    }\n}\n\nuint32_t const * mn_mn_iterator_SliceIterator_2_pointer_const_u32_Iterator_next(struct mn_slice_u32 * iterator) {\n    if ((*iterator).length == 0u) {\n        return NULL;\n    }\n    uint32_t const * const element = &(*iterator).items[0u];\n    (*iterator) = (mn_slice_u32){ .items = (*iterator).items + 1u, .length = (*iterator).length - 1u };\n    return element;\n}\n\nbool mn_mn_iterator_fill_zipped_4([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_const_u32_usize * element) {\n    {\n        const mn_optional_usize item = mn_mn_range_RangeCursor_usize_Iterator_next(&(*cursors)._1);\n        if (!item.present) {\n            return false;\n        }\n        (*element)._1 = item.value;\n        return mn_mn_iterator_fill_zipped_6(cursors, element);\n    }\n}\n\nmn_mn_iterator_SliceIterator_1 mn_mn_iterator_slice_u32_SliceIterator_1_Iterable_iterator(mn_slice_u32 items) {\n    return items;\n}\n\nvoid mn_mn_iterator_fill_cursors_3([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors) {\n    {\n        (*cursors)._1 = mn_mn_range_Range_RangeCursor_Iterable_iterator(iterables._1);\n        mn_mn_iterator_fill_cursors_5(iterables, cursors);\n    }\n}\n\nbool mn_mn_iterator_fill_zipped_5([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_u32_usize * element) {\n    {\n        return true;\n    }\n}\n\nmn_mn_iterator_SliceIterator_2 mn_mn_iterator_slice_const_u32_SliceIterator_2_Iterable_iterator(mn_slice_u32 items) {\n    return items;\n}\n\nvoid mn_mn_iterator_fill_cursors_4([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors) {\n    {\n        (*cursors)._1 = mn_mn_range_Range_RangeCursor_Iterable_iterator(iterables._1);\n        mn_mn_iterator_fill_cursors_6(iterables, cursors);\n    }\n}\n\nbool mn_mn_iterator_fill_zipped_6([[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors, [[maybe_unused]] struct mn_tuple_2_pointer_const_u32_usize * element) {\n    {\n        return true;\n    }\n}\n\nvoid mn_mn_iterator_fill_cursors_5([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_1_mn_range_RangeCursor * cursors) {\n    {}\n}\n\nvoid mn_mn_iterator_fill_cursors_6([[maybe_unused]] mn_tuple_2_slice_u32_mn_range_Range iterables, [[maybe_unused]] struct mn_tuple_2_mn_iterator_SliceIterator_2_mn_range_RangeCursor * cursors) {\n    {}\n}\n",
         files[3].contents,
     );
     try std.testing.expectEqualStrings(
-        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\ntypedef struct mn_mn_range_Range {\n    size_t start;\n    mn_optional_usize end;\n} mn_mn_range_Range;\n\ntypedef struct mn_mn_range_RangeCursor {\n    size_t position;\n    mn_optional_usize end;\n} mn_mn_range_RangeCursor;\n\nmn_mn_range_RangeCursor mn_mn_range_Range_RangeCursor_Iterable_iterator(mn_mn_range_Range range);\nmn_optional_usize mn_mn_range_RangeCursor_usize_Iterator_next(struct mn_mn_range_RangeCursor * cursor);\nmn_mn_range_RangeCursor mn_mn_range_RangeCursor_RangeCursor_Iterable_iterator(mn_mn_range_RangeCursor cursor);\n",
+        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\ntypedef struct mn_mn_range_Range {\n    size_t start;\n    mn_optional_usize end;\n} mn_mn_range_Range;\n\ntypedef struct mn_mn_range_RangeCursor {\n    size_t position;\n    mn_optional_usize end;\n} mn_mn_range_RangeCursor;\n\nmn_mn_range_RangeCursor mn_mn_range_Range_RangeCursor_Iterable_iterator(mn_mn_range_Range range);\nmn_optional_usize mn_mn_range_RangeCursor_usize_Iterator_next(struct mn_mn_range_RangeCursor * cursor);\n",
         files[4].contents,
     );
     try std.testing.expectEqualStrings(
-        "#include \"range.h\"\n\nmn_mn_range_RangeCursor mn_mn_range_Range_RangeCursor_Iterable_iterator(mn_mn_range_Range range) {\n    return (mn_mn_range_RangeCursor){ .position = range.start, .end = range.end };\n}\n\nmn_optional_usize mn_mn_range_RangeCursor_usize_Iterator_next(struct mn_mn_range_RangeCursor * cursor) {\n    if ((cursor->end.present) && (cursor->position >= cursor->end.value)) {\n        return (mn_optional_usize){ .present = false };\n    }\n    const size_t value = cursor->position;\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &cursor->position, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n    return (mn_optional_usize){ .value = value, .present = true };\n}\n\nmn_mn_range_RangeCursor mn_mn_range_RangeCursor_RangeCursor_Iterable_iterator(mn_mn_range_RangeCursor cursor) {\n    return cursor;\n}\n",
+        "#include \"range.h\"\n\nmn_mn_range_RangeCursor mn_mn_range_Range_RangeCursor_Iterable_iterator(mn_mn_range_Range range) {\n    return (mn_mn_range_RangeCursor){ .position = range.start, .end = range.end };\n}\n\nmn_optional_usize mn_mn_range_RangeCursor_usize_Iterator_next(struct mn_mn_range_RangeCursor * cursor) {\n    if ((cursor->end.present) && (cursor->position >= cursor->end.value)) {\n        return (mn_optional_usize){ .present = false };\n    }\n    const size_t value = cursor->position;\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &cursor->position, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n    return (mn_optional_usize){ .value = value, .present = true };\n}\n",
         files[5].contents,
     );
     try std.testing.expectEqualStrings(
@@ -19950,6 +20244,33 @@ test "generateConverted: widens a smaller float to f128 through the runtime" {
 
     try std.testing.expectEqualStrings(
         "#include \"main.h\"\n\n#ifndef mn_optional_f128_defined\n#define mn_optional_f128_defined\ntypedef struct mn_optional_f128 {\n    mn_f128 value;\n    bool present;\n} mn_optional_f128;\n#endif\n\nmn_f128 mn_main_widen(float value) {\n    return mn_runtime_f128_from_f32(value);\n}\n\nmn_optional_f128 mn_main_wrap(double value) {\n    return (mn_optional_f128){ .value = mn_runtime_f128_from_f64(value), .present = true };\n}\n\nmn_main_Pair mn_main_pair(_Float16 value) {\n    return (mn_main_Pair){ .one = mn_runtime_f128_from_f16(value), .two = value };\n}\n",
+        files[1].contents,
+    );
+}
+
+test "generateConverted: gives an optional pointer and an optional slice to their read-only optionals as they are" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pointer(value: ?*i32) -> ?const(*i32) = return value\nfn slice(bytes: ?*[]u8) -> ?const(*[]u8) = return bytes" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = @import("monolith").NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+    const program: ast.Program = .{ .modules = loader.modules.items, .types = &type_registry };
+    var type_checker = @import("monolith").TypeChecker.init(&arena, program);
+    try type_checker.check();
+    var generator = Generator.init(program);
+    const files = try generator.generateFiles(arena.allocator());
+
+    try std.testing.expectEqualStrings(
+        "#include \"main.h\"\n\n#ifndef mn_slice_u8_defined\n#define mn_slice_u8_defined\ntypedef struct mn_slice_u8 {\n    uint8_t *items;\n    size_t length;\n} mn_slice_u8;\n#endif\n\n#ifndef mn_optional_slice_u8_defined\n#define mn_optional_slice_u8_defined\ntypedef struct mn_optional_slice_u8 {\n    mn_slice_u8 value;\n    bool present;\n} mn_optional_slice_u8;\n#endif\n\nint32_t const * mn_main_pointer(int32_t * value) {\n    return value;\n}\n\nmn_optional_slice_u8 mn_main_slice(mn_optional_slice_u8 bytes) {\n    return bytes;\n}\n",
         files[1].contents,
     );
 }
@@ -23324,12 +23645,12 @@ test "generateFunction: generates mn::random with its generator, range and entro
     );
     try std.testing.expectEqualStrings("mn/range.h", files[4].path);
     try std.testing.expectEqualStrings(
-        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\ntypedef struct mn_mn_range_Range {\n    size_t start;\n    mn_optional_usize end;\n} mn_mn_range_Range;\n\ntypedef struct mn_mn_range_RangeCursor {\n    size_t position;\n    mn_optional_usize end;\n} mn_mn_range_RangeCursor;\n\nmn_mn_range_RangeCursor mn_mn_range_Range_RangeCursor_Iterable_iterator(mn_mn_range_Range range);\nmn_optional_usize mn_mn_range_RangeCursor_usize_Iterator_next(struct mn_mn_range_RangeCursor * cursor);\nmn_mn_range_RangeCursor mn_mn_range_RangeCursor_RangeCursor_Iterable_iterator(mn_mn_range_RangeCursor cursor);\n",
+        "#pragma once\n\n#include \"../runtime/monolith.h\"\n\n#ifndef mn_optional_usize_defined\n#define mn_optional_usize_defined\ntypedef struct mn_optional_usize {\n    size_t value;\n    bool present;\n} mn_optional_usize;\n#endif\n\ntypedef struct mn_mn_range_Range {\n    size_t start;\n    mn_optional_usize end;\n} mn_mn_range_Range;\n\ntypedef struct mn_mn_range_RangeCursor {\n    size_t position;\n    mn_optional_usize end;\n} mn_mn_range_RangeCursor;\n\nmn_mn_range_RangeCursor mn_mn_range_Range_RangeCursor_Iterable_iterator(mn_mn_range_Range range);\nmn_optional_usize mn_mn_range_RangeCursor_usize_Iterator_next(struct mn_mn_range_RangeCursor * cursor);\n",
         files[4].contents,
     );
     try std.testing.expectEqualStrings("mn/range.c", files[5].path);
     try std.testing.expectEqualStrings(
-        "#include \"range.h\"\n\nmn_mn_range_RangeCursor mn_mn_range_Range_RangeCursor_Iterable_iterator(mn_mn_range_Range range) {\n    return (mn_mn_range_RangeCursor){ .position = range.start, .end = range.end };\n}\n\nmn_optional_usize mn_mn_range_RangeCursor_usize_Iterator_next(struct mn_mn_range_RangeCursor * cursor) {\n    if ((cursor->end.present) && (cursor->position >= cursor->end.value)) {\n        return (mn_optional_usize){ .present = false };\n    }\n    const size_t value = cursor->position;\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &cursor->position, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n    return (mn_optional_usize){ .value = value, .present = true };\n}\n\nmn_mn_range_RangeCursor mn_mn_range_RangeCursor_RangeCursor_Iterable_iterator(mn_mn_range_RangeCursor cursor) {\n    return cursor;\n}\n",
+        "#include \"range.h\"\n\nmn_mn_range_RangeCursor mn_mn_range_Range_RangeCursor_Iterable_iterator(mn_mn_range_Range range) {\n    return (mn_mn_range_RangeCursor){ .position = range.start, .end = range.end };\n}\n\nmn_optional_usize mn_mn_range_RangeCursor_usize_Iterator_next(struct mn_mn_range_RangeCursor * cursor) {\n    if ((cursor->end.present) && (cursor->position >= cursor->end.value)) {\n        return (mn_optional_usize){ .present = false };\n    }\n    const size_t value = cursor->position;\n    size_t * mn_temporary_1;\n    mn_temporary_1 = &cursor->position, (*mn_temporary_1) = ((*mn_temporary_1) + 1u);\n    return (mn_optional_usize){ .value = value, .present = true };\n}\n",
         files[5].contents,
     );
     try std.testing.expectEqualStrings("mn/hash.h", files[6].path);
