@@ -776,12 +776,19 @@ pub const Parser = struct {
         offset: *usize,
     ) ParseError!ValueNames {
         var position = offset.*;
+        const variable = self.match(&position, .keyword_var) != null;
         if (self.tokens[position].kind == .left_parenthesis) return self.fail(position, error.ParenthesizedPattern);
         const tuple = self.tokens[position].kind == .left_brace;
         const names = if (tuple)
             try self.parseElementNames(allocator, &position)
         else
             try allocator.dupe(ast.ElementName, &.{try self.parseValueName(&position)});
+        if (variable) {
+            for (names) |*name| {
+                if (name.pointer) return self.failAt(name.location, error.PointerVariableName);
+                name.variable = true;
+            }
+        }
 
         offset.* = position;
         return .{ .names = names, .tuple = tuple };
@@ -2873,6 +2880,7 @@ pub const ParseError = error{
     InlineSignature,
     RangeOperand,
     DiscardedValueName,
+    PointerVariableName,
     ExpectedDeferredStatement,
     ParenthesizedPattern,
     MisplacedPrivate,
@@ -3069,6 +3077,7 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.InlineSignature => "a typeclass function without a body cannot be inline",
         error.RangeOperand => "a range cannot be an operand",
         error.DiscardedValueName => "'as' needs a name, leave it out to leave the value without a name",
+        error.PointerVariableName => "a name after 'as var' is a variable and cannot be a pointer, use 'as *name' for a pointer to the value",
         error.ExpectedDeferredStatement => "expected a call, an assignment or a discard",
         error.ParenthesizedPattern => "names that take a value apart are written in braces, not parentheses, e.g. `const { name, score } = pair`, `for { card, index } in Zip::zip({ cards, 0.. })` or `while map.pop() as { key, value }`",
         error.MisplacedPrivate => "private is written only before a top-level declaration other than an import or instance, before a function or type in the block of a struct, an enum or a typeclass, or before a struct field, e.g. `private fn build_text` or `private storage: *[]T`; at a use it is written between `.` or `::` and the name it crosses to, or before a field of a struct literal, e.g. `list.private.count`, `filesystem::private::build_path` or `{ private.bytes = text }`",
@@ -4805,6 +4814,65 @@ test "parseConditionNames: parses names in braces" {
     const conditional = body[1].kind.@"if";
     try std.testing.expect(conditional.tuple);
     try std.testing.expectEqual(1, conditional.names.len);
+}
+
+test "parseValueNames: parses a variable name after as var and a constant name after as" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while (list.pop() as var element) element.deinit()\n    if (found as card) noop\n    match value\n        case (i64 as var count) noop\n        else _ as var rest\n            noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    const loop = body[0].kind.@"while";
+    try std.testing.expectEqualStrings("element", loop.names[0].name);
+    try std.testing.expect(loop.names[0].variable);
+    try std.testing.expect(!loop.names[0].pointer);
+    try std.testing.expect(!body[1].kind.@"if".names[0].variable);
+    const names = body[2].kind.match.names;
+    try std.testing.expectEqualStrings("count", names[0].name);
+    try std.testing.expect(names[0].variable);
+    try std.testing.expectEqualStrings("rest", names[1].name);
+    try std.testing.expect(names[1].variable);
+}
+
+test "parseValueNames: parses variable names in braces after as var" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while map.pop() as var { one, two }\n        noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const loop = module.declarations[0].kind.function_definition.body[0].kind.@"while";
+    try std.testing.expect(loop.tuple);
+    try std.testing.expectEqualStrings("one", loop.names[0].name);
+    try std.testing.expect(loop.names[0].variable);
+    try std.testing.expectEqualStrings("two", loop.names[1].name);
+    try std.testing.expect(loop.names[1].variable);
+}
+
+test "parseValueNames: rejects a pointer name after as var" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    while map.pop() as var { key, *value }\n        noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.PointerVariableName, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 35 }, parser.failure.?.location.?);
+}
+
+test "parseValueNames: rejects a pointer name after as var in a case" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    match value\n        case (i64 as var *count) noop");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.PointerVariableName, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 26 }, parser.failure.?.location.?);
 }
 
 test "parseFor: parses a name, a sequence and an indented body" {

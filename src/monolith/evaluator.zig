@@ -4158,6 +4158,27 @@ test "enterCondition: takes the value of an optional apart and writes through a 
     try std.testing.expectEqual(Value{ .integer = .{ .signed = 0 } }, declarations[2].kind.constant_declaration.known.?.*);
 }
 
+test "enterCondition: writes a name after as var without writing the tested optional" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pair(start: i64) -> ?[i64, i64] = return { start, start + 1 }\nfn bump(start: ?i64) -> i64\n    if start as var count\n        count += 10\n        return count * 100 + (start orelse 0)\n    return 0\nfn sum(start: i64) -> i64\n    if pair(start) as var { first, second }\n        first += 1\n        second += first\n        return second\n    return 0\nconst BUMPED = bump(1)\nconst SUMMED = sum(2)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 1101 } }, declarations[3].kind.constant_declaration.known.?.*);
+    try std.testing.expectEqual(Value{ .integer = .{ .signed = 6 } }, declarations[4].kind.constant_declaration.known.?.*);
+}
+
 test "enterCondition: evaluates the optional of a while loop before each run" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

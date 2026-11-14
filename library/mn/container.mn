@@ -103,8 +103,7 @@ instance(type A: Decode(_, D) and Deinit, type D: Decoder) Decode(ArrayList(A), 
 
 
 private fn drain_list(type A, list: *ArrayList(A))
-    while list.pop() as element
-        var element = element
+    while list.pop() as var element
         element.deinit()
     list.deinit()
 
@@ -251,9 +250,7 @@ instance(type K: Hash and Decode(_, D) and Deinit, type V: Decode(_, D) and Dein
 
 
 private fn drain_map(type K, type V, map: *HashMap(K, V))
-    while map.pop() as { key, value }
-        var key = key
-        var value = value
+    while map.pop() as var { key, value }
         key.deinit()
         value.deinit()
     map.deinit()
@@ -374,8 +371,7 @@ instance(type T: Hash and Decode(_, D) and Deinit, type D: Decoder) Decode(HashS
 
 
 private fn drain_set(type T, set: *HashSet(T))
-    while set.pop() as value
-        var value = value
+    while set.pop() as var value
         value.deinit()
     set.deinit()
 

@@ -172,6 +172,7 @@ pub const TupleDeclaration = struct {
 pub const ElementName = struct {
     name: []const u8,
     pointer: bool = false,
+    variable: bool = false,
     location: token.Location,
     type: ?types.Type = null,
 };
@@ -1852,7 +1853,7 @@ pub fn findNameBranch(matching: Match, position: usize) usize {
 pub fn isWritableElement(element: Resolution.Element) bool {
     return switch (element.statement.kind) {
         .tuple_declaration => |declaration| declaration.variable,
-        else => false,
+        else => findElementName(element).variable,
     };
 }
 

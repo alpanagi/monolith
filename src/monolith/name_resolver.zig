@@ -2895,6 +2895,7 @@ pub const NameResolver = struct {
         try self.resolveNamesInBlock(block, statement.kind.@"if".body);
         for (block.locals.items[start..]) |local| {
             if (self.isDroppedName(local.name)) continue;
+            if (isUnmodifiedVariableName(local)) return self.fail(local.location, error.NeverModified);
             try self.expectUsed(local.use, local.location, error.UnusedValueName);
         }
         block.locals.shrinkRetainingCapacity(start);
@@ -2930,6 +2931,7 @@ pub const NameResolver = struct {
         try self.resolveNamesInBlock(block, body);
         for (block.locals.items[start..]) |local| {
             if (self.isDroppedName(local.name)) continue;
+            if (isUnmodifiedVariableName(local)) return self.fail(local.location, error.NeverModified);
             try self.expectUsed(local.use, local.location, error.UnusedLoopName);
         }
         block.locals.shrinkRetainingCapacity(start);
@@ -2980,6 +2982,7 @@ pub const NameResolver = struct {
             try self.resolveNamesInBlock(block, branch.body);
             for (block.locals.items[start..]) |local| {
                 if (self.isDroppedName(local.name)) continue;
+                if (isUnmodifiedVariableName(local)) return self.fail(local.location, error.NeverModified);
                 try self.expectUsed(local.use, local.location, error.UnusedValueName);
             }
             block.locals.shrinkRetainingCapacity(start);
@@ -3258,6 +3261,7 @@ pub const NameResolver = struct {
                 const local = findLocal(scope.locals, identifier.name) orelse {
                     return self.resolveNamesInExpression(scope, expression);
                 };
+                if (local.target == .element and ast.isWritableElement(local.target.element)) local.use.modified = true;
                 if (local.statement.kind != .variable_declaration) {
                     return self.resolveNamesInExpression(scope, expression);
                 }
@@ -6046,10 +6050,21 @@ fn recordModifiedVariable(scope: Scope, expression: ast.Expression) void {
     if (expression.kind != .identifier) return;
     const identifier = expression.kind.identifier;
     const resolution = identifier.resolution orelse return;
-    if (resolution != .local) return;
     const local = findLocal(scope.locals, identifier.name) orelse return;
-    if (local.statement != resolution.local) return;
-    if (local.statement.kind == .variable_declaration) local.use.modified = true;
+    switch (resolution) {
+        .local => |statement| {
+            if (local.statement == statement and statement.kind == .variable_declaration) local.use.modified = true;
+        },
+        .element => |element| {
+            if (local.target == .element and std.meta.eql(local.target.element, element)) local.use.modified = true;
+        },
+        else => {},
+    }
+}
+
+fn isUnmodifiedVariableName(local: Local) bool {
+    if (local.target != .element) return false;
+    return ast.findElementName(local.target.element).variable and !local.use.modified;
 }
 
 fn recordReadVariable(scope: Scope, expression: ast.Expression) void {
@@ -11022,6 +11037,25 @@ test "resolveNamedBody: rejects an unused name of an if" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, name_resolver.failure.?.location.?);
 }
 
+test "resolveNamedBody: rejects a name after as var that is never modified" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?i64) -> i64\n    if (value as var found) return found + 1\n    return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeverModified, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 22 }, name_resolver.failure.?.location.?);
+}
+
 test "resolveSequence: resolves a sequence outside the names of its loop" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -11220,6 +11254,25 @@ test "resolveLoop: rejects an unused name of a for loop" {
 
     try std.testing.expectError(error.UnusedLoopName, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 38 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveLoop: rejects a name in braces after as var that is never modified" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?[i64, i64]) -> i64\n    while value as var { one, two }\n        one += 1\n        return one + two\n    return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NeverModified, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 31 }, name_resolver.failure.?.location.?);
 }
 
 test "resolveLoop: accepts an underscore in place of a name of a for loop" {
@@ -12142,6 +12195,27 @@ test "resolveTarget: assigns a field of a variable" {
     try std.testing.expectEqual(&body[0], root.kind.identifier.resolution.?.local);
 }
 
+test "resolveTarget: assigns a name after as var" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn pick(value: ?i32) -> i32\n    if value as var found\n        found = 2\n        return found\n    return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const conditional = &loader.modules.items[0].declarations[0].kind.function_definition.body[0];
+    const target = conditional.kind.@"if".body[0].kind.assignment.target;
+    try std.testing.expectEqual(ast.Resolution{ .element = .{ .statement = conditional, .position = 0 } }, target.kind.identifier.resolution.?);
+}
+
 test "resolveTarget: counts a write through a local constant as a use" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -12299,6 +12373,25 @@ test "resolveTargetPath: leaves the use of a variable written through a field to
     const use = body[0].kind.variable_declaration.deferred_use.?;
     try std.testing.expect(!use.used);
     try std.testing.expect(!use.modified);
+}
+
+test "resolveTargetPath: counts writing a field of a name after as var as modifying it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point\n    x: i32\nfn pick(value: ?Point) -> i32\n    if value as var point\n        point.x = 2\n        return point.x\n    return 0" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    try std.testing.expectEqual(null, name_resolver.failure);
 }
 
 test "resolveDiscardedName: discards a parameter" {
