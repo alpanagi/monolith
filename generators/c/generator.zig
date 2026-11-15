@@ -13067,7 +13067,7 @@ test "Generator.generate: builds an executable that reports the errors of moving
     const allocator = arena.allocator();
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
     var loader = @import("monolith").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::convert::To\nimport mn::convert::View\nimport mn::filesystem\nimport mn::filesystem::Path\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::process::stdout\nimport mn::text\n\nfn report(source: Path, target: Path, options: filesystem::MoveOptions) -> !void\n    match filesystem::move(source, target, options)\n        case (filesystem::Error::AlreadyExists) try text::print(&stdout, \"already_exists\\n\", {})\n        case (filesystem::Error::NameTooLong) try text::print(&stdout, \"name_too_long\\n\", {})\n        case (filesystem::Error::NotFound) try text::print(&stdout, \"not_found\\n\", {})\n        else try text::print(&stdout, \"unexpected\\n\", {})\n\nfn report_text(source: const(*[]u8), target: const(*[]u8), options: filesystem::MoveOptions) -> !void\n    var source_path = try source.to(Path)\n    defer source_path.deinit()\n    var target_path = try target.to(Path)\n    defer target_path.deinit()\n    try report(source_path, target_path, options)\n\nfn main -> !void\n    with memory::Heap\n    try report_text(\"missing\", \"anything\", {})\n    try report_text(\"file\", \"missing/file\", {})\n    try report_text(\"directory\", \"empty\", {})\n    try report_text(\"directory\", \"full\", {})\n    try report_text(\"directory\", \"full\", { overwrite = true })\n    var nested = try \"/\".to(Path)\n    defer nested.deinit()\n    for _ in 0..2048\n        const longer = try nested.join(\"a\".view_as(Path))\n        nested.deinit()\n        nested = longer\n    var file = try \"file\".to(Path)\n    defer file.deinit()\n    try report(file, nested, {})\n    try report(nested, file, {})\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::convert::To\nimport mn::convert::View\nimport mn::filesystem\nimport mn::filesystem::Path\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::process::stdout\nimport mn::text\n\nfn report(source: Path, target: Path, options: filesystem::MoveOptions) -> !void\n    match filesystem::move(source, target, options)\n        case (filesystem::Error::AlreadyExists) try text::print(&stdout, \"already_exists\\n\", {})\n        case (filesystem::Error::IsDirectory) try text::print(&stdout, \"is_directory\\n\", {})\n        case (filesystem::Error::NameTooLong) try text::print(&stdout, \"name_too_long\\n\", {})\n        case (filesystem::Error::NotFound) try text::print(&stdout, \"not_found\\n\", {})\n        else try text::print(&stdout, \"unexpected\\n\", {})\n\nfn report_text(source: const(*[]u8), target: const(*[]u8), options: filesystem::MoveOptions) -> !void\n    var source_path = try source.to(Path)\n    defer source_path.deinit()\n    var target_path = try target.to(Path)\n    defer target_path.deinit()\n    try report(source_path, target_path, options)\n\nfn main -> !void\n    with memory::Heap\n    try report_text(\"missing\", \"anything\", {})\n    try report_text(\"file\", \"missing/file\", {})\n    try report_text(\"directory\", \"empty\", {})\n    try report_text(\"directory\", \"full\", {})\n    try report_text(\"directory\", \"full\", { overwrite = true })\n    var nested = try \"/\".to(Path)\n    defer nested.deinit()\n    for _ in 0..2048\n        const longer = try nested.join(\"a\".view_as(Path))\n        nested.deinit()\n        nested = longer\n    var file = try \"file\".to(Path)\n    defer file.deinit()\n    try report(file, nested, {})\n    try report(nested, file, {})\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13083,13 +13083,95 @@ test "Generator.generate: builds an executable that reports the errors of moving
     try std.testing.expectEqual(0, setup.term.exited);
 
     const result = try std.process.run(allocator, std.testing.io, .{ .argv = &.{"./main"}, .cwd = .{ .dir = build_directory } });
-    try std.testing.expectEqualStrings("not_found\nnot_found\nalready_exists\nalready_exists\nalready_exists\nname_too_long\nname_too_long\n", result.stdout);
+    try std.testing.expectEqualStrings("not_found\nnot_found\nis_directory\nis_directory\nis_directory\nname_too_long\nname_too_long\n", result.stdout);
     try std.testing.expectEqual(0, result.term.exited);
     try std.testing.expectError(error.FileNotFound, build_directory.statFile(std.testing.io, "anything", .{}));
     try std.testing.expectEqualStrings("hello", try build_directory.readFileAlloc(std.testing.io, "file", allocator, .unlimited));
     try std.testing.expectEqualStrings("kept", try build_directory.readFileAlloc(std.testing.io, "full/inside", allocator, .unlimited));
     try std.testing.expectEqual(.directory, (try build_directory.statFile(std.testing.io, "directory", .{})).kind);
     try std.testing.expectEqual(.directory, (try build_directory.statFile(std.testing.io, "empty", .{})).kind);
+}
+
+test "Generator.generate: builds an executable that moves across file systems by copying a file with its permissions and times or a symbolic link and removing the source, and copies no other kind of file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::convert::To\nimport mn::filesystem\nimport mn::filesystem::Path\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::process::stdout\nimport mn::text\n\nfn report(source: const(*[]u8), target: const(*[]u8), options: filesystem::MoveOptions) -> !void\n    var source_path = try source.to(Path)\n    defer source_path.deinit()\n    var target_path = try target.to(Path)\n    defer target_path.deinit()\n    match filesystem::move(source_path, target_path, options)\n        case (void) try text::print(&stdout, \"moved\\n\", {})\n        case (filesystem::Error::AlreadyExists) try text::print(&stdout, \"already_exists\\n\", {})\n        case (filesystem::Error::IsDirectory) try text::print(&stdout, \"is_directory\\n\", {})\n        case (filesystem::Error::NoSpace) try text::print(&stdout, \"no_space\\n\", {})\n        case (filesystem::Error::SystemFailure) try text::print(&stdout, \"system_failure\\n\", {})\n        else try text::print(&stdout, \"unexpected\\n\", {})\n\nfn main -> !void\n    with memory::Heap\n    try report(\"same\", \"renamed\", {})\n    try report(\"near/file\", \"far/file\", {})\n    try report(\"near/kept\", \"far/existing\", {})\n    try report(\"near/replacing\", \"far/existing\", { overwrite = true })\n    try report(\"near/other\", \"far/pointer\", { overwrite = true })\n    try report(\"near/link\", \"far/link\", {})\n    try report(\"near/second_link\", \"far/existing\", {})\n    try report(\"near/pipe\", \"far/pipe\", {})\n    try report(\"near/directory\", \"far/directory\", {})\n    try report(\"near/large\", \"far/large\", {})\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
+    defer build_directory.close(std.testing.io);
+    const source_directory = try build_directory.openDir(std.testing.io, "source", .{});
+    defer source_directory.close(std.testing.io);
+    try source_directory.writeFile(std.testing.io, .{ .sub_path = "crossing.c", .data = "#define _GNU_SOURCE\n#include <errno.h>\n#include <stdio.h>\n#include <string.h>\n\nint __real_rename(char const *from, char const *to);\nint __real_renameat2(int from_directory, char const *from, int to_directory, char const *to, unsigned int flags);\n\nstatic bool is_apart(char const *from, char const *to) {\n    char const *from_separator = strrchr(from, '/');\n    char const *to_separator = strrchr(to, '/');\n    size_t from_length = from_separator == NULL ? 0 : (size_t)(from_separator - from);\n    size_t to_length = to_separator == NULL ? 0 : (size_t)(to_separator - to);\n    return from_length != to_length || strncmp(from, to, from_length) != 0;\n}\n\nint __wrap_rename(char const *from, char const *to) {\n    fprintf(stderr, \"rename %s %s\\n\", from, to);\n    if (is_apart(from, to)) {\n        errno = EXDEV;\n        return -1;\n    }\n    return __real_rename(from, to);\n}\n\nint __wrap_renameat2(int from_directory, char const *from, int to_directory, char const *to, unsigned int flags) {\n    fprintf(stderr, \"renameat2 %s %s\\n\", from, to);\n    if (is_apart(from, to)) {\n        errno = EXDEV;\n        return -1;\n    }\n    return __real_renameat2(from_directory, from, to_directory, to, flags);\n}\n" });
+    const crossing_build = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "sh", "-c", "gcc -std=c23 -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -pedantic -O2 -Wl,--wrap=rename -Wl,--wrap=renameat2 $(find . -name '*.c') -o crossing" }, .cwd = .{ .dir = source_directory } });
+    try std.testing.expectEqualStrings("", crossing_build.stderr);
+    try std.testing.expectEqual(0, crossing_build.term.exited);
+    const setup = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "sh", "-c", "mkdir near far near/directory && printf same > same && stat -c %i same && printf content > near/file && chmod 640 near/file && touch -m -d @1000000000.123456789 near/file && touch -a -d @1100000000.111111111 near/file && printf kept > near/kept && printf old > far/existing && printf replacing > near/replacing && printf other > near/other && printf untouched > far/target && ln -s target far/pointer && ln -s absent near/link && ln -s elsewhere near/second_link && mkfifo near/pipe && truncate -s 100000 near/large" }, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqualStrings("", setup.stderr);
+    try std.testing.expectEqual(0, setup.term.exited);
+
+    const result = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "sh", "-c", "trap '' XFSZ && ulimit -f 8 && exec source/crossing" }, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqualStrings("moved\nmoved\nalready_exists\nmoved\nmoved\nmoved\nalready_exists\nsystem_failure\nis_directory\nno_space\n", result.stdout);
+    try std.testing.expectEqualStrings("renameat2 same renamed\nrenameat2 near/file far/file\nrenameat2 near/kept far/existing\nrename near/replacing far/existing\nrename near/other far/pointer\nrenameat2 near/link far/link\nrenameat2 near/second_link far/existing\nrenameat2 near/pipe far/pipe\nrenameat2 near/large far/large\n", result.stderr);
+    try std.testing.expectEqual(0, result.term.exited);
+
+    const state = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "sh", "-c", "export LC_ALL=C && test ! -e same && stat -c %i renamed && for name in far/file near/kept far/existing far/pointer far/target; do printf '%s %s\\n' $name \"$(cat $name)\"; done && stat -c '%n %a %.9Y %.9X' far/file && stat -c '%n %F' far/pointer far/link near/second_link near/pipe near/directory && readlink far/link near/second_link && stat -c '%n %s' near/large && ls -A far near" }, .cwd = .{ .dir = build_directory } });
+    const expected = try std.fmt.allocPrint(allocator, "{s}far/file content\nnear/kept kept\nfar/existing replacing\nfar/pointer other\nfar/target untouched\nfar/file 640 1000000000.123456789 1100000000.111111111\nfar/pointer regular file\nfar/link symbolic link\nnear/second_link symbolic link\nnear/pipe fifo\nnear/directory directory\nabsent\nelsewhere\nnear/large 100000\nfar:\nexisting\nfile\nlink\npointer\ntarget\n\nnear:\ndirectory\nkept\nlarge\npipe\nsecond_link\n", .{setup.stdout});
+    try std.testing.expectEqualStrings("", state.stderr);
+    try std.testing.expectEqualStrings(expected, state.stdout);
+    try std.testing.expectEqual(0, state.term.exited);
+}
+
+test "Generator.generate: builds an executable that reports a failure to remove the source after copying across file systems and leaves the file at both paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::convert::To\nimport mn::filesystem\nimport mn::filesystem::Path\nimport mn::memory\nimport mn::memory::Deinit\nimport mn::process::stdout\nimport mn::text\n\nfn main -> !void\n    with memory::Heap\n    var source = try \"locked/file\".to(Path)\n    defer source.deinit()\n    var target = try \"far/file\".to(Path)\n    defer target.deinit()\n    match filesystem::move(source, target)\n        case (void) try text::print(&stdout, \"moved\\n\", {})\n        case (filesystem::Error::PermissionDenied) try text::print(&stdout, \"permission_denied\\n\", {})\n        else try text::print(&stdout, \"unexpected\\n\", {})\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
+    defer build_directory.close(std.testing.io);
+    const source_directory = try build_directory.openDir(std.testing.io, "source", .{});
+    defer source_directory.close(std.testing.io);
+    try source_directory.writeFile(std.testing.io, .{ .sub_path = "crossing.c", .data = "#include <errno.h>\n\nint __wrap_renameat2(int from_directory, char const *from, int to_directory, char const *to, unsigned int flags) {\n    errno = EXDEV;\n    return -1;\n}\n" });
+    const crossing_build = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "sh", "-c", "gcc -std=c23 -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -pedantic -O2 -Wl,--wrap=renameat2 $(find . -name '*.c') -o crossing" }, .cwd = .{ .dir = source_directory } });
+    try std.testing.expectEqualStrings("", crossing_build.stderr);
+    try std.testing.expectEqual(0, crossing_build.term.exited);
+    const setup = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "sh", "-c", "mkdir locked far && printf content > locked/file && chmod 555 locked && id -u" }, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqualStrings("", setup.stderr);
+    try std.testing.expectEqual(0, setup.term.exited);
+    if (std.mem.eql(u8, setup.stdout, "0\n")) return error.SkipZigTest;
+
+    const result = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "sh", "-c", "source/crossing; status=$?; chmod 755 locked; exit $status" }, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqualStrings("permission_denied\n", result.stdout);
+    try std.testing.expectEqual(0, result.term.exited);
+    try std.testing.expectEqualStrings("content", try build_directory.readFileAlloc(std.testing.io, "locked/file", allocator, .unlimited));
+    try std.testing.expectEqualStrings("content", try build_directory.readFileAlloc(std.testing.io, "far/file", allocator, .unlimited));
 }
 
 test "Generator.generate: builds an executable that reads byte by byte through a buffered reader, which reads its inner reader once per buffer, gives 0 for an empty destination without reading and 0 at the end" {

@@ -16,8 +16,10 @@
 #include "monolith.h"
 
 #if defined(__APPLE__)
+#define mn_access_time st_atimespec
 #define mn_modified_time st_mtimespec
 #else
+#define mn_access_time st_atim
 #define mn_modified_time st_mtim
 #endif
 
@@ -200,10 +202,114 @@ static int mn_runtime_filesystem_move_exclusive(char const *from, char const *to
 #endif
 }
 
+static int mn_runtime_filesystem_clear_target(char const *target, bool overwrite) {
+    if (!overwrite || unlink(target) == 0 || errno == ENOENT) return 0;
+    return -1;
+}
+
+static int mn_runtime_filesystem_copy_by_reading(int source, int target) {
+    char buffer[65536];
+    while (true) {
+        ssize_t count = read(source, buffer, sizeof buffer);
+        if (count == 0) return 0;
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        ssize_t written = 0;
+        while (written < count) {
+            ssize_t result = write(target, buffer + written, (size_t)(count - written));
+            if (result < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            written += result;
+        }
+    }
+}
+
+static int mn_runtime_filesystem_copy_contents(int source, int target) {
+#if defined(__linux__)
+    while (true) {
+        ssize_t copied = copy_file_range(source, NULL, target, NULL, (size_t)1 << 30, 0);
+        if (copied == 0) return 0;
+        if (copied > 0) continue;
+        if (errno == EINTR) continue;
+        if (errno != EXDEV && errno != ENOSYS && errno != EINVAL && errno != EOPNOTSUPP) return -1;
+        break;
+    }
+#endif
+    return mn_runtime_filesystem_copy_by_reading(source, target);
+}
+
+static int mn_runtime_filesystem_copy_ownership(int descriptor, struct stat const *status) {
+    if (fchown(descriptor, status->st_uid, status->st_gid) == 0) return 0;
+    if (errno != EPERM) return -1;
+    if (fchown(descriptor, (uid_t)-1, status->st_gid) == 0 || errno == EPERM) return 0;
+    return -1;
+}
+
+static int mn_runtime_filesystem_copy_attributes(int descriptor, struct stat const *status) {
+    if (mn_runtime_filesystem_copy_ownership(descriptor, status) != 0) return -1;
+    if (fchmod(descriptor, status->st_mode & 07777) != 0) return -1;
+    struct timespec const times[2] = { status->mn_access_time, status->mn_modified_time };
+    return futimens(descriptor, times);
+}
+
+static int mn_runtime_filesystem_copy_file(mn_slice_u8 from, mn_slice_u8 to, bool overwrite) {
+    int source = mn_runtime_filesystem_open_at(AT_FDCWD, from, O_RDONLY | O_NOFOLLOW, 0);
+    if (source < 0) return -1;
+    struct stat status;
+    if (fstat(source, &status) != 0 || mn_runtime_filesystem_clear_target((char const *)to.items, overwrite) != 0) {
+        int number = errno;
+        close(source);
+        errno = number;
+        return -1;
+    }
+    int target = mn_runtime_filesystem_open_at(AT_FDCWD, to, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (target < 0) {
+        int number = errno;
+        close(source);
+        errno = number;
+        return -1;
+    }
+    bool is_copied = mn_runtime_filesystem_copy_contents(source, target) == 0 && mn_runtime_filesystem_copy_attributes(target, &status) == 0;
+    int number = errno;
+    close(source);
+    if (close(target) != 0 && is_copied) {
+        is_copied = false;
+        number = errno;
+    }
+    if (is_copied) return 0;
+    unlink((char const *)to.items);
+    errno = number;
+    return -1;
+}
+
+static int mn_runtime_filesystem_copy_link(char const *source, char const *target, bool overwrite) {
+    char link_target[PATH_MAX];
+    ssize_t length = readlink(source, link_target, sizeof link_target);
+    if (length < 0) return -1;
+    if ((size_t)length >= sizeof link_target) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    link_target[length] = 0;
+    if (mn_runtime_filesystem_clear_target(target, overwrite) != 0) return -1;
+    return symlink(link_target, target);
+}
+
 int32_t mn_runtime_filesystem_move(mn_slice_u8 from, mn_slice_u8 to, bool overwrite) {
     char const *source = (char const *)from.items;
     char const *target = (char const *)to.items;
-    int status = overwrite ? rename(source, target) : mn_runtime_filesystem_move_exclusive(source, target);
-    if (status != 0) return mn_runtime_filesystem_error_code(errno);
+    struct stat status;
+    if (lstat(source, &status) != 0) return mn_runtime_filesystem_error_code(errno);
+    if (S_ISDIR(status.st_mode)) return mn_runtime_filesystem_error_code(EISDIR);
+    int renamed = overwrite ? rename(source, target) : mn_runtime_filesystem_move_exclusive(source, target);
+    if (renamed == 0) return 0;
+    if (errno != EXDEV || !(S_ISREG(status.st_mode) || S_ISLNK(status.st_mode))) return mn_runtime_filesystem_error_code(errno);
+    int copied = S_ISREG(status.st_mode) ? mn_runtime_filesystem_copy_file(from, to, overwrite) : mn_runtime_filesystem_copy_link(source, target, overwrite);
+    if (copied != 0) return mn_runtime_filesystem_error_code(errno);
+    if (unlink(source) != 0) return mn_runtime_filesystem_error_code(errno);
     return 0;
 }
