@@ -100,18 +100,19 @@ instance stream::Writer(ArrayList(u8))
 instance(type A: Encode(_, E), type E: Encoder) Encode(ArrayList(A), E)
 
     fn encode(list: const(*Self), encoder: *E) -> !void
-        try encoder.sequence(list.count)
+        try encoder.begin_sequence()
         for *element in list.view_as(const(*[]A))
             try encoder.encode(element)
+        try encoder.end_sequence()
 
 
 instance(type A: Decode(_, D) and Deinit, type D: Decoder) Decode(ArrayList(A), D)
 
     fn decode(decoder: *D) -> !Self
-        const count = try decoder.sequence()
+        try decoder.sequence()
         var list = Self::init()
         errdefer drain_list(A, &list)
-        for _ in 0..count
+        while !try decoder.has_sequence_ended()
             var element = try decoder.decode(A)
             errdefer element.deinit()
             try list.append(element)
@@ -241,19 +242,20 @@ instance(type K: Hash, type V) Deinit(HashMap(K, V))
 instance(type K: Hash and Encode(_, E), type V: Encode(_, E), type E: Encoder) Encode(HashMap(K, V), E)
 
     fn encode(map: const(*Self), encoder: *E) -> !void
-        try encoder.map(map.count)
+        try encoder.begin_map()
         for { *key, *value } in map.iterator()
             try encoder.encode(key)
             try encoder.encode(value)
+        try encoder.end_map()
 
 
 instance(type K: Hash and Decode(_, D) and Deinit, type V: Decode(_, D) and Deinit, type D: Decoder) Decode(HashMap(K, V), D)
 
     fn decode(decoder: *D) -> !Self
-        const count = try decoder.map()
+        try decoder.map()
         var map = Self::init()
         errdefer drain_map(K, V, &map)
-        for _ in 0..count
+        while !try decoder.has_map_ended()
             var key = try decoder.decode(K)
             errdefer key.deinit()
             var value = try decoder.decode(V)
@@ -367,18 +369,19 @@ instance(type T: Hash) ToOwned(HashSet(T), *[]T)
 instance(type T: Hash and Encode(_, E), type E: Encoder) Encode(HashSet(T), E)
 
     fn encode(set: const(*Self), encoder: *E) -> !void
-        try encoder.sequence(set.count)
+        try encoder.begin_sequence()
         for *value in set.values()
             try encoder.encode(value)
+        try encoder.end_sequence()
 
 
 instance(type T: Hash and Decode(_, D) and Deinit, type D: Decoder) Decode(HashSet(T), D)
 
     fn decode(decoder: *D) -> !Self
-        const count = try decoder.sequence()
+        try decoder.sequence()
         var set = Self::init()
         errdefer drain_set(T, &set)
-        for _ in 0..count
+        while !try decoder.has_sequence_ended()
             var value = try decoder.decode(T)
             errdefer value.deinit()
             if (set.contains(&value)) return codec::Error::Malformed

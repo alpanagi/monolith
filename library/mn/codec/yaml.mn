@@ -31,7 +31,7 @@ fn YamlEncoder(type W: Writer) -> type
         private pending: ArrayList(u8)
         private is_line_open: bool
 
-        fn init(writer: *W) -> Self = { writer = writer, document = { kind = ::Document, remaining = 1, indentation = 0, is_value_next = false, budget = null }, frames = ::init(), pending = ::init(), is_line_open = false }
+        fn init(writer: *W) -> Self = { writer = writer, document = { kind = ::Document, remaining = 1, indentation = 0, place = ::Document, is_empty = false, is_value_next = false, budget = null }, frames = ::init(), pending = ::init(), is_line_open = false }
 
 
         private fn write_number(self: *Self, type T, value: T) -> !void
@@ -55,17 +55,26 @@ fn YamlEncoder(type W: Writer) -> type
             try self.end_scalar(place)
 
 
-        private fn open_collection(self: *Self, kind: FrameKind, count: usize) -> !void
+        private fn begin_collection(self: *Self, kind: FrameKind) -> !void
             const place = try self.begin_part(false)
-            if count == 0
-                if (place == ::Value) try self.pending.write(" ")
-                try self.pending.write(if (kind == ::Sequence) "[]" else "{}")
-                return self.end_scalar(place)
             const indentation: usize = if (place == ::Document) 0 else self.find_top().indentation + 2
-            if (place == ::Value) try self.pending.write("\n")
-            self.is_line_open = place == ::Item
-            try self.frames.append({ kind, remaining = count, indentation, is_value_next = false, budget = null })
+            try self.frames.append({ kind, remaining = null, indentation, place, is_empty = true, is_value_next = false, budget = null })
             try self.settle()
+
+
+        private fn end_collection(self: *Self, kind: FrameKind) -> !void
+            const frame = self.find_top()
+            if (frame.kind != kind or frame.budget != null) return Error::ExtraPart
+            if (frame.is_value_next) return Error::MissingPart
+            const ended = self.frames.pop().?
+            if (ended.is_empty) return self.write_empty(kind, ended.place)
+            try self.settle()
+
+
+        private fn write_empty(self: *Self, kind: FrameKind, place: Place) -> !void
+            if (place == ::Value) try self.pending.write(" ")
+            try self.pending.write(if (kind == ::Sequence) "[]" else "{}")
+            try self.end_scalar(place)
 
 
         private fn begin_scalar(self: *Self) -> !Place
@@ -75,17 +84,16 @@ fn YamlEncoder(type W: Writer) -> type
 
 
         private fn begin_part(self: *Self, is_scalar: bool) -> !Place
-            self.close_finished_frames()
             const frame = self.find_top()
-            if (frame.remaining == 0 or (frame.budget orelse 1) == 0) return Error::ExtraPart
+            if ((frame.remaining orelse 1) == 0 or (frame.budget orelse 1) == 0) return Error::ExtraPart
             if (frame.kind == ::Structure and !frame.is_value_next) return Error::ExtraPart
             if (frame.kind == ::Mapping and !frame.is_value_next and !is_scalar) return Error::KeyNotScalar
             if (frame.budget as budget) frame.budget = budget - 1
+            try self.write_opening(frame)
             if frame.kind == ::Document
                 frame.remaining = 0
                 return ::Document
             if frame.kind == ::Sequence
-                frame.remaining -= 1
                 try self.write_indentation(frame.indentation)
                 try self.pending.write("- ")
                 return ::Item
@@ -93,9 +101,15 @@ fn YamlEncoder(type W: Writer) -> type
                 try self.write_indentation(frame.indentation)
                 frame.is_value_next = true
                 return ::Key
-            frame.remaining -= 1
             frame.is_value_next = false
             return ::Value
+
+
+        private fn write_opening(self: *Self, frame: *EncodeFrame) -> !void
+            if (!frame.is_empty) return
+            frame.is_empty = false
+            if (frame.place == ::Value) try self.pending.write("\n")
+            self.is_line_open = frame.place == ::Item
 
 
         private fn end_scalar(self: *Self, place: Place) -> !void
@@ -117,15 +131,7 @@ fn YamlEncoder(type W: Writer) -> type
             return &frames[length - 1]
 
 
-        private fn close_finished_frames(self: *Self)
-            while self.frames.length() > 0
-                const frame = self.frames.view_as(const(*[]EncodeFrame))[self.frames.length() - 1]
-                if (frame.remaining != 0 or frame.is_value_next or frame.budget != null) return
-                _ = self.frames.pop()
-
-
         private fn open_value(self: *Self) -> Mark
-            self.close_finished_frames()
             const frame = self.find_top()
             const mark: Mark = { depth = self.frames.length(), saved = frame.budget, allowed = find_allowance(frame.budget) }
             frame.budget = mark.allowed
@@ -133,10 +139,7 @@ fn YamlEncoder(type W: Writer) -> type
 
 
         private fn close_value(self: *Self, mark: Mark) -> !void
-            while self.frames.length() > mark.depth
-                const open = self.frames.view_as(const(*[]EncodeFrame))[self.frames.length() - 1]
-                if (open.remaining != 0 or open.is_value_next) return Error::MissingPart
-                _ = self.frames.pop()
+            if (self.frames.length() > mark.depth) return Error::MissingPart
             const frame = self.find_top()
             if (mark.allowed == 0 or (frame.budget orelse 0) != 0) return Error::MissingPart
             frame.budget = find_restored_budget(mark.saved, mark.allowed)
@@ -176,23 +179,27 @@ instance(type W: Writer) Encoder(YamlEncoder(W))
     fn bytes(self: *Self, value: const(*[]u8)) -> !void = self.write_scalar(value, true)
     fn absent(self: *Self) -> !void = self.write_scalar("null", false)
     fn present(_: *Self) -> !void = noop
-    fn sequence(self: *Self, count: usize) -> !void = self.open_collection(::Sequence, count)
-    fn map(self: *Self, count: usize) -> !void = self.open_collection(::Mapping, count)
-    fn structure(self: *Self, count: usize) -> !void = self.open_collection(::Structure, count)
+    fn begin_sequence(self: *Self) -> !void = self.begin_collection(::Sequence)
+    fn end_sequence(self: *Self) -> !void = self.end_collection(::Sequence)
+    fn begin_map(self: *Self) -> !void = self.begin_collection(::Mapping)
+    fn end_map(self: *Self) -> !void = self.end_collection(::Mapping)
+    fn begin_structure(self: *Self) -> !void = self.begin_collection(::Structure)
+    fn end_structure(self: *Self) -> !void = self.end_collection(::Structure)
 
 
     fn field(self: *Self, name: const(*[]u8)) -> !void
-        self.close_finished_frames()
         const frame = self.find_top()
-        if (frame.kind != ::Structure or frame.remaining == 0) return Error::ExtraPart
+        if (frame.kind != ::Structure) return Error::ExtraPart
         if (frame.is_value_next) return Error::MissingPart
+        try self.write_opening(frame)
         try self.write_indentation(frame.indentation)
         try write_text(&self.pending, name)
         try self.pending.write(":")
         frame.is_value_next = true
 
 
-    fn tuple(self: *Self, count: usize) -> !void = self.open_collection(::Sequence, count)
+    fn begin_tuple(self: *Self) -> !void = self.begin_collection(::Sequence)
+    fn end_tuple(self: *Self) -> !void = self.end_collection(::Sequence)
     fn variant(self: *Self, name: const(*[]u8), _: usize) -> !void = self.write_scalar(name, true)
 
 
@@ -215,13 +222,12 @@ struct YamlDecoder
     private contents: ArrayList(u8)
     private frames: ArrayList(DecodeFrame)
     private document: DecodeFrame
-    private has_unread_part: bool
 
     fn(type R: Reader) init(reader: *R) -> !Self
         var input = ArrayList(u8)::init()
         defer input.deinit()
         try read_input(reader, &input)
-        var decoder: Self = { nodes = ::init(), contents = ::init(), frames = ::init(), document = { kind = ::Document, node = 0, next = 0, remaining = 1, selected = null, budget = null }, has_unread_part = false }
+        var decoder: Self = { nodes = ::init(), contents = ::init(), frames = ::init(), document = { kind = ::Document, node = 0, next = 0, remaining = 1, selected = null, budget = null } }
         errdefer decoder.deinit()
         var parser: Parser = { input = input.view_as(const(*[]u8)), position = 0, line_start = 0, depth = 0, nodes = &decoder.nodes, contents = &decoder.contents }
         const root = try parser.parse_document()
@@ -247,6 +253,15 @@ struct YamlDecoder
         return node.count
 
 
+    private fn has_collection_ended(self: *Self, kind: FrameKind) -> codec::Error!bool
+        self.close_finished_frames()
+        const frame = self.find_top()
+        if (frame.kind != kind or frame.budget != null) return codec::Error::Malformed
+        if (frame.remaining != 0) return false
+        _ = self.frames.pop()
+        return true
+
+
     private fn take_scalar(self: *Self) -> codec::Error!const(*[]u8)
         const index = try self.take_part()
         if (self.nodes.view_as(const(*[]Node))[index].kind != ::Scalar) return codec::Error::Malformed
@@ -267,7 +282,6 @@ struct YamlDecoder
 
 
     private fn find_part(self: *Self) -> codec::Error!usize
-        if (self.has_unread_part) return codec::Error::Malformed
         self.close_finished_frames()
         const frame = self.find_top()
         if (frame.remaining == 0 or (frame.budget orelse 1) == 0) return codec::Error::Malformed
@@ -301,12 +315,12 @@ struct YamlDecoder
     private fn close_finished_frames(self: *Self)
         while self.frames.length() > 0
             const frame = self.frames.view_as(const(*[]DecodeFrame))[self.frames.length() - 1]
+            if (frame.kind != ::Structure and frame.kind != ::Tuple) return
             if (frame.remaining != 0 or frame.selected != null or frame.budget != null) return
             _ = self.frames.pop()
 
 
-    private fn open_value(self: *Self) -> codec::Error!Mark
-        if (self.has_unread_part) return codec::Error::Malformed
+    private fn open_value(self: *Self) -> Mark
         self.close_finished_frames()
         const frame = self.find_top()
         const mark: Mark = { depth = self.frames.length(), saved = frame.budget, allowed = find_allowance(frame.budget) }
@@ -315,12 +329,10 @@ struct YamlDecoder
 
 
     private fn close_value(self: *Self, mark: Mark)
-        while self.frames.length() > mark.depth
-            const open = self.frames.view_as(const(*[]DecodeFrame))[self.frames.length() - 1]
-            if (open.remaining != 0 or open.selected != null) self.has_unread_part = true
-            _ = self.frames.pop()
+        while (self.frames.length() > mark.depth) _ = self.frames.pop()
         const frame = self.find_top()
-        if (mark.allowed == 0 or (frame.budget orelse 0) != 0) self.has_unread_part = true
+        const is_part_unread = (frame.budget orelse 0) != 0 and frame.remaining != 0
+        if (is_part_unread and (frame.kind != ::Structure or frame.selected != null)) self.consume_part()
         frame.budget = find_restored_budget(mark.saved, mark.allowed)
 
 
@@ -366,22 +378,26 @@ instance Decoder(YamlDecoder)
         return false
 
 
-    fn sequence(self: *Self) -> !usize = self.open_collection(::Sequence, ::Sequence)
+    fn sequence(self: *Self) -> !void
+        _ = try self.open_collection(::Sequence, ::Sequence)
 
 
-    fn map(self: *Self) -> !usize
-        const count = try self.open_collection(::Mapping, ::Mapping)
-        return count / 2
+    fn has_sequence_ended(self: *Self) -> !bool = self.has_collection_ended(::Sequence)
 
 
-    fn structure(self: *Self, count: usize) -> !void
+    fn map(self: *Self) -> !void
+        _ = try self.open_collection(::Mapping, ::Mapping)
+
+
+    fn has_map_ended(self: *Self) -> !bool = self.has_collection_ended(::Mapping)
+
+
+    fn structure(self: *Self) -> !void
         const children = try self.open_collection(::Mapping, ::Structure)
-        if (children != count * 2) return codec::Error::Malformed
-        self.find_top().remaining = count
+        self.find_top().remaining = children / 2
 
 
     fn field(self: *Self, name: const(*[]u8)) -> !void
-        if (self.has_unread_part) return codec::Error::Malformed
         self.close_finished_frames()
         const frame = self.find_top()
         if (frame.kind != ::Structure or frame.remaining == 0 or frame.selected != null) return codec::Error::Malformed
@@ -396,8 +412,8 @@ instance Decoder(YamlDecoder)
         return codec::Error::Malformed
 
 
-    fn tuple(self: *Self, count: usize) -> !void
-        if (try self.open_collection(::Sequence, ::Sequence) != count) return codec::Error::Malformed
+    fn tuple(self: *Self) -> !void
+        _ = try self.open_collection(::Sequence, ::Tuple)
 
 
     fn variant(self: *Self, names: const(*[]const(*[]u8))) -> !usize
@@ -408,7 +424,7 @@ instance Decoder(YamlDecoder)
 
 
     fn decode(self: *Self, type T: Decode(_, Self)) -> !T
-        const mark = try self.open_value()
+        const mark = self.open_value()
         const value = try Decode(T, Self)::decode(self)
         self.close_value(mark)
         return value
@@ -424,8 +440,10 @@ instance Deinit(YamlDecoder)
 
 private struct EncodeFrame
     kind: FrameKind
-    remaining: usize
+    remaining: ?usize
     indentation: usize
+    place: Place
+    is_empty: bool
     is_value_next: bool
     budget: ?usize
 
@@ -457,6 +475,7 @@ private enum FrameKind
     Sequence
     Mapping
     Structure
+    Tuple
 
 
 private struct Parser

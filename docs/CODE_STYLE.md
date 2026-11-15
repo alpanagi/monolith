@@ -1,3 +1,7 @@
+## Project Layout
+
+- An application's modules are inside a directory `source` at the top of the project, with `main.mn` directly in it, e.g. `source/main.mn` and `source/index.mn`, built with `monolith build source/main.mn`. The top of the project holds no `.mn` files.
+
 ## Module Layout
 
 - A module starts with its imports, then its external functions, then its constants, then its other declarations.

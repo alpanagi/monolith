@@ -32,11 +32,15 @@ typeclass Encoder(type E)
     fn bytes(self: *E, value: const(*[]u8)) -> !void
     fn absent(self: *E) -> !void
     fn present(self: *E) -> !void
-    fn sequence(self: *E, count: usize) -> !void
-    fn map(self: *E, count: usize) -> !void
-    fn structure(self: *E, count: usize) -> !void
+    fn begin_sequence(self: *E) -> !void
+    fn end_sequence(self: *E) -> !void
+    fn begin_map(self: *E) -> !void
+    fn end_map(self: *E) -> !void
+    fn begin_structure(self: *E) -> !void
+    fn end_structure(self: *E) -> !void
     fn field(self: *E, name: const(*[]u8)) -> !void
-    fn tuple(self: *E, count: usize) -> !void
+    fn begin_tuple(self: *E) -> !void
+    fn end_tuple(self: *E) -> !void
     fn variant(self: *E, name: const(*[]u8), number: usize) -> !void
     fn(type T: Encode(_, E)) encode(self: *E, value: const(*T)) -> !void
 
@@ -67,11 +71,13 @@ typeclass Decoder(type D)
     fn bool(self: *D) -> !bool
     fn bytes(self: *D) -> !*[]u8
     fn is_present(self: *D) -> !bool
-    fn sequence(self: *D) -> !usize
-    fn map(self: *D) -> !usize
-    fn structure(self: *D, count: usize) -> !void
+    fn sequence(self: *D) -> !void
+    fn has_sequence_ended(self: *D) -> !bool
+    fn map(self: *D) -> !void
+    fn has_map_ended(self: *D) -> !bool
+    fn structure(self: *D) -> !void
     fn field(self: *D, name: const(*[]u8)) -> !void
-    fn tuple(self: *D, count: usize) -> !void
+    fn tuple(self: *D) -> !void
     fn variant(self: *D, names: const(*[]const(*[]u8))) -> !usize
     fn decode(self: *D, type T: Decode(_, D)) -> !T
 
@@ -282,24 +288,29 @@ instance(type A: Decode(_, D), type D: Decoder) Decode(?A, D)
 instance(type A: Encode(_, E), type E: Encoder, comptime N: usize) Encode([N]A, E)
 
     fn encode(value: const(*Self), encoder: *E) -> !void
-        try encoder.sequence(N)
+        try encoder.begin_sequence()
         if N > 0
             for *element in value
                 try encoder.encode(element)
+        try encoder.end_sequence()
 
 
 instance(type A: Decode(_, D) and Deinit, type D: Decoder, comptime N: usize) Decode([N]A, D)
 
     fn decode(decoder: *D) -> !Self
-        if (try decoder.sequence() != N) return Error::Malformed
+        try decoder.sequence()
         var elements: Self = undefined
         if N > 0
             var count: usize = 0
             errdefer drain_elements(A, N, &elements, count)
-            while count < N
+            while !try decoder.has_sequence_ended()
+                if (count == N) return Error::Malformed
                 const element = try decoder.decode(A)
                 elements[count] = element
                 count += 1
+            if (count < N) return Error::Malformed
+        else
+            if (!try decoder.has_sequence_ended()) return Error::Malformed
         return elements
 
 

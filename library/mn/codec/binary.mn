@@ -4,7 +4,10 @@ import mn::codec::Decode
 import mn::codec::Decoder
 import mn::codec::Encode
 import mn::codec::Encoder
+import mn::container::ArrayList
+import mn::convert::View
 import mn::memory
+import mn::memory::Deinit
 import mn::stream::Reader
 import mn::stream::Writer
 
@@ -12,165 +15,260 @@ import mn::stream::Writer
 fn BinaryEncoder(type W: Writer) -> type
     return struct
         private writer: *W
+        private buffers: ArrayList(Buffer)
+        private depth: usize
 
-        fn init(writer: *W) -> Self = { writer = writer }
+        fn init(writer: *W) -> Self = { writer = writer, buffers = ::init(), depth = 0 }
+
+
+        private fn write_unsigned(self: *Self, type U, value: U) -> !void
+            var bytes: [16]u8 = undefined
+            var rest = value
+            for index in 0..mn::size(U)
+                bytes[index] = mn::truncate(u8, rest & 255)
+                rest = rest >> 8
+            try self.write(bytes[..mn::size(U)])
+
+
+        private fn write(self: *Self, bytes: const(*[]u8)) -> !void
+            const buffer = self.find_innermost() orelse return Writer::write(self.writer, bytes)
+            try buffer.bytes.write(bytes)
+
+
+        private fn find_innermost(self: *Self) -> ?*Buffer
+            const length = self.buffers.length()
+            if (length == 0) return null
+            const buffers = self.buffers.view_as(*[]Buffer)
+            return &buffers[length - 1]
+
+
+        private fn open_collection(self: *Self) -> !void
+            try self.buffers.append({ bytes = ::init(), count = 0, depth = self.depth })
+
+
+        private fn close_collection(self: *Self, parts: usize) -> !void
+            var buffer = self.buffers.pop().?
+            defer buffer.bytes.deinit()
+            try self.write_unsigned(usize, buffer.count / parts)
+            try self.write(buffer.bytes.view_as(const(*[]u8)))
+
+
+        private fn count_part(self: *Self)
+            const buffer = self.find_innermost() orelse return
+            if (buffer.depth == self.depth) buffer.count += 1
 
 
 instance(type W: Writer) Encoder(BinaryEncoder(W))
 
-    fn i8(self: *Self, value: i8) -> !void = write_unsigned(self.writer, u8, copy_bits(u8, i8, &value))
-    fn i16(self: *Self, value: i16) -> !void = write_unsigned(self.writer, u16, copy_bits(u16, i16, &value))
-    fn i32(self: *Self, value: i32) -> !void = write_unsigned(self.writer, u32, copy_bits(u32, i32, &value))
-    fn i64(self: *Self, value: i64) -> !void = write_unsigned(self.writer, u64, copy_bits(u64, i64, &value))
-    fn i128(self: *Self, value: i128) -> !void = write_unsigned(self.writer, u128, copy_bits(u128, i128, &value))
-    fn isize(self: *Self, value: isize) -> !void = write_unsigned(self.writer, usize, copy_bits(usize, isize, &value))
-    fn u8(self: *Self, value: u8) -> !void = write_unsigned(self.writer, u8, value)
-    fn u16(self: *Self, value: u16) -> !void = write_unsigned(self.writer, u16, value)
-    fn u32(self: *Self, value: u32) -> !void = write_unsigned(self.writer, u32, value)
-    fn u64(self: *Self, value: u64) -> !void = write_unsigned(self.writer, u64, value)
-    fn u128(self: *Self, value: u128) -> !void = write_unsigned(self.writer, u128, value)
-    fn usize(self: *Self, value: usize) -> !void = write_unsigned(self.writer, usize, value)
-    fn f16(self: *Self, value: f16) -> !void = write_unsigned(self.writer, u16, copy_bits(u16, f16, &value))
-    fn f32(self: *Self, value: f32) -> !void = write_unsigned(self.writer, u32, copy_bits(u32, f32, &value))
-    fn f64(self: *Self, value: f64) -> !void = write_unsigned(self.writer, u64, copy_bits(u64, f64, &value))
-    fn f128(self: *Self, value: f128) -> !void = write_unsigned(self.writer, u128, copy_bits(u128, f128, &value))
-    fn bool(self: *Self, value: bool) -> !void = write_unsigned(self.writer, u8, if (value) 1 else 0)
+    fn i8(self: *Self, value: i8) -> !void = self.write_unsigned(u8, copy_bits(u8, i8, &value))
+    fn i16(self: *Self, value: i16) -> !void = self.write_unsigned(u16, copy_bits(u16, i16, &value))
+    fn i32(self: *Self, value: i32) -> !void = self.write_unsigned(u32, copy_bits(u32, i32, &value))
+    fn i64(self: *Self, value: i64) -> !void = self.write_unsigned(u64, copy_bits(u64, i64, &value))
+    fn i128(self: *Self, value: i128) -> !void = self.write_unsigned(u128, copy_bits(u128, i128, &value))
+    fn isize(self: *Self, value: isize) -> !void = self.write_unsigned(usize, copy_bits(usize, isize, &value))
+    fn u8(self: *Self, value: u8) -> !void = self.write_unsigned(u8, value)
+    fn u16(self: *Self, value: u16) -> !void = self.write_unsigned(u16, value)
+    fn u32(self: *Self, value: u32) -> !void = self.write_unsigned(u32, value)
+    fn u64(self: *Self, value: u64) -> !void = self.write_unsigned(u64, value)
+    fn u128(self: *Self, value: u128) -> !void = self.write_unsigned(u128, value)
+    fn usize(self: *Self, value: usize) -> !void = self.write_unsigned(usize, value)
+    fn f16(self: *Self, value: f16) -> !void = self.write_unsigned(u16, copy_bits(u16, f16, &value))
+    fn f32(self: *Self, value: f32) -> !void = self.write_unsigned(u32, copy_bits(u32, f32, &value))
+    fn f64(self: *Self, value: f64) -> !void = self.write_unsigned(u64, copy_bits(u64, f64, &value))
+    fn f128(self: *Self, value: f128) -> !void = self.write_unsigned(u128, copy_bits(u128, f128, &value))
+    fn bool(self: *Self, value: bool) -> !void = self.write_unsigned(u8, if (value) 1 else 0)
 
 
     fn bytes(self: *Self, value: const(*[]u8)) -> !void
-        try write_unsigned(self.writer, usize, value.length)
-        try Writer::write(self.writer, value)
+        try self.write_unsigned(usize, value.length)
+        try self.write(value)
 
 
-    fn absent(self: *Self) -> !void = write_unsigned(self.writer, u8, 0)
-    fn present(self: *Self) -> !void = write_unsigned(self.writer, u8, 1)
-    fn sequence(self: *Self, count: usize) -> !void = write_unsigned(self.writer, usize, count)
-    fn map(self: *Self, count: usize) -> !void = write_unsigned(self.writer, usize, count)
-    fn structure(self: *Self, count: usize) -> !void = write_unsigned(self.writer, usize, count)
+    fn absent(self: *Self) -> !void = self.write_unsigned(u8, 0)
+    fn present(self: *Self) -> !void = self.write_unsigned(u8, 1)
+    fn begin_sequence(self: *Self) -> !void = self.open_collection()
+    fn end_sequence(self: *Self) -> !void = self.close_collection(1)
+    fn begin_map(self: *Self) -> !void = self.open_collection()
+    fn end_map(self: *Self) -> !void = self.close_collection(2)
+    fn begin_structure(self: *Self) -> !void = self.open_collection()
+    fn end_structure(self: *Self) -> !void = self.close_collection(1)
     fn field(_: *Self, _: const(*[]u8)) -> !void = noop
-    fn tuple(self: *Self, count: usize) -> !void = write_unsigned(self.writer, usize, count)
-    fn variant(self: *Self, _: const(*[]u8), number: usize) -> !void = write_unsigned(self.writer, usize, number)
-    fn(type T: Encode(_, Self)) encode(self: *Self, value: const(*T)) -> !void = Encode::encode(value, self)
+    fn begin_tuple(self: *Self) -> !void = self.open_collection()
+    fn end_tuple(self: *Self) -> !void = self.close_collection(1)
+    fn variant(self: *Self, _: const(*[]u8), number: usize) -> !void = self.write_unsigned(usize, number)
+
+
+    fn(type T: Encode(_, Self)) encode(self: *Self, value: const(*T)) -> !void
+        self.count_part()
+        self.depth += 1
+        defer self.depth -= 1
+        try Encode::encode(value, self)
+
+
+instance(type W: Writer) Deinit(BinaryEncoder(W))
+
+    fn deinit(encoder: *Self)
+        while encoder.buffers.pop() as var buffer
+            buffer.bytes.deinit()
+        encoder.buffers.deinit()
 
 
 fn BinaryDecoder(type R: Reader) -> type
     return struct
         private reader: *R
+        private remaining: ArrayList(usize)
+        private parts: ?usize
+        private has_unread_part: bool
 
-        fn init(reader: *R) -> Self = { reader = reader }
+        fn init(reader: *R) -> Self = { reader = reader, remaining = ::init(), parts = null, has_unread_part = false }
+
+
+        private fn read(self: *Self, type U) -> !U
+            if (self.has_unread_part) return codec::Error::Malformed
+            return read_unsigned(self.reader, U)
+
+
+        private fn open_collection(self: *Self) -> !void
+            const count = try self.read(usize)
+            try self.remaining.append(count)
+
+
+        private fn has_collection_ended(self: *Self) -> bool
+            const remaining = self.remaining.view_as(*[]usize)
+            const innermost = &remaining[remaining.length - 1]
+            if innermost.* == 0
+                _ = self.remaining.pop()
+                return true
+            innermost.* -= 1
+            return false
+
+
+        private fn count_part(self: *Self) -> codec::Error!void
+            const parts = self.parts orelse return
+            if (parts == 0) return codec::Error::Malformed
+            self.parts = parts - 1
+
+
+        private fn open_counted(self: *Self) -> !void
+            self.parts = try self.read(usize)
 
 
 instance(type R: Reader) Decoder(BinaryDecoder(R))
 
     fn i8(self: *Self) -> !i8
-        const bits = try read_unsigned(self.reader, u8)
+        const bits = try self.read(u8)
         return copy_bits(i8, u8, &bits)
 
 
     fn i16(self: *Self) -> !i16
-        const bits = try read_unsigned(self.reader, u16)
+        const bits = try self.read(u16)
         return copy_bits(i16, u16, &bits)
 
 
     fn i32(self: *Self) -> !i32
-        const bits = try read_unsigned(self.reader, u32)
+        const bits = try self.read(u32)
         return copy_bits(i32, u32, &bits)
 
 
     fn i64(self: *Self) -> !i64
-        const bits = try read_unsigned(self.reader, u64)
+        const bits = try self.read(u64)
         return copy_bits(i64, u64, &bits)
 
 
     fn i128(self: *Self) -> !i128
-        const bits = try read_unsigned(self.reader, u128)
+        const bits = try self.read(u128)
         return copy_bits(i128, u128, &bits)
 
 
     fn isize(self: *Self) -> !isize
-        const bits = try read_unsigned(self.reader, usize)
+        const bits = try self.read(usize)
         return copy_bits(isize, usize, &bits)
 
 
-    fn u8(self: *Self) -> !u8 = read_unsigned(self.reader, u8)
-    fn u16(self: *Self) -> !u16 = read_unsigned(self.reader, u16)
-    fn u32(self: *Self) -> !u32 = read_unsigned(self.reader, u32)
-    fn u64(self: *Self) -> !u64 = read_unsigned(self.reader, u64)
-    fn u128(self: *Self) -> !u128 = read_unsigned(self.reader, u128)
-    fn usize(self: *Self) -> !usize = read_unsigned(self.reader, usize)
+    fn u8(self: *Self) -> !u8 = self.read(u8)
+    fn u16(self: *Self) -> !u16 = self.read(u16)
+    fn u32(self: *Self) -> !u32 = self.read(u32)
+    fn u64(self: *Self) -> !u64 = self.read(u64)
+    fn u128(self: *Self) -> !u128 = self.read(u128)
+    fn usize(self: *Self) -> !usize = self.read(usize)
 
 
     fn f16(self: *Self) -> !f16
-        const bits = try read_unsigned(self.reader, u16)
+        const bits = try self.read(u16)
         return copy_bits(f16, u16, &bits)
 
 
     fn f32(self: *Self) -> !f32
-        const bits = try read_unsigned(self.reader, u32)
+        const bits = try self.read(u32)
         return copy_bits(f32, u32, &bits)
 
 
     fn f64(self: *Self) -> !f64
-        const bits = try read_unsigned(self.reader, u64)
+        const bits = try self.read(u64)
         return copy_bits(f64, u64, &bits)
 
 
     fn f128(self: *Self) -> !f128
-        const bits = try read_unsigned(self.reader, u128)
+        const bits = try self.read(u128)
         return copy_bits(f128, u128, &bits)
 
 
-    fn bool(self: *Self) -> !bool = match try read_unsigned(self.reader, u8)
+    fn bool(self: *Self) -> !bool = match try self.read(u8)
         case (0) false
         case (1) true
         else codec::Error::Malformed
 
 
     fn bytes(self: *Self) -> !*[]u8
-        const length = try read_unsigned(self.reader, usize)
+        const length = try self.read(usize)
         const bytes = try memory::allocate(u8, length)
         errdefer memory::free(bytes)
         try read_exact(self.reader, bytes)
         return bytes
 
 
-    fn is_present(self: *Self) -> !bool = match try read_unsigned(self.reader, u8)
+    fn is_present(self: *Self) -> !bool = match try self.read(u8)
         case (0) false
         case (1) true
         else codec::Error::Malformed
 
 
-    fn sequence(self: *Self) -> !usize = read_unsigned(self.reader, usize)
-    fn map(self: *Self) -> !usize = read_unsigned(self.reader, usize)
+    fn sequence(self: *Self) -> !void = self.open_collection()
+    fn has_sequence_ended(self: *Self) -> !bool = self.has_collection_ended()
+    fn map(self: *Self) -> !void = self.open_collection()
+    fn has_map_ended(self: *Self) -> !bool = self.has_collection_ended()
 
 
-    fn structure(self: *Self, count: usize) -> !void
-        if (try read_unsigned(self.reader, usize) != count) return codec::Error::Malformed
-
-
+    fn structure(self: *Self) -> !void = self.open_counted()
     fn field(_: *Self, _: const(*[]u8)) -> !void = noop
-
-
-    fn tuple(self: *Self, count: usize) -> !void
-        if (try read_unsigned(self.reader, usize) != count) return codec::Error::Malformed
+    fn tuple(self: *Self) -> !void = self.open_counted()
 
 
     fn variant(self: *Self, names: const(*[]const(*[]u8))) -> !usize
-        const number = try read_unsigned(self.reader, usize)
+        const number = try self.read(usize)
         if (number >= names.length) return codec::Error::Malformed
         return number
 
 
-    fn decode(self: *Self, type T: Decode(_, Self)) -> !T = Decode(T, Self)::decode(self)
+    fn decode(self: *Self, type T: Decode(_, Self)) -> !T
+        try self.count_part()
+        const enclosing = self.parts
+        self.parts = null
+        defer self.parts = enclosing
+        const value = try Decode(T, Self)::decode(self)
+        if ((self.parts orelse 0) != 0) self.has_unread_part = true
+        return value
 
 
-private fn(type W: Writer) write_unsigned(writer: *W, type U, value: U) -> !void
-    var bytes: [16]u8 = undefined
-    var rest = value
-    for index in 0..mn::size(U)
-        bytes[index] = mn::truncate(u8, rest & 255)
-        rest = rest >> 8
-    try Writer::write(writer, bytes[..mn::size(U)])
+instance(type R: Reader) Deinit(BinaryDecoder(R))
+
+    fn deinit(decoder: *Self) = decoder.remaining.deinit()
+
+
+private struct Buffer
+    bytes: ArrayList(u8)
+    count: usize
+    depth: usize
 
 
 private fn copy_bits(type T, type F, value: const(*F)) -> T

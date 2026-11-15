@@ -42,17 +42,18 @@ instance(type R: Reader) Decode(WallTime, binary::BinaryDecoder(R))
 instance(type W: Writer) Encode(WallTime, yaml::YamlEncoder(W))
 
     fn encode(wall_time: const(*Self), encoder: *yaml::YamlEncoder(W)) -> !void
-        try encoder.structure(2)
+        try encoder.begin_structure()
         try encoder.field("seconds")
         try encoder.encode(&wall_time.seconds)
         try encoder.field("nanoseconds")
         try encoder.encode(&wall_time.nanoseconds)
+        try encoder.end_structure()
 
 
 instance Decode(WallTime, yaml::YamlDecoder)
 
     fn decode(decoder: *yaml::YamlDecoder) -> !Self
-        try decoder.structure(2)
+        try decoder.structure()
         try decoder.field("seconds")
         const seconds = try decoder.decode(i64)
         try decoder.field("nanoseconds")
