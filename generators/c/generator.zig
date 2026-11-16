@@ -27415,3 +27415,26 @@ test "integration: gives a generic function that writes the allocator only for t
         files[1].contents,
     );
 }
+
+test "integration: builds the program that init writes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var project_directory = std.testing.tmpDir(.{});
+    defer project_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    var initializer: @import("monolith").ProjectInitializer = .{};
+    try initializer.initialize(allocator, std.testing.io, project_directory.dir);
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &project_directory.sub_path, "source" });
+    var loader = @import("monolith").Loader.init(program_path, "library");
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    var generator = Generator.init(try analyzer.analyze());
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const executable = try output_directory.dir.statFile(std.testing.io, "build/main", .{});
+    try std.testing.expectEqual(.file, executable.kind);
+}

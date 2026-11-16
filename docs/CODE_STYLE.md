@@ -1,6 +1,7 @@
 ## Project Layout
 
 - An application's modules are inside a directory `source` at the top of the project, with `main.mn` directly in it, e.g. `source/main.mn` and `source/index.mn`, built with `monolith build source/main.mn`. The top of the project holds no `.mn` files.
+- Tests are inside a directory `tests` beside `source`, e.g. `tests/index.mn` for the tests of `source/index.mn`, run with `monolith test`.
 
 ## Module Layout
 

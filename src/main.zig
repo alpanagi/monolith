@@ -9,6 +9,7 @@ const CallNote = monolith.CallNote;
 const Command = monolith.Command;
 const Failure = core.Failure;
 const Loader = monolith.Loader;
+const ProjectInitializer = monolith.ProjectInitializer;
 const TestRunner = monolith.TestRunner;
 
 const isRootModuleName = monolith.isRootModuleName;
@@ -32,15 +33,27 @@ pub fn main(init: std.process.Init) !u8 {
     };
     const compiler_path = try std.process.executableDirPathAlloc(io, allocator);
     return switch (command) {
+        .init => initializeProject(allocator, io, stderr),
         .build => |build| buildProgram(arena, io, stderr, compiler_path, build),
         .@"test" => |tests| buildTests(arena, io, stderr, compiler_path, tests),
     };
 }
 
 fn printUsage(stderr: *std.Io.Writer) std.Io.Writer.Error!u8 {
-    try stderr.writeAll("usage: monolith build <file.mn> [--output <path>]\n       monolith test [<directory>] [--source <directory>]\n");
+    try stderr.writeAll("usage: monolith init\n       monolith build <file.mn> [--output <path>]\n       monolith test [<directory>] [--source <directory>]\n");
     try stderr.flush();
     return 1;
+}
+
+fn initializeProject(allocator: std.mem.Allocator, io: std.Io, stderr: *std.Io.Writer) !u8 {
+    var initializer: ProjectInitializer = .{};
+    initializer.initialize(allocator, io, std.Io.Dir.cwd()) catch |initialize_error| {
+        const failure = initializer.failure orelse return initialize_error;
+        try stderr.print("error: {s}\n", .{failure.message});
+        try stderr.flush();
+        return 1;
+    };
+    return 0;
 }
 
 fn buildProgram(

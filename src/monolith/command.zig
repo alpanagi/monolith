@@ -5,15 +5,19 @@ const Failure = core.Failure;
 
 const default_source_directory = "source";
 const default_test_directory = "tests";
+const main_file = "main.mn";
+const main_source = "fn main = noop\n";
 
 pub fn parseCommand(arguments: []const [:0]const u8) ?Command {
     if (arguments.len < 2) return null;
+    if (std.mem.eql(u8, arguments[1], "init")) return parseInit(arguments[2..]);
     if (std.mem.eql(u8, arguments[1], "build")) return parseBuild(arguments[2..]);
     if (std.mem.eql(u8, arguments[1], "test")) return parseTest(arguments[2..]);
     return null;
 }
 
 pub const Command = union(enum) {
+    init: void,
     build: Build,
     @"test": Test,
 };
@@ -29,6 +33,32 @@ pub const Test = struct {
     test_directory: []const u8,
     is_test_directory_optional: bool,
 };
+
+pub const ProjectInitializer = struct {
+    failure: ?Failure = null,
+
+    pub fn initialize(self: *ProjectInitializer, allocator: std.mem.Allocator, io: std.Io, directory: std.Io.Dir) InitializeError!void {
+        directory.createDir(io, default_source_directory, .default_dir) catch |create_error| {
+            if (create_error == error.PathAlreadyExists) {
+                self.failure = .{ .message = "'" ++ default_source_directory ++ "' already exists" };
+                return create_error;
+            }
+            const message = try std.fmt.allocPrint(allocator, "cannot create '{s}': {t}", .{ default_source_directory, create_error });
+            self.failure = .{ .message = message };
+            return create_error;
+        };
+        const path = default_source_directory ++ std.fs.path.sep_str ++ main_file;
+        directory.writeFile(io, .{ .sub_path = path, .data = main_source }) catch |write_error| {
+            const message = try std.fmt.allocPrint(allocator, "cannot write '{s}': {t}", .{ path, write_error });
+            self.failure = .{ .message = message };
+            return write_error;
+        };
+    }
+};
+
+pub const InitializeError = std.mem.Allocator.Error ||
+    std.Io.Dir.CreateDirError ||
+    std.Io.Dir.WriteFileError;
 
 pub const TestRunner = struct {
     failure: ?Failure = null,
@@ -54,6 +84,11 @@ pub const RunError = std.mem.Allocator.Error ||
     std.process.SpawnError ||
     std.process.Child.WaitError ||
     error{EndedWithoutStatus};
+
+fn parseInit(arguments: []const [:0]const u8) ?Command {
+    if (arguments.len != 0) return null;
+    return .init;
+}
 
 fn parseBuild(arguments: []const [:0]const u8) ?Command {
     if (arguments.len == 0) return null;
@@ -89,6 +124,16 @@ fn findModuleName(path: []const u8) ?[]const u8 {
     const has_extension = std.mem.endsWith(u8, file_name, source_extension);
     if (!has_extension or file_name.len == source_extension.len) return null;
     return file_name[0 .. file_name.len - source_extension.len];
+}
+
+test "parseCommand: initializes a project without arguments" {
+    try std.testing.expectEqual(.init, parseCommand(&.{ "monolith", "init" }).?);
+}
+
+test "parseCommand: rejects anything after init" {
+    try std.testing.expectEqual(null, parseCommand(&.{ "monolith", "init", "project" }));
+    try std.testing.expectEqual(null, parseCommand(&.{ "monolith", "init", "--source", "program" }));
+    try std.testing.expectEqual(null, parseCommand(&.{ "monolith", "init", "" }));
 }
 
 test "parseCommand: builds the file it names into the module it names" {
@@ -169,6 +214,58 @@ test "parseCommand: rejects an option without its value and anything else after 
     try std.testing.expectEqual(null, parseCommand(&.{ "monolith", "test", "tests", "-s", "source" }));
     try std.testing.expectEqual(null, parseCommand(&.{ "monolith", "test", "tests", "--source", "one", "--source", "two" }));
     try std.testing.expectEqual(null, parseCommand(&.{ "monolith", "test", "tests", "source" }));
+}
+
+test "ProjectInitializer.initialize: creates the source directory holding main.mn with an empty main" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    var initializer: ProjectInitializer = .{};
+
+    try initializer.initialize(arena.allocator(), std.testing.io, directory.dir);
+    try std.testing.expectEqualStrings("fn main = noop\n", try directory.dir.readFileAlloc(std.testing.io, "source/main.mn", arena.allocator(), .unlimited));
+    var walker = try directory.dir.walk(arena.allocator());
+    defer walker.deinit();
+    const source = (try walker.next(std.testing.io)).?;
+    try std.testing.expectEqualStrings("source", source.path);
+    try std.testing.expectEqual(.directory, source.kind);
+    const main = (try walker.next(std.testing.io)).?;
+    try std.testing.expectEqualStrings("source" ++ std.fs.path.sep_str ++ "main.mn", main.path);
+    try std.testing.expectEqual(.file, main.kind);
+    try std.testing.expectEqual(null, try walker.next(std.testing.io));
+}
+
+test "ProjectInitializer.initialize: leaves an existing source directory untouched" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var directory = std.testing.tmpDir(.{ .iterate = true });
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "source");
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "source/main.mn", .data = "fn main = run()\n" });
+    var initializer: ProjectInitializer = .{};
+
+    try std.testing.expectError(error.PathAlreadyExists, initializer.initialize(arena.allocator(), std.testing.io, directory.dir));
+    try std.testing.expectEqualStrings("'source' already exists", initializer.failure.?.message);
+    try std.testing.expectEqualStrings("fn main = run()\n", try directory.dir.readFileAlloc(std.testing.io, "source/main.mn", arena.allocator(), .unlimited));
+    var walker = try directory.dir.walk(arena.allocator());
+    defer walker.deinit();
+    try std.testing.expectEqualStrings("source", (try walker.next(std.testing.io)).?.path);
+    try std.testing.expectEqualStrings("source" ++ std.fs.path.sep_str ++ "main.mn", (try walker.next(std.testing.io)).?.path);
+    try std.testing.expectEqual(null, try walker.next(std.testing.io));
+}
+
+test "ProjectInitializer.initialize: leaves an existing file named source untouched" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "source", .data = "notes" });
+    var initializer: ProjectInitializer = .{};
+
+    try std.testing.expectError(error.PathAlreadyExists, initializer.initialize(arena.allocator(), std.testing.io, directory.dir));
+    try std.testing.expectEqualStrings("'source' already exists", initializer.failure.?.message);
+    try std.testing.expectEqualStrings("notes", try directory.dir.readFileAlloc(std.testing.io, "source", arena.allocator(), .unlimited));
 }
 
 test "TestRunner.run: reports an executable it cannot start" {
