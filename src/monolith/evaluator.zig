@@ -1161,6 +1161,7 @@ pub const Evaluator = struct {
                 self.produced = try self.evaluateConverted(expression, self.production_type.?);
                 return .next;
             },
+            .replacement => return .next,
         }
     }
 

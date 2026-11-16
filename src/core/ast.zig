@@ -80,6 +80,7 @@ pub const Need = enum {
 pub const allocator_parameter = "mn_allocator";
 pub const context_local = "mn_context";
 pub const allocator_name = "allocator";
+pub const replacement_parameter = "mn_replacement";
 
 pub const Binding = struct {
     name: []const u8,
@@ -148,6 +149,7 @@ pub const StatementKind = union(enum) {
     @"break": Jump,
     @"continue": Jump,
     value: Expression,
+    replacement: Replacement,
 };
 
 pub const ConstantDeclaration = struct {
@@ -319,6 +321,8 @@ pub const Iteration = struct {
     cursor: types.Type,
     next: Resolution.Function,
     element: types.Type,
+    iterator_values: []const Expression = &.{},
+    next_values: []const Expression = &.{},
 };
 
 pub const Defer = struct {
@@ -382,6 +386,14 @@ pub const Range = struct {
 pub const Jump = struct {
     label: ?[]const u8 = null,
     loop: ?*const Statement = null,
+};
+
+pub const Replacement = struct {
+    target: Expression,
+    replacement: Expression,
+    function: ?Resolution.Function = null,
+    replacing: ?Resolution.Function = null,
+    receiver: ?Expression = null,
 };
 
 pub const Expression = struct {
@@ -1515,6 +1527,7 @@ pub fn extractBlocks(statement: Statement) [2][]const Statement {
         .@"break",
         .@"continue",
         .value,
+        .replacement,
         => .{ &.{}, &.{} },
     };
 }
@@ -1540,7 +1553,7 @@ fn isEndingStatement(module: Module, statement: Statement) bool {
             }
             return true;
         },
-        .noop, .discard, .constant_declaration, .tuple_declaration, .variable_declaration, .assignment, .@"while", .@"for", .@"defer", .value => false,
+        .noop, .discard, .constant_declaration, .tuple_declaration, .variable_declaration, .assignment, .@"while", .@"for", .@"defer", .value, .replacement => false,
     };
 }
 
@@ -1566,7 +1579,7 @@ pub fn extractExpressions(statement: *const Statement) Expressions {
             },
         },
         .match => |*matching| expressions.append(&matching.value),
-        .noop, .@"defer", .@"break", .@"continue" => {},
+        .noop, .@"defer", .@"break", .@"continue", .replacement => {},
     }
     return expressions;
 }
@@ -1764,7 +1777,7 @@ pub fn findBranching(statement: *const Statement) ?*Statement {
         .tuple_declaration => |declaration| declaration.value,
         .variable_declaration => |variable| variable.value,
         .assignment => |assignment| assignment.value,
-        .noop, .discard, .call, .@"if", .@"while", .@"for", .match, .@"defer", .@"break", .@"continue", .value => return null,
+        .noop, .discard, .call, .@"if", .@"while", .@"for", .match, .@"defer", .@"break", .@"continue", .value, .replacement => return null,
     };
     if (value.kind != .branching) return null;
     return value.kind.branching;
@@ -1788,6 +1801,7 @@ pub fn extractLabel(statement: Statement) ?[]const u8 {
         .@"break",
         .@"continue",
         .value,
+        .replacement,
         => null,
     };
 }
@@ -1835,6 +1849,7 @@ pub fn extractElementNames(statement: Statement) []ElementName {
         .@"break",
         .@"continue",
         .value,
+        .replacement,
         => unreachable,
     };
 }
@@ -2192,6 +2207,10 @@ fn cloneStatement(allocator: std.mem.Allocator, statement: Statement) std.mem.Al
         .@"break" => |jump| .{ .@"break" = .{ .label = jump.label } },
         .@"continue" => |jump| .{ .@"continue" = .{ .label = jump.label } },
         .value => |expression| .{ .value = try cloneExpression(allocator, expression) },
+        .replacement => |replacement| .{ .replacement = .{
+            .target = try cloneExpression(allocator, replacement.target),
+            .replacement = try cloneExpression(allocator, replacement.replacement),
+        } },
     };
     return .{ .kind = kind, .location = statement.location };
 }

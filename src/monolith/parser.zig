@@ -2132,8 +2132,22 @@ pub const Parser = struct {
         }
         const start = offset.*;
         const value = (try self.parseExpression(allocator, offset)) orelse return self.fail(start, error.ExpectedExpression);
+        if (self.match(offset, .equals) != null) return self.parseReplacement(allocator, offset, location, value);
         if (!self.endsValueLine(offset.*)) return self.fail(offset.*, error.ExpectedStatement);
         return .{ .kind = .{ .constant_declaration = .{ .name = ast.context_local, .value = value, .context = true } }, .location = location };
+    }
+
+    fn parseReplacement(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        offset: *usize,
+        location: token.Location,
+        target: ast.Expression,
+    ) ParseError!ast.Statement {
+        const start = offset.*;
+        const replacement = (try self.parseExpression(allocator, offset)) orelse return self.fail(start, error.ExpectedExpression);
+        if (!self.endsValueLine(offset.*)) return self.fail(offset.*, error.ExpectedStatement);
+        return .{ .kind = .{ .replacement = .{ .target = target, .replacement = replacement } }, .location = location };
     }
 
     fn parseOperand(
@@ -7562,6 +7576,61 @@ test "parseWithStatement: sets the context from a name other than allocator" {
     try std.testing.expect(constant.context);
     try std.testing.expect(!constant.with);
     try std.testing.expectEqualStrings("arena", constant.value.kind.identifier.name);
+}
+
+test "parseWithStatement: keeps every other form of with beside a replacement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn f()\n    with memory::Heap\n    with clock::now = fixed_now\n    with allocator\n    with &arena\n    with memory::None\n    g() with &other");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expectEqualStrings("Heap", body[0].kind.constant_declaration.value.kind.path_expression.path[1]);
+    try std.testing.expect(body[0].kind.constant_declaration.context);
+    try std.testing.expectEqualStrings("fixed_now", body[1].kind.replacement.replacement.kind.identifier.name);
+    try std.testing.expect(body[2].kind.constant_declaration.with);
+    try std.testing.expectEqualStrings("arena", body[3].kind.constant_declaration.value.kind.address_of.kind.identifier.name);
+    try std.testing.expectEqualStrings("None", body[4].kind.constant_declaration.value.kind.path_expression.path[1]);
+    try std.testing.expectEqualStrings("other", body[5].kind.call.kind.call.with_value.?.kind.address_of.kind.identifier.name);
+}
+
+test "parseReplacement: replaces a path by a function named by a path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn f()\n    with mn::time::WallTime::now = fakes::fixed_now\n    g()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const replacement = module.declarations[0].kind.function_definition.body[0].kind.replacement;
+    try std.testing.expectEqualStrings("now", replacement.target.kind.path_expression.path[3]);
+    try std.testing.expectEqualStrings("fixed_now", replacement.replacement.kind.path_expression.path[1]);
+}
+
+test "parseReplacement: replaces a path by a function of a local value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn f()\n    with filesystem::read = files.read\n    g()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const replacement = module.declarations[0].kind.function_definition.body[0].kind.replacement;
+    try std.testing.expectEqualStrings("read", replacement.target.kind.path_expression.path[1]);
+    try std.testing.expectEqualStrings("files", replacement.replacement.kind.field_access.value.kind.identifier.name);
+    try std.testing.expectEqualStrings("read", replacement.replacement.kind.field_access.field);
+}
+
+test "parseReplacement: rejects an equals sign without a replacement after it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn f()\n    with filesystem::read =\n    g()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedExpression, parser.parse(&arena));
 }
 
 test "parseComparison: binds bitwise operators tighter than a comparison" {

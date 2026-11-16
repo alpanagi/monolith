@@ -57,6 +57,7 @@ pub const TypeChecker = struct {
     exact_numbers: bool = false,
     instances: std.ArrayList(Instance) = .empty,
     created: std.ArrayList(ast.Resolution.Function) = .empty,
+    replacement_copies: std.ArrayList(ReplacementCopy) = .empty,
     instance_depth: usize = 0,
     failure: ?Failure = null,
 
@@ -136,6 +137,7 @@ pub const TypeChecker = struct {
         try self.finishNeeds();
         try self.checkInlineRecursion();
         try self.checkTests();
+        try self.applyReplacements();
     }
 
     fn prepareCreated(self: *TypeChecker, start: usize) TypeError!void {
@@ -173,6 +175,417 @@ pub const TypeChecker = struct {
         try self.prepareCreated(created_start);
         try self.finishNeeds();
         try self.checkInlineRecursion();
+    }
+
+    fn applyReplacements(self: *TypeChecker) TypeError!void {
+        const created_start = self.created.items.len;
+        const caller_current_function = self.current_function;
+        defer self.current_function = caller_current_function;
+        var found = false;
+        for (self.program.modules, 0..) |module, module_index| {
+            for (module.declarations, 0..) |declaration, index| {
+                if (!ast.isTest(declaration)) continue;
+                const body = declaration.kind.function_definition.body;
+                if (!hasReplacement(body)) continue;
+                found = true;
+                self.module_index = module_index;
+                self.current_function = .{ .module = module_index, .declaration = index };
+                var active: std.ArrayList(ActiveReplacement) = .empty;
+                try self.replaceInBlock(&active, body);
+            }
+        }
+        if (!found) return;
+        try self.prepareCreated(created_start);
+        try self.finishNeeds();
+        try self.checkInlineRecursion();
+    }
+
+    fn replaceInBlock(self: *TypeChecker, active: *std.ArrayList(ActiveReplacement), statements: []ast.Statement) TypeError!void {
+        const start = active.items.len;
+        defer active.shrinkRetainingCapacity(start);
+        for (statements) |*statement| {
+            switch (statement.kind) {
+                .replacement => |*replacement| {
+                    const entry = self.buildActiveReplacement(replacement, statement.location) orelse continue;
+                    try active.append(self.arena.allocator(), entry);
+                },
+                else => try self.replaceInStatement(active, statement),
+            }
+        }
+    }
+
+    fn buildActiveReplacement(self: *const TypeChecker, replacement: *const ast.Replacement, location: token.Location) ?ActiveReplacement {
+        const function = replacement.function orelse return null;
+        const replacing = replacement.replacing orelse return null;
+        return .{
+            .function = function,
+            .replacing = replacing,
+            .receiver = if (replacement.receiver) |receiver| receiver.type.? else null,
+            .value = replacement.receiver,
+            .statement = replacement,
+            .location = location,
+            .module = self.module_index,
+        };
+    }
+
+    fn replaceInStatement(self: *TypeChecker, active: *std.ArrayList(ActiveReplacement), statement: *ast.Statement) TypeError!void {
+        switch (statement.kind) {
+            .noop, .@"break", .@"continue", .replacement => {},
+            .@"return" => |*value| if (value.*) |*returned| try self.replaceInExpression(active, returned),
+            .discard, .call, .value => |*expression| try self.replaceInExpression(active, expression),
+            .constant_declaration => |*constant| if (constant.known == null) try self.replaceInExpression(active, &constant.value),
+            .tuple_declaration => |*declaration| try self.replaceInExpression(active, &declaration.value),
+            .variable_declaration => |*variable| try self.replaceInExpression(active, &variable.value),
+            .assignment => |*assignment| {
+                try self.replaceInExpression(active, &assignment.target);
+                try self.replaceInExpression(active, &assignment.value);
+            },
+            .@"if" => |*conditional| {
+                try self.replaceInExpression(active, &conditional.condition);
+                if (conditional.known != false) try self.replaceInBlock(active, conditional.body);
+                if (conditional.else_body) |else_body| try self.replaceInBlock(active, else_body);
+            },
+            .@"while" => |*loop| {
+                try self.replaceInExpression(active, &loop.condition);
+                try self.replaceInBlock(active, loop.body);
+                if (loop.else_body) |else_body| try self.replaceInBlock(active, else_body);
+            },
+            .@"for" => |*loop| {
+                switch (loop.sequence) {
+                    .value => |*value| try self.replaceInExpression(active, value),
+                    .range => |*range| {
+                        try self.replaceInExpression(active, &range.start);
+                        if (range.end) |*end| try self.replaceInExpression(active, end);
+                    },
+                }
+                if (loop.iterator) |*iteration| try self.replaceInIteration(active.items, iteration);
+                try self.replaceInBlock(active, loop.body);
+                if (loop.else_body) |else_body| try self.replaceInBlock(active, else_body);
+            },
+            .match => |*matching| {
+                try self.replaceInExpression(active, &matching.value);
+                for (matching.branches) |*branch| try self.replaceInBlock(active, branch.body);
+            },
+            .@"defer" => |deferred| try self.replaceInStatement(active, deferred.statement),
+        }
+    }
+
+    fn replaceInExpression(self: *TypeChecker, active: *std.ArrayList(ActiveReplacement), expression: *ast.Expression) TypeError!void {
+        switch (expression.kind) {
+            .call => |*call| {
+                for (call.arguments) |*argument| try self.replaceInExpression(active, &argument.value);
+                try self.replaceCall(active.items, expression);
+            },
+            .method_call => |*call| {
+                try self.replaceInExpression(active, call.receiver);
+                for (call.arguments) |*argument| try self.replaceInExpression(active, &argument.value);
+            },
+            .composite_literal => |*literal| {
+                for (literal.elements) |*element| try self.replaceInExpression(active, &element.value);
+            },
+            .case_literal => |*literal| {
+                for (literal.arguments) |*argument| try self.replaceInExpression(active, &argument.value);
+            },
+            .binary => |binary| {
+                try self.replaceInExpression(active, binary.left);
+                try self.replaceInExpression(active, binary.right);
+            },
+            .unary => |unary| try self.replaceInExpression(active, unary.operand),
+            .negation, .address_of, .dereference, .unwrap, .@"try" => |operand| try self.replaceInExpression(active, operand),
+            .index => |indexing| {
+                try self.replaceInExpression(active, indexing.value);
+                try self.replaceInExpression(active, indexing.index);
+            },
+            .slice => |slice| {
+                try self.replaceInExpression(active, slice.value);
+                if (slice.start) |start| try self.replaceInExpression(active, start);
+                if (slice.end) |end| try self.replaceInExpression(active, end);
+            },
+            .field_access => |access| try self.replaceInExpression(active, access.value),
+            .range => |range| {
+                try self.replaceInExpression(active, &range.start);
+                if (range.end) |*end| try self.replaceInExpression(active, end);
+            },
+            .jump, .branching => |statement| try self.replaceInStatement(active, statement),
+            .integer_literal,
+            .float_literal,
+            .boolean_literal,
+            .string_literal,
+            .undefined,
+            .null,
+            .identifier,
+            .path_expression,
+            .member,
+            .inferred_type,
+            .array_type,
+            .slice_type,
+            .pointer_type,
+            .optional_type,
+            .tuple_type,
+            .function_type,
+            .struct_type,
+            => {},
+        }
+    }
+
+    fn replaceCall(self: *TypeChecker, active: []const ActiveReplacement, expression: *ast.Expression) TypeError!void {
+        if (active.len == 0) return;
+        const resolution = ast.extractResolution(expression.kind.call.callee);
+        if (resolution != .function) return;
+        const callee = resolution.function;
+        const base = self.findReplacementBase(callee);
+        if (findActiveReplacement(active, base.function)) |replacement| return self.redirectCall(active, expression, base, replacement);
+        if (!try self.reachesReplaced(callee, active)) return;
+        const copy = try self.findReplacementCopy(callee, active);
+        try self.callReplacementCopy(active, &expression.kind.call, copy, expression.location);
+    }
+
+    fn replaceInIteration(self: *TypeChecker, active: []const ActiveReplacement, iteration: *ast.Iteration) TypeError!void {
+        if (active.len == 0) return;
+        if (try self.reachesReplaced(iteration.iterator, active)) {
+            iteration.iterator = try self.findReplacementCopy(iteration.iterator, active);
+            iteration.iterator_values = try self.collectReplacementValues(active);
+        }
+        if (try self.reachesReplaced(iteration.next, active)) {
+            iteration.next = try self.findReplacementCopy(iteration.next, active);
+            iteration.next_values = try self.collectReplacementValues(active);
+        }
+    }
+
+    fn collectReplacementValues(self: *TypeChecker, active: []const ActiveReplacement) std.mem.Allocator.Error![]const ast.Expression {
+        var values: std.ArrayList(ast.Expression) = .empty;
+        for (try self.collectActiveReplacements(active)) |replacement| {
+            const value = replacement.value orelse continue;
+            try values.append(self.arena.allocator(), value);
+        }
+        return values.items;
+    }
+
+    fn findReplacementBase(self: *const TypeChecker, function: ast.Resolution.Function) ReplacementBase {
+        var base: ReplacementBase = .{ .function = function };
+        if (self.findAllocatorRecord(function)) |record| {
+            base.function = record.function;
+            base.allocator_type = record.allocator_type;
+        }
+        if (self.findCreatingInstance(base.function)) |creating| {
+            base.function = creating.template;
+            base.arguments = creating.arguments;
+        }
+        return base;
+    }
+
+    fn findAllocatorRecord(self: *const TypeChecker, function: ast.Resolution.Function) ?AllocatorInstance {
+        for (self.allocator_instances.items) |record| {
+            if (std.meta.eql(record.instance, function)) return record;
+        }
+        return null;
+    }
+
+    fn redirectCall(
+        self: *TypeChecker,
+        active: []const ActiveReplacement,
+        expression: *ast.Expression,
+        base: ReplacementBase,
+        replacement: ActiveReplacement,
+    ) TypeError!void {
+        const allocator = self.arena.allocator();
+        const call = &expression.kind.call;
+        const original = ast.extractResolution(call.callee).function;
+        const skip: usize = if (replacement.value != null) 1 else 0;
+        var replacing = replacement.replacing;
+        if (base.arguments) |arguments| replacing = try self.findInstance(replacement.location, replacing, arguments);
+        try self.prepareReached(replacing);
+        if (try self.needsAllocator(replacing)) {
+            const allocator_type = base.allocator_type orelse return self.failReplacementAllocator(replacement);
+            replacing = try self.findAllocatorInstance(replacing, allocator_type);
+            try self.prepareReached(replacing);
+        }
+        if (!self.isReplaceable(original, replacing, skip, true)) {
+            self.module_index = replacement.module;
+            return self.failReplacement(replacement.location, replacement.statement.*, original, replacing);
+        }
+        var arguments: std.ArrayList(ast.Argument) = .empty;
+        if (replacement.value) |value| try arguments.append(allocator, .{ .name = null, .value = value, .location = expression.location });
+        const count = if (base.allocator_type != null) call.arguments.len - 1 else call.arguments.len;
+        try arguments.appendSlice(allocator, call.arguments[0..count]);
+        const beneath = try self.removeReplacement(active, replacement.function);
+        if (beneath.len > 0 and try self.reachesReplaced(replacing, beneath)) {
+            const copy = try self.findReplacementCopy(replacing, beneath);
+            try self.appendReplacementValues(&arguments, beneath, expression.location);
+            replacing = copy;
+        }
+        if (self.hasAllocatorParameter(replacing)) try arguments.append(allocator, call.arguments[count]);
+        setCallee(call, replacing);
+        call.arguments = arguments.items;
+        call.typeclass_arguments = &.{};
+        call.@"inline" = self.extractSignature(.{ .function = replacing }).@"inline";
+    }
+
+    fn prepareReached(self: *TypeChecker, function: ast.Resolution.Function) TypeError!void {
+        const declaration = ast.findDeclaration(self.program.modules[function.module], function.declaration);
+        if (declaration.kind != .function_definition) return;
+        const definition = declaration.kind.function_definition;
+        if (definition.check_progress != .pending) return;
+        if (definition.allocator != null) return self.prepareFunction(function);
+        try self.prepareWithoutAllocator(function);
+    }
+
+    fn hasAllocatorParameter(self: *const TypeChecker, function: ast.Resolution.Function) bool {
+        const declaration = ast.findDeclaration(self.program.modules[function.module], function.declaration);
+        return declaration.kind == .function_definition and declaration.kind.function_definition.allocator != null;
+    }
+
+    fn failReplacementAllocator(self: *TypeChecker, replacement: ActiveReplacement) TypeError {
+        const allocator = self.arena.allocator();
+        self.module_index = replacement.module;
+        const replacing_name = try renderReplacementName(allocator, replacement.statement.replacement);
+        const original_name = try renderReplacementName(allocator, replacement.statement.target);
+        const failure = self.fail(replacement.location, error.ReplacementNeedsAllocator);
+        const format = "`{s}` needs an allocator, and a call to `{s}` that it replaces is made where none is set";
+        self.failure.?.message = try std.fmt.allocPrint(allocator, format, .{ replacing_name, original_name });
+        return failure;
+    }
+
+    fn removeReplacement(
+        self: *TypeChecker,
+        active: []const ActiveReplacement,
+        function: ast.Resolution.Function,
+    ) std.mem.Allocator.Error![]const ActiveReplacement {
+        var kept: std.ArrayList(ActiveReplacement) = .empty;
+        for (active) |replacement| {
+            if (!std.meta.eql(replacement.function, function)) try kept.append(self.arena.allocator(), replacement);
+        }
+        return kept.items;
+    }
+
+    fn reachesReplaced(self: *TypeChecker, function: ast.Resolution.Function, active: []const ActiveReplacement) TypeError!bool {
+        const allocator = self.arena.allocator();
+        var visited: std.ArrayList(ast.Resolution.Function) = .empty;
+        var waiting: std.ArrayList(ast.Resolution.Function) = .empty;
+        try waiting.append(allocator, function);
+        while (waiting.pop()) |current| {
+            if (containsFunction(visited.items, current)) continue;
+            try visited.append(allocator, current);
+            const declaration = ast.findDeclaration(self.program.modules[current.module], current.declaration);
+            if (declaration.kind != .function_definition) continue;
+            try self.prepareReached(current);
+            var calls: std.ArrayList(FunctionCall) = .empty;
+            try appendBlockCalls(allocator, &calls, declaration.kind.function_definition.body);
+            try appendIterationCalls(allocator, &calls, declaration.kind.function_definition.body);
+            for (calls.items) |call| {
+                if (findActiveReplacement(active, self.findReplacementBase(call.function).function) != null) return true;
+                try waiting.append(allocator, call.function);
+            }
+        }
+        return false;
+    }
+
+    fn findReplacementCopy(
+        self: *TypeChecker,
+        function: ast.Resolution.Function,
+        active: []const ActiveReplacement,
+    ) TypeError!ast.Resolution.Function {
+        const replacements = try self.collectActiveReplacements(active);
+        for (self.replacement_copies.items) |existing| {
+            if (std.meta.eql(existing.function, function) and isSameReplacements(existing.replacements, replacements)) return existing.copy;
+        }
+        const allocator = self.arena.allocator();
+        const resolver = &self.resolver.?;
+        const record = self.findAllocatorRecord(function);
+        const inner = if (record) |found| found.function else function;
+        const number = self.replacement_copies.items.len + 1;
+        const copy = if (self.findCreatingInstance(inner)) |creating|
+            try resolver.instantiate(resolver.context, creating.template, creating.arguments, number, false)
+        else
+            try resolver.createReplacementCopy(resolver.context, inner);
+        const inner_replacements = try self.addReplacementParameters(copy, replacements);
+        if (record) |found| try resolver.giveAllocator(resolver.context, copy, found.allocator_type);
+        try self.replacement_copies.append(allocator, .{ .function = function, .replacements = replacements, .copy = copy });
+        try resolver.resolve(resolver.context, copy);
+        try self.prepareReached(copy);
+        const definition = &ast.findDeclaration(self.program.modules[copy.module], copy.declaration).kind.function_definition;
+        definition.signature.name = try std.fmt.allocPrint(allocator, "mn_replaced_{d}_{s}", .{ number, definition.signature.name });
+        try self.replaceInFunction(copy, inner_replacements);
+        return copy;
+    }
+
+    fn collectActiveReplacements(self: *TypeChecker, active: []const ActiveReplacement) std.mem.Allocator.Error![]const ActiveReplacement {
+        var collected: std.ArrayList(ActiveReplacement) = .empty;
+        for (active, 0..) |replacement, index| {
+            const overridden = for (active[index + 1 ..]) |later| {
+                if (std.meta.eql(later.function, replacement.function)) break true;
+            } else false;
+            if (!overridden) try collected.append(self.arena.allocator(), replacement);
+        }
+        return collected.items;
+    }
+
+    fn addReplacementParameters(
+        self: *TypeChecker,
+        function: ast.Resolution.Function,
+        replacements: []const ActiveReplacement,
+    ) std.mem.Allocator.Error![]const ActiveReplacement {
+        const allocator = self.arena.allocator();
+        const declaration = ast.findDeclaration(self.program.modules[function.module], function.declaration);
+        const definition = &declaration.kind.function_definition;
+        var parameters: std.ArrayList(ast.TypedName) = .empty;
+        try parameters.appendSlice(allocator, definition.signature.parameters);
+        const inner = try allocator.dupe(ActiveReplacement, replacements);
+        for (inner) |*replacement| {
+            const value_type = replacement.receiver orelse continue;
+            const position = parameters.items.len;
+            const name = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ ast.replacement_parameter, position });
+            const written: ast.Expression = .{ .kind = .{ .identifier = .{ .name = name } }, .location = declaration.location, .denoted = value_type };
+            try parameters.append(allocator, .{ .name = name, .type = written, .location = declaration.location, .hidden = true });
+            const identifier: ast.Identifier = .{ .name = name, .resolution = .{ .parameter = position } };
+            replacement.value = .{ .kind = .{ .identifier = identifier }, .location = declaration.location, .type = value_type };
+        }
+        definition.signature.parameters = parameters.items;
+        return inner;
+    }
+
+    fn replaceInFunction(self: *TypeChecker, function: ast.Resolution.Function, replacements: []const ActiveReplacement) TypeError!void {
+        const caller_current_function = self.current_function;
+        const caller_module_index = self.module_index;
+        defer self.current_function = caller_current_function;
+        defer self.module_index = caller_module_index;
+        self.current_function = function;
+        self.module_index = function.module;
+        var active: std.ArrayList(ActiveReplacement) = .empty;
+        try active.appendSlice(self.arena.allocator(), replacements);
+        const definition = ast.findDeclaration(self.program.modules[function.module], function.declaration).kind.function_definition;
+        try self.replaceInBlock(&active, definition.body);
+    }
+
+    fn callReplacementCopy(
+        self: *TypeChecker,
+        active: []const ActiveReplacement,
+        call: *ast.Call,
+        copy: ast.Resolution.Function,
+        location: token.Location,
+    ) TypeError!void {
+        const allocator = self.arena.allocator();
+        const has_allocator = self.hasAllocatorParameter(copy);
+        const count = if (has_allocator) call.arguments.len - 1 else call.arguments.len;
+        var arguments: std.ArrayList(ast.Argument) = .empty;
+        try arguments.appendSlice(allocator, call.arguments[0..count]);
+        try self.appendReplacementValues(&arguments, active, location);
+        if (has_allocator) try arguments.append(allocator, call.arguments[count]);
+        setCallee(call, copy);
+        call.arguments = arguments.items;
+    }
+
+    fn appendReplacementValues(
+        self: *TypeChecker,
+        arguments: *std.ArrayList(ast.Argument),
+        active: []const ActiveReplacement,
+        location: token.Location,
+    ) std.mem.Allocator.Error!void {
+        const allocator = self.arena.allocator();
+        for (try self.collectActiveReplacements(active)) |replacement| {
+            const value = replacement.value orelse continue;
+            try arguments.append(allocator, .{ .name = null, .value = value, .location = location });
+        }
     }
 
     fn prepareCheckCopy(self: *TypeChecker, function: ast.Resolution.Function) TypeError!void {
@@ -952,6 +1365,7 @@ pub const TypeChecker = struct {
             .@"defer",
             .@"break",
             .@"continue",
+            .replacement,
             => {},
         }
         try self.checkProducingBlock(signature, body, true);
@@ -978,6 +1392,7 @@ pub const TypeChecker = struct {
             .variable_declaration,
             .assignment,
             .@"defer",
+            .replacement,
             => if (!self.endsWithVoid()) {
                 const production = self.production orelse return self.fail(statement.location, error.MissingBranchValue);
                 if (!production.combining) return self.fail(statement.location, error.MissingBranchValue);
@@ -1161,7 +1576,7 @@ pub const TypeChecker = struct {
                 if (ast.isComptimeErrorCall(self.program.modules[self.module_index], expression)) return .ended;
                 return flow;
             },
-            .noop, .discard, .constant_declaration, .tuple_declaration, .@"defer", .value => return flow,
+            .noop, .discard, .constant_declaration, .tuple_declaration, .@"defer", .value, .replacement => return flow,
             .variable_declaration, .assignment => return flow,
             .@"return", .@"continue" => return .ended,
             .@"break" => |jump| {
@@ -1376,7 +1791,144 @@ pub const TypeChecker = struct {
             },
             .@"break", .@"continue" => {},
             .value => try self.checkProducedValue(parameters, statement),
+            .replacement => |*replacement| try self.checkReplacement(parameters, statement.location, replacement),
         }
+    }
+
+    fn checkReplacement(
+        self: *TypeChecker,
+        parameters: []const ast.TypedName,
+        location: token.Location,
+        replacement: *ast.Replacement,
+    ) TypeError!void {
+        replacement.function = findNamedFunction(replacement.target) orelse return self.fail(replacement.target.location, error.ReplacedNotFunction);
+        switch (replacement.replacement.kind) {
+            .identifier, .path_expression => {
+                replacement.replacing = findNamedFunction(replacement.replacement) orelse return self.fail(replacement.replacement.location, error.ReplacementForm);
+            },
+            .field_access => |access| try self.checkReplacingMethod(parameters, replacement, access),
+            else => return self.fail(replacement.replacement.location, error.ReplacementForm),
+        }
+        const original = replacement.function.?;
+        const replacing = replacement.replacing.?;
+        try self.prepareWithoutAllocator(original);
+        try self.prepareWithoutAllocator(replacing);
+        const skip: usize = if (replacement.receiver != null) 1 else 0;
+        if (self.isReplaceable(original, replacing, skip, false)) return;
+        return self.failReplacement(location, replacement.*, original, replacing);
+    }
+
+    fn checkReplacingMethod(
+        self: *TypeChecker,
+        parameters: []const ast.TypedName,
+        replacement: *ast.Replacement,
+        access: ast.FieldAccess,
+    ) TypeError!void {
+        const receiver_type = try self.inferType(parameters, access.value);
+        const lookup: MethodLookup = .{
+            .location = access.field_location,
+            .name = access.field,
+            .crossing = access.crossing,
+            .parameters = parameters,
+            .arguments = &.{},
+            .receiver = access.value,
+        };
+        const method = try self.findMethodFunction(&lookup, receiver_type);
+        if (method.function != .function) return self.fail(access.field_location, error.ReplacementForm);
+        const signature = self.extractSignature(method.function);
+        if (signature.self_parameter == .none) return self.fail(access.field_location, error.NoSelf);
+        var receiver = if (method.addressed)
+            try self.buildAddressedReceiver(parameters, access.value, method.reads_only)
+        else
+            try self.buildReceiver(parameters, access.value, method.dereferenced, signature);
+        _ = try self.inferType(parameters, &receiver);
+        replacement.receiver = receiver;
+        replacement.replacing = method.function.function;
+    }
+
+    fn isReplaceable(
+        self: *const TypeChecker,
+        original: ast.Resolution.Function,
+        replacing: ast.Resolution.Function,
+        skip: usize,
+        concrete: bool,
+    ) bool {
+        const one = self.extractSignature(.{ .function = original });
+        const two = self.extractSignature(.{ .function = replacing });
+        const generic = ast.isGeneric(one);
+        if (generic != ast.isGeneric(two)) return false;
+        if (one.declared.len != two.declared.len) return false;
+        for (one.declared, two.declared) |first, second| {
+            if (!isSameRequirements(first.resolved_requirements, second.resolved_requirements)) return false;
+        }
+        const first_parameters = one.parameters[0..countVisibleParameters(one.parameters)];
+        const second_parameters = two.parameters[0..countVisibleParameters(two.parameters)];
+        if (second_parameters.len != first_parameters.len + skip) return false;
+        for (first_parameters, second_parameters[skip..]) |first, second| {
+            if (first.kind != second.kind) return false;
+            if (!std.meta.eql(first.constraint, second.constraint)) return false;
+            if (!isSameRequirements(first.resolved_requirements, second.resolved_requirements)) return false;
+            if (generic) continue;
+            if (!std.meta.eql(ast.extractType(first.type), ast.extractType(second.type))) return false;
+        }
+        if (generic) return true;
+        if (!concrete and (hasUnfinishedErrorSet(one) or hasUnfinishedErrorSet(two))) return true;
+        return std.meta.eql(ast.extractType(one.return_type), ast.extractType(two.return_type));
+    }
+
+    fn failReplacement(
+        self: *TypeChecker,
+        location: token.Location,
+        replacement: ast.Replacement,
+        original: ast.Resolution.Function,
+        replacing: ast.Resolution.Function,
+    ) TypeError {
+        const allocator = self.arena.allocator();
+        const skip: usize = if (replacement.receiver != null) 1 else 0;
+        const original_name = try renderReplacementName(allocator, replacement.target);
+        const replacing_name = try renderReplacementName(allocator, replacement.replacement);
+        const original_signature = try self.renderSignature(original, findLastName(replacement.target), 0);
+        const replacing_signature = try self.renderSignature(replacing, findLastName(replacement.replacement), skip);
+        const failure = self.fail(location, error.ReplacementSignatureMismatch);
+        const format = "`{s}` cannot replace `{s}`, since their signatures differ: `{s}` and `{s}`";
+        self.failure.?.message = try std.fmt.allocPrint(allocator, format, .{ replacing_name, original_name, original_signature, replacing_signature });
+        return failure;
+    }
+
+    fn renderSignature(
+        self: *TypeChecker,
+        function: ast.Resolution.Function,
+        name: []const u8,
+        skip: usize,
+    ) std.mem.Allocator.Error![]const u8 {
+        const allocator = self.arena.allocator();
+        const signature = self.extractSignature(.{ .function = function });
+        const visible = signature.parameters[0..countVisibleParameters(signature.parameters)];
+        var parameters: std.ArrayList([]const u8) = .empty;
+        for (visible[@min(skip, visible.len)..]) |parameter| try parameters.append(allocator, try self.renderParameter(parameter));
+        var declared: std.ArrayList([]const u8) = .empty;
+        for (signature.declared) |type_name| try declared.append(allocator, try std.fmt.allocPrint(allocator, "type {s}", .{type_name.name}));
+        const header = if (declared.items.len == 0) "fn" else try std.fmt.allocPrint(allocator, "fn({s})", .{try std.mem.join(allocator, ", ", declared.items)});
+        const list = if (parameters.items.len == 0) "" else try std.fmt.allocPrint(allocator, "({s})", .{try std.mem.join(allocator, ", ", parameters.items)});
+        const return_type = try self.renderTypeOf(signature.return_type);
+        if (std.mem.eql(u8, return_type, "void")) return std.fmt.allocPrint(allocator, "{s} {s}{s}", .{ header, name, list });
+        return std.fmt.allocPrint(allocator, "{s} {s}{s} -> {s}", .{ header, name, list, return_type });
+    }
+
+    fn renderParameter(self: *TypeChecker, parameter: ast.TypedName) std.mem.Allocator.Error![]const u8 {
+        const allocator = self.arena.allocator();
+        return switch (parameter.kind) {
+            .type => std.fmt.allocPrint(allocator, "type {s}", .{parameter.name}),
+            .compile_time => std.fmt.allocPrint(allocator, "comptime {s}: {s}", .{ parameter.name, try self.renderTypeOf(parameter.type) }),
+            .run_time, .implicit, .any => std.fmt.allocPrint(allocator, "{s}: {s}", .{ parameter.name, try self.renderTypeOf(parameter.type) }),
+        };
+    }
+
+    fn renderTypeOf(self: *TypeChecker, written: ast.Expression) std.mem.Allocator.Error![]const u8 {
+        const allocator = self.arena.allocator();
+        const resolved = findResolvedType(written) orelse return renderWrittenType(allocator, written);
+        if (!isConcreteType(resolved)) return renderWrittenType(allocator, written);
+        return ast.renderTypeName(allocator, self.program.modules, resolved);
     }
 
     fn checkDiscard(
@@ -4643,6 +5195,7 @@ pub const TypeChecker = struct {
                 .@"break",
                 .@"continue",
                 .value,
+                .replacement,
                 => unreachable,
             },
             .element => |element| ast.findElementName(element).type.?,
@@ -5067,6 +5620,10 @@ pub const CheckError = error{
     NotTupleType,
     PointerOverIterator,
     CursorNotIterator,
+    ReplacedNotFunction,
+    ReplacementForm,
+    ReplacementSignatureMismatch,
+    ReplacementNeedsAllocator,
 };
 
 fn describeError(check_error: CheckError) []const u8 {
@@ -5209,6 +5766,10 @@ fn describeError(check_error: CheckError) []const u8 {
         error.NotTupleType => "only tuple types can be indexed",
         error.PointerOverIterator => "this element of the iterator is not a pointer, so it cannot be named by pointer; name it without *",
         error.CursorNotIterator => "the cursor that this value's Iterable instance gives has no instance of Iterator, so for cannot go over it",
+        error.ReplacedNotFunction => "only a function can be replaced, and this path does not name one",
+        error.ReplacementForm => "a replacement is a function named by a path, e.g. fixed_now, or a function of a local value, e.g. files.read",
+        error.ReplacementSignatureMismatch => "the replacement does not have the signature of the function it replaces",
+        error.ReplacementNeedsAllocator => "the replacement needs an allocator that the call it replaces does not give",
         error.NoInstance => "type has no instance of the typeclass",
     };
 }
@@ -5298,6 +5859,7 @@ pub const Resolver = struct {
         function: ast.Resolution.Function,
         allocator_type: types.Type,
     ) AnalyzeError!void,
+    createReplacementCopy: *const fn (context: *anyopaque, function: ast.Resolution.Function) AnalyzeError!ast.Resolution.Function,
 };
 
 pub const Bound = struct {
@@ -5457,6 +6019,28 @@ const AllocatorInstance = struct {
     instance: ast.Resolution.Function,
 };
 
+const ReplacementCopy = struct {
+    function: ast.Resolution.Function,
+    replacements: []const ActiveReplacement,
+    copy: ast.Resolution.Function,
+};
+
+const ActiveReplacement = struct {
+    function: ast.Resolution.Function,
+    replacing: ast.Resolution.Function,
+    receiver: ?types.Type,
+    value: ?ast.Expression,
+    statement: *const ast.Replacement,
+    location: token.Location,
+    module: usize,
+};
+
+const ReplacementBase = struct {
+    function: ast.Resolution.Function,
+    arguments: ?[]const Bound = null,
+    allocator_type: ?types.Type = null,
+};
+
 const Grouped = struct {
     head: *ast.FunctionDefinition,
     member: *ast.FunctionDefinition,
@@ -5532,7 +6116,7 @@ fn isEndless(statement: ast.Statement) bool {
         .@"while" => |loop| loop.condition.kind == .boolean_literal and loop.condition.kind.boolean_literal,
         .@"for" => |loop| loop.sequence == .range and loop.sequence.range.end == null,
         .noop, .@"return", .discard, .call, .constant_declaration, .tuple_declaration, .variable_declaration => false,
-        .assignment, .@"if", .match, .@"defer", .@"break", .@"continue", .value => false,
+        .assignment, .@"if", .match, .@"defer", .@"break", .@"continue", .value, .replacement => false,
     };
 }
 
@@ -5953,7 +6537,7 @@ fn appendBlockCalls(
             .match => |matching| try appendExpressionCalls(allocator, calls, matching.value),
             .@"defer" => |deferred| try appendBlockCalls(allocator, calls, deferred.statement[0..1]),
             .value => |expression| try appendExpressionCalls(allocator, calls, expression),
-            .noop, .@"break", .@"continue" => {},
+            .noop, .@"break", .@"continue", .replacement => {},
         }
         var blocks = ast.iterateBlocks(statement);
         while (blocks.next()) |block| try appendBlockCalls(allocator, calls, block);
@@ -6159,6 +6743,156 @@ fn findFunctionName(modules: []const ast.Module, function: ast.Resolution.Functi
     return ast.findDeclaration(modules[function.module], function.declaration).kind.function_definition.signature.name;
 }
 
+fn hasReplacement(statements: []const ast.Statement) bool {
+    for (statements) |*statement| {
+        if (statement.kind == .replacement) return true;
+        if (statement.kind == .@"defer" and hasReplacement(statement.kind.@"defer".statement[0..1])) return true;
+        if (ast.findBranching(statement)) |inner| {
+            if (hasReplacement(inner[0..1])) return true;
+        }
+        var blocks = ast.iterateBlocks(statement.*);
+        while (blocks.next()) |block| {
+            if (hasReplacement(block)) return true;
+        }
+    }
+    return false;
+}
+
+fn findActiveReplacement(active: []const ActiveReplacement, function: ast.Resolution.Function) ?ActiveReplacement {
+    var index = active.len;
+    while (index > 0) {
+        index -= 1;
+        if (std.meta.eql(active[index].function, function)) return active[index];
+    }
+    return null;
+}
+
+fn setCallee(call: *ast.Call, function: ast.Resolution.Function) void {
+    switch (call.callee) {
+        inline else => |*name| name.resolution = .{ .function = function },
+    }
+}
+
+fn appendIterationCalls(
+    allocator: std.mem.Allocator,
+    calls: *std.ArrayList(FunctionCall),
+    statements: []const ast.Statement,
+) std.mem.Allocator.Error!void {
+    for (statements) |*statement| {
+        var branchings: std.ArrayList(*ast.Statement) = .empty;
+        try ast.collectStatementBranchings(allocator, &branchings, statement);
+        for (branchings.items) |inner| try appendIterationCalls(allocator, calls, inner[0..1]);
+        switch (statement.kind) {
+            .@"for" => |loop| if (loop.iterator) |iteration| {
+                try calls.append(allocator, .{ .function = iteration.iterator, .location = statement.location });
+                try calls.append(allocator, .{ .function = iteration.next, .location = statement.location });
+            },
+            .@"defer" => |deferred| try appendIterationCalls(allocator, calls, deferred.statement[0..1]),
+            else => {},
+        }
+        var blocks = ast.iterateBlocks(statement.*);
+        while (blocks.next()) |block| try appendIterationCalls(allocator, calls, block);
+    }
+}
+
+fn isSameReplacements(one: []const ActiveReplacement, two: []const ActiveReplacement) bool {
+    if (one.len != two.len) return false;
+    for (one, two) |first, second| {
+        if (!std.meta.eql(first.function, second.function)) return false;
+        if (!std.meta.eql(first.replacing, second.replacing)) return false;
+        if (!std.meta.eql(first.receiver, second.receiver)) return false;
+    }
+    return true;
+}
+
+fn findNamedFunction(expression: ast.Expression) ?ast.Resolution.Function {
+    const resolution = switch (expression.kind) {
+        .identifier => |identifier| identifier.resolution,
+        .path_expression => |path_expression| path_expression.resolution,
+        else => null,
+    } orelse return null;
+    if (resolution != .function) return null;
+    return resolution.function;
+}
+
+fn countVisibleParameters(parameters: []const ast.TypedName) usize {
+    for (parameters, 0..) |parameter, index| {
+        if (parameter.hidden) return index;
+    }
+    return parameters.len;
+}
+
+fn isSameRequirements(one: []const ast.Requirement, two: []const ast.Requirement) bool {
+    if (one.len != two.len) return false;
+    for (one, two) |first, second| {
+        if (!std.meta.eql(first.typeclass, second.typeclass)) return false;
+        if (first.arguments.len != second.arguments.len) return false;
+    }
+    return true;
+}
+
+fn hasUnfinishedErrorSet(signature: ast.FunctionSignature) bool {
+    const error_set = signature.error_set orelse return false;
+    const return_type = ast.extractType(signature.return_type);
+    return return_type == .result and return_type.result.error_set == error_set;
+}
+
+fn renderReplacementName(allocator: std.mem.Allocator, expression: ast.Expression) std.mem.Allocator.Error![]const u8 {
+    return switch (expression.kind) {
+        .identifier => |identifier| identifier.name,
+        .path_expression => |path_expression| std.mem.join(allocator, "::", path_expression.path),
+        .field_access => |access| std.fmt.allocPrint(allocator, "{s}.{s}", .{ try renderReplacementName(allocator, access.value.*), access.field }),
+        else => "",
+    };
+}
+
+fn findLastName(expression: ast.Expression) []const u8 {
+    return switch (expression.kind) {
+        .identifier => |identifier| identifier.name,
+        .path_expression => |path_expression| path_expression.path[path_expression.path.len - 1],
+        .field_access => |access| access.field,
+        else => "",
+    };
+}
+
+fn findResolvedType(written: ast.Expression) ?types.Type {
+    if (written.denoted) |denoted| return denoted;
+    const resolution = switch (written.kind) {
+        .identifier => |identifier| identifier.resolution,
+        .path_expression => |path_expression| path_expression.resolution,
+        else => null,
+    } orelse return null;
+    if (resolution != .type) return null;
+    return resolution.type;
+}
+
+fn isConcreteType(value_type: types.Type) bool {
+    for ([_]types.Scope{ .typeclass, .instance, .function, .declared }) |scope| {
+        if (types.containsVariable(value_type, scope)) return false;
+    }
+    return true;
+}
+
+fn renderWrittenType(allocator: std.mem.Allocator, written: ast.Expression) std.mem.Allocator.Error![]const u8 {
+    return switch (written.kind) {
+        .identifier => |identifier| identifier.name,
+        .path_expression => |path_expression| std.mem.join(allocator, "::", path_expression.path),
+        .pointer_type => |pointer_type| {
+            const target = try renderWrittenType(allocator, pointer_type.target.*);
+            const prefix = if (pointer_type.many) "*[many]" else "*";
+            if (pointer_type.constant) return std.fmt.allocPrint(allocator, "const({s}{s})", .{ prefix, target });
+            return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, target });
+        },
+        .slice_type => |slice_type| {
+            const element = try renderWrittenType(allocator, slice_type.element.*);
+            if (slice_type.constant) return std.fmt.allocPrint(allocator, "const(*[]{s})", .{element});
+            return std.fmt.allocPrint(allocator, "*[]{s}", .{element});
+        },
+        .optional_type => |optional_type| std.fmt.allocPrint(allocator, "?{s}", .{try renderWrittenType(allocator, optional_type.child.*)}),
+        else => "the type",
+    };
+}
+
 fn containsFunction(functions: []const ast.Resolution.Function, function: ast.Resolution.Function) bool {
     for (functions) |one| {
         if (std.meta.eql(one, function)) return true;
@@ -6296,6 +7030,7 @@ fn recordTargetUses(
             .@"break",
             .@"continue",
             .value,
+            .replacement,
             => {},
         }
     }
@@ -7340,6 +8075,51 @@ test "checkTests: rejects a type error in a test of a program analyzed for a nor
 
     try std.testing.expectError(error.TypeMismatch, analyzer.analyze());
     try std.testing.expectEqual(token.Location{ .row = 4, .column = 24 }, analyzer.failure.?.location.?);
+}
+
+test "applyReplacements: calls the replacement after the statement, beneath a call, and the real function before it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn now -> i64 = 1\n\nfn fixed_now -> i64 = 7\n\nfn stamp -> i64 = now()\n\nfn main = noop\n\ntest \"stamp: is replaced after the statement\"\n    _ = now()\n    with now = fixed_now\n    _ = now()\n    _ = stamp()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const module = loader.modules.items[0];
+    const body = module.declarations[4].kind.function_definition.body;
+    const now: ast.Resolution.Function = .{ .module = 0, .declaration = 0 };
+    const fixed_now: ast.Resolution.Function = .{ .module = 0, .declaration = 1 };
+    const stamp: ast.Resolution.Function = .{ .module = 0, .declaration = 2 };
+    try std.testing.expectEqual(now, ast.extractResolution(body[0].kind.discard.kind.call.callee).function);
+    try std.testing.expectEqual(fixed_now, ast.extractResolution(body[2].kind.discard.kind.call.callee).function);
+    const copy = ast.extractResolution(body[3].kind.discard.kind.call.callee).function;
+    try std.testing.expect(!std.meta.eql(stamp, copy));
+    const copied = module.declarations[copy.declaration].kind.function_definition.body;
+    try std.testing.expectEqual(fixed_now, ast.extractResolution(copied[0].kind.@"return".?.kind.call.callee).function);
+    const original = module.declarations[stamp.declaration].kind.function_definition.body;
+    try std.testing.expectEqual(now, ast.extractResolution(original[0].kind.@"return".?.kind.call.callee).function);
+}
+
+test "applyReplacements: rejects a replacement that needs an allocator where the call it replaces has none" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory\n\nfn now -> i64 = 1\n\nfn allocating_now -> i64\n    const items = memory::allocate(i64, 1) catch return 0\n    defer memory::free(items)\n    return 2\n\nfn stamp -> i64 = now()\n\nfn main = noop\n\ntest \"stamp: is replaced\"\n    with memory::Heap\n    with now = allocating_now\n    _ = stamp()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ReplacementNeedsAllocator, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 16, .column = 5 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`allocating_now` needs an allocator, and a call to `now` that it replaces is made where none is set", analyzer.failure.?.message);
 }
 
 test "prepareFunction: rejects a function that its own check calls at compile time" {
@@ -9877,6 +10657,44 @@ test "checkStatement: rejects with allocator after with memory::None" {
     try std.testing.expectError(error.MissingAllocator, analyzer.analyze());
     try std.testing.expectEqual(token.Location{ .row = 5, .column = 5 }, analyzer.failure.?.location.?);
     try std.testing.expectEqual(0, (try analyzer.collectCallTrace(arena.allocator(), analyzer.failure.?)).len);
+}
+
+test "checkReplacement: rejects a replacement with another signature and shows both signatures" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::time::WallTime\n\nfn fixed_now -> i64 = 7\n\nfn main = noop\n\ntest \"now: is replaced\"\n    with WallTime::now = fixed_now\n    _ = WallTime::now()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ReplacementSignatureMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 8, .column = 5 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`fixed_now` cannot replace `WallTime::now`, since their signatures differ: `fn now -> WallTime` and `fn fixed_now -> i64`", analyzer.failure.?.message);
+}
+
+test "checkReplacement: sets aside the first parameter of a function of a local value and passes the value to it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::time::WallTime\n\nstruct Clock\n    seconds: i64\n\n    fn now(self: const(*Self)) -> WallTime = { seconds = self.seconds, nanoseconds = 0 }\n\n\nfn main = noop\n\ntest \"now: is replaced\"\n    const fake: Clock = { seconds = 3 }\n    with WallTime::now = fake.now\n    _ = WallTime::now()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[4].kind.function_definition.body;
+    try std.testing.expect(body[1].kind.replacement.receiver.?.kind == .address_of);
+    const call = body[2].kind.discard.kind.call;
+    try std.testing.expectEqual(ast.Resolution.Function{ .module = 0, .declaration = 2 }, ast.extractResolution(call.callee).function);
+    try std.testing.expectEqual(1, call.arguments.len);
+    try std.testing.expect(call.arguments[0].value.kind == .address_of);
 }
 
 test "findCreatingCall: reaches the call that created an allocator instance" {

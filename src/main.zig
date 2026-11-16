@@ -9,11 +9,14 @@ const CallNote = monolith.CallNote;
 const Command = monolith.Command;
 const Failure = core.Failure;
 const Loader = monolith.Loader;
+const TestRunner = monolith.TestRunner;
 
 const isRootModuleName = monolith.isRootModuleName;
 const parseCommand = monolith.parseCommand;
 
 const output_directory = "build";
+const test_output_directory = "tests";
+const test_executable_name = "test";
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
@@ -35,7 +38,7 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 fn printUsage(stderr: *std.Io.Writer) std.Io.Writer.Error!u8 {
-    try stderr.writeAll("usage: monolith build <file.mn> [--output <path>]\n       monolith test <directory> [--output <path>]\n");
+    try stderr.writeAll("usage: monolith build <file.mn> [--output <path>]\n       monolith test [<directory>] [--source <directory>]\n");
     try stderr.flush();
     return 1;
 }
@@ -70,7 +73,8 @@ fn buildProgram(
 
     var generator = c.Generator.init(program);
     generator.executable_path = build.output;
-    return generate(allocator, io, stderr, compiler_path, &loader, &generator);
+    generator.kept_directory = test_output_directory;
+    return generate(allocator, io, stderr, compiler_path, output_directory, &loader, &generator);
 }
 
 fn buildTests(
@@ -81,9 +85,9 @@ fn buildTests(
     tests: @FieldType(Command, "test"),
 ) !u8 {
     const allocator = arena.allocator();
-    var loader = Loader.init(tests.directory, compiler_path);
+    var loader = Loader.init(tests.source_directory, compiler_path);
 
-    const modules = loader.loadTestModules(arena, io) catch |load_error| {
+    const modules = loader.loadTestModules(arena, io, tests.test_directory, tests.is_test_directory_optional) catch |load_error| {
         const failure = loader.failure orelse return load_error;
         return report(allocator, io, stderr, &loader, failure, &.{});
     };
@@ -100,10 +104,19 @@ fn buildTests(
         const file = try loader.buildModuleFileName(allocator, io, loader.modules.items[module].path);
         test_module.* = .{ .module = module, .file = file };
     }
+    const output_path = try std.fs.path.join(allocator, &.{ output_directory, test_output_directory });
+    const executable_path = try std.fs.path.join(allocator, &.{ output_path, test_executable_name });
     var generator = c.Generator.init(program);
     generator.tests = test_modules;
-    generator.executable_path = tests.output orelse try std.fs.path.join(allocator, &.{ output_directory, "test" });
-    return generate(allocator, io, stderr, compiler_path, &loader, &generator);
+    generator.executable_path = executable_path;
+    const status = try generate(allocator, io, stderr, compiler_path, output_path, &loader, &generator);
+    if (status != 0) return status;
+
+    var runner: TestRunner = .{};
+    return runner.run(allocator, io, executable_path) catch |run_error| {
+        const failure = runner.failure orelse return run_error;
+        return report(allocator, io, stderr, &loader, failure, &.{});
+    };
 }
 
 fn generate(
@@ -111,11 +124,12 @@ fn generate(
     io: std.Io,
     stderr: *std.Io.Writer,
     compiler_path: []const u8,
+    output_path: []const u8,
     loader: *Loader,
     generator: *c.Generator,
 ) !u8 {
     const generator_path = try std.fs.path.join(allocator, &.{ compiler_path, "generators", "c" });
-    generator.generate(allocator, io, generator_path, output_directory) catch |generate_error| {
+    generator.generate(allocator, io, generator_path, output_path) catch |generate_error| {
         const failure = generator.failure orelse return generate_error;
         return report(allocator, io, stderr, loader, failure, &.{});
     };

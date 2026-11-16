@@ -3,6 +3,7 @@ pub const CallNote = @import("analyzer.zig").CallNote;
 pub const Command = @import("command.zig").Command;
 pub const Loader = @import("loader.zig").Loader;
 pub const NameResolver = @import("name_resolver.zig").NameResolver;
+pub const TestRunner = @import("command.zig").TestRunner;
 pub const TypeChecker = @import("type_checker.zig").TypeChecker;
 
 pub const isRootModuleName = @import("loader.zig").isRootModuleName;

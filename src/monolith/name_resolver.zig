@@ -44,6 +44,7 @@ pub const NameResolver = struct {
     resolved_branchings: std.AutoHashMapUnmanaged(*const ast.Statement, void) = .empty,
     nested_types: std.ArrayList(NestedType) = .empty,
     preparing: bool = false,
+    testing: bool = false,
     failure: ?Failure = null,
 
     pub fn init(
@@ -1654,6 +1655,9 @@ pub const NameResolver = struct {
         const caller_owner_name = self.owner_name;
         defer self.owner_name = caller_owner_name;
         self.owner_name = self.findOwnerName(definition.*);
+        const caller_testing = self.testing;
+        defer self.testing = caller_testing;
+        self.testing = definition.test_text != null;
         if (definition.signature.receiver) |receiver| self.self_type = ast.extractType(receiver);
         self.self_name = if (definition.instance == null) "Self" else "";
         if (definition.default_of) |typeclass| self.module_index = typeclass.module;
@@ -2248,6 +2252,7 @@ pub const NameResolver = struct {
             .finishStruct = finishStructForChecker,
             .instantiateAllocator = instantiateAllocatorForChecker,
             .giveAllocator = giveAllocatorForChecker,
+            .createReplacementCopy = createReplacementCopyForChecker,
         };
     }
 
@@ -2843,8 +2848,52 @@ pub const NameResolver = struct {
                 try self.resolveBranches(block, statement);
             },
             .@"break", .@"continue" => try self.resolveJump(block.loops.items, statement),
+            .replacement => |*replacement| try self.resolveReplacement(scope, statement.location, replacement),
         }
         return null;
+    }
+
+    fn resolveReplacement(
+        self: *NameResolver,
+        scope: Scope,
+        location: token.Location,
+        replacement: *ast.Replacement,
+    ) ResolveError!void {
+        if (!self.testing) return self.fail(location, error.ReplacementOutsideTest);
+        try self.resolveReplacedFunction(scope, &replacement.target);
+        try self.resolveReplacingFunction(scope, &replacement.replacement);
+    }
+
+    fn resolveReplacedFunction(self: *NameResolver, scope: Scope, target: *ast.Expression) ResolveError!void {
+        const location = target.location;
+        switch (target.kind) {
+            .identifier => |*identifier| {
+                if (findLocal(scope.locals, identifier.name) != null) return self.fail(location, error.ReplacedNotFunction);
+                if (findTypedName(scope.parameters, identifier.name) != null) return self.fail(location, error.ReplacedNotFunction);
+                const found = try self.resolveName(location, identifier.name);
+                if (found != .function and found != .method) return self.fail(location, error.ReplacedNotFunction);
+                try self.resolveValue(location, found, &identifier.resolution);
+            },
+            .path_expression => |*path_expression| {
+                const found = try self.resolvePath(scope, location, buildRoute(path_expression.*));
+                if (found != .function and found != .method) return self.fail(location, error.ReplacedNotFunction);
+                try self.resolveValue(location, found, &path_expression.resolution);
+            },
+            else => return self.fail(location, error.ReplacedNotFunction),
+        }
+    }
+
+    fn resolveReplacingFunction(self: *NameResolver, scope: Scope, replacement: *ast.Expression) ResolveError!void {
+        switch (replacement.kind) {
+            .identifier, .path_expression => try self.resolveNamesInExpression(scope, replacement),
+            .field_access => |access| {
+                if (access.value.kind != .identifier) return self.fail(replacement.location, error.ReplacementForm);
+                if (findLocal(scope.locals, access.value.kind.identifier.name) == null) return self.fail(replacement.location, error.ReplacementForm);
+                try self.resolveNamesInExpression(scope, access.value);
+                recordModifiedVariable(scope, findStorageRoot(access.value.*));
+            },
+            else => return self.fail(replacement.location, error.ReplacementForm),
+        }
     }
 
     fn resolveBranchings(self: *NameResolver, block: Block, statement: *const ast.Statement) ResolveError!void {
@@ -4137,6 +4186,19 @@ pub const NameResolver = struct {
         definition.signature.parameters = parameters;
     }
 
+    fn createReplacementCopyForChecker(context: *anyopaque, function: ast.Resolution.Function) AnalyzeError!ast.Resolution.Function {
+        const self: *NameResolver = @ptrCast(@alignCast(context));
+        const allocator = self.arena.allocator();
+        const module = &self.loader.modules.items[function.module];
+        const declaration = ast.findDeclaration(module.*, function.declaration).*;
+        const copy = try self.copyFunction(declaration.kind.function_definition.pristine.?.*);
+        const index = module.declarations.len + module.instances.items.len;
+        const created = try allocator.create(ast.Declaration);
+        created.* = .{ .kind = .{ .function_definition = copy }, .location = declaration.location, .owner = declaration.owner };
+        try module.instances.append(allocator, created);
+        return .{ .module = function.module, .declaration = index };
+    }
+
     fn findConstantOwner(self: *NameResolver, constant: ast.Resolution.Constant) ResolveError!?Target {
         const declaration = &self.loader.modules.items[constant.module].declarations[constant.declaration];
         const caller_module_index = self.module_index;
@@ -4695,6 +4757,9 @@ pub const ResolveError = AnalyzeError;
 
 pub const NameError = error{
     MisplacedInferredErrorSet,
+    ReplacementOutsideTest,
+    ReplacedNotFunction,
+    ReplacementForm,
     DuplicateFunction,
     DuplicateConstant,
     DuplicateStruct,
@@ -5000,6 +5065,9 @@ fn describeError(name_error: NameError) []const u8 {
         error.UnknownName => "unknown name",
         error.NotAFunction => "name is not a function",
         error.MainUsedAsValue => "main cannot be used as a value",
+        error.ReplacementOutsideTest => "a replacement, with followed by a path, = and its replacement, is written only in the body of a test",
+        error.ReplacedNotFunction => "only a function can be replaced, and this path does not name one",
+        error.ReplacementForm => "a replacement is a function named by a path, e.g. fixed_now, or a function of a local value, e.g. files.read",
         error.NoMembers => "name has no members",
         error.ModuleNotFound => "there is no module with this name",
         error.ConstantRefersToItself => "constant refers to itself",
@@ -5391,6 +5459,7 @@ fn dropDependent(
                 .@"break",
                 .@"continue",
                 .value,
+                .replacement,
                 => {},
             }
             dependency.removed = true;
@@ -5420,7 +5489,7 @@ fn dropDependent(
             .variable_declaration => |variable| {
                 if (mentionsAny(dependency.values.items, variable.value)) try dependency.values.append(allocator, variable.name);
             },
-            .noop, .@"return", .discard, .call, .tuple_declaration, .assignment, .@"defer", .@"break", .@"continue", .value => {},
+            .noop, .@"return", .discard, .call, .tuple_declaration, .assignment, .@"defer", .@"break", .@"continue", .value, .replacement => {},
         }
         try kept.append(allocator, copy);
     }
@@ -5429,7 +5498,7 @@ fn dropDependent(
 
 fn isDependentStatement(names: Names, statement: ast.Statement) bool {
     return switch (statement.kind) {
-        .noop, .@"break", .@"continue" => false,
+        .noop, .@"break", .@"continue", .replacement => false,
         .@"return" => |value| if (value) |returned| names.returns or isDependentExpression(names, returned, false) else false,
         .discard, .call, .value => |expression| isDependentExpression(names, expression, false),
         .constant_declaration => |constant| isDependentDeclaration(names, constant.type, constant.value),
@@ -5661,7 +5730,7 @@ fn collectStatementNames(
     statement: ast.Statement,
 ) std.mem.Allocator.Error!void {
     switch (statement.kind) {
-        .noop, .@"break", .@"continue" => {},
+        .noop, .@"break", .@"continue", .replacement => {},
         .@"defer" => |deferred| try collectStatementNames(allocator, names, deferred.statement.*),
         .@"return" => |value| if (value) |returned| try collectExpressionNames(allocator, names, returned),
         .discard, .call, .value => |expression| try collectExpressionNames(allocator, names, expression),
@@ -10879,6 +10948,60 @@ test "resolveNamesInStatement: resolves the value of a tuple declaration before 
     try std.testing.expectEqual(ast.Resolution{ .parameter = 0 }, body[0].kind.tuple_declaration.value.kind.identifier.resolution.?);
     const shadowed = body[1].kind.call.kind.call.arguments[0].value.kind.identifier.resolution.?;
     try std.testing.expectEqual(&body[0], shadowed.element.statement);
+}
+
+test "resolveReplacement: rejects a replacement outside the body of a test" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::time::WallTime\n\nfn fixed_now -> WallTime = { seconds = 7, nanoseconds = 0 }\n\nfn main\n    with WallTime::now = fixed_now\n    _ = WallTime::now()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ReplacementOutsideTest, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 5 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("a replacement, with followed by a path, = and its replacement, is written only in the body of a test", analyzer.failure.?.message);
+}
+
+test "resolveReplacedFunction: rejects a path that names a type, a module or a constant" {
+    for ([_][]const u8{ "WallTime", "time", "limit", "mn::time::WallTime" }) |target| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var program_directory = std.testing.tmpDir(.{});
+        defer program_directory.cleanup();
+        const allocator = arena.allocator();
+        const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+        var loader = @import("loader.zig").Loader.init(program_path, "library");
+        const source = try std.mem.concat(allocator, u8, &.{ "import mn\nimport mn::time\nimport mn::time::WallTime\n\nconst limit: i64 = 3\n\nfn fixed_now -> WallTime = { seconds = limit, nanoseconds = 0 }\n\nfn main = noop\n\ntest \"now: is replaced\"\n    with ", target, " = fixed_now\n    _ = time::WallTime::now()\n" });
+        try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = source });
+        try loader.loadMainModule(&arena, std.testing.io, "main");
+        var type_registry: types.Registry = .{};
+        var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+        try std.testing.expectError(error.ReplacedNotFunction, analyzer.analyze());
+        try std.testing.expectEqual(token.Location{ .row = 12, .column = 10 }, analyzer.failure.?.location.?);
+        try std.testing.expectEqualStrings("only a function can be replaced, and this path does not name one", analyzer.failure.?.message);
+    }
+}
+
+test "resolveReplacingFunction: rejects a replacement that is neither a path nor a function of a local value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::time::WallTime\n\nfn fixed_now -> WallTime = { seconds = 7, nanoseconds = 0 }\n\nfn main = noop\n\ntest \"now: is replaced\"\n    with WallTime::now = fixed_now().seconds\n    _ = WallTime::now()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ReplacementForm, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 8, .column = 26 }, analyzer.failure.?.location.?);
 }
 
 test "resolveBranchings: counts a name in a one-line if inside an expression as a use" {

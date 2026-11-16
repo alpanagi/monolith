@@ -47,6 +47,7 @@ pub const Generator = struct {
     in_main: bool = false,
     tests: ?[]const TestModule = null,
     executable_path: ?[]const u8 = null,
+    kept_directory: ?[]const u8 = null,
     failure: ?Failure = null,
 
     pub fn init(program: ast.Program) Generator {
@@ -64,7 +65,7 @@ pub const Generator = struct {
 
         const generator_directory = try std.Io.Dir.cwd().openDir(io, generator_path, .{});
         defer generator_directory.close(io);
-        try std.Io.Dir.cwd().deleteTree(io, output_path);
+        try self.clearOutput(allocator, io, output_path);
         const output_directory = try std.Io.Dir.cwd().createDirPathOpen(io, output_path, .{});
         defer output_directory.close(io);
         const source_directory = try output_directory.createDirPathOpen(io, "source", .{});
@@ -83,6 +84,37 @@ pub const Generator = struct {
         }
         const source_path = try std.fs.path.join(allocator, &.{ output_path, "source" });
         try self.buildExecutable(allocator, io, output_path, source_path, files, runtime_files);
+    }
+
+    fn clearOutput(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        output_path: []const u8,
+    ) GenerateError!void {
+        const kept_directory = self.kept_directory orelse return std.Io.Dir.cwd().deleteTree(io, output_path);
+        var directory = std.Io.Dir.cwd().openDir(io, output_path, .{ .iterate = true }) catch |open_error| switch (open_error) {
+            error.FileNotFound => return,
+            else => return open_error,
+        };
+        defer directory.close(io);
+        var names: std.ArrayList([]const u8) = .empty;
+        var walker = directory.walk(allocator) catch |walk_error| return self.failClear(allocator, output_path, walk_error);
+        defer walker.deinit();
+        while (true) {
+            const next = walker.next(io) catch |walk_error| return self.failClear(allocator, output_path, walk_error);
+            const entry = next orelse break;
+            if (std.mem.findScalar(u8, entry.path, '/') != null) continue;
+            if (std.mem.eql(u8, entry.path, kept_directory)) continue;
+            try names.append(allocator, try allocator.dupe(u8, entry.path));
+        }
+        for (names.items) |name| try directory.deleteTree(io, name);
+    }
+
+    fn failClear(self: *Generator, allocator: std.mem.Allocator, output_path: []const u8, walk_error: anyerror) GenerateError {
+        const message = std.fmt.allocPrint(allocator, "cannot clear '{s}': {t}", .{ output_path, walk_error }) catch return error.OutOfMemory;
+        self.failure = .{ .message = message };
+        return error.OutputNotCleared;
     }
 
     fn collectRuntimeFiles(
@@ -1967,7 +1999,7 @@ pub const Generator = struct {
         try self.generateTemporaries(writer, statement);
         if (statement.kind != .@"while") try self.generateLiftedSteps(allocator, reached, writer, statement);
         switch (statement.kind) {
-            .noop => unreachable,
+            .noop, .replacement => unreachable,
             .@"return" => try self.generateReturn(allocator, reached, writer, statement),
             .discard, .call => |*expression| {
                 if (self.isLiftedRoot(expression)) return;
@@ -2074,6 +2106,7 @@ pub const Generator = struct {
             .discard => |expression| expression.kind != .identifier,
             .@"defer" => |deferred| self.hasOutput(deferred.statement),
             .@"return", .call, .@"if", .@"while", .@"for", .match, .@"break", .@"continue", .value => true,
+            .replacement => false,
         };
     }
 
@@ -3039,6 +3072,7 @@ pub const Generator = struct {
         try self.generateFunctionName(allocator, reached, writer, iteration.iterator);
         try writer.writeByte('(');
         try self.generateFullValue(allocator, reached, writer, sequence, sequence_type);
+        try self.generateReplacementValues(allocator, reached, writer, iteration.iterator, iteration.iterator_values);
         try writer.writeAll(");\n");
         try self.generateIndentation(writer);
         try writer.writeAll("for (;;) {\n");
@@ -3047,7 +3081,9 @@ pub const Generator = struct {
         try self.generateType(writer, optional_type);
         try writer.print(" mn_element_{d} = ", .{number});
         try self.generateFunctionName(allocator, reached, writer, iteration.next);
-        try writer.print("(&mn_iterator_{d});\n", .{number});
+        try writer.print("(&mn_iterator_{d}", .{number});
+        try self.generateReplacementValues(allocator, reached, writer, iteration.next, iteration.next_values);
+        try writer.writeAll(");\n");
         try self.generateIndentation(writer);
         if (isPointerOptional(optional_type)) {
             try writer.print("if (mn_element_{d} == NULL) break;\n", .{number});
@@ -3058,6 +3094,24 @@ pub const Generator = struct {
         try self.generateIndentation(writer);
         try writer.writeAll("}\n");
         try self.generateLoopEnd(allocator, reached, writer, statement);
+    }
+
+    fn generateReplacementValues(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        function: ast.Resolution.Function,
+        values: []const ast.Expression,
+    ) WriteError!void {
+        const declaration = self.program.modules[function.module].declarations[function.declaration];
+        const parameters = ast.extractFunctionSignature(declaration).parameters;
+        const first = parameters.len - values.len;
+        for (values, parameters[first..]) |*value, parameter| {
+            if (isZeroSized(value.type.?)) continue;
+            try writer.writeAll(", ");
+            try self.generateConvertedOperand(allocator, reached, writer, value, ast.extractType(parameter.type));
+        }
     }
 
     fn generatePart(
@@ -5297,7 +5351,7 @@ pub const GenerateError = std.mem.Allocator.Error ||
     std.Io.Dir.AccessError ||
     std.process.SpawnError ||
     std.process.Child.WaitError ||
-    error{ NameDefinedInTarget, StructsContainEachOther, CompilerFailed };
+    error{ NameDefinedInTarget, StructsContainEachOther, CompilerFailed, OutputNotCleared };
 
 const WriteError = std.mem.Allocator.Error || std.Io.Writer.Error;
 
@@ -5996,7 +6050,7 @@ fn findStatementExpression(statement: *const ast.Statement) ?*const ast.Expressi
         .@"if" => |*conditional| &conditional.condition,
         .@"while" => |*loop| &loop.condition,
         .match => |*matching| &matching.value,
-        .@"for", .@"defer", .@"break", .@"continue" => null,
+        .@"for", .@"defer", .@"break", .@"continue", .replacement => null,
     };
 }
 
@@ -6415,7 +6469,7 @@ fn buildLocalNames(
 fn declaresNames(statement: ast.Statement) bool {
     return switch (statement.kind) {
         .@"for", .tuple_declaration, .match, .@"if", .@"while" => true,
-        .noop, .@"return", .discard, .call, .constant_declaration, .variable_declaration, .assignment, .@"defer", .@"break", .@"continue", .value => false,
+        .noop, .@"return", .discard, .call, .constant_declaration, .variable_declaration, .assignment, .@"defer", .@"break", .@"continue", .value, .replacement => false,
     };
 }
 
@@ -6517,7 +6571,7 @@ fn containsGoto(
                 }
             },
             .noop, .@"return", .discard, .call, .constant_declaration, .tuple_declaration => {},
-            .variable_declaration, .assignment, .@"defer", .value => {},
+            .variable_declaration, .assignment, .@"defer", .value, .replacement => {},
         }
     }
     return false;
@@ -6559,7 +6613,7 @@ fn extractLocal(statement: ast.Statement) ?Local {
         .constant_declaration => |constant| .{ .name = constant.name, .value = constant.value },
         .variable_declaration => |variable| .{ .name = variable.name, .value = variable.value },
         .noop, .@"return", .discard, .call, .tuple_declaration, .assignment, .@"if", .@"while", .@"for" => null,
-        .match, .@"defer", .@"break", .@"continue", .value => null,
+        .match, .@"defer", .@"break", .@"continue", .value, .replacement => null,
     };
 }
 
@@ -6568,7 +6622,7 @@ fn findLocalType(statement: ast.Statement) types.Type {
         .constant_declaration => |constant| ast.extractDeclaredType(constant.type, constant.value),
         .variable_declaration => |variable| ast.extractDeclaredType(variable.type, variable.value),
         .noop, .@"return", .discard, .call, .tuple_declaration, .assignment, .@"if", .@"while", .@"for" => unreachable,
-        .match, .@"defer", .@"break", .@"continue", .value => unreachable,
+        .match, .@"defer", .@"break", .@"continue", .value, .replacement => unreachable,
     };
 }
 
@@ -6650,6 +6704,7 @@ fn isDiscarded(body: []const ast.Statement, resolution: ast.Resolution) bool {
             .@"break",
             .@"continue",
             .value,
+            .replacement,
             => continue,
             .@"if", .@"while", .@"for", .match => {
                 var blocks = ast.iterateBlocks(statement.*);
@@ -6774,6 +6829,7 @@ fn findAddressedContainer(statement: *const ast.Statement) ?*const ast.Expressio
         .@"break",
         .@"continue",
         .value,
+        .replacement,
         => null,
     };
 }
@@ -7416,7 +7472,7 @@ test "Generator.generate: builds a test executable that runs every test of every
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "zone/extra.mn", .data = "error Failure\n    Missing\n\ntest \"extra: returns its own error\"\n    return Failure::Missing\n\ntest \"extra: passes without an error\"\n    noop\n" });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::process::stdout\nimport mn::text\n\nfn main -> !void\n    try text::print(&stdout, \"main\\n\", {})\n" });
     var loader = @import("monolith").Loader.init(program_path, "library");
-    const modules = try loader.loadTestModules(&arena, std.testing.io);
+    const modules = try loader.loadTestModules(&arena, std.testing.io, program_path, false);
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     var generator = Generator.init(try analyzer.analyze());
@@ -7426,17 +7482,22 @@ test "Generator.generate: builds a test executable that runs every test of every
         try test_modules.append(allocator, .{ .module = module, .file = file });
     }
     generator.tests = test_modules.items;
-    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build", "tests" });
     generator.executable_path = try std.fs.path.join(allocator, &.{ output_path, "test" });
     try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
-    const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build/tests", .{});
     defer build_directory.close(std.testing.io);
-    const result = try std.process.run(allocator, std.testing.io, .{ .argv = &.{"./test"}, .cwd = .{ .dir = build_directory } });
-    try std.testing.expectEqual(1, result.term.exited);
+    const capture = "printf '%s\\n' '#!/bin/sh' 'cd \"$(dirname \"$0\")\" && exec ./test >stdout 2>stderr' > capture && chmod +x capture";
+    const created = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "sh", "-c", capture }, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqual(0, created.term.exited);
+    var runner: @import("monolith").TestRunner = .{};
+    const status = try runner.run(allocator, std.testing.io, try std.fs.path.join(allocator, &.{ output_path, "capture" }));
+
+    try std.testing.expectEqual(1, status);
     const expected = try std.fmt.allocPrint(allocator, "{s}/list.mn:8: test \"double: is wrong on purpose\" failed: Failed\n{s}/zone/extra.mn:4: test \"extra: returns its own error\" failed: Missing\n3 passed, 2 failed\n", .{ program_path, program_path });
-    try std.testing.expectEqualStrings(expected, result.stderr);
-    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expectEqualStrings(expected, try build_directory.readFileAlloc(std.testing.io, "stderr", allocator, .unlimited));
+    try std.testing.expectEqualStrings("", try build_directory.readFileAlloc(std.testing.io, "stdout", allocator, .unlimited));
 }
 
 test "Generator.generate: builds a test executable that exits with status 0 when every test passes, with the allocator each test sets" {
@@ -7450,21 +7511,266 @@ test "Generator.generate: builds a test executable that exits with status 0 when
     const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
     try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "list.mn", .data = "import mn\nimport mn::container::ArrayList\nimport mn::memory\nimport mn::memory::Allocator\nimport mn::memory::Deinit\nimport mn::test::expect\n\nstruct Counting\n    live: usize\n    allocations: usize\n\ninstance Allocator(Counting)\n\n    fn allocate(counting: *Counting, type T, count: usize) -> memory::Error!*[]T\n        counting.live += mn::size(T) * count\n        counting.allocations += 1\n        return memory::allocate(T, count) with memory::Heap\n\n    fn(type T) resize(_: *Counting, _: *[]T, _: usize) -> bool = false\n\n    fn(type T) free(counting: *Counting, items: const(*[]T))\n        counting.live -= mn::size(T) * items.length\n        memory::free(items) with memory::Heap\n\ntest \"append: allocates through the allocator the test sets and frees it all\"\n    var counting: Counting = { live = 0, allocations = 0 }\n    with &counting\n    var list = ArrayList(u32)::init()\n    try list.append(1)\n    try expect(counting.allocations == 1 and counting.live > 0)\n    list.deinit()\n    try expect(counting.live == 0)\n\ntest \"swap_remove: puts the last element in the gap\"\n    with memory::Heap\n    var list = ArrayList(u32)::init()\n    defer list.deinit()\n    try list.append(1)\n    try list.append(2)\n    try list.append(3)\n    try expect(list.swap_remove(0) == 1)\n    try expect(list.length() == 2 and list.swap_remove(0) == 3)\n" });
     var loader = @import("monolith").Loader.init(program_path, "library");
-    const modules = try loader.loadTestModules(&arena, std.testing.io);
+    const modules = try loader.loadTestModules(&arena, std.testing.io, program_path, false);
     var type_registry: types.Registry = .{};
     var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
     var generator = Generator.init(try analyzer.analyze());
     const file = try loader.buildModuleFileName(allocator, std.testing.io, loader.modules.items[modules[0]].path);
     generator.tests = &.{.{ .module = modules[0], .file = file }};
-    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build", "tests" });
     generator.executable_path = try std.fs.path.join(allocator, &.{ output_path, "test" });
     try generator.generate(allocator, std.testing.io, "generators/c", output_path);
 
-    const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build/tests", .{});
     defer build_directory.close(std.testing.io);
-    const result = try std.process.run(allocator, std.testing.io, .{ .argv = &.{"./test"}, .cwd = .{ .dir = build_directory } });
-    try std.testing.expectEqual(0, result.term.exited);
-    try std.testing.expectEqualStrings("2 passed, 0 failed\n", result.stderr);
+    const capture = "printf '%s\\n' '#!/bin/sh' 'cd \"$(dirname \"$0\")\" && exec ./test >stdout 2>stderr' > capture && chmod +x capture";
+    const created = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "sh", "-c", capture }, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqual(0, created.term.exited);
+    var runner: @import("monolith").TestRunner = .{};
+    const status = try runner.run(allocator, std.testing.io, try std.fs.path.join(allocator, &.{ output_path, "capture" }));
+
+    try std.testing.expectEqual(0, status);
+    try std.testing.expectEqualStrings("2 passed, 0 failed\n", try build_directory.readFileAlloc(std.testing.io, "stderr", allocator, .unlimited));
+}
+
+test "Generator.generate: builds a test executable that runs the tests of a source directory and of a test directory that imports it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var project_directory = std.testing.tmpDir(.{});
+    defer project_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const project_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &project_directory.sub_path });
+    try project_directory.dir.createDirPath(std.testing.io, "source");
+    try project_directory.dir.createDirPath(std.testing.io, "tests/parsing");
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "source/index.mn", .data = "import mn::test::expect\n\nfn double(value: u32) -> u32 = value * 2\n\nprivate fn triple(value: u32) -> u32 = value * 3\n\ntest \"double: doubles\"\n    try expect(double(2) == 4)\n" });
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "tests/fixtures.mn", .data = "fn build_value -> u32 = 5\n" });
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "tests/parsing/numbers.mn", .data = "import mn::test::expect\n\nimport index::double\nimport index::private::triple\nimport tests::fixtures::build_value\n\ntest \"numbers: doubles the value of a fixture\"\n    try expect(double(build_value()) == 10)\n\ntest \"numbers: triples through the private crossing\"\n    try expect(triple(1) == 3)\n" });
+    const test_path = try std.fs.path.join(allocator, &.{ project_path, "tests" });
+    var loader = @import("monolith").Loader.init(try std.fs.path.join(allocator, &.{ project_path, "source" }), "library");
+    const modules = try loader.loadTestModules(&arena, std.testing.io, test_path, false);
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    var generator = Generator.init(try analyzer.analyze());
+    var test_modules: std.ArrayList(TestModule) = .empty;
+    for (modules) |module| {
+        const file = try loader.buildModuleFileName(allocator, std.testing.io, loader.modules.items[module].path);
+        try test_modules.append(allocator, .{ .module = module, .file = file });
+    }
+    generator.tests = test_modules.items;
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build", "tests" });
+    generator.executable_path = try std.fs.path.join(allocator, &.{ output_path, "test" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build/tests", .{});
+    defer build_directory.close(std.testing.io);
+    const capture = "printf '%s\\n' '#!/bin/sh' 'cd \"$(dirname \"$0\")\" && exec ./test >stdout 2>stderr' > capture && chmod +x capture";
+    const created = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "sh", "-c", capture }, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqual(0, created.term.exited);
+    var runner: @import("monolith").TestRunner = .{};
+    const status = try runner.run(allocator, std.testing.io, try std.fs.path.join(allocator, &.{ output_path, "capture" }));
+
+    try std.testing.expectEqual(0, status);
+    try std.testing.expectEqualStrings("3 passed, 0 failed\n", try build_directory.readFileAlloc(std.testing.io, "stderr", allocator, .unlimited));
+}
+
+test "Generator.generate: builds a test executable whose tests replace a function of the library after the replacement and beneath its calls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var project_directory = std.testing.tmpDir(.{});
+    defer project_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const project_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &project_directory.sub_path });
+    try project_directory.dir.createDirPath(std.testing.io, "source");
+    try project_directory.dir.createDirPath(std.testing.io, "tests");
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "source/clock.mn", .data = "import mn::time::WallTime\n\nfn stamp -> i64\n    const now = WallTime::now()\n    return now.seconds\n\n\nfn later -> i64 = stamp() + 1\n" });
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "source/report.mn", .data = "import clock::later\n\nfn describe -> i64 = later() * 10\n" });
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "tests/fakes.mn", .data = "import mn::time::WallTime\n\nstruct Clock\n    seconds: i64\n    calls: u32\n\n    fn now(self: *Self) -> WallTime\n        self.calls += 1\n        return { seconds = self.seconds, nanoseconds = 0 }\n\n\nfn fixed_now -> WallTime = { seconds = 7, nanoseconds = 0 }\n\n\nfn other_now -> WallTime = { seconds = 9, nanoseconds = 0 }\n\n\nfn shifted_now -> WallTime\n    const real = WallTime::now()\n    return { seconds = real.seconds + 1000, nanoseconds = real.nanoseconds }\n" });
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "tests/replacing.mn", .data = "import mn::container::ArrayList\nimport mn::memory::{ self, Allocator, Arena, Deinit }\nimport mn::test::expect\nimport mn::time::WallTime\n\nimport clock::{ later, stamp }\nimport report::describe\nimport tests::fakes::{ Clock, fixed_now, other_now, shifted_now }\n\n\ntest \"integration: replaces now by a function named by a path in a call from the test\"\n    with WallTime::now = fixed_now\n    const now = WallTime::now()\n    try expect(now.seconds == 7)\n\n\ntest \"integration: replaces now beneath a call deep inside the source\"\n    with WallTime::now = fixed_now\n    try expect(describe() == 80)\n\n\ntest \"integration: replaces now by a function of a local value that keeps state\"\n    var fake: Clock = { seconds = 5, calls = 0 }\n    with WallTime::now = fake.now\n    try expect(stamp() == 5 and later() == 6)\n    try expect(fake.calls == 2)\n\n\ntest \"integration: reaches the real now from inside the replacement\"\n    const before = stamp()\n    with WallTime::now = shifted_now\n    try expect(stamp() >= before + 1000)\n\n\ntest \"integration: leaves a call before the replacement to the real now\"\n    const before = stamp()\n    with WallTime::now = fixed_now\n    try expect(before != 7 and stamp() == 7)\n\n\ntest \"integration: ends a replacement in a nested block with the block\"\n    if later() > 0\n        with WallTime::now = fixed_now\n        try expect(stamp() == 7)\n    try expect(stamp() != 7)\n\n\ntest \"integration: lets a later replacement of the same function override an earlier one\"\n    with WallTime::now = fixed_now\n    try expect(stamp() == 7)\n    with WallTime::now = other_now\n    try expect(stamp() == 9)\n\n\ntest \"integration: keeps every form of with working beside a replacement\"\n    with memory::Heap\n    with WallTime::now = fixed_now\n    var list = ArrayList(i64)::init()\n    defer list.deinit()\n    try list.append(stamp())\n    var arena = Arena::init(memory::Heap::init())\n    defer arena.deinit()\n    const numbers = try memory::allocate(i64, 1) with &arena\n    numbers[0] = later()\n    with allocator\n    const items = try allocator.allocate(i64, 1)\n    defer memory::free(items)\n    items[0] = stamp()\n    with &arena\n    const more = try memory::allocate(i64, 1)\n    more[0] = later()\n    with memory::None\n    try expect(list.length() == 1 and numbers[0] == 8 and items[0] == 7 and more[0] == 8)\n" });
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "tests/separate.mn", .data = "import mn::test::expect\nimport mn::time::WallTime\n\nimport clock::stamp\nimport tests::fakes::{ fixed_now, other_now }\n\n\ntest \"integration: replaces now by one fake in one test\"\n    with WallTime::now = fixed_now\n    try expect(stamp() == 7)\n\n\ntest \"integration: replaces now by another fake in another test\"\n    with WallTime::now = other_now\n    try expect(stamp() == 9)\n\n\ntest \"integration: gets the real now in a test without a replacement\"\n    try expect(stamp() > 9)\n" });
+    const test_path = try std.fs.path.join(allocator, &.{ project_path, "tests" });
+    var loader = @import("monolith").Loader.init(try std.fs.path.join(allocator, &.{ project_path, "source" }), "library");
+    const modules = try loader.loadTestModules(&arena, std.testing.io, test_path, false);
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    var generator = Generator.init(try analyzer.analyze());
+    var test_modules: std.ArrayList(TestModule) = .empty;
+    for (modules) |module| {
+        const file = try loader.buildModuleFileName(allocator, std.testing.io, loader.modules.items[module].path);
+        try test_modules.append(allocator, .{ .module = module, .file = file });
+    }
+    generator.tests = test_modules.items;
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build", "tests" });
+    generator.executable_path = try std.fs.path.join(allocator, &.{ output_path, "test" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build/tests", .{});
+    defer build_directory.close(std.testing.io);
+    const capture = "printf '%s\\n' '#!/bin/sh' 'cd \"$(dirname \"$0\")\" && exec ./test >stdout 2>stderr' > capture && chmod +x capture";
+    const created = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "sh", "-c", capture }, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqual(0, created.term.exited);
+    var runner: @import("monolith").TestRunner = .{};
+    const status = try runner.run(allocator, std.testing.io, try std.fs.path.join(allocator, &.{ output_path, "capture" }));
+
+    try std.testing.expectEqualStrings("11 passed, 0 failed\n", try build_directory.readFileAlloc(std.testing.io, "stderr", allocator, .unlimited));
+    try std.testing.expectEqual(0, status);
+}
+
+test "Generator.generate: builds a test executable whose tests replace functions reached only through the calls of a for loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var project_directory = std.testing.tmpDir(.{});
+    defer project_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const project_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &project_directory.sub_path });
+    try project_directory.dir.createDirPath(std.testing.io, "source");
+    try project_directory.dir.createDirPath(std.testing.io, "tests");
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "source/countdown.mn", .data = "import mn::iterator::{ Iterable, Iterator }\n\n\nstruct Countdown\n    count: i64\n\n\ninstance Iterable(Countdown, Countdown)\n\n    fn iterator(countdown: Self) -> Self = { count = countdown.count + start_count() }\n\n\ninstance Iterator(Countdown, i64)\n\n    fn next(countdown: *Self) -> ?i64\n        if (countdown.count <= 0) return null\n        countdown.count -= step()\n        return countdown.count\n\n\nfn start_count -> i64 = 2\n\n\nfn step -> i64 = 1\n\n\nfn total(start: i64) -> i64\n    var sum: i64 = 0\n    const countdown: Countdown = { count = start }\n    for value in countdown\n        sum += value\n    return sum\n" });
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "tests/fakes.mn", .data = "struct Stepper\n    steps: u32\n    size: i64\n\n    fn step(self: *Self) -> i64\n        self.steps += 1\n        return self.size\n\n\nfn five -> i64 = 5\n" });
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "tests/looping.mn", .data = "import mn::iterator::{ Iterable, Iterator }\nimport mn::test::expect\n\nimport countdown::{ self, Countdown, total }\nimport tests::fakes::{ Stepper, five }\n\n\ntest \"integration: replaces a function reached only through the iterator a for loop in the test gets\"\n    with countdown::start_count = five\n    var sum: i64 = 0\n    const counter: Countdown = { count = 1 }\n    for value in counter\n        sum += value\n    try expect(sum == 15)\n\n\ntest \"integration: passes the value of a local to a replacement reached only through the next element of a for loop\"\n    var stepper: Stepper = { steps = 0, size = 2 }\n    with countdown::step = stepper.step\n    try expect(total(3) == 3)\n    try expect(stepper.steps == 3)\n\n\ntest \"integration: gets the real functions through a for loop without a replacement\"\n    try expect(total(1) == 3)\n" });
+    const test_path = try std.fs.path.join(allocator, &.{ project_path, "tests" });
+    var loader = @import("monolith").Loader.init(try std.fs.path.join(allocator, &.{ project_path, "source" }), "library");
+    const modules = try loader.loadTestModules(&arena, std.testing.io, test_path, false);
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    var generator = Generator.init(try analyzer.analyze());
+    var test_modules: std.ArrayList(TestModule) = .empty;
+    for (modules) |module| {
+        const file = try loader.buildModuleFileName(allocator, std.testing.io, loader.modules.items[module].path);
+        try test_modules.append(allocator, .{ .module = module, .file = file });
+    }
+    generator.tests = test_modules.items;
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build", "tests" });
+    generator.executable_path = try std.fs.path.join(allocator, &.{ output_path, "test" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build/tests", .{});
+    defer build_directory.close(std.testing.io);
+    const capture = "printf '%s\\n' '#!/bin/sh' 'cd \"$(dirname \"$0\")\" && exec ./test >stdout 2>stderr' > capture && chmod +x capture";
+    const created = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "sh", "-c", capture }, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqual(0, created.term.exited);
+    var runner: @import("monolith").TestRunner = .{};
+    const status = try runner.run(allocator, std.testing.io, try std.fs.path.join(allocator, &.{ output_path, "capture" }));
+
+    try std.testing.expectEqualStrings("3 passed, 0 failed\n", try build_directory.readFileAlloc(std.testing.io, "stderr", allocator, .unlimited));
+    try std.testing.expectEqual(0, status);
+}
+
+test "Generator.generate: keeps the code of a test without a replacement the same when another test of the build replaces a function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var project_directory = std.testing.tmpDir(.{});
+    defer project_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const project_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &project_directory.sub_path });
+    try project_directory.dir.createDirPath(std.testing.io, "source");
+    try project_directory.dir.createDirPath(std.testing.io, "tests");
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "source/clock.mn", .data = "import mn::time::WallTime\n\nfn stamp -> i64\n    const now = WallTime::now()\n    return now.seconds\n" });
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "tests/checks.mn", .data = "import mn::test::expect\n\nimport clock::stamp\n\n\ntest \"checks: gets the real time\"\n    try expect(stamp() > 9)\n" });
+    const replacing = "import mn::test::expect\nimport mn::time::WallTime\n\nimport clock::stamp\n\n\nfn fixed_now -> WallTime = { seconds = 7, nanoseconds = 0 }\n\n\ntest \"replacing: gives the fixed time\"\n";
+    const bodies = [_][]const u8{ "    with WallTime::now = fixed_now\n    try expect(stamp() == 7)\n", "    try expect(stamp() == 7)\n" };
+    const test_path = try std.fs.path.join(allocator, &.{ project_path, "tests" });
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build", "tests" });
+    var generated: [bodies.len][]const u8 = undefined;
+    for (bodies, &generated) |body, *code| {
+        try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "tests/replacing.mn", .data = try std.mem.concat(allocator, u8, &.{ replacing, body }) });
+        var loader = @import("monolith").Loader.init(try std.fs.path.join(allocator, &.{ project_path, "source" }), "library");
+        const modules = try loader.loadTestModules(&arena, std.testing.io, test_path, false);
+        var type_registry: types.Registry = .{};
+        var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+        var generator = Generator.init(try analyzer.analyze());
+        var test_modules: std.ArrayList(TestModule) = .empty;
+        for (modules) |module| {
+            const file = try loader.buildModuleFileName(allocator, std.testing.io, loader.modules.items[module].path);
+            try test_modules.append(allocator, .{ .module = module, .file = file });
+        }
+        generator.tests = test_modules.items;
+        generator.executable_path = try std.fs.path.join(allocator, &.{ output_path, "test" });
+        try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+        code.* = try output_directory.dir.readFileAlloc(std.testing.io, "build/tests/source/tests/checks.c", allocator, .unlimited);
+    }
+
+    try std.testing.expectEqualStrings(generated[1], generated[0]);
+}
+
+test "Generator.generate: generates the same program whether or not a test of it replaces a function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    const program = "import mn::time::WallTime\n\nfn stamp -> i64\n    const now = WallTime::now()\n    return now.seconds\n\n\nfn fixed_now -> WallTime = { seconds = 7, nanoseconds = 0 }\n\n\nfn main\n    _ = stamp()\n\n\ntest \"stamp: gives the fixed time\"\n";
+    const bodies = [_][]const u8{ "    with WallTime::now = fixed_now\n    _ = stamp()\n", "    _ = stamp()\n" };
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    var generated: [bodies.len][]const u8 = undefined;
+    for (bodies, &generated) |body, *code| {
+        try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = try std.mem.concat(allocator, u8, &.{ program, body }) });
+        var loader = @import("monolith").Loader.init(program_path, "library");
+        try loader.loadMainModule(&arena, std.testing.io, "main");
+        var type_registry: types.Registry = .{};
+        var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+        var generator = Generator.init(try analyzer.analyze());
+        try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+        code.* = try output_directory.dir.readFileAlloc(std.testing.io, "build/source/main.c", allocator, .unlimited);
+    }
+
+    try std.testing.expectEqualStrings(generated[1], generated[0]);
+}
+
+test "Generator.generate: keeps the files of a test build in a program build of the same project and the other way around" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::process::stdout\nimport mn::text\n\nfn main -> !void\n    try text::print(&stdout, \"main\\n\", {})\n\ntest \"main: passes\"\n    noop\n" });
+    try output_directory.dir.createDirPath(std.testing.io, "build");
+    try output_directory.dir.writeFile(std.testing.io, .{ .sub_path = "build/old.txt", .data = "old" });
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    const test_output_path = try std.fs.path.join(allocator, &.{ output_path, "tests" });
+
+    for ([_]bool{ false, true, false }, 0..) |is_test_build, step| {
+        var loader = @import("monolith").Loader.init(program_path, "library");
+        var modules: []const usize = &.{};
+        if (is_test_build) {
+            modules = try loader.loadTestModules(&arena, std.testing.io, program_path, false);
+        } else {
+            try loader.loadMainModule(&arena, std.testing.io, "main");
+        }
+        var type_registry: types.Registry = .{};
+        var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+        var generator = Generator.init(try analyzer.analyze());
+        if (is_test_build) {
+            const file = try loader.buildModuleFileName(allocator, std.testing.io, loader.modules.items[modules[0]].path);
+            generator.tests = &.{.{ .module = modules[0], .file = file }};
+            generator.executable_path = try std.fs.path.join(allocator, &.{ test_output_path, "test" });
+            try generator.generate(allocator, std.testing.io, "generators/c", test_output_path);
+        } else {
+            generator.kept_directory = "tests";
+            try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+        }
+        if (step == 0) continue;
+
+        try std.testing.expectEqual(.file, (try output_directory.dir.statFile(std.testing.io, "build/main", .{})).kind);
+        try std.testing.expectEqual(.file, (try output_directory.dir.statFile(std.testing.io, "build/source/main.c", .{})).kind);
+        try std.testing.expectEqual(.file, (try output_directory.dir.statFile(std.testing.io, "build/tests/test", .{})).kind);
+        try std.testing.expectEqual(.file, (try output_directory.dir.statFile(std.testing.io, "build/tests/source/test-runner.c", .{})).kind);
+    }
+    try std.testing.expectError(error.FileNotFound, output_directory.dir.statFile(std.testing.io, "build/old.txt", .{}));
+    try std.testing.expectError(error.FileNotFound, output_directory.dir.statFile(std.testing.io, "build/test", .{}));
 }
 
 test "Generator.generate: builds an executable that uses the standard streams and a file" {

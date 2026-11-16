@@ -17,6 +17,7 @@ const isWordStart = @import("name.zig").isWordStart;
 pub const Loader = struct {
     program_path: []const u8,
     compiler_path: []const u8,
+    test_directory: ?TestDirectory = null,
     modules: std.ArrayList(ast.Module) = .empty,
     namespaces: std.ArrayList(Namespace) = .empty,
     failure: ?Failure = null,
@@ -42,23 +43,18 @@ pub const Loader = struct {
         self: *Loader,
         arena: *std.heap.ArenaAllocator,
         io: std.Io,
+        test_path: []const u8,
+        is_test_path_optional: bool,
     ) ![]const usize {
         const allocator = arena.allocator();
+        try self.expectDirectory(allocator, io, self.program_path);
         try self.expectProgramLayout(allocator, io);
-        const prefix: ast.Path = if (try self.isLibraryDirectory(allocator, io)) &.{"mn"} else &.{};
-        var directory = std.Io.Dir.cwd().openDir(io, self.program_path, .{ .iterate = true }) catch |open_error| {
-            const message = try std.fmt.allocPrint(allocator, "cannot open '{s}': {t}", .{ self.program_path, open_error });
-            self.failure = .{ .message = message };
-            return open_error;
-        };
-        defer directory.close(io);
-        var walker = try directory.walk(allocator);
-        defer walker.deinit();
         var paths: std.ArrayList(ast.Path) = .empty;
-        while (try walker.next(io)) |entry| {
-            if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".mn")) continue;
-            const file = try std.fs.path.join(allocator, &.{ self.program_path, entry.path });
-            try paths.append(allocator, try self.buildTestModulePath(allocator, prefix, try allocator.dupe(u8, entry.path), file));
+        const prefix: ast.Path = if (try self.isLibraryDirectory(allocator, io)) &.{"mn"} else &.{};
+        try self.collectTestModulePaths(allocator, io, self.program_path, prefix, &paths);
+        if (try self.findTestDirectory(allocator, io, test_path, is_test_path_optional)) |test_directory| {
+            try self.collectTestModulePaths(allocator, io, test_directory.path, &.{test_directory.name}, &paths);
+            self.test_directory = test_directory;
         }
         std.mem.sort(ast.Path, paths.items, {}, isPathBefore);
         for (paths.items) |path| try self.loadPath(arena, io, path);
@@ -133,6 +129,62 @@ pub const Loader = struct {
         return std.mem.eql(u8, library, directory);
     }
 
+    fn expectDirectory(self: *Loader, allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+        const directory = std.Io.Dir.cwd().openDir(io, path, .{}) catch |open_error| {
+            const message = try std.fmt.allocPrint(allocator, "cannot open '{s}': {t}", .{ path, open_error });
+            self.failure = .{ .message = message };
+            return open_error;
+        };
+        directory.close(io);
+    }
+
+    fn collectTestModulePaths(
+        self: *Loader,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        directory_path: []const u8,
+        prefix: ast.Path,
+        paths: *std.ArrayList(ast.Path),
+    ) !void {
+        var directory = try std.Io.Dir.cwd().openDir(io, directory_path, .{ .iterate = true });
+        defer directory.close(io);
+        var walker = try directory.walk(allocator);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".mn")) continue;
+            const file = try std.fs.path.join(allocator, &.{ directory_path, entry.path });
+            try paths.append(allocator, try self.buildTestModulePath(allocator, prefix, try allocator.dupe(u8, entry.path), file));
+        }
+    }
+
+    fn findTestDirectory(
+        self: *Loader,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        path: []const u8,
+        is_optional: bool,
+    ) !?TestDirectory {
+        if (is_optional and !try isDirectory(io, path)) return null;
+        try self.expectDirectory(allocator, io, path);
+        if (try isSameDirectory(allocator, io, self.program_path, path)) return null;
+        const name = std.fs.path.basename(path);
+        if (!isRootModuleName(name)) {
+            const message = try std.fmt.allocPrint(allocator, "'{s}' cannot be a module, its directory name must be a valid name", .{path});
+            self.failure = .{ .message = message };
+            return error.InvalidModuleName;
+        }
+        const own_file = try std.fs.path.join(allocator, &.{ self.program_path, try std.mem.concat(allocator, u8, &.{ name, ".mn" }) });
+        const own_directory = try std.fs.path.join(allocator, &.{ self.program_path, name });
+        const has_file = try isFile(io, own_file);
+        if (has_file or try isDirectory(io, own_directory)) {
+            const clash = if (has_file) own_file else own_directory;
+            const message = try std.fmt.allocPrint(allocator, "'{s}' has the name of the test directory '{s}'", .{ clash, path });
+            self.failure = .{ .message = message };
+            return error.ReservedModuleName;
+        }
+        return .{ .path = path, .name = name };
+    }
+
     fn buildTestModulePath(
         self: *Loader,
         allocator: std.mem.Allocator,
@@ -203,7 +255,8 @@ pub const Loader = struct {
         const outer_file = try self.buildOuterFileName(allocator, path);
         const inner_file = try self.buildInnerFileName(allocator, path);
         const directory_path = try self.buildDirectoryName(allocator, path);
-        const is_outer_file = try isFile(io, outer_file);
+        const is_test_root = path.len == 1 and self.isTestRoot(path[0]);
+        const is_outer_file = !is_test_root and try isFile(io, outer_file);
         const is_directory = try isDirectory(io, directory_path);
         if (is_outer_file and is_directory) {
             const format = "'{s}' is next to the directory with its name, move it to '{s}'";
@@ -229,8 +282,8 @@ pub const Loader = struct {
         allocator: std.mem.Allocator,
         path: ast.Path,
     ) std.mem.Allocator.Error![]const u8 {
-        const file = try buildSourceFileName(allocator, path);
-        return std.fs.path.join(allocator, &.{ self.chooseRoot(path[0]), file });
+        const directory_path = try self.buildDirectoryName(allocator, path);
+        return std.mem.concat(allocator, u8, &.{ directory_path, ".mn" });
     }
 
     fn buildInnerFileName(
@@ -247,8 +300,17 @@ pub const Loader = struct {
         allocator: std.mem.Allocator,
         path: ast.Path,
     ) std.mem.Allocator.Error![]const u8 {
+        if (self.isTestRoot(path[0])) {
+            const names = try std.mem.concat(allocator, []const u8, &.{ &.{self.test_directory.?.path}, path[1..] });
+            return std.fs.path.join(allocator, names);
+        }
         const joined = try std.mem.join(allocator, "/", path);
         return std.fs.path.join(allocator, &.{ self.chooseRoot(path[0]), joined });
+    }
+
+    fn isTestRoot(self: *const Loader, name: []const u8) bool {
+        const test_directory = self.test_directory orelse return false;
+        return std.mem.eql(u8, name, test_directory.name);
     }
 
     fn chooseRoot(self: *Loader, name: []const u8) []const u8 {
@@ -308,6 +370,11 @@ pub const Loader = struct {
         });
         return self.modules.items.len - 1;
     }
+};
+
+const TestDirectory = struct {
+    path: []const u8,
+    name: []const u8,
 };
 
 pub const Namespace = struct {
@@ -379,6 +446,17 @@ fn isPathBefore(_: void, left: ast.Path, right: ast.Path) bool {
     return left.len < right.len;
 }
 
+fn isSameDirectory(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    one: []const u8,
+    two: []const u8,
+) (std.mem.Allocator.Error || std.Io.Dir.RealPathFileAllocError)!bool {
+    const real_one = try std.Io.Dir.cwd().realPathFileAlloc(io, one, allocator);
+    const real_two = try std.Io.Dir.cwd().realPathFileAlloc(io, two, allocator);
+    return std.mem.eql(u8, real_one, real_two);
+}
+
 fn isWord(name: []const u8) bool {
     if (name.len == 0 or !isWordStart(name[0])) return false;
     for (name[1..]) |byte| {
@@ -389,13 +467,6 @@ fn isWord(name: []const u8) bool {
 
 fn isDirectoryModuleName(name: []const u8) bool {
     return std.mem.eql(u8, name, "module");
-}
-
-fn buildSourceFileName(
-    allocator: std.mem.Allocator,
-    path: ast.Path,
-) std.mem.Allocator.Error![]const u8 {
-    return std.mem.concat(allocator, u8, &.{ try std.mem.join(allocator, "/", path), ".mn" });
 }
 
 fn isFile(io: std.Io, path: []const u8) LoadError!bool {
@@ -552,7 +623,7 @@ test "loadTestModules: loads every file under the directory in the order of its 
     try program_directory.dir.writeFile(io, .{ .sub_path = "one/two.mn", .data = "" });
     try program_directory.dir.writeFile(io, .{ .sub_path = "one/module.mn", .data = "" });
     try program_directory.dir.writeFile(io, .{ .sub_path = "notes.txt", .data = "" });
-    const modules = try loader.loadTestModules(&arena, io);
+    const modules = try loader.loadTestModules(&arena, io, loader.program_path, false);
 
     try std.testing.expectEqual(3, modules.len);
     try std.testing.expectEqualDeep(@as(ast.Path, &.{"one"}), loader.modules.items[modules[0]].path);
@@ -572,7 +643,7 @@ test "loadTestModules: rejects a file whose name cannot be the name of a module"
     try program_directory.dir.createDirPath(io, "one");
     try program_directory.dir.writeFile(io, .{ .sub_path = "one/two-three.mn", .data = "" });
 
-    try std.testing.expectError(error.InvalidModuleName, loader.loadTestModules(&arena, io));
+    try std.testing.expectError(error.InvalidModuleName, loader.loadTestModules(&arena, io, loader.program_path, false));
     const file = try std.fs.path.join(arena.allocator(), &.{ program_path, "one/two-three.mn" });
     const expected = try std.fmt.allocPrint(arena.allocator(), "'{s}' cannot be a module, its file name must be a valid name", .{file});
     try std.testing.expectEqualStrings(expected, loader.failure.?.message);
@@ -588,7 +659,7 @@ test "loadTestModules: rejects a directory with its own mn module" {
     var loader = Loader.init(program_path, "library");
     try program_directory.dir.writeFile(io, .{ .sub_path = "mn.mn", .data = "" });
 
-    try std.testing.expectError(error.ReservedModuleName, loader.loadTestModules(&arena, io));
+    try std.testing.expectError(error.ReservedModuleName, loader.loadTestModules(&arena, io, loader.program_path, false));
 }
 
 test "loadTestModules: loads the files of the library's directory as modules of mn" {
@@ -602,12 +673,168 @@ test "loadTestModules: loads the files of the library's directory as modules of 
     try compiler_directory.dir.writeFile(io, .{ .sub_path = "mn/two.mn", .data = "import mn::one" });
     try compiler_directory.dir.writeFile(io, .{ .sub_path = "mn/one/module.mn", .data = "" });
     var loader = Loader.init(try std.fs.path.join(arena.allocator(), &.{ compiler_path, "mn" }), compiler_path);
-    const modules = try loader.loadTestModules(&arena, io);
+    const modules = try loader.loadTestModules(&arena, io, loader.program_path, false);
 
     try std.testing.expectEqual(2, modules.len);
     try std.testing.expectEqualDeep(@as(ast.Path, &.{ "mn", "one" }), loader.modules.items[modules[0]].path);
     try std.testing.expectEqualDeep(@as(ast.Path, &.{ "mn", "two" }), loader.modules.items[modules[1]].path);
     try std.testing.expectEqual(2, loader.modules.items.len);
+}
+
+test "loadTestModules: loads the files of a separate test directory as modules under its name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const allocator = arena.allocator();
+    var project_directory = std.testing.tmpDir(.{});
+    defer project_directory.cleanup();
+    const project_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &project_directory.sub_path });
+    try project_directory.dir.createDirPath(io, "source");
+    try project_directory.dir.createDirPath(io, "tests/parsing");
+    try project_directory.dir.writeFile(io, .{ .sub_path = "source/index.mn", .data = "" });
+    try project_directory.dir.writeFile(io, .{ .sub_path = "tests/fixtures.mn", .data = "import index" });
+    try project_directory.dir.writeFile(io, .{ .sub_path = "tests/parsing/numbers.mn", .data = "import tests::fixtures" });
+    const test_path = try std.fs.path.join(allocator, &.{ project_path, "tests" });
+    var loader = Loader.init(try std.fs.path.join(allocator, &.{ project_path, "source" }), "library");
+    const modules = try loader.loadTestModules(&arena, io, test_path, false);
+
+    try std.testing.expectEqual(3, modules.len);
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"index"}), loader.modules.items[modules[0]].path);
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{ "tests", "fixtures" }), loader.modules.items[modules[1]].path);
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{ "tests", "parsing", "numbers" }), loader.modules.items[modules[2]].path);
+    try std.testing.expectEqual(3, loader.modules.items.len);
+    const expected = try std.fs.path.join(allocator, &.{ test_path, "parsing/numbers.mn" });
+    try std.testing.expectEqualStrings(expected, try loader.buildModuleFileName(allocator, io, loader.modules.items[modules[2]].path));
+}
+
+test "loadTestModules: names the modules of a test directory after the last part of its path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const allocator = arena.allocator();
+    var project_directory = std.testing.tmpDir(.{});
+    defer project_directory.cleanup();
+    const project_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &project_directory.sub_path });
+    try project_directory.dir.createDirPath(io, "source");
+    try project_directory.dir.createDirPath(io, "checks/unit");
+    try project_directory.dir.writeFile(io, .{ .sub_path = "checks/unit/one.mn", .data = "" });
+    var loader = Loader.init(try std.fs.path.join(allocator, &.{ project_path, "source" }), "library");
+    const modules = try loader.loadTestModules(&arena, io, try std.fs.path.join(allocator, &.{ project_path, "checks/unit" }), false);
+
+    try std.testing.expectEqual(1, modules.len);
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{ "unit", "one" }), loader.modules.items[modules[0]].path);
+}
+
+test "loadTestModules: takes each file once when the test directory is the source directory under another path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const allocator = arena.allocator();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    try program_directory.dir.createDirPath(io, "two");
+    try program_directory.dir.writeFile(io, .{ .sub_path = "one.mn", .data = "" });
+    var loader = Loader.init(program_path, "library");
+    const modules = try loader.loadTestModules(&arena, io, try std.fs.path.join(allocator, &.{ program_path, "two", ".." }), false);
+
+    try std.testing.expectEqual(1, modules.len);
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"one"}), loader.modules.items[modules[0]].path);
+}
+
+test "loadTestModules: loads only the source directory when the test directory it may skip is absent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const allocator = arena.allocator();
+    var project_directory = std.testing.tmpDir(.{});
+    defer project_directory.cleanup();
+    const project_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &project_directory.sub_path });
+    try project_directory.dir.createDirPath(io, "source");
+    try project_directory.dir.writeFile(io, .{ .sub_path = "source/one.mn", .data = "" });
+    var loader = Loader.init(try std.fs.path.join(allocator, &.{ project_path, "source" }), "library");
+    const modules = try loader.loadTestModules(&arena, io, try std.fs.path.join(allocator, &.{ project_path, "tests" }), true);
+
+    try std.testing.expectEqual(1, modules.len);
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"one"}), loader.modules.items[modules[0]].path);
+}
+
+test "loadTestModules: rejects an absent test directory it may not skip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const allocator = arena.allocator();
+    var project_directory = std.testing.tmpDir(.{});
+    defer project_directory.cleanup();
+    const project_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &project_directory.sub_path });
+    try project_directory.dir.createDirPath(io, "source");
+    const test_path = try std.fs.path.join(allocator, &.{ project_path, "tests" });
+    var loader = Loader.init(try std.fs.path.join(allocator, &.{ project_path, "source" }), "library");
+
+    try std.testing.expectError(error.FileNotFound, loader.loadTestModules(&arena, io, test_path, false));
+    const expected = try std.fmt.allocPrint(allocator, "cannot open '{s}': FileNotFound", .{test_path});
+    try std.testing.expectEqualStrings(expected, loader.failure.?.message);
+}
+
+test "loadTestModules: rejects an absent source directory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const allocator = arena.allocator();
+    var project_directory = std.testing.tmpDir(.{});
+    defer project_directory.cleanup();
+    const project_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &project_directory.sub_path });
+    try project_directory.dir.createDirPath(io, "tests");
+    const source_path = try std.fs.path.join(allocator, &.{ project_path, "source" });
+    var loader = Loader.init(source_path, "library");
+
+    try std.testing.expectError(error.FileNotFound, loader.loadTestModules(&arena, io, try std.fs.path.join(allocator, &.{ project_path, "tests" }), true));
+    const expected = try std.fmt.allocPrint(allocator, "cannot open '{s}': FileNotFound", .{source_path});
+    try std.testing.expectEqualStrings(expected, loader.failure.?.message);
+}
+
+test "loadTestModules: rejects a module and a directory of the source directory with the name of the test directory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const allocator = arena.allocator();
+    var project_directory = std.testing.tmpDir(.{});
+    defer project_directory.cleanup();
+    const project_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &project_directory.sub_path });
+    try project_directory.dir.createDirPath(io, "one/source");
+    try project_directory.dir.createDirPath(io, "one/tests");
+    try project_directory.dir.writeFile(io, .{ .sub_path = "one/source/tests.mn", .data = "" });
+    try project_directory.dir.createDirPath(io, "two/source/tests");
+    try project_directory.dir.createDirPath(io, "two/tests");
+
+    for ([_][]const u8{ "one", "two" }, [_][]const u8{ "tests.mn", "tests" }) |project, clash| {
+        const source_path = try std.fs.path.join(allocator, &.{ project_path, project, "source" });
+        const test_path = try std.fs.path.join(allocator, &.{ project_path, project, "tests" });
+        var loader = Loader.init(source_path, "library");
+
+        try std.testing.expectError(error.ReservedModuleName, loader.loadTestModules(&arena, io, test_path, false));
+        const clash_path = try std.fs.path.join(allocator, &.{ source_path, clash });
+        const expected = try std.fmt.allocPrint(allocator, "'{s}' has the name of the test directory '{s}'", .{ clash_path, test_path });
+        try std.testing.expectEqualStrings(expected, loader.failure.?.message);
+    }
+}
+
+test "loadTestModules: rejects a test directory whose name cannot be the name of a module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const allocator = arena.allocator();
+    var project_directory = std.testing.tmpDir(.{});
+    defer project_directory.cleanup();
+    const project_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &project_directory.sub_path });
+    try project_directory.dir.createDirPath(io, "source");
+    try project_directory.dir.createDirPath(io, "two-three");
+    const test_path = try std.fs.path.join(allocator, &.{ project_path, "two-three" });
+    var loader = Loader.init(try std.fs.path.join(allocator, &.{ project_path, "source" }), "library");
+
+    try std.testing.expectError(error.InvalidModuleName, loader.loadTestModules(&arena, io, test_path, false));
+    const expected = try std.fmt.allocPrint(allocator, "'{s}' cannot be a module, its directory name must be a valid name", .{test_path});
+    try std.testing.expectEqualStrings(expected, loader.failure.?.message);
 }
 
 test "buildModuleFileName: gives the module in the directory when there is no file next to it" {
