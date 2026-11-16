@@ -323,6 +323,8 @@ pub const Iteration = struct {
     element: types.Type,
     iterator_values: []const Expression = &.{},
     next_values: []const Expression = &.{},
+    iterator_receiver: ?Expression = null,
+    next_receiver: ?Expression = null,
 };
 
 pub const Defer = struct {

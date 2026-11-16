@@ -3071,6 +3071,7 @@ pub const Generator = struct {
         try writer.print(" mn_iterator_{d} = ", .{number});
         try self.generateFunctionName(allocator, reached, writer, iteration.iterator);
         try writer.writeByte('(');
+        try self.generateReplacementReceiver(allocator, reached, writer, iteration.iterator, iteration.iterator_receiver);
         try self.generateFullValue(allocator, reached, writer, sequence, sequence_type);
         try self.generateReplacementValues(allocator, reached, writer, iteration.iterator, iteration.iterator_values);
         try writer.writeAll(");\n");
@@ -3081,7 +3082,9 @@ pub const Generator = struct {
         try self.generateType(writer, optional_type);
         try writer.print(" mn_element_{d} = ", .{number});
         try self.generateFunctionName(allocator, reached, writer, iteration.next);
-        try writer.print("(&mn_iterator_{d}", .{number});
+        try writer.writeByte('(');
+        try self.generateReplacementReceiver(allocator, reached, writer, iteration.next, iteration.next_receiver);
+        try writer.print("&mn_iterator_{d}", .{number});
         try self.generateReplacementValues(allocator, reached, writer, iteration.next, iteration.next_values);
         try writer.writeAll(");\n");
         try self.generateIndentation(writer);
@@ -3094,6 +3097,22 @@ pub const Generator = struct {
         try self.generateIndentation(writer);
         try writer.writeAll("}\n");
         try self.generateLoopEnd(allocator, reached, writer, statement);
+    }
+
+    fn generateReplacementReceiver(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        reached: *Reached,
+        writer: *std.Io.Writer,
+        function: ast.Resolution.Function,
+        receiver: ?ast.Expression,
+    ) WriteError!void {
+        const value = receiver orelse return;
+        if (isZeroSized(value.type.?)) return;
+        const declaration = self.program.modules[function.module].declarations[function.declaration];
+        const parameters = ast.extractFunctionSignature(declaration).parameters;
+        try self.generateConvertedOperand(allocator, reached, writer, &value, ast.extractType(parameters[0].type));
+        try writer.writeAll(", ");
     }
 
     fn generateReplacementValues(
@@ -7659,6 +7678,78 @@ test "Generator.generate: builds a test executable whose tests replace functions
 
     try std.testing.expectEqualStrings("3 passed, 0 failed\n", try build_directory.readFileAlloc(std.testing.io, "stderr", allocator, .unlimited));
     try std.testing.expectEqual(0, status);
+}
+
+test "Generator.generate: builds a test executable whose tests replace functions of typeclass instances for the types they name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var project_directory = std.testing.tmpDir(.{});
+    defer project_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const project_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &project_directory.sub_path });
+    try project_directory.dir.createDirPath(std.testing.io, "source");
+    try project_directory.dir.createDirPath(std.testing.io, "tests");
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "source/lines.mn", .data = "import mn::filesystem::File\nimport mn::stream::{ BufferedReader, Reader }\n\n\nfn count_lines(file: *File) -> !usize\n    var storage: [64]u8 = undefined\n    var reader = BufferedReader::init(file, &storage)\n    var count: usize = 0\n    while true\n        const line = try reader.read_line()\n        if (line.length == 0) break\n        count += 1\n    return count\n\n\nfn read_first(file: *File) -> !usize\n    var buffer: [8]u8 = undefined\n    return Reader::read(file, &buffer)\n\n\nfn read_second(file: *File) -> !usize\n    var buffer: [8]u8 = undefined\n    return file.read(&buffer)\n" });
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "source/measure.mn", .data = "typeclass Measure(type T)\n\n    fn measure(value: T) -> i64\n\n\nfn Holder(type T) -> type\n    return struct\n        value: T\n\n\ninstance(type T) Measure(Holder(T))\n\n    fn measure(_: Self) -> i64 = 1\n\n\nfn measure_both -> i64\n    const small: Holder(u8) = { value = 1 }\n    const large: Holder(u16) = { value = 2 }\n    return small.measure() + large.measure()\n" });
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "source/countdown.mn", .data = "import mn::iterator::Iterator\n\n\nstruct Countdown\n    count: i64\n\n\ninstance Iterator(Countdown, i64)\n\n    fn next(countdown: *Self) -> ?i64\n        if (countdown.count <= 0) return null\n        countdown.count -= 1\n        return countdown.count\n" });
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "tests/fakes.mn", .data = "import mn::filesystem::{ self, File }\nimport mn::memory\nimport mn::stream::Reader\n\nimport countdown::Countdown\nimport measure::Holder\n\n\nstruct FakeFiles\n    reads: u32\n\n    fn read(self: *Self, _: const(*File), buffer: *[]u8) -> filesystem::Error!usize\n        self.reads += 1\n        if (self.reads > 1) return 0\n        const text = \"a\\nb\\nc\\n\"\n        memory::copy(buffer[..text.length], text)\n        return text.length\n\n\nstruct CountingFiles\n    reads: u32\n\n    fn read(self: *Self, file: const(*File), buffer: *[]u8) -> filesystem::Error!usize\n        self.reads += 1\n        return file.read(buffer)\n\n\nstruct FakeCountdown\n    remaining: i64\n\n    fn next(self: *Self, _: *Countdown) -> ?i64\n        if (self.remaining == 0) return null\n        self.remaining -= 1\n        return self.remaining + 1\n\n\nfn five_for_bytes(_: Holder(u8)) -> i64 = 5\n" });
+    try project_directory.dir.writeFile(std.testing.io, .{ .sub_path = "tests/instances.mn", .data = "import mn::convert::View\nimport mn::filesystem::{ self, File }\nimport mn::iterator::Iterator\nimport mn::stream::Reader\nimport mn::test::expect\n\nimport countdown::Countdown\nimport lines::{ count_lines, read_first, read_second }\nimport measure::{ Holder, Measure, measure_both }\nimport tests::fakes::{ CountingFiles, FakeCountdown, FakeFiles, five_for_bytes }\n\n\ntest \"integration: replaces the read of the reader instance of File beneath a buffered reader\"\n    var file = try File::open(\"words.txt\".view_as(filesystem::Path))\n    defer file.close()\n    var fake: FakeFiles = { reads = 0 }\n    with Reader(File)::read = fake.read\n    const lines = try count_lines(&file)\n    try expect(lines == 3 and fake.reads == 2)\n\n\ntest \"integration: replaces the read of the reader instance of File in the typeclass form and the method form\"\n    var file = try File::open(\"words.txt\".view_as(filesystem::Path))\n    defer file.close()\n    var fake: FakeFiles = { reads = 0 }\n    with Reader(File)::read = fake.read\n    const first = try read_first(&file)\n    const second = try read_second(&file)\n    try expect(first == 6 and second == 0 and fake.reads == 2)\n\n\ntest \"integration: reaches the real read of the reader instance of File from inside the replacement\"\n    var file = try File::open(\"words.txt\".view_as(filesystem::Path))\n    defer file.close()\n    var counting: CountingFiles = { reads = 0 }\n    with Reader(File)::read = counting.read\n    const lines = try count_lines(&file)\n    try expect(lines == 2 and counting.reads == 2)\n\n\ntest \"integration: replaces the function of a generic instance for the types named and not for others\"\n    with Measure(Holder(u8))::measure = five_for_bytes\n    try expect(measure_both() == 6)\n\n\ntest \"integration: gets the real function of a generic instance without a replacement\"\n    try expect(measure_both() == 2)\n\n\ntest \"integration: uses a replaced next function of an iterator instance in a for loop\"\n    var fake: FakeCountdown = { remaining = 3 }\n    with Iterator(Countdown, i64)::next = fake.next\n    var sum: i64 = 0\n    const counter: Countdown = { count = 100 }\n    for value in counter\n        sum += value\n    try expect(sum == 6 and fake.remaining == 0)\n" });
+    const test_path = try std.fs.path.join(allocator, &.{ project_path, "tests" });
+    var loader = @import("monolith").Loader.init(try std.fs.path.join(allocator, &.{ project_path, "source" }), "library");
+    const modules = try loader.loadTestModules(&arena, std.testing.io, test_path, false);
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    var generator = Generator.init(try analyzer.analyze());
+    var test_modules: std.ArrayList(TestModule) = .empty;
+    for (modules) |module| {
+        const file = try loader.buildModuleFileName(allocator, std.testing.io, loader.modules.items[module].path);
+        try test_modules.append(allocator, .{ .module = module, .file = file });
+    }
+    generator.tests = test_modules.items;
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build", "tests" });
+    generator.executable_path = try std.fs.path.join(allocator, &.{ output_path, "test" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build/tests", .{});
+    defer build_directory.close(std.testing.io);
+    try build_directory.writeFile(std.testing.io, .{ .sub_path = "words.txt", .data = "alpha\nbeta\n" });
+    const capture = "printf '%s\\n' '#!/bin/sh' 'cd \"$(dirname \"$0\")\" && exec ./test >stdout 2>stderr' > capture && chmod +x capture";
+    const created = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "sh", "-c", capture }, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqual(0, created.term.exited);
+    var runner: @import("monolith").TestRunner = .{};
+    const status = try runner.run(allocator, std.testing.io, try std.fs.path.join(allocator, &.{ output_path, "capture" }));
+
+    try std.testing.expectEqualStrings("6 passed, 0 failed\n", try build_directory.readFileAlloc(std.testing.io, "stderr", allocator, .unlimited));
+    try std.testing.expectEqual(0, status);
+}
+
+test "Generator.generate: generates the same program whether or not a test of it replaces a function of an instance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    const program = "typeclass Measure(type T)\n\n    fn measure(value: T) -> i64\n\n\nfn Holder(type T) -> type\n    return struct\n        value: T\n\n\ninstance(type T) Measure(Holder(T))\n\n    fn measure(_: Self) -> i64 = 1\n\n\nfn five_for_bytes(_: Holder(u8)) -> i64 = 5\n\n\nfn measure_small -> i64\n    const small: Holder(u8) = { value = 1 }\n    return small.measure()\n\n\nfn main\n    _ = measure_small()\n\n\ntest \"measure_small: gives five\"\n";
+    const bodies = [_][]const u8{ "    with Measure(Holder(u8))::measure = five_for_bytes\n    _ = measure_small()\n", "    _ = measure_small()\n" };
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    var generated: [bodies.len][]const u8 = undefined;
+    for (bodies, &generated) |body, *code| {
+        try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = try std.mem.concat(allocator, u8, &.{ program, body }) });
+        var loader = @import("monolith").Loader.init(program_path, "library");
+        try loader.loadMainModule(&arena, std.testing.io, "main");
+        var type_registry: types.Registry = .{};
+        var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+        var generator = Generator.init(try analyzer.analyze());
+        try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+        code.* = try output_directory.dir.readFileAlloc(std.testing.io, "build/source/main.c", allocator, .unlimited);
+    }
+
+    try std.testing.expectEqualStrings(generated[1], generated[0]);
 }
 
 test "Generator.generate: keeps the code of a test without a replacement the same when another test of the build replaces a function" {

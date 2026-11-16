@@ -2879,8 +2879,55 @@ pub const NameResolver = struct {
                 if (found != .function and found != .method) return self.fail(location, error.ReplacedNotFunction);
                 try self.resolveValue(location, found, &path_expression.resolution);
             },
+            .member => |*member| try self.resolveReplacedInstanceFunction(scope, location, member),
             else => return self.fail(location, error.ReplacedNotFunction),
         }
+    }
+
+    fn resolveReplacedInstanceFunction(self: *NameResolver, scope: Scope, location: token.Location, member: *ast.Member) ResolveError!void {
+        if (findInferredType(member.owner.*)) |inferred| return self.fail(inferred, error.ReplacedInstanceType);
+        const named = (try self.findNamedInstance(scope, member.owner)) orelse return self.fail(location, error.ReplacedNotFunction);
+        if (containsFunctionVariable(named.arguments)) return self.fail(location, error.ReplacedInstanceType);
+        const modules = self.loader.modules.items;
+        const definition = modules[named.typeclass.module].declarations[named.typeclass.declaration].kind.typeclass_definition;
+        const position = findSignaturePosition(definition.functions, member.name) orelse {
+            return self.failReplacedInstance(location, named, member.name, error.ReplacedUnknownFunction);
+        };
+        try self.expectReachableTypeclassFunction(location, named.typeclass, position, .{ .name = member.name, .crossed = member.crossing });
+        const decided = try self.arena.allocator().alloc(?types.Argument, named.arguments.len);
+        for (named.arguments, decided) |argument, *slot| slot.* = argument;
+        const function = (try self.findInstanceFunction(self.module_index, location, named.typeclass, decided, member.name)) orelse {
+            return self.failReplacedInstance(location, named, member.name, error.ReplacedNoInstance);
+        };
+        member.resolution = .{ .function = function };
+    }
+
+    fn failReplacedInstance(
+        self: *NameResolver,
+        location: token.Location,
+        named: NamedInstance,
+        name: []const u8,
+        name_error: NameError,
+    ) ResolveError {
+        const allocator = self.arena.allocator();
+        const modules = self.loader.modules.items;
+        const typeclass_name = modules[named.typeclass.module].declarations[named.typeclass.declaration].kind.typeclass_definition.name;
+        var parts: std.ArrayList([]const u8) = .empty;
+        for (named.arguments) |argument| {
+            try parts.append(allocator, switch (argument) {
+                .type => |value_type| try ast.renderTypeName(allocator, modules, value_type),
+                .length => |length| try std.fmt.allocPrint(allocator, "{d}", .{length}),
+                .constructor => "the type",
+            });
+        }
+        const instance = try std.fmt.allocPrint(allocator, "{s}({s})", .{ typeclass_name, try std.mem.join(allocator, ", ", parts.items) });
+        const message = if (name_error == error.ReplacedNoInstance)
+            try std.fmt.allocPrint(allocator, "there is no instance `{s}`, so `{s}::{s}` names no function to replace", .{ instance, instance, name })
+        else
+            try std.fmt.allocPrint(allocator, "`{s}` has no function `{s}`, so `{s}::{s}` names no function to replace", .{ typeclass_name, name, instance, name });
+        const failure = self.fail(location, name_error);
+        self.failure.?.message = message;
+        return failure;
     }
 
     fn resolveReplacingFunction(self: *NameResolver, scope: Scope, replacement: *ast.Expression) ResolveError!void {
@@ -4760,6 +4807,9 @@ pub const NameError = error{
     ReplacementOutsideTest,
     ReplacedNotFunction,
     ReplacementForm,
+    ReplacedInstanceType,
+    ReplacedUnknownFunction,
+    ReplacedNoInstance,
     DuplicateFunction,
     DuplicateConstant,
     DuplicateStruct,
@@ -5068,6 +5118,9 @@ fn describeError(name_error: NameError) []const u8 {
         error.ReplacementOutsideTest => "a replacement, with followed by a path, = and its replacement, is written only in the body of a test",
         error.ReplacedNotFunction => "only a function can be replaced, and this path does not name one",
         error.ReplacementForm => "a replacement is a function named by a path, e.g. fixed_now, or a function of a local value, e.g. files.read",
+        error.ReplacedInstanceType => "the types of an instance whose function is replaced are written out, and _ cannot stand for one",
+        error.ReplacedUnknownFunction => "the typeclass has no function with this name",
+        error.ReplacedNoInstance => "there is no instance of the typeclass for these types",
         error.NoMembers => "name has no members",
         error.ModuleNotFound => "there is no module with this name",
         error.ConstantRefersToItself => "constant refers to itself",
@@ -5856,6 +5909,19 @@ fn collectExpressionNames(
         },
         .branching => |statement| try collectStatementNames(allocator, names, statement.*),
     }
+}
+
+fn findInferredType(expression: ast.Expression) ?token.Location {
+    return switch (expression.kind) {
+        .inferred_type => expression.location,
+        .call => |call| for (call.arguments) |argument| {
+            if (findInferredType(argument.value)) |location| break location;
+        } else null,
+        .pointer_type => |pointer_type| findInferredType(pointer_type.target.*),
+        .slice_type => |slice_type| findInferredType(slice_type.element.*),
+        .optional_type => |optional_type| findInferredType(optional_type.child.*),
+        else => null,
+    };
 }
 
 fn containsFunctionVariable(arguments: []const types.Argument) bool {
@@ -10985,6 +11051,34 @@ test "resolveReplacedFunction: rejects a path that names a type, a module or a c
         try std.testing.expectError(error.ReplacedNotFunction, analyzer.analyze());
         try std.testing.expectEqual(token.Location{ .row = 12, .column = 10 }, analyzer.failure.?.location.?);
         try std.testing.expectEqualStrings("only a function can be replaced, and this path does not name one", analyzer.failure.?.message);
+    }
+}
+
+test "resolveReplacedInstanceFunction: rejects types without an instance, a function the typeclass lacks and an underscore among the types" {
+    const cases = [_]struct { target: []const u8, failure: NameError, column: usize, message: ?[]const u8 }{
+        .{ .target = "Reader(u8)::read", .failure = error.ReplacedNoInstance, .column = 10, .message = "there is no instance `Reader(u8)`, so `Reader(u8)::read` names no function to replace" },
+        .{ .target = "Reader(File)::write", .failure = error.ReplacedUnknownFunction, .column = 10, .message = "`Reader` has no function `write`, so `Reader(File)::write` names no function to replace" },
+        .{ .target = "Reader(_)::read", .failure = error.ReplacedInstanceType, .column = 17, .message = null },
+        .{ .target = "Reader(Holder(u8))::read", .failure = error.ReplacedNoInstance, .column = 10, .message = "there is no instance `Reader(Holder(u8))`, so `Reader(Holder(u8))::read` names no function to replace" },
+        .{ .target = "Reader(Holder(u8))::write", .failure = error.ReplacedUnknownFunction, .column = 10, .message = "`Reader` has no function `write`, so `Reader(Holder(u8))::write` names no function to replace" },
+    };
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var program_directory = std.testing.tmpDir(.{});
+        defer program_directory.cleanup();
+        const allocator = arena.allocator();
+        const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+        var loader = @import("loader.zig").Loader.init(program_path, "library");
+        const source = try std.mem.concat(allocator, u8, &.{ "import mn::filesystem::File\nimport mn::stream::Reader\n\nfn fake_read(_: const(*File), _: *[]u8) -> !usize = 0\n\nfn main = noop\n\ntest \"read: is replaced\"\n    with ", case.target, " = fake_read\n    noop\n\n\nfn Holder(type T) -> type\n    return struct\n        value: T\n" });
+        try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = source });
+        try loader.loadMainModule(&arena, std.testing.io, "main");
+        var type_registry: types.Registry = .{};
+        var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+        try std.testing.expectError(case.failure, analyzer.analyze());
+        try std.testing.expectEqual(token.Location{ .row = 9, .column = case.column }, analyzer.failure.?.location.?);
+        if (case.message) |message| try std.testing.expectEqualStrings(message, analyzer.failure.?.message);
     }
 }
 

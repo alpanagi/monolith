@@ -7623,6 +7623,21 @@ test "parseReplacement: replaces a path by a function of a local value" {
     try std.testing.expectEqualStrings("read", replacement.replacement.kind.field_access.field);
 }
 
+test "parseReplacement: replaces a function of a typeclass applied to types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn f()\n    with stream::Reader(File)::read = files.read\n    g()");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const target = module.declarations[0].kind.function_definition.body[0].kind.replacement.target.kind.member;
+    try std.testing.expectEqualStrings("read", target.name);
+    const owner = target.owner.kind.call;
+    try std.testing.expectEqualStrings("Reader", owner.callee.path_expression.path[1]);
+    try std.testing.expectEqualStrings("File", owner.arguments[0].value.kind.identifier.name);
+}
+
 test "parseReplacement: rejects an equals sign without a replacement after it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

@@ -342,14 +342,50 @@ pub const TypeChecker = struct {
 
     fn replaceInIteration(self: *TypeChecker, active: []const ActiveReplacement, iteration: *ast.Iteration) TypeError!void {
         if (active.len == 0) return;
-        if (try self.reachesReplaced(iteration.iterator, active)) {
-            iteration.iterator = try self.findReplacementCopy(iteration.iterator, active);
-            iteration.iterator_values = try self.collectReplacementValues(active);
+        try self.replaceLoopCall(active, &iteration.iterator, &iteration.iterator_receiver, &iteration.iterator_values);
+        try self.replaceLoopCall(active, &iteration.next, &iteration.next_receiver, &iteration.next_values);
+    }
+
+    fn replaceLoopCall(
+        self: *TypeChecker,
+        active: []const ActiveReplacement,
+        function: *ast.Resolution.Function,
+        receiver: *?ast.Expression,
+        values: *[]const ast.Expression,
+    ) TypeError!void {
+        const base = self.findReplacementBase(function.*);
+        if (findActiveReplacement(active, base.function)) |replacement| return self.redirectLoopCall(active, function, receiver, values, base, replacement);
+        if (!try self.reachesReplaced(function.*, active)) return;
+        function.* = try self.findReplacementCopy(function.*, active);
+        values.* = try self.collectReplacementValues(active);
+    }
+
+    fn redirectLoopCall(
+        self: *TypeChecker,
+        active: []const ActiveReplacement,
+        function: *ast.Resolution.Function,
+        receiver: *?ast.Expression,
+        values: *[]const ast.Expression,
+        base: ReplacementBase,
+        replacement: ActiveReplacement,
+    ) TypeError!void {
+        const original = function.*;
+        const skip: usize = if (replacement.value != null) 1 else 0;
+        var replacing = replacement.replacing;
+        if (base.arguments) |arguments| replacing = try self.findInstance(replacement.location, replacing, arguments);
+        try self.prepareReached(replacing);
+        if (try self.needsAllocator(replacing)) return self.failReplacementAllocator(replacement);
+        if (!self.isReplaceable(original, replacing, skip, true)) {
+            self.module_index = replacement.module;
+            return self.failReplacement(replacement.location, replacement.statement.*, original, replacing);
         }
-        if (try self.reachesReplaced(iteration.next, active)) {
-            iteration.next = try self.findReplacementCopy(iteration.next, active);
-            iteration.next_values = try self.collectReplacementValues(active);
+        receiver.* = replacement.value;
+        const beneath = try self.removeReplacement(active, replacement.function);
+        if (beneath.len > 0 and try self.reachesReplaced(replacing, beneath)) {
+            replacing = try self.findReplacementCopy(replacing, beneath);
+            values.* = try self.collectReplacementValues(beneath);
         }
+        function.* = replacing;
     }
 
     fn collectReplacementValues(self: *TypeChecker, active: []const ActiveReplacement) std.mem.Allocator.Error![]const ast.Expression {
@@ -438,8 +474,8 @@ pub const TypeChecker = struct {
     fn failReplacementAllocator(self: *TypeChecker, replacement: ActiveReplacement) TypeError {
         const allocator = self.arena.allocator();
         self.module_index = replacement.module;
-        const replacing_name = try renderReplacementName(allocator, replacement.statement.replacement);
-        const original_name = try renderReplacementName(allocator, replacement.statement.target);
+        const replacing_name = try renderReplacementName(allocator, self.program.modules, replacement.statement.replacement);
+        const original_name = try renderReplacementName(allocator, self.program.modules, replacement.statement.target);
         const failure = self.fail(replacement.location, error.ReplacementNeedsAllocator);
         const format = "`{s}` needs an allocator, and a call to `{s}` that it replaces is made where none is set";
         self.failure.?.message = try std.fmt.allocPrint(allocator, format, .{ replacing_name, original_name });
@@ -1885,8 +1921,8 @@ pub const TypeChecker = struct {
     ) TypeError {
         const allocator = self.arena.allocator();
         const skip: usize = if (replacement.receiver != null) 1 else 0;
-        const original_name = try renderReplacementName(allocator, replacement.target);
-        const replacing_name = try renderReplacementName(allocator, replacement.replacement);
+        const original_name = try renderReplacementName(allocator, self.program.modules, replacement.target);
+        const replacing_name = try renderReplacementName(allocator, self.program.modules, replacement.replacement);
         const original_signature = try self.renderSignature(original, findLastName(replacement.target), 0);
         const replacing_signature = try self.renderSignature(replacing, findLastName(replacement.replacement), skip);
         const failure = self.fail(location, error.ReplacementSignatureMismatch);
@@ -1926,8 +1962,8 @@ pub const TypeChecker = struct {
 
     fn renderTypeOf(self: *TypeChecker, written: ast.Expression) std.mem.Allocator.Error![]const u8 {
         const allocator = self.arena.allocator();
-        const resolved = findResolvedType(written) orelse return renderWrittenType(allocator, written);
-        if (!isConcreteType(resolved)) return renderWrittenType(allocator, written);
+        const resolved = findResolvedType(written) orelse return renderWrittenType(allocator, self.program.modules, written);
+        if (!isConcreteType(resolved)) return renderWrittenType(allocator, self.program.modules, written);
         return ast.renderTypeName(allocator, self.program.modules, resolved);
     }
 
@@ -6809,6 +6845,7 @@ fn findNamedFunction(expression: ast.Expression) ?ast.Resolution.Function {
     const resolution = switch (expression.kind) {
         .identifier => |identifier| identifier.resolution,
         .path_expression => |path_expression| path_expression.resolution,
+        .member => |member| member.resolution,
         else => null,
     } orelse return null;
     if (resolution != .function) return null;
@@ -6837,11 +6874,12 @@ fn hasUnfinishedErrorSet(signature: ast.FunctionSignature) bool {
     return return_type == .result and return_type.result.error_set == error_set;
 }
 
-fn renderReplacementName(allocator: std.mem.Allocator, expression: ast.Expression) std.mem.Allocator.Error![]const u8 {
+fn renderReplacementName(allocator: std.mem.Allocator, modules: []const ast.Module, expression: ast.Expression) std.mem.Allocator.Error![]const u8 {
     return switch (expression.kind) {
         .identifier => |identifier| identifier.name,
         .path_expression => |path_expression| std.mem.join(allocator, "::", path_expression.path),
-        .field_access => |access| std.fmt.allocPrint(allocator, "{s}.{s}", .{ try renderReplacementName(allocator, access.value.*), access.field }),
+        .field_access => |access| std.fmt.allocPrint(allocator, "{s}.{s}", .{ try renderReplacementName(allocator, modules, access.value.*), access.field }),
+        .member => |member| std.fmt.allocPrint(allocator, "{s}::{s}", .{ try renderWrittenType(allocator, modules, member.owner.*), member.name }),
         else => "",
     };
 }
@@ -6851,6 +6889,7 @@ fn findLastName(expression: ast.Expression) []const u8 {
         .identifier => |identifier| identifier.name,
         .path_expression => |path_expression| path_expression.path[path_expression.path.len - 1],
         .field_access => |access| access.field,
+        .member => |member| member.name,
         else => "",
     };
 }
@@ -6873,24 +6912,45 @@ fn isConcreteType(value_type: types.Type) bool {
     return true;
 }
 
-fn renderWrittenType(allocator: std.mem.Allocator, written: ast.Expression) std.mem.Allocator.Error![]const u8 {
+fn renderWrittenType(allocator: std.mem.Allocator, modules: []const ast.Module, written: ast.Expression) std.mem.Allocator.Error![]const u8 {
     return switch (written.kind) {
         .identifier => |identifier| identifier.name,
         .path_expression => |path_expression| std.mem.join(allocator, "::", path_expression.path),
         .pointer_type => |pointer_type| {
-            const target = try renderWrittenType(allocator, pointer_type.target.*);
+            const target = try renderWrittenType(allocator, modules, pointer_type.target.*);
             const prefix = if (pointer_type.many) "*[many]" else "*";
             if (pointer_type.constant) return std.fmt.allocPrint(allocator, "const({s}{s})", .{ prefix, target });
             return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, target });
         },
         .slice_type => |slice_type| {
-            const element = try renderWrittenType(allocator, slice_type.element.*);
+            const element = try renderWrittenType(allocator, modules, slice_type.element.*);
             if (slice_type.constant) return std.fmt.allocPrint(allocator, "const(*[]{s})", .{element});
             return std.fmt.allocPrint(allocator, "*[]{s}", .{element});
         },
-        .optional_type => |optional_type| std.fmt.allocPrint(allocator, "?{s}", .{try renderWrittenType(allocator, optional_type.child.*)}),
+        .optional_type => |optional_type| std.fmt.allocPrint(allocator, "?{s}", .{try renderWrittenType(allocator, modules, optional_type.child.*)}),
+        .call => |call| std.fmt.allocPrint(allocator, "{s}({s})", .{ try renderWrittenCallee(allocator, modules, call.callee), try renderWrittenArguments(allocator, modules, call.arguments) }),
         else => "the type",
     };
+}
+
+fn renderWrittenCallee(allocator: std.mem.Allocator, modules: []const ast.Module, callee: ast.Name) std.mem.Allocator.Error![]const u8 {
+    return switch (callee) {
+        .identifier => |identifier| identifier.name,
+        .path_expression => |path_expression| std.mem.join(allocator, "::", path_expression.path),
+        .member => |member| std.fmt.allocPrint(allocator, "{s}::{s}", .{ try renderWrittenType(allocator, modules, member.owner.*), member.name }),
+    };
+}
+
+fn renderWrittenArguments(allocator: std.mem.Allocator, modules: []const ast.Module, arguments: []const ast.Argument) std.mem.Allocator.Error![]const u8 {
+    var rendered: std.ArrayList([]const u8) = .empty;
+    for (arguments) |argument| try rendered.append(allocator, try renderWrittenArgument(allocator, modules, argument.value));
+    return std.mem.join(allocator, ", ", rendered.items);
+}
+
+fn renderWrittenArgument(allocator: std.mem.Allocator, modules: []const ast.Module, written: ast.Expression) std.mem.Allocator.Error![]const u8 {
+    const resolved = findResolvedType(written) orelse return renderWrittenType(allocator, modules, written);
+    if (resolved == .application or !isConcreteType(resolved)) return renderWrittenType(allocator, modules, written);
+    return ast.renderTypeName(allocator, modules, resolved);
 }
 
 fn containsFunction(functions: []const ast.Resolution.Function, function: ast.Resolution.Function) bool {
@@ -10695,6 +10755,57 @@ test "checkReplacement: sets aside the first parameter of a function of a local 
     try std.testing.expectEqual(ast.Resolution.Function{ .module = 0, .declaration = 2 }, ast.extractResolution(call.callee).function);
     try std.testing.expectEqual(1, call.arguments.len);
     try std.testing.expect(call.arguments[0].value.kind == .address_of);
+}
+
+test "checkReplacement: shows the resolved signatures of a function of a generic instance and its replacement that differ" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type T)\n\n    fn measure(value: T) -> i64\n\n\nfn Holder(type T) -> type\n    return struct\n        value: T\n\n\ninstance(type T) Measure(Holder(T))\n\n    fn measure(_: Self) -> i64 = 1\n\n\nfn wrong_measure(_: Holder(u8)) -> u8 = 5\n\n\nfn main = noop\n\n\ntest \"measure: is replaced\"\n    with Measure(Holder(u8))::measure = wrong_measure\n    noop\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ReplacementSignatureMismatch, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 23, .column = 5 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`wrong_measure` cannot replace `Measure(Holder(u8))::measure`, since their signatures differ: `fn measure(_: Holder(u8)) -> i64` and `fn wrong_measure(_: Holder(u8)) -> u8`", analyzer.failure.?.message);
+}
+
+test "checkReplacement: replaces the function of the blanket instance of Deinit for a type that holds no memory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::memory::Deinit\n\n\nstruct Point\n    x: i64\n\n\nstruct Tracker\n    count: u32\n\n    fn forget(self: *Self, _: *Point)\n        self.count += 1\n\n\nfn main = noop\n\n\ntest \"deinit: is replaced\"\n    var tracker: Tracker = { count = 0 }\n    var point: Point = { x = 1 }\n    with Deinit(Point)::deinit = tracker.forget\n    point.deinit()\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const call = loader.modules.items[0].declarations[5].kind.function_definition.body[3].kind.call.kind.call;
+    try std.testing.expectEqual(ast.Resolution.Function{ .module = 0, .declaration = 3 }, ast.extractResolution(call.callee).function);
+    try std.testing.expectEqual(2, call.arguments.len);
+    try std.testing.expect(!call.@"inline");
+}
+
+test "computeValueType: refuses a function of a named instance used as a value outside a replacement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "typeclass Measure(type T)\n\n    fn measure(value: T) -> i64\n\n\nfn Holder(type T) -> type\n    return struct\n        value: T\n\n\ninstance(type T) Measure(Holder(T))\n\n    fn measure(_: Self) -> i64 = 1\n\n\nfn main\n    _ = Measure(Holder(u8))::measure\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.FunctionUsedAsValue, analyzer.analyze());
 }
 
 test "findCreatingCall: reaches the call that created an allocator instance" {
