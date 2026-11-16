@@ -79,7 +79,7 @@ instance(type W: Writer) Encoder(BinaryEncoder(W))
     fn bool(self: *Self, value: bool) -> !void = self.write_unsigned(u8, if (value) 1 else 0)
 
 
-    fn bytes(self: *Self, value: const(*[]u8)) -> !void
+    fn byte_slice(self: *Self, value: const(*[]u8)) -> !void
         try self.write_unsigned(usize, value.length)
         try self.write(value)
 
@@ -219,7 +219,7 @@ instance(type R: Reader) Decoder(BinaryDecoder(R))
         else codec::Error::Malformed
 
 
-    fn bytes(self: *Self) -> !*[]u8
+    fn byte_slice(self: *Self) -> !*[]u8
         const length = try self.read(usize)
         const bytes = try memory::allocate(u8, length)
         errdefer memory::free(bytes)

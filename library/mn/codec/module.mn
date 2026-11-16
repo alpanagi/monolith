@@ -29,7 +29,7 @@ typeclass Encoder(type E)
     fn f64(self: *E, value: f64) -> !void
     fn f128(self: *E, value: f128) -> !void
     fn bool(self: *E, value: bool) -> !void
-    fn bytes(self: *E, value: const(*[]u8)) -> !void
+    fn byte_slice(self: *E, value: const(*[]u8)) -> !void
     fn absent(self: *E) -> !void
     fn present(self: *E) -> !void
     fn begin_sequence(self: *E) -> !void
@@ -69,7 +69,7 @@ typeclass Decoder(type D)
     fn f64(self: *D) -> !f64
     fn f128(self: *D) -> !f128
     fn bool(self: *D) -> !bool
-    fn bytes(self: *D) -> !*[]u8
+    fn byte_slice(self: *D) -> !*[]u8
     fn is_present(self: *D) -> !bool
     fn sequence(self: *D) -> !void
     fn has_sequence_ended(self: *D) -> !bool
@@ -254,17 +254,17 @@ instance(type D: Decoder) Decode(bool, D)
 
 instance(type E: Encoder) Encode(const(*[]u8), E)
 
-    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.bytes(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.byte_slice(value.*)
 
 
 instance(type E: Encoder) Encode(*[]u8, E)
 
-    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.bytes(value.*)
+    fn encode(value: const(*Self), encoder: *E) -> !void = encoder.byte_slice(value.*)
 
 
 instance(type D: Decoder) Decode(*[]u8, D)
 
-    fn decode(decoder: *D) -> !Self = decoder.bytes()
+    fn decode(decoder: *D) -> !Self = decoder.byte_slice()
 
 
 instance(type A: Encode(_, E), type E: Encoder) Encode(?A, E)

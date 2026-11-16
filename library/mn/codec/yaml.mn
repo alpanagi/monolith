@@ -176,7 +176,7 @@ instance(type W: Writer) Encoder(YamlEncoder(W))
     fn f64(self: *Self, value: f64) -> !void = self.write_float(f64, value)
     fn f128(self: *Self, value: f128) -> !void = self.write_float(f128, value)
     fn bool(self: *Self, value: bool) -> !void = self.write_scalar(if (value) "true" else "false", false)
-    fn bytes(self: *Self, value: const(*[]u8)) -> !void = self.write_scalar(value, true)
+    fn byte_slice(self: *Self, value: const(*[]u8)) -> !void = self.write_scalar(value, true)
     fn absent(self: *Self) -> !void = self.write_scalar("null", false)
     fn present(_: *Self) -> !void = noop
     fn begin_sequence(self: *Self) -> !void = self.begin_collection(::Sequence)
@@ -363,7 +363,7 @@ instance Decoder(YamlDecoder)
         return codec::Error::Malformed
 
 
-    fn bytes(self: *Self) -> !*[]u8
+    fn byte_slice(self: *Self) -> !*[]u8
         const scalar = try self.take_scalar()
         const bytes = try memory::allocate(u8, scalar.length)
         memory::copy(bytes, scalar)

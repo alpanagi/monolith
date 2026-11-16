@@ -261,13 +261,13 @@ instance View(Path, const(*[]u8))
 
 instance(type E: Encoder) Encode(Path, E)
 
-    fn encode(path: const(*Self), encoder: *E) -> !void = encoder.bytes(path.bytes)
+    fn encode(path: const(*Self), encoder: *E) -> !void = encoder.byte_slice(path.bytes)
 
 
 instance(type D: Decoder) Decode(Path, D)
 
     fn decode(decoder: *D) -> !Self
-        const bytes = try decoder.bytes()
+        const bytes = try decoder.byte_slice()
         return { bytes = bytes }
 
 

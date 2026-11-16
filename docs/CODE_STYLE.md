@@ -31,6 +31,7 @@
 
 - A struct literal leaves out its type when the surrounding code gives it, e.g. `return { directory = directory }`, and a declaration gives it with an annotation, e.g. `const stdout: Stdout = {}`. It writes the type only where nothing gives it, e.g. `Foo{}.area()`.
 - A struct, tuple or array literal with contents has one space after `{` and one before `}`, e.g. `{ x = 1, y = { a = 2 } }` and `{ name, count }`. An empty literal is `{}`.
+- An argument with a default is passed only when it differs from the default, e.g. `try filesystem::move(old, new)` and `try filesystem::move(old, new, { overwrite = true })`, never `try filesystem::move(old, new, {})`.
 
 ## Errors
 
