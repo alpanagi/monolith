@@ -1,0 +1,40 @@
+import mn::convert::{ To, ToOwned, View }
+import mn::memory::{ self, Deinit }
+
+
+struct CString
+    private bytes: *[]u8
+
+
+instance To(const(*[]u8), CString)
+
+    fn to(text: Self, type U) -> !U
+        const bytes = try memory::allocate(u8, text.length + 1)
+        memory::copy(bytes[..text.length], text)
+        bytes[text.length] = 0
+        return { bytes = bytes }
+
+
+instance ToOwned(*[]u8, CString)
+
+    fn to_owned(text: *Self) -> !CString
+        const length = text.*.length
+        var bytes = text.*
+        if length > 0 and memory::resize(bytes, length + 1)
+            memory::refit(&bytes, length + 1)
+        else
+            bytes = try memory::allocate(u8, length + 1)
+            memory::copy(bytes[..length], text.*)
+            memory::free(text.*)
+        bytes[length] = 0
+        return { bytes = bytes }
+
+
+instance View(CString, const(*[many]u8))
+
+    fn view_as(string: Self, type U) -> U = string.bytes.pointer
+
+
+instance Deinit(CString)
+
+    fn deinit(string: *Self) = memory::free(string.bytes)

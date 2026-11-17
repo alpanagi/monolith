@@ -25,6 +25,7 @@
 ## Layout
 
 - Two blank lines separate top-level functions, constants, structs, enums, error sets, typeclasses and instances, and the functions in a struct's, typeclass's or instance's block. One blank line separates groups of statements inside a function. Consecutive one-line functions, and consecutive one-line constants, can stay together. External functions stay together.
+- The groups at the start of a module, its imports, its external functions and its constants, are separated from each other by one blank line, e.g. the last `import`, a blank line, the `external fn` lines, a blank line, then the `const` lines. Two blank lines follow the last of them, before the module's other declarations.
 - Fields and cases follow their header directly, and one blank line separates them from the functions after them. A struct, enum, typeclass or instance without fields or cases has one blank line between its header and its first function, e.g. `instance Deinit(Record)`, a blank line, then `fn deinit(record: *Record)`.
 - A function without parameters is declared without parentheses, with a body on the same line, with a block, or without a body, e.g. `fn init -> Self = {}`, `fn now -> Self` and `fn Cursor -> type`. It is still called with them, e.g. `WallTime::now()`.
 

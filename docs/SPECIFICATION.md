@@ -690,7 +690,22 @@
 - Everything a test build generates is in `build/tests`, and its executable is `build/tests/test`. A program build leaves `build/tests` in place, and a test build leaves the rest of `build` in place.
 - When the build has no errors, the compiler runs the executable, with the executable's standard output and standard error being the compiler's, and exits with the executable's exit status. A build with errors reports them and runs nothing. An executable that cannot be started or that is ended by a signal is an error that names it.
 - The test executable runs every test to its end, one after the other, in the order of the module paths of their files and in each file in the order they are written. A failing test does not stop the others.
-- For each failing test the executable writes one line to the standard error stream with its file, the row of `test`, its text and the name of the error it returned, e.g. `tests/list.mn:4: test "swap_remove: puts the last element in the gap" failed: Failed`. After the tests it writes the number that passed and the number that failed, e.g. `3 passed, 1 failed`. It exits with status 1 if a test failed and 0 otherwise.
+- The executable writes every test to the standard error stream as it runs, grouped under its file. Before the first test of a file it writes a line with the file's path, and a file without tests writes nothing. An empty line separates the tests of one file from the path of the next.
+- For each test it writes four spaces and the test's text, without quotation marks, before the test runs, so a test that ends the process leaves its text as the last thing written. When the test returns, a passing test ends the line, and a failing test adds two spaces, `failed:` and the name of the error it returned before ending the line.
+- After the tests it writes an empty line and the number that passed and the number that failed. Without any test it writes only the numbers. For example:
+
+  ```
+  tests/index.mn
+      index: finds a duplicate
+      index: rejects a missing file  failed: NotFound
+
+  tests/list.mn
+      swap_remove: puts the last element in the gap
+
+  2 passed, 1 failed
+  ```
+
+- What a test writes itself is not captured and appears where it is written. The executable exits with status 1 if a test failed and 0 otherwise.
 
 ## Build Script
 
