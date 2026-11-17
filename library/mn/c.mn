@@ -1,9 +1,9 @@
-import mn::convert::{ To, ToOwned, View }
+import mn::convert::{ To, ToOwned }
 import mn::memory::{ self, Deinit }
 
 
-struct CString
-    private bytes: *[]u8
+inline struct CString
+    private pointer: const(*[many]u8)
 
 
 instance To(const(*[]u8), CString)
@@ -12,7 +12,7 @@ instance To(const(*[]u8), CString)
         const bytes = try memory::allocate(u8, text.length + 1)
         memory::copy(bytes[..text.length], text)
         bytes[text.length] = 0
-        return { bytes = bytes }
+        return { pointer = bytes.pointer }
 
 
 instance ToOwned(*[]u8, CString)
@@ -27,14 +27,12 @@ instance ToOwned(*[]u8, CString)
             memory::copy(bytes[..length], text.*)
             memory::free(text.*)
         bytes[length] = 0
-        return { bytes = bytes }
-
-
-instance View(CString, const(*[many]u8))
-
-    fn view_as(string: Self, type U) -> U = string.bytes.pointer
+        return { pointer = bytes.pointer }
 
 
 instance Deinit(CString)
 
-    fn deinit(string: *Self) = memory::free(string.bytes)
+    fn deinit(string: *Self)
+        var length: usize = 0
+        while (string.pointer[length] != 0) length += 1
+        memory::free(string.pointer[0..length + 1])

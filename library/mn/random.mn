@@ -15,7 +15,7 @@ typeclass Generator(type G)
 
 
     fn range(generator: *G, range: Range) -> usize
-        const count = mn::convert(u64, range.end.? - range.start)
+        const count = mn::convert(u64, (range.end orelse unreachable) - range.start)
         const threshold = math::subtract_wrapping(0, count) % count
         while true
             const bits = Generator::next(generator)

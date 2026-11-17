@@ -88,6 +88,7 @@ pub const Parser = struct {
         var kind: ast.DeclarationKind = kind: {
             if (private and self.tokens[offset.*].kind == .keyword_instance) return self.fail(offset.*, error.PrivateInstance);
             if (private and self.tokens[offset.*].kind == .keyword_import) return self.fail(offset.* - 1, error.MisplacedPrivate);
+            if (private and self.tokens[offset.*].kind == .keyword_public) return self.fail(offset.* - 1, error.MisplacedPrivate);
             if (private and self.tokens[offset.*].kind == .keyword_test) return self.fail(offset.* - 1, error.MisplacedPrivate);
             if (try self.parseTest(allocator, offset)) |definition| {
                 break :kind .{ .function_definition = definition };
@@ -1109,6 +1110,10 @@ pub const Parser = struct {
     fn parseJump(self: *Parser, offset: *usize) ParseError!?ast.Statement {
         var position = offset.*;
         const keyword = self.tokens[position];
+        if (keyword.kind == .keyword_unreachable) {
+            offset.* = position + 1;
+            return .{ .kind = .@"unreachable", .location = keyword.location };
+        }
         if (keyword.kind != .keyword_break and keyword.kind != .keyword_continue) return null;
         position += 1;
         if (self.tokens[position].kind == .identifier) return self.fail(position, error.LabelWithoutSigil);
@@ -1727,19 +1732,25 @@ pub const Parser = struct {
         offset: *usize,
     ) ParseError!?[]ast.Declaration {
         var position = offset.*;
-        const keyword = self.match(&position, .keyword_import) orelse return null;
+        const location = self.tokens[position].location;
+        const public = self.match(&position, .keyword_public) != null;
+        const keyword = position;
+        if (self.match(&position, .keyword_import) == null) {
+            if (public) return self.fail(offset.*, error.MisplacedPublic);
+            return null;
+        }
         const first = try self.expect(&position, .identifier, error.ExpectedIdentifier);
         const prefix = try self.parseSegments(allocator, &position, first.kind.identifier, true);
         if (self.match(&position, .double_colon) == null) {
-            const import = try self.parseImportName(&position, offset.*, prefix);
+            const import = try self.parseImportName(&position, keyword, prefix, public);
             offset.* = position;
-            return try allocator.dupe(ast.Declaration, &.{.{ .kind = .{ .import = import }, .location = keyword.location }});
+            return try allocator.dupe(ast.Declaration, &.{.{ .kind = .{ .import = import }, .location = location }});
         }
         const crossing = try self.matchCrossing(&position, .double_colon);
         _ = try self.expect(&position, .left_brace, error.ExpectedLeftBrace);
         var declarations: std.ArrayList(ast.Declaration) = .empty;
         while (true) {
-            try declarations.append(allocator, try self.parseImportItem(allocator, &position, prefix, crossing));
+            try declarations.append(allocator, try self.parseImportItem(allocator, &position, prefix, crossing, public));
             if (self.match(&position, .comma) == null) break;
         }
         _ = try self.expect(&position, .right_brace, error.ExpectedRightBrace);
@@ -1754,6 +1765,7 @@ pub const Parser = struct {
         offset: *usize,
         prefix: ast.PathExpression,
         crossing: bool,
+        public: bool,
     ) ParseError!ast.Declaration {
         var position = offset.*;
         const start = position;
@@ -1774,7 +1786,7 @@ pub const Parser = struct {
             crossings[prefix.path.len] = crossing;
             break :written .{ .path = path, .crossings = crossings };
         };
-        const import = try self.parseImportName(&position, start, written);
+        const import = try self.parseImportName(&position, start, written, public);
 
         offset.* = position;
         return .{ .kind = .{ .import = import }, .location = item.location };
@@ -1785,6 +1797,7 @@ pub const Parser = struct {
         offset: *usize,
         start: usize,
         written: ast.PathExpression,
+        public: bool,
     ) ParseError!ast.Import {
         var position = offset.*;
         const path = written.path;
@@ -1795,7 +1808,7 @@ pub const Parser = struct {
         }
 
         offset.* = position;
-        return .{ .path = path, .crossings = written.crossings, .name = name };
+        return .{ .path = path, .crossings = written.crossings, .name = name, .public = public };
     }
 
     fn expectBlock(self: *Parser, offset: usize, outer: usize) ParseError!usize {
@@ -2718,9 +2731,7 @@ pub const Parser = struct {
         if (self.match(offset, .asterisk) != null) {
             return .{ .kind = .{ .dereference = stored }, .location = value.location };
         }
-        if (self.match(offset, .question_mark) != null) {
-            return .{ .kind = .{ .unwrap = stored }, .location = value.location };
-        }
+        if (self.tokens[offset.*].kind == .question_mark) return self.fail(offset.* - 1, error.RemovedUnwrap);
         const crossing = try self.matchCrossing(offset, .dot);
         const field = try self.expect(offset, .identifier, error.ExpectedIdentifier);
         if (self.match(offset, .left_parenthesis) != null) {
@@ -2803,6 +2814,7 @@ pub const Parser = struct {
         }
         const reported = switch (self.tokens[offset].kind) {
             .keyword_private => if (parse_error == error.RepeatedPrivate) parse_error else error.MisplacedPrivate,
+            .keyword_public => error.MisplacedPublic,
             .keyword_test => if (self.tokens[offset + 1].kind == .string_literal) error.MisplacedTest else parse_error,
             else => parse_error,
         };
@@ -2910,6 +2922,7 @@ pub const ParseError = error{
     ElseNotLast,
     NamedCases,
     LabelWithoutSigil,
+    RemovedUnwrap,
     MisplacedAny,
     InlineExternal,
     InlineExternalStruct,
@@ -2920,6 +2933,7 @@ pub const ParseError = error{
     ExpectedDeferredStatement,
     ParenthesizedPattern,
     MisplacedPrivate,
+    MisplacedPublic,
     RepeatedPrivate,
     PrivateInstance,
 };
@@ -3115,6 +3129,7 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.ElseNotLast => "'else' must be the last branch",
         error.NamedCases => "a branch with several cases cannot name a value",
         error.LabelWithoutSigil => "a label is written '@' and a name, e.g. '@outer while'",
+        error.RemovedUnwrap => "'.?' is not part of the language; write `value orelse unreachable`",
         error.MisplacedAny => "'any' can only be the type of a parameter",
         error.InlineExternal => "an external function cannot be inline",
         error.InlineExternalStruct => "an external struct cannot be inline, since C gives it its layout",
@@ -3125,6 +3140,7 @@ fn describeError(parse_error: ParseError) []const u8 {
         error.ExpectedDeferredStatement => "expected a call, an assignment or a discard",
         error.ParenthesizedPattern => "names that take a value apart are written in braces, not parentheses, e.g. `const { name, score } = pair`, `for { card, index } in Zip::zip({ cards, 0.. })` or `while map.pop() as { key, value }`",
         error.MisplacedPrivate => "private is written only before a top-level declaration other than an import or instance, before a function or type in the block of a struct, an enum or a typeclass, or before a struct field, e.g. `private fn build_text` or `private storage: *[]T`; at a use it is written between `.` or `::` and the name it crosses to, or before a field of a struct literal, e.g. `list.private.count`, `filesystem::private::build_path` or `{ private.bytes = text }`",
+        error.MisplacedPublic => "public is written only before an import, e.g. `public import window::descriptor::WindowDescriptor`, since every declaration is reachable from other modules unless it is marked private",
         error.RepeatedPrivate => "private is written once before a declaration, a field or a name",
         error.PrivateInstance => "an instance cannot be private, since instances are always visible wherever their typeclass and type are",
     };
@@ -3244,6 +3260,17 @@ test "parseDeclaration: rejects private before an import" {
 
     try std.testing.expectError(error.MisplacedPrivate, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, parser.failure.?.location.?);
+}
+
+test "parseDeclaration: rejects private before public import" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = noop\nprivate public import mn::stream");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.MisplacedPrivate, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 2, .column = 1 }, parser.failure.?.location.?);
 }
 
 test "parseDeclaration: rejects private before a test" {
@@ -5782,6 +5809,19 @@ test "parseJump: parses break and continue with and without a label" {
     try std.testing.expectEqualStrings("outer", body[3].kind.@"continue".label.?);
 }
 
+test "parseJump: parses unreachable as a statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn main()\n    log()\n    unreachable");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expect(body[1].kind == .@"unreachable");
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, body[1].location);
+}
+
 test "parseJump: rejects a label without the at sign" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6014,10 +6054,10 @@ test "parseAssignment: rejects a call as the target" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, parser.failure.?.location.?);
 }
 
-test "parseAssignment: rejects an unwrap as the target" {
+test "parseAssignment: rejects an orelse as the target" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn main() = maybe.? = 1");
+    var lexer = @import("lexer.zig").Lexer.init("fn main() = (maybe orelse unreachable) = 1");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
 
@@ -7206,6 +7246,17 @@ test "parseImport: rejects a reserved word as the name" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 31 }, parser.failure.?.location.?);
 }
 
+test "parseImport: accepts export as the name after as, since it is not reserved" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("import mn::process::stdout as export");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    try std.testing.expectEqualStrings("export", module.declarations[0].kind.import.name);
+}
+
 test "parseImport: makes one import of each item of a group at the item's name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -7280,6 +7331,101 @@ test "parseImport: rejects a path as an item of a group" {
 
     try std.testing.expectError(error.ExpectedRightBrace, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 19 }, parser.failure.?.location.?);
+}
+
+test "parseImport: marks every name of a public import as public, in each form of import" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("public import window::descriptor::Descriptor\npublic import window::handle as Handle\npublic import mn::text::{ self as words, Parser, Writer as TextWriter }\nimport window::descriptor::Descriptor");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    try std.testing.expectEqual(6, module.declarations.len);
+    const expected = [_]struct { path: ast.Path, name: []const u8, public: bool }{
+        .{ .path = &.{ "window", "descriptor", "Descriptor" }, .name = "Descriptor", .public = true },
+        .{ .path = &.{ "window", "handle" }, .name = "Handle", .public = true },
+        .{ .path = &.{ "mn", "text" }, .name = "words", .public = true },
+        .{ .path = &.{ "mn", "text", "Parser" }, .name = "Parser", .public = true },
+        .{ .path = &.{ "mn", "text", "Writer" }, .name = "TextWriter", .public = true },
+        .{ .path = &.{ "window", "descriptor", "Descriptor" }, .name = "Descriptor", .public = false },
+    };
+    for (expected, module.declarations) |item, declaration| {
+        try std.testing.expectEqualDeep(item.path, declaration.kind.import.path);
+        try std.testing.expectEqualStrings(item.name, declaration.kind.import.name);
+        try std.testing.expectEqual(item.public, declaration.kind.import.public);
+    }
+}
+
+test "parseImport: rejects a group nested in a group of a public import, as for an import" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("public import mn::{ codec::{ Decode } }");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+
+    try std.testing.expectError(error.ExpectedRightBrace, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 26 }, parser.failure.?.location.?);
+}
+
+test "parseImport: gives each error in the path of a public import that the same import gives, at the same place in the path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { source: []const u8, expected: ParseError }{
+        .{ .source = "import module::thing", .expected = error.ReservedImport },
+        .{ .source = "import module::thing::{ self }", .expected = error.ReservedImport },
+        .{ .source = "import mn::{ codec::{ Decode } }", .expected = error.ExpectedRightBrace },
+        .{ .source = "import mn::{ codec::Decode }", .expected = error.ExpectedRightBrace },
+        .{ .source = "import mn::filesystem::private::{ self }", .expected = error.MisplacedPrivate },
+        .{ .source = "import mn::text::{ private }", .expected = error.MisplacedPrivate },
+        .{ .source = "import mn::text::private", .expected = error.MisplacedPrivate },
+        .{ .source = "import mn::text as as", .expected = error.ExpectedIdentifier },
+    };
+    for (cases) |case| {
+        const source = case.source;
+        var plain_lexer = @import("lexer.zig").Lexer.init(source);
+        try plain_lexer.lex(&arena);
+        var plain = Parser.init(plain_lexer.tokens.items);
+        var public_lexer = @import("lexer.zig").Lexer.init(try std.mem.concat(arena.allocator(), u8, &.{ "public ", source }));
+        try public_lexer.lex(&arena);
+        var public = Parser.init(public_lexer.tokens.items);
+
+        try std.testing.expectError(case.expected, plain.parse(&arena));
+        try std.testing.expectError(case.expected, public.parse(&arena));
+        const location = plain.failure.?.location.?;
+        try std.testing.expectEqual(token.Location{ .row = location.row, .column = location.column + "public ".len }, public.failure.?.location.?);
+        try std.testing.expectEqualStrings(plain.failure.?.message, public.failure.?.message);
+    }
+}
+
+test "parseImport: rejects public before anything but import, saying that declarations are reachable unless private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_][]const u8{
+        "public fn one() = noop",
+        "public external fn write()",
+        "public inline fn one() = noop",
+        "public const limit: u8 = 1",
+        "public struct Data\n    value: u8",
+        "public external struct Data\n    value: u8",
+        "public enum Mode\n    Read",
+        "public error Failure\n    Broken",
+        "public typeclass Shape(type T)\n    fn area(value: T) -> u8",
+        "public instance Shape(u8)",
+        "public test \"one: passes\"\n    noop",
+        "public public import mn::text",
+        "public private import mn::text",
+        "public",
+    };
+    for (sources) |source| {
+        var lexer = @import("lexer.zig").Lexer.init(source);
+        try lexer.lex(&arena);
+        var parser = Parser.init(lexer.tokens.items);
+
+        try std.testing.expectError(error.MisplacedPublic, parser.parse(&arena));
+        try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, parser.failure.?.location.?);
+        try std.testing.expectEqualStrings("public is written only before an import, e.g. `public import window::descriptor::WindowDescriptor`, since every declaration is reachable from other modules unless it is marked private", parser.failure.?.message);
+    }
 }
 
 test "expectBlock: rejects empty block" {
@@ -8082,6 +8228,19 @@ test "parseJumpExpression: parses break and continue with a label" {
     try std.testing.expectEqual(null, continued.kind.@"continue".label);
 }
 
+test "parseJumpExpression: parses unreachable as the fallback of orelse and catch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = @import("lexer.zig").Lexer.init("fn f()\n    const a = b orelse unreachable\n    const c = d catch unreachable");
+    try lexer.lex(&arena);
+    var parser = Parser.init(lexer.tokens.items);
+    const module = try parser.parse(&arena);
+
+    const body = module.declarations[0].kind.function_definition.body;
+    try std.testing.expect(body[0].kind.constant_declaration.value.kind.binary.right.kind.jump.kind == .@"unreachable");
+    try std.testing.expect(body[1].kind.constant_declaration.value.kind.binary.right.kind.jump.kind == .@"unreachable");
+}
+
 test "parseJumpExpression: rejects a label without the at sign" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -8162,20 +8321,6 @@ test "parsePostfix: parses a field after a dereference" {
     const value = module.declarations[0].kind.function_definition.body[0].kind.@"return".?;
     try std.testing.expectEqualStrings("x", value.kind.field_access.field);
     try std.testing.expectEqualStrings("pointer", value.kind.field_access.value.kind.dereference.kind.identifier.name);
-}
-
-test "parsePostfix: binds an unwrap tighter than a prefix operator and before a field access" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return -value.?.count");
-    try lexer.lex(&arena);
-    var parser = Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
-
-    const value = module.declarations[0].kind.function_definition.body[0].kind.@"return".?;
-    const access = value.kind.unary.operand.kind.field_access;
-    try std.testing.expectEqualStrings("count", access.field);
-    try std.testing.expectEqualStrings("value", access.value.kind.unwrap.kind.identifier.name);
 }
 
 test "parseStructType: parses the fields and functions of a struct without a name" {
@@ -9678,17 +9823,16 @@ test "parseMember: parses a dereference" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, value.location);
 }
 
-test "parseMember: parses an optional unwrap" {
+test "parseMember: rejects an optional unwrap and shows its replacement" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var lexer = @import("lexer.zig").Lexer.init("fn f() -> i32 = return value.?");
     try lexer.lex(&arena);
     var parser = Parser.init(lexer.tokens.items);
-    const module = try parser.parse(&arena);
 
-    const value = module.declarations[0].kind.function_definition.body[0].kind.@"return".?;
-    try std.testing.expectEqualStrings("value", value.kind.unwrap.kind.identifier.name);
-    try std.testing.expectEqual(token.Location{ .row = 1, .column = 24 }, value.location);
+    try std.testing.expectError(error.RemovedUnwrap, parser.parse(&arena));
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 29 }, parser.failure.?.location.?);
+    try std.testing.expectEqualStrings("'.?' is not part of the language; write `value orelse unreachable`", parser.failure.?.message);
 }
 
 test "parseMember: rejects a dot without a name" {
@@ -10310,6 +10454,26 @@ test "fail: rejects private before a tuple element" {
 
     try std.testing.expectError(error.MisplacedPrivate, parser.parse(&arena));
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 14 }, parser.failure.?.location.?);
+}
+
+test "fail: rejects public in a struct's block and in a function body as written only before an import" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { source: []const u8, row: usize }{
+        .{ .source = "struct Data\n    value: u8\n    public", .row = 3 },
+        .{ .source = "struct Data\n    value: u8\n    public fn get(self: Self) -> u8 = self.value", .row = 3 },
+        .{ .source = "fn main\n    public", .row = 2 },
+        .{ .source = "fn main\n    public const limit: u8 = 1\n    _ = limit", .row = 2 },
+    };
+    for (cases) |case| {
+        var lexer = @import("lexer.zig").Lexer.init(case.source);
+        try lexer.lex(&arena);
+        var parser = Parser.init(lexer.tokens.items);
+
+        try std.testing.expectError(error.MisplacedPublic, parser.parse(&arena));
+        try std.testing.expectEqual(token.Location{ .row = case.row, .column = 5 }, parser.failure.?.location.?);
+        try std.testing.expectEqualStrings("public is written only before an import, e.g. `public import window::descriptor::WindowDescriptor`, since every declaration is reachable from other modules unless it is marked private", parser.failure.?.message);
+    }
 }
 
 test "findUnclosedParenthesis: points at a parenthesis left open at the end of the file" {

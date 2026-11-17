@@ -148,6 +148,7 @@ pub const StatementKind = union(enum) {
     @"defer": Defer,
     @"break": Jump,
     @"continue": Jump,
+    @"unreachable",
     value: Expression,
     replacement: Replacement,
 };
@@ -258,6 +259,7 @@ pub const Import = struct {
     path: Path,
     crossings: []const bool = &.{},
     name: []const u8,
+    public: bool = false,
     typeclass: ?Resolution.Typeclass = null,
 };
 
@@ -1528,6 +1530,7 @@ pub fn extractBlocks(statement: Statement) [2][]const Statement {
         .@"defer",
         .@"break",
         .@"continue",
+        .@"unreachable",
         .value,
         .replacement,
         => .{ &.{}, &.{} },
@@ -1543,7 +1546,7 @@ pub fn isEndingBlock(module: Module, statements: []const Statement) bool {
 
 fn isEndingStatement(module: Module, statement: Statement) bool {
     return switch (statement.kind) {
-        .@"return", .@"break", .@"continue" => true,
+        .@"return", .@"break", .@"continue", .@"unreachable" => true,
         .call => |expression| isComptimeErrorCall(module, expression),
         .@"if" => |conditional| {
             const else_body = conditional.else_body orelse return false;
@@ -1581,7 +1584,7 @@ pub fn extractExpressions(statement: *const Statement) Expressions {
             },
         },
         .match => |*matching| expressions.append(&matching.value),
-        .noop, .@"defer", .@"break", .@"continue", .replacement => {},
+        .noop, .@"defer", .@"break", .@"continue", .@"unreachable", .replacement => {},
     }
     return expressions;
 }
@@ -1779,7 +1782,7 @@ pub fn findBranching(statement: *const Statement) ?*Statement {
         .tuple_declaration => |declaration| declaration.value,
         .variable_declaration => |variable| variable.value,
         .assignment => |assignment| assignment.value,
-        .noop, .discard, .call, .@"if", .@"while", .@"for", .match, .@"defer", .@"break", .@"continue", .value, .replacement => return null,
+        .noop, .discard, .call, .@"if", .@"while", .@"for", .match, .@"defer", .@"break", .@"continue", .@"unreachable", .value, .replacement => return null,
     };
     if (value.kind != .branching) return null;
     return value.kind.branching;
@@ -1802,6 +1805,7 @@ pub fn extractLabel(statement: Statement) ?[]const u8 {
         .@"defer",
         .@"break",
         .@"continue",
+        .@"unreachable",
         .value,
         .replacement,
         => null,
@@ -1850,6 +1854,7 @@ pub fn extractElementNames(statement: Statement) []ElementName {
         .@"defer",
         .@"break",
         .@"continue",
+        .@"unreachable",
         .value,
         .replacement,
         => unreachable,
@@ -2208,6 +2213,7 @@ fn cloneStatement(allocator: std.mem.Allocator, statement: Statement) std.mem.Al
         .@"defer" => |deferred| .{ .@"defer" = try cloneDefer(allocator, deferred) },
         .@"break" => |jump| .{ .@"break" = .{ .label = jump.label } },
         .@"continue" => |jump| .{ .@"continue" = .{ .label = jump.label } },
+        .@"unreachable" => .@"unreachable",
         .value => |expression| .{ .value = try cloneExpression(allocator, expression) },
         .replacement => |replacement| .{ .replacement = .{
             .target = try cloneExpression(allocator, replacement.target),

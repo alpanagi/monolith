@@ -794,6 +794,10 @@ pub fn containsEnum(value_type: Type, target: *const Enum) bool {
     return containsByValue(value_type, .{ .@"enum" = target }, null);
 }
 
+pub fn holdsStruct(value_type: Type, target: Struct) bool {
+    return holdsStructWithin(value_type, @intFromPtr(target.fields.ptr), null);
+}
+
 fn containsTypeValue(value_type: Type, visited: ?*const Visited) bool {
     return switch (value_type) {
         .type => true,
@@ -874,6 +878,41 @@ fn containsByValue(value_type: Type, target: Type, visited: ?*const Visited) boo
             const node: Visited = .{ .identity = identity, .parent = visited };
             for (enumeration.cases) |case| {
                 if (containsByValue(case.type orelse continue, target, &node)) return true;
+            }
+            return false;
+        },
+    };
+}
+
+fn holdsStructWithin(value_type: Type, target: usize, visited: ?*const Visited) bool {
+    return switch (value_type) {
+        .number, .boolean, .void, .type, .@"enum", .variable, .application => false,
+        .array => |array| holdsStructWithin(array.element, target, visited),
+        .slice => |slice| holdsStructWithin(slice.element, target, visited),
+        .pointer => |pointer| holdsStructWithin(pointer.target, target, visited),
+        .optional => |optional| holdsStructWithin(optional.child, target, visited),
+        .result => |result| holdsStructWithin(result.value, target, visited),
+        .tuple => |tuple| {
+            for (tuple.elements) |element| {
+                if (holdsStructWithin(element, target, visited)) return true;
+            }
+            return false;
+        },
+        .function => |function| {
+            for (function.parameters) |parameter| {
+                if (holdsStructWithin(parameter, target, visited)) return true;
+            }
+            return holdsStructWithin(function.return_type, target, visited);
+        },
+        .@"struct" => |struct_type| {
+            const identity = @intFromPtr(struct_type.fields.ptr);
+            if (identity == target) return true;
+            if (isVisited(visited, identity)) return false;
+            const node: Visited = .{ .identity = identity, .parent = visited };
+            if (struct_type.@"inline" and holdsStructWithin(struct_type.fields[0].type, target, &node)) return true;
+            const origin = struct_type.origin orelse return false;
+            for (origin.arguments) |argument| {
+                if (holdsStructWithin(argument, target, &node)) return true;
             }
             return false;
         },
@@ -1095,13 +1134,14 @@ pub fn findLayout(value_type: Type) Layout {
             return .{ .size = element.size * array.length, .alignment = element.alignment };
         },
         .optional => |optional| {
-            if (optional.child == .pointer) return findLayout(optional.child);
+            if (isPointerOptional(value_type)) return findLayout(optional.child);
             var layout: Layout = .{ .size = 0, .alignment = 1 };
             layout.append(findLayout(optional.child));
             layout.append(findLayout(.boolean));
             return layout.finish();
         },
         .result => |result| {
+            if (findBareValue(value_type)) |bare| return findLayout(bare);
             var layout: Layout = .{ .size = 0, .alignment = 1 };
             layout.append(findLayout(.{ .@"enum" = result.error_set }));
             layout.append(findLayout(result.value));
@@ -1149,25 +1189,34 @@ pub const Layout = struct {
 };
 
 pub fn isZeroSized(value_type: Type) bool {
-    switch (value_type) {
-        .@"struct" => |struct_type| {
-            for (struct_type.fields) |field| {
-                if (!isZeroSized(field.type)) return false;
-            }
-            return true;
-        },
-        .array => |array| return array.length == 0 or isZeroSized(array.element),
-        .tuple => |tuple| {
-            for (tuple.elements) |element| {
-                if (!isZeroSized(element)) return false;
-            }
-            return true;
-        },
-        .void => return true,
-        .number, .boolean, .type, .slice, .pointer, .optional, .result, .function, .variable, .application, .@"enum" => {
-            return false;
-        },
-    }
+    return hasNoSize(value_type, .bare);
+}
+
+pub fn isZeroSizedWithErrorTags(value_type: Type) bool {
+    return hasNoSize(value_type, .tagged);
+}
+
+pub fn findBareValue(value_type: Type) ?Type {
+    if (value_type != .result or value_type.result.error_set.cases.len > 0) return null;
+    return value_type.result.value;
+}
+
+pub fn findUnwrappedField(value_type: Type) ?Field {
+    if (value_type != .@"struct" or isZeroSizedWithErrorTags(value_type)) return null;
+    const struct_type = value_type.@"struct";
+    if (!struct_type.@"inline") return null;
+    return struct_type.fields[0];
+}
+
+pub fn findInlineRepresentation(value_type: Type) Type {
+    var current = value_type;
+    while (findUnwrappedField(current)) |field| current = field.type;
+    return current;
+}
+
+pub fn isPointerOptional(value_type: Type) bool {
+    if (value_type != .optional) return false;
+    return findInlineRepresentation(value_type.optional.child) == .pointer;
 }
 
 fn hasVariables(value_type: Type) bool {
@@ -1184,6 +1233,34 @@ fn hasVariables(value_type: Type) bool {
         .function => |function| function.variables,
     };
 }
+
+fn hasNoSize(value_type: Type, results: ResultForm) bool {
+    switch (value_type) {
+        .@"struct" => |struct_type| {
+            for (struct_type.fields) |field| {
+                if (!hasNoSize(field.type, results)) return false;
+            }
+            return true;
+        },
+        .array => |array| return array.length == 0 or hasNoSize(array.element, results),
+        .tuple => |tuple| {
+            for (tuple.elements) |element| {
+                if (!hasNoSize(element, results)) return false;
+            }
+            return true;
+        },
+        .result => |result| return results == .bare and result.error_set.cases.len == 0 and hasNoSize(result.value, results),
+        .void => return true,
+        .number, .boolean, .type, .slice, .pointer, .optional, .function, .variable, .application, .@"enum" => {
+            return false;
+        },
+    }
+}
+
+const ResultForm = enum {
+    bare,
+    tagged,
+};
 
 fn anyVariables(value_types: []const Type) bool {
     for (value_types) |value_type| {
@@ -1331,10 +1408,37 @@ test "followPointer: follows a single and a multiple value pointer one level" {
     try std.testing.expectEqual(Type.boolean, followPointer(.boolean));
 }
 
+test "findLayout: lays out a result whose error set has no cases as its value, alone and inside an optional and an array" {
+    const empty: Enum = .{ .module = 0, .name = "", .kind = .error_set };
+    const bare: Result = .{ .error_set = &empty, .value = .{ .number = .u64 } };
+    const optional: Optional = .{ .child = .{ .result = &bare } };
+    const optional_value: Optional = .{ .child = .{ .number = .u64 } };
+    const array: Array = .{ .length = 3, .element = .{ .result = &bare } };
+    const array_value: Array = .{ .length = 3, .element = .{ .number = .u64 } };
+
+    try std.testing.expectEqual(findLayout(.{ .number = .u64 }), findLayout(.{ .result = &bare }));
+    try std.testing.expectEqual(findLayout(.{ .optional = &optional_value }), findLayout(.{ .optional = &optional }));
+    try std.testing.expectEqual(findLayout(.{ .array = &array_value }), findLayout(.{ .array = &array }));
+}
+
 test "isZeroSized: treats an array of void as zero-sized" {
     const voids: Array = .{ .length = 3, .element = .void };
     const numbers: Array = .{ .length = 3, .element = .{ .number = .i32 } };
 
     try std.testing.expect(isZeroSized(.{ .array = &voids }));
     try std.testing.expect(!isZeroSized(.{ .array = &numbers }));
+}
+
+test "isZeroSized: treats a result of void whose error set has no cases as zero-sized" {
+    const empty: Enum = .{ .module = 0, .name = "", .kind = .error_set };
+    const bare: Result = .{ .error_set = &empty, .value = .void };
+
+    try std.testing.expect(isZeroSized(.{ .result = &bare }));
+}
+
+test "isZeroSizedWithErrorTags: keeps a result of void whose error set has no cases sized" {
+    const empty: Enum = .{ .module = 0, .name = "", .kind = .error_set };
+    const bare: Result = .{ .error_set = &empty, .value = .void };
+
+    try std.testing.expect(!isZeroSizedWithErrorTags(.{ .result = &bare }));
 }

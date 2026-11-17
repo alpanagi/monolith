@@ -47,7 +47,7 @@ fn BinaryEncoder(type W: Writer) -> type
 
 
         private fn close_collection(self: *Self, parts: usize) -> !void
-            var buffer = self.buffers.pop().?
+            var buffer = self.buffers.pop() orelse unreachable
             defer buffer.bytes.deinit()
             try self.write_unsigned(usize, buffer.count / parts)
             try self.write(buffer.bytes.view_as(const(*[]u8)))

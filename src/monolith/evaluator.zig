@@ -158,7 +158,7 @@ pub const Evaluator = struct {
         return switch (expression.kind) {
             .integer_literal, .float_literal, .boolean_literal, .string_literal, .null => true,
             inline .identifier, .path_expression, .member => |name| self.isKnownResolution(name.resolution, calls),
-            .negation, .unwrap, .dereference, .address_of => |operand| self.isKnownWith(operand.*, calls),
+            .negation, .dereference, .address_of => |operand| self.isKnownWith(operand.*, calls),
             .@"try" => false,
             .range => |range| self.isKnownWith(range.start, calls) and
                 (if (range.end) |end| self.isKnownWith(end, calls) else true),
@@ -188,7 +188,9 @@ pub const Evaluator = struct {
             },
             .method_call => |call| calls and call.with_value == null and self.isKnownWith(call.receiver.*, calls) and self.areKnown(call.arguments, calls),
             .array_type, .slice_type, .pointer_type, .optional_type, .tuple_type, .function_type, .struct_type => true,
-            .undefined, .jump, .branching => false,
+            .jump => |statement| statement.kind == .@"unreachable",
+            .undefined, .branching => false,
+            .unwrap => unreachable,
         };
     }
 
@@ -237,7 +239,7 @@ pub const Evaluator = struct {
             .field_access => self.evaluateFieldAccess(expression),
             .dereference => self.readPlace(location, try self.findPlace(expression.*)),
             .slice => |slice| self.evaluateSlice(expression.*, slice),
-            .unwrap => |operand| self.evaluateUnwrap(expression.*, operand.*),
+            .unwrap => unreachable,
             .@"try" => |operand| self.evaluateTry(operand.*),
             .range => |range| self.evaluateRange(range),
             .address_of => |operand| self.evaluateAddress(operand.*),
@@ -819,12 +821,6 @@ pub const Evaluator = struct {
         return @intCast(value);
     }
 
-    fn evaluateUnwrap(self: *Evaluator, expression: ast.Expression, operand: ast.Expression) EvaluateError!Value {
-        const value = try self.evaluateExpression(&operand);
-        const inner = value.optional orelse return self.fail(expression.location, error.UnwrappedNull);
-        return inner.*;
-    }
-
     fn evaluateTry(self: *Evaluator, operand: ast.Expression) EvaluateError!Value {
         const value = try self.evaluateExpression(&operand);
         if (value != .failure) return value;
@@ -833,6 +829,7 @@ pub const Evaluator = struct {
     }
 
     fn evaluateJump(self: *Evaluator, location: token.Location, statement: *const ast.Statement) EvaluateError!Value {
+        if (statement.kind == .@"unreachable") return self.fail(location, error.UnreachableReached);
         if (self.frame == null) return self.fail(location, error.CannotEvaluate);
         self.jumped = switch (statement.kind) {
             .@"return" => try self.executeStatement(statement),
@@ -1157,6 +1154,7 @@ pub const Evaluator = struct {
             .@"defer" => unreachable,
             .@"break" => |*jump| return .{ .broke = jump.loop.? },
             .@"continue" => |*jump| return .{ .continued = jump.loop.? },
+            .@"unreachable" => return self.fail(statement.location, error.UnreachableReached),
             .value => |*expression| {
                 self.produced = try self.evaluateConverted(expression, self.production_type.?);
                 return .next;
@@ -1554,7 +1552,7 @@ pub const EvaluationError = error{
     DivisionByZero,
     IndexOutOfRange,
     SliceOutOfRange,
-    UnwrappedNull,
+    UnreachableReached,
     ReadUndefined,
     ReversedRange,
     ExternalCall,
@@ -1608,7 +1606,7 @@ fn describeError(evaluation_error: EvaluationError) []const u8 {
         error.DivisionByZero => "division by zero",
         error.IndexOutOfRange => "index is outside the length",
         error.SliceOutOfRange => "slice bounds are outside the length or reversed",
-        error.UnwrappedNull => "null is unwrapped",
+        error.UnreachableReached => "unreachable code was reached",
         error.ReadUndefined => "undefined is read",
         error.ReversedRange => "range starts after its end",
         error.ExternalCall => "external functions cannot run at compile time",
@@ -3180,28 +3178,6 @@ test "evaluateSlice: rejects bounds outside the length" {
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 12 }, analyzer.failure.?.location.?);
 }
 
-test "evaluateUnwrap: rejects unwrapping null" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var program_directory = std.testing.tmpDir(.{});
-    defer program_directory.cleanup();
-    const program_path = try std.fs.path.join(
-        arena.allocator(),
-        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
-    );
-    var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn main()\n    const maybe: ?i32 = null\n    const value = maybe.?\n    _ = value" });
-    try loader.loadMainModule(&arena, std.testing.io, "main");
-    var type_registry: types.Registry = .{};
-    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
-    _ = try analyzer.analyze();
-
-    const body = loader.modules.items[0].declarations[0].kind.function_definition.body;
-    const value = body[1].kind.constant_declaration.value;
-    try std.testing.expectError(error.UnwrappedNull, analyzer.type_checker.evaluator.evaluate(&value));
-    try std.testing.expectEqual(token.Location{ .row = 3, .column = 19 }, analyzer.type_checker.evaluator.failure.?.location.?);
-}
-
 test "evaluateTry: returns the error of a result from the function" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3247,6 +3223,45 @@ test "evaluateJump: returns, breaks and continues from inside an expression at c
     try std.testing.expectEqual(Value{ .integer = .{ .signed = 521 } }, elements[4]);
     try std.testing.expectEqual(Value{ .integer = .{ .signed = 9 } }, elements[5]);
     try std.testing.expectEqual(Value{ .integer = .{ .signed = 4 } }, elements[6]);
+}
+
+test "evaluateJump: rejects reaching unreachable as the fallback of a null optional" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn find() -> ?i32 = null\nfn take() -> i32\n    const found = find()\n    return found orelse unreachable\nconst TAKEN = take()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnreachableReached, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 25 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("unreachable code was reached", analyzer.failure.?.message);
+}
+
+test "evaluateJump: rejects reaching unreachable as the fallback of a result that holds an error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "error ParseError\n    MissingEnd\nfn parse() -> ParseError!i32 = ParseError::MissingEnd\nfn take() -> i32\n    const parsed = parse()\n    return parsed catch unreachable\nconst TAKEN = take()" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnreachableReached, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 6, .column = 25 }, analyzer.failure.?.location.?);
 }
 
 test "evaluateBranching: gives the value of the block a run-time condition chooses at compile time, nested" {
@@ -3673,6 +3688,25 @@ test "executeStatement: returns the last line of a function and of each block at
     try std.testing.expectEqual(Value{ .integer = .{ .signed = 1 } }, declarations[5].kind.constant_declaration.known.?.*);
 }
 
+test "executeOtherStatement: rejects reaching an unreachable statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: i32) -> i32\n    if (value > 0) return value\n    unreachable\nconst TAKEN = take(0)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.UnreachableReached, analyzer.analyze());
+    try std.testing.expectEqual(token.Location{ .row = 3, .column = 5 }, analyzer.failure.?.location.?);
+}
+
 test "executeExpressionStatement: runs a caught call once and its fallback only for an error at compile time" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3873,7 +3907,7 @@ test "executeMatch: runs the branch of an optional and writes through a pointer 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn bump(start: ?i64) -> i64\n    var value = start\n    match value\n        case (i64 as *count) count.* += 1\n        case (null) return 0\n    return value.?\nconst BUMPED = bump(4)\nconst NOTHING = bump(null)" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn bump(start: ?i64) -> i64\n    var value = start\n    match value\n        case (i64 as *count) count.* += 1\n        case (null) return 0\n    return value orelse unreachable\nconst BUMPED = bump(4)\nconst NOTHING = bump(null)" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4125,7 +4159,7 @@ test "executeIteration: steps the cursor of a read-only slice through pointers t
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Iterable\nimport mn::iterator::Iterator\nfn take() -> [u32, u32]\n    const cards = [3]u32{ 7, 8, 9 }\n    var cursor = Iterable::iterator(cards[..])\n    const first = Iterator::next(&cursor)\n    const second = Iterator::next(&cursor)\n    return { first.?.*, second.?.* }\nconst TAKEN = take()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Iterable\nimport mn::iterator::Iterator\nfn take() -> [u32, u32]\n    const cards = [3]u32{ 7, 8, 9 }\n    var cursor = Iterable::iterator(cards[..])\n    const first = Iterator::next(&cursor)\n    const second = Iterator::next(&cursor)\n    return { (first orelse unreachable).*, (second orelse unreachable).* }\nconst TAKEN = take()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -4146,7 +4180,7 @@ test "executeIteration: steps the cursor of a slice through pointers to its elem
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Iterable\nimport mn::iterator::Iterator\nfn take() -> [u32, u32]\n    var cards = [3]u32{ 7, 8, 9 }\n    var cursor = Iterable::iterator(cards[..])\n    const first = Iterator::next(&cursor)\n    const second = Iterator::next(&cursor)\n    return { first.?.*, second.?.* }\nconst TAKEN = take()" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Iterable\nimport mn::iterator::Iterator\nfn take() -> [u32, u32]\n    var cards = [3]u32{ 7, 8, 9 }\n    var cursor = Iterable::iterator(cards[..])\n    const first = Iterator::next(&cursor)\n    const second = Iterator::next(&cursor)\n    return { (first orelse unreachable).*, (second orelse unreachable).* }\nconst TAKEN = take()" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);

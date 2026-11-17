@@ -66,7 +66,7 @@ fn YamlEncoder(type W: Writer) -> type
             const frame = self.find_top()
             if (frame.kind != kind or frame.budget != null) return Error::ExtraPart
             if (frame.is_value_next) return Error::MissingPart
-            const ended = self.frames.pop().?
+            const ended = self.frames.pop() orelse unreachable
             if (ended.is_empty) return self.write_empty(kind, ended.place)
             try self.settle()
 

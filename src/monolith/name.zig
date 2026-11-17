@@ -21,6 +21,7 @@ pub const keywords = std.StaticStringMap(token.TokenKind).initComptime(.{
     .{ "while", .keyword_while },
     .{ "break", .keyword_break },
     .{ "continue", .keyword_continue },
+    .{ "unreachable", .keyword_unreachable },
     .{ "and", .keyword_and },
     .{ "or", .keyword_or },
     .{ "orelse", .keyword_orelse },
@@ -42,6 +43,7 @@ pub const keywords = std.StaticStringMap(token.TokenKind).initComptime(.{
     .{ "with", .keyword_with },
     .{ "many", .keyword_many },
     .{ "private", .keyword_private },
+    .{ "public", .keyword_public },
     .{ "test", .keyword_test },
     .{ "_", .underscore },
 });
@@ -88,9 +90,15 @@ test "isName: rejects keywords and the discard symbol" {
     try std.testing.expect(!isName("_"));
 }
 
-test "isName: rejects private and accepts public" {
+test "isName: rejects private and public and accepts export" {
     try std.testing.expect(!isName("private"));
-    try std.testing.expect(isName("public"));
+    try std.testing.expect(!isName("public"));
+    try std.testing.expect(isName("export"));
+}
+
+test "isName: rejects unreachable and accepts a name that starts with it" {
+    try std.testing.expect(!isName("unreachable"));
+    try std.testing.expect(isName("unreachable_code"));
 }
 
 test "isName: rejects words that are not names" {

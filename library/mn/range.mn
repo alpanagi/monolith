@@ -20,7 +20,7 @@ struct RangeCursor
 instance Iterator(RangeCursor, usize)
 
     fn next(cursor: *Self) -> ?usize
-        if (cursor.end != null and cursor.position >= cursor.end.?) return null
+        if (cursor.end != null and cursor.position >= cursor.end orelse unreachable) return null
         const value = cursor.position
         cursor.position += 1
         return value

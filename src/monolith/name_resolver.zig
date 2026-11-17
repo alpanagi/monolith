@@ -43,6 +43,9 @@ pub const NameResolver = struct {
     pending: std.ArrayList(PendingMethod) = .empty,
     resolved_branchings: std.AutoHashMapUnmanaged(*const ast.Statement, void) = .empty,
     nested_types: std.ArrayList(NestedType) = .empty,
+    struct_depth: usize = 0,
+    deferred_external_structs: std.ArrayList(DeferredExternalStruct) = .empty,
+    resolving_public_imports: std.ArrayList(PublicImportReference) = .empty,
     preparing: bool = false,
     testing: bool = false,
     failure: ?Failure = null,
@@ -406,12 +409,13 @@ pub const NameResolver = struct {
         const declaration = modules[self.module_index].declarations[index];
         return switch (declaration.kind) {
             .function_definition => |definition| rest.len == 0 and isTypeFunction(definition.signature),
-            .import => |import| self.isImportedTypeFunction(import.path, rest),
+            .import => |import| self.isImportedTypeFunction(import.path, rest, 0),
             .function_declaration, .constant_declaration, .struct_definition, .enum_definition, .typeclass_definition, .instance_declaration => false,
         };
     }
 
-    fn isImportedTypeFunction(self: *const NameResolver, path: ast.Path, rest: ast.Path) bool {
+    fn isImportedTypeFunction(self: *const NameResolver, path: ast.Path, rest: ast.Path, depth: usize) bool {
+        if (depth > maximum_alias_depth) return false;
         const modules = self.loader.modules.items;
         const last = if (rest.len > 0) rest[rest.len - 1] else path[path.len - 1];
         var namespace = self.loader.findRoot(path[0]) orelse return false;
@@ -423,8 +427,9 @@ pub const NameResolver = struct {
             for (rest[0 .. rest.len - 1]) |name| namespace = self.loader.findMember(namespace, name) orelse return false;
         }
         const module_index = namespace.module orelse return false;
-        const index = findMember(modules[module_index], last) orelse return false;
+        const index = self.findMember(module_index, last) orelse return false;
         const declaration = modules[module_index].declarations[index];
+        if (declaration.kind == .import) return self.isImportedTypeFunction(declaration.kind.import.path, &.{}, depth + 1);
         if (declaration.kind != .function_definition) return false;
         return isTypeFunction(declaration.kind.function_definition.signature);
     }
@@ -477,6 +482,7 @@ pub const NameResolver = struct {
         if (declaration.kind != .import and try self.hasMember(module.path, name)) {
             return self.fail(location, error.NamedLikeModule);
         }
+        if (isPublicImport(declaration) and try self.hasMember(module.path, name)) try self.expectNamedSubmodule(index);
         return switch (declaration.kind) {
             .function_definition => .function,
             .function_declaration => .external,
@@ -486,6 +492,22 @@ pub const NameResolver = struct {
             .enum_definition => .enumeration,
             .struct_definition, .instance_declaration => .skip,
         };
+    }
+
+    fn expectNamedSubmodule(self: *NameResolver, index: usize) ResolveError!void {
+        const allocator = self.arena.allocator();
+        const module = self.loader.modules.items[self.module_index];
+        const declaration = module.declarations[index];
+        const import = declaration.kind.import;
+        const target = try self.resolveImport(self.module_index, index);
+        if (target == .namespace and isSubmodulePath(target.namespace.path, module.path, import.name)) return;
+        const path = try std.mem.join(allocator, "::", import.path);
+        const module_name = try std.mem.join(allocator, "::", module.path);
+        const format = "the public import of `{s}` as `{s}` clashes with the module or directory `{s}::{s}`, which it does not name";
+        const message = try std.fmt.allocPrint(allocator, format, .{ path, import.name, module_name, import.name });
+        const name_error = self.fail(declaration.location, error.PublicImportNamedLikeModule);
+        self.failure.?.message = message;
+        return name_error;
     }
 
     fn expectUniqueMember(self: *NameResolver, module: ast.Module, owner: usize, index: usize) NameError!void {
@@ -1682,15 +1704,28 @@ pub const NameResolver = struct {
         try self.resolveFunctionTypes(signature);
         try self.resolveParameterDefaults(signature);
         for (signature.parameters) |parameter| {
-            if (containsInternalStruct(ast.extractType(parameter.type))) {
-                return self.fail(parameter.type.location, error.InternalStructInExternalFunction);
-            }
+            try self.expectExternalSignatureType(parameter.type);
         }
-        const return_type = signature.return_type;
-        if (containsInternalStruct(ast.extractType(return_type))) {
-            return self.fail(return_type.location, error.InternalStructInExternalFunction);
-        }
+        try self.expectExternalSignatureType(signature.return_type);
         signature.progress = .done;
+    }
+
+    fn expectExternalSignatureType(self: *NameResolver, written: ast.Expression) ResolveError!void {
+        const value_type = ast.extractType(written);
+        if (!containsInternalStruct(value_type)) return;
+        const failure = self.fail(written.location, error.InternalStructInExternalFunction);
+        const inline_struct = findInternalStructInline(value_type) orelse return failure;
+        const format = "`{s}` is an inline struct over `{s}`, and a struct in an external function's parameters or return type must be an external struct";
+        self.failure.?.message = try self.renderInlineRefusal(format, inline_struct);
+        return failure;
+    }
+
+    fn renderInlineRefusal(self: *NameResolver, comptime format: []const u8, inline_struct: types.Struct) std.mem.Allocator.Error![]const u8 {
+        const allocator = self.arena.allocator();
+        const modules = self.loader.modules.items;
+        const name = try ast.renderTypeName(allocator, modules, .{ .@"struct" = inline_struct });
+        const field = try ast.renderTypeName(allocator, modules, inline_struct.fields[0].type);
+        return std.fmt.allocPrint(allocator, format, .{ name, field });
     }
 
     fn resolveAllSignatures(self: *NameResolver) ResolveError!void {
@@ -2350,6 +2385,7 @@ pub const NameResolver = struct {
                     const fields = try cloneFields(allocator, definition.fields);
                     try self.resolveFields(fields, @constCast(nested.@"struct".fields));
                     try self.expectNotContained(nested.@"struct", template.location);
+                    try self.expectNotHeldByItself(nested.@"struct", nested.@"struct".name, template.location);
                     try self.types.add(allocator, nested);
                 },
                 .enum_definition => |definition| try self.completeNestedEnum(definition, @constCast(nested.@"enum"), template.location),
@@ -2446,6 +2482,7 @@ pub const NameResolver = struct {
         location: token.Location,
     ) ResolveError!void {
         try self.expectNotContained(value_type.@"struct", location);
+        try self.expectNotHeldByItself(value_type.@"struct", struct_type.prefix, location);
         try self.types.add(self.arena.allocator(), value_type);
         try self.addStructFunctions(struct_type, self.bindings);
     }
@@ -2586,9 +2623,10 @@ pub const NameResolver = struct {
             .tuple_type => |tuple_type| return tuple_type.value.?,
             .function_type => |function_type| return function_type.value.?,
             .call => unreachable,
-            .method_call, .index, .field_access, .unwrap, .dereference, .struct_type => {
+            .method_call, .index, .field_access, .dereference, .struct_type => {
                 return self.evaluateType(expression);
             },
+            .unwrap => unreachable,
             .binary => |binary| {
                 if (binary.operator != .combine and binary.operator != .result) {
                     return self.fail(expression.location, error.TypeMismatch);
@@ -2848,6 +2886,7 @@ pub const NameResolver = struct {
                 try self.resolveBranches(block, statement);
             },
             .@"break", .@"continue" => try self.resolveJump(block.loops.items, statement),
+            .@"unreachable" => {},
             .replacement => |*replacement| try self.resolveReplacement(scope, statement.location, replacement),
         }
         return null;
@@ -3177,7 +3216,7 @@ pub const NameResolver = struct {
         var jumps: std.ArrayList(*ast.Statement) = .empty;
         try ast.collectStatementJumps(self.arena.allocator(), &jumps, statement);
         for (jumps.items) |jump| {
-            if (jump.kind == .@"return") continue;
+            if (jump.kind == .@"return" or jump.kind == .@"unreachable") continue;
             try self.resolveJump(block.loops.items, jump);
         }
     }
@@ -3505,7 +3544,8 @@ pub const NameResolver = struct {
             .tuple_type => |*tuple_type| try self.resolveTupleType(scope, tuple_type),
             .function_type => |*function_type| try self.resolveFunctionType(scope, function_type),
             .field_access => |access| try self.resolveNamesInExpression(scope, access.value),
-            .dereference, .unwrap, .@"try" => |operand| try self.resolveNamesInExpression(scope, operand),
+            .dereference, .@"try" => |operand| try self.resolveNamesInExpression(scope, operand),
+            .unwrap => unreachable,
             .range => |range| try self.resolveRange(scope, location, range),
             .struct_type => |struct_type| {
                 struct_type.module = self.module_index;
@@ -3923,10 +3963,15 @@ pub const NameResolver = struct {
             namespace = try self.resolveMemberNamespace(location, namespace, route.at(position));
         }
         const module_index = namespace.module orelse return null;
-        const index = findMember(self.loader.modules.items[module_index], route.names[end - 1]) orelse return null;
+        const index = self.findMember(module_index, route.names[end - 1]) orelse return null;
         switch (self.loader.modules.items[module_index].declarations[index].kind) {
             .function_definition, .function_declaration => {},
-            .constant_declaration, .struct_definition, .enum_definition, .typeclass_definition, .instance_declaration, .import => return null,
+            .import => {
+                const target = try self.resolveDeclaration(module_index, index);
+                if (target != .function) return null;
+                return target.function;
+            },
+            .constant_declaration, .struct_definition, .enum_definition, .typeclass_definition, .instance_declaration => return null,
         }
         try self.expectReachable(location, module_index, index, route.at(end - 1));
         return .{ .module = module_index, .declaration = index };
@@ -4126,7 +4171,7 @@ pub const NameResolver = struct {
             namespace = try self.resolveMemberNamespace(location, namespace, route.at(position));
         }
         const module_index = namespace.module orelse return null;
-        const index = findMember(self.loader.modules.items[module_index], route.names[end - 1]) orelse return null;
+        const index = self.findMember(module_index, route.names[end - 1]) orelse return null;
         try self.expectReachable(location, module_index, index, route.at(end - 1));
         return self.findOwner(module_index, index);
     }
@@ -4157,7 +4202,7 @@ pub const NameResolver = struct {
 
     fn findModuleType(self: *NameResolver, location: token.Location, namespace: Namespace, crossing: Crossing) ResolveError!?Target {
         const module_index = namespace.module orelse return null;
-        const index = findMember(self.loader.modules.items[module_index], crossing.name) orelse return null;
+        const index = self.findMember(module_index, crossing.name) orelse return null;
         const target = try self.findOwner(module_index, index) orelse return null;
         if (target != .type) return null;
         try self.expectReachable(location, module_index, index, crossing);
@@ -4171,6 +4216,15 @@ pub const NameResolver = struct {
             .constant => |constant| self.findConstantOwner(constant),
             .function, .namespace, .local, .element, .method, .typeclass_method, .case, .constructor, .builtin => null,
         };
+    }
+
+    fn findMember(self: *const NameResolver, module_index: usize, name: []const u8) ?usize {
+        const module = self.loader.modules.items[module_index];
+        const index = findDeclaration(module, name) orelse return null;
+        const declaration = module.declarations[index];
+        if (declaration.kind != .import) return index;
+        if (declaration.kind.import.public and module_index != self.module_index) return index;
+        return null;
     }
 
     fn keepPristine(self: *NameResolver, definition: *ast.FunctionDefinition) ResolveError!void {
@@ -4312,12 +4366,11 @@ pub const NameResolver = struct {
             return member;
         }
         if (namespace.module) |module_index| {
-            const module = self.loader.modules.items[module_index];
-            if (isImported(module, name)) return self.fail(location, error.ImportNotMember);
-            if (findMember(module, name)) |index| {
+            if (self.findMember(module_index, name)) |index| {
                 try self.expectReachable(location, module_index, index, crossing);
                 return self.expectNamespace(location, module_index, index);
             }
+            if (isImported(self.loader.modules.items[module_index], name)) return self.fail(location, error.ImportNotMember);
         }
         if (namespace.directory) return self.failMissingModule(location, namespace.path, name);
         return self.fail(location, error.UnknownName);
@@ -4357,8 +4410,7 @@ pub const NameResolver = struct {
             return .{ .builtin = builtin };
         }
         if (namespace.module) |module_index| {
-            const module = self.loader.modules.items[module_index];
-            if (findMember(module, name)) |index| {
+            if (self.findMember(module_index, name)) |index| {
                 try self.expectReachable(location, module_index, index, crossing);
                 return self.resolveDeclaration(module_index, index);
             }
@@ -4379,7 +4431,12 @@ pub const NameResolver = struct {
         module_index: usize,
         index: usize,
     ) ResolveError!Target {
-        return switch (self.loader.modules.items[module_index].declarations[index].kind) {
+        const kind = self.loader.modules.items[module_index].declarations[index].kind;
+        if (kind == .import) return self.resolveImport(module_index, index);
+        const public_imports = self.resolving_public_imports;
+        self.resolving_public_imports = .empty;
+        defer self.resolving_public_imports = public_imports;
+        return switch (kind) {
             .function_definition, .function_declaration => .{
                 .function = .{ .module = module_index, .declaration = index },
             },
@@ -4387,8 +4444,7 @@ pub const NameResolver = struct {
             .struct_definition => .{ .type = try self.resolveStruct(module_index, index) },
             .enum_definition => .{ .type = try self.resolveEnum(module_index, index) },
             .typeclass_definition => .{ .typeclass = .{ .module = module_index, .declaration = index } },
-            .import => self.resolveImport(module_index, index),
-            .instance_declaration => unreachable,
+            .import, .instance_declaration => unreachable,
         };
     }
 
@@ -4410,8 +4466,12 @@ pub const NameResolver = struct {
         defer self.self_name = caller_self_name;
         defer self.typeclass = caller_typeclass;
         defer self.bindings = caller_bindings;
+        if (import.public) try self.beginPublicImport(location, .{ .module = module_index, .declaration = index });
+        defer if (import.public) {
+            _ = self.resolving_public_imports.pop();
+        };
         const path = import.path;
-        const route: Route = .{ .names = path, .crossings = import.crossings, .import = true };
+        const route: Route = .{ .names = path, .crossings = import.crossings, .import = true, .public = import.public };
         var namespace = self.loader.findRoot(path[0]) orelse {
             return self.failMissingModule(location, &.{}, path[0]);
         };
@@ -4425,6 +4485,34 @@ pub const NameResolver = struct {
         const target = try self.resolveMember(location, namespace, route.at(path.len - 1));
         if (target == .typeclass) import.typeclass = target.typeclass;
         return target;
+    }
+
+    fn beginPublicImport(self: *NameResolver, location: token.Location, reference: PublicImportReference) ResolveError!void {
+        for (self.resolving_public_imports.items, 0..) |earlier, position| {
+            if (earlier.module != reference.module or earlier.declaration != reference.declaration) continue;
+            return self.failPublicImportCycle(location, self.resolving_public_imports.items[position..]);
+        }
+        try self.resolving_public_imports.append(self.arena.allocator(), reference);
+    }
+
+    fn failPublicImportCycle(self: *NameResolver, location: token.Location, cycle: []const PublicImportReference) ResolveError {
+        const allocator = self.arena.allocator();
+        var chain: std.ArrayList(u8) = .empty;
+        for (cycle) |reference| {
+            try chain.print(allocator, "`{s}` -> ", .{try self.buildPublicImportName(reference)});
+        }
+        const first = try self.buildPublicImportName(cycle[0]);
+        try chain.print(allocator, "`{s}`", .{first});
+        const message = try std.fmt.allocPrint(allocator, "the public import `{s}` leads back to itself: {s}", .{ first, chain.items });
+        const name_error = self.fail(location, error.PublicImportCycle);
+        self.failure.?.message = message;
+        return name_error;
+    }
+
+    fn buildPublicImportName(self: *NameResolver, reference: PublicImportReference) std.mem.Allocator.Error![]const u8 {
+        const module = self.loader.modules.items[reference.module];
+        const module_name = try std.mem.join(self.arena.allocator(), "::", module.path);
+        return std.mem.concat(self.arena.allocator(), u8, &.{ module_name, "::", extractName(module.declarations[reference.declaration]) });
     }
 
     fn resolveConstant(self: *NameResolver, module_index: usize, index: usize) ResolveError!Target {
@@ -4488,7 +4576,6 @@ pub const NameResolver = struct {
             .field_access,
             .index,
             .dereference,
-            .unwrap,
             .@"try",
             .range,
             .struct_type,
@@ -4502,6 +4589,7 @@ pub const NameResolver = struct {
                 }
                 return own;
             },
+            .unwrap => unreachable,
         };
     }
 
@@ -4626,6 +4714,8 @@ pub const NameResolver = struct {
         defer self.self_name = caller_self_name;
         defer self.typeclass = caller_typeclass;
         defer self.bindings = caller_bindings;
+        self.struct_depth += 1;
+        defer self.struct_depth -= 1;
         const resolved = try reserveFields(self.arena.allocator(), definition.fields);
         const struct_type: types.Struct = .{
             .module = module_index,
@@ -4639,10 +4729,12 @@ pub const NameResolver = struct {
         self.self_type = value_type;
         self.self_name = "Self";
         try self.resolveFields(definition.fields, resolved);
-        if (definition.external) try self.expectExternalFields(definition.fields);
+        if (definition.external) try self.expectExternalFields(module_index, definition.fields);
         if (definition.external) try self.expectNoPrivateFields(struct_type.name, definition.fields);
         try self.expectNotContained(struct_type, declaration.location);
+        try self.expectNotHeldByItself(struct_type, struct_type.name, declaration.location);
         try self.types.add(self.arena.allocator(), value_type);
+        if (self.struct_depth == 1) try self.expectDeferredExternalFields();
         return value_type;
     }
 
@@ -4654,10 +4746,44 @@ pub const NameResolver = struct {
         return std.mem.concat(self.arena.allocator(), u8, &.{ outer, "::", extractName(declaration) });
     }
 
-    fn expectExternalFields(self: *NameResolver, fields: []const ast.Field) NameError!void {
+    fn expectExternalFields(self: *NameResolver, module_index: usize, fields: []const ast.Field) ResolveError!void {
         for (fields) |field| {
-            if (!isExternalFieldType(ast.extractType(field.type))) return self.fail(field.type.location, error.NotExternalField);
+            if (isExternalFieldType(ast.extractType(field.type))) continue;
+            if (self.struct_depth > 1) {
+                return self.deferred_external_structs.append(self.arena.allocator(), .{ .module = module_index, .fields = fields });
+            }
+            return self.failExternalField(field);
         }
+    }
+
+    fn expectDeferredExternalFields(self: *NameResolver) ResolveError!void {
+        while (self.deferred_external_structs.pop()) |deferred| {
+            for (deferred.fields) |field| {
+                if (isExternalFieldType(ast.extractType(field.type))) continue;
+                self.module_index = deferred.module;
+                return self.failExternalField(field);
+            }
+        }
+    }
+
+    fn failExternalField(self: *NameResolver, field: ast.Field) ResolveError!void {
+        const value_type = ast.extractType(field.type);
+        const failure = self.fail(field.type.location, error.NotExternalField);
+        const inline_struct = findRefusedFieldInline(value_type) orelse return failure;
+        const format = "`{s}` is an inline struct over `{s}`, and an external struct's fields must be numbers, bool, pointers, optional pointers, function pointers, arrays of these or external structs";
+        self.failure.?.message = try self.renderInlineRefusal(format, inline_struct);
+        return failure;
+    }
+
+    fn expectNotHeldByItself(self: *NameResolver, struct_type: types.Struct, name: []const u8, location: token.Location) ResolveError!void {
+        if (!struct_type.@"inline") return;
+        if (!types.holdsStruct(struct_type.fields[0].type, struct_type)) return;
+        const allocator = self.arena.allocator();
+        const format = "`{s}` is an inline struct that holds itself, and an inline struct only wraps another type, so it cannot hold itself; declare it as an ordinary `struct`";
+        const message = try std.fmt.allocPrint(allocator, format, .{name});
+        const failure = self.fail(location, error.InlineStructHoldsItself);
+        self.failure.?.message = message;
+        return failure;
     }
 
     fn expectNoPrivateFields(self: *NameResolver, name: []const u8, fields: []const ast.Field) ResolveError!void {
@@ -4750,9 +4876,10 @@ pub const NameResolver = struct {
     }
 
     fn isRefused(self: *NameResolver, location: token.Location, module_index: usize, private: bool, crossing: Crossing) ResolveError!bool {
-        const hidden = private and module_index != self.module_index;
+        const public = crossing.isPublic();
+        const hidden = private and (public or module_index != self.module_index);
         if (crossing.crossed and !hidden) return self.failNeedlessPrivate(location, crossing.name, private);
-        return hidden and !crossing.crossed;
+        return hidden and (public or !crossing.crossed);
     }
 
     fn expectNotCrossed(self: *NameResolver, location: token.Location, crossing: Crossing) ResolveError!void {
@@ -4762,6 +4889,12 @@ pub const NameResolver = struct {
     fn failPrivate(self: *NameResolver, location: token.Location, name: []const u8, module_index: usize, crossing: Crossing) ResolveError {
         const allocator = self.arena.allocator();
         const module_name = try std.mem.join(allocator, "::", self.loader.modules.items[module_index].path);
+        if (crossing.isPublic()) {
+            const message = try std.fmt.allocPrint(allocator, "`{s}` is private to `{s}` and cannot be publicly imported", .{ name, module_name });
+            const name_error = self.fail(location, error.PrivatePublicImport);
+            self.failure.?.message = message;
+            return name_error;
+        }
         const way_out = try renderCrossing(allocator, name, crossing);
         const message = try std.fmt.allocPrint(allocator, "`{s}` is private to `{s}`; write `{s}` to use it anyway", .{ name, module_name, way_out });
         const name_error = self.fail(location, error.PrivateDeclaration);
@@ -4836,6 +4969,7 @@ pub const NameError = error{
     SelfConstructor,
     NotExternalField,
     InternalStructInExternalFunction,
+    InlineStructHoldsItself,
     ManyVoidPointer,
     NotAssignable,
     MethodIsField,
@@ -4847,6 +4981,8 @@ pub const NameError = error{
     AmbiguousMethod,
     DuplicateTypeclass,
     DuplicateImport,
+    PublicImportNamedLikeModule,
+    PublicImportCycle,
     NamedLikeModule,
     ImportNotMember,
     ModuleUsedAsValue,
@@ -4898,6 +5034,7 @@ pub const NameError = error{
     GenericParameterDefault,
     DependencyLoop,
     PrivateDeclaration,
+    PrivatePublicImport,
     PrivateExternalField,
     PrivateInSignature,
     NeedlessPrivate,
@@ -5001,6 +5138,16 @@ const NestedType = struct {
     private: bool = false,
 };
 
+const DeferredExternalStruct = struct {
+    module: usize,
+    fields: []const ast.Field,
+};
+
+const PublicImportReference = struct {
+    module: usize,
+    declaration: usize,
+};
+
 const Local = struct {
     name: []const u8,
     target: Target,
@@ -5086,12 +5233,18 @@ const Crossing = struct {
     crossed: bool = false,
     route: ?Route = null,
     position: usize = 0,
+
+    fn isPublic(self: Crossing) bool {
+        const route = self.route orelse return false;
+        return route.public;
+    }
 };
 
 const Route = struct {
     names: ast.Path,
     crossings: []const bool = &.{},
     import: bool = false,
+    public: bool = false,
 
     fn at(self: Route, position: usize) Crossing {
         return .{ .name = self.names[position], .crossed = self.isCrossed(position), .route = self, .position = position };
@@ -5136,6 +5289,7 @@ fn describeError(name_error: NameError) []const u8 {
         error.SelfConstructor => "`Self` is not a type in an instance for a type constructor; write the constructor's name instead",
         error.NotExternalField => "an external struct's fields must be numbers, bool, pointers, optional pointers, function pointers, arrays of these or external structs",
         error.InternalStructInExternalFunction => "a struct in an external function's parameters or return type must be an external struct",
+        error.InlineStructHoldsItself => "an inline struct cannot hold itself",
         error.ManyVoidPointer => "*[many]void is not allowed, use *void",
         error.NotAssignable => "only variables and their fields can be assigned",
         error.MethodIsCase => "function has the name of a case",
@@ -5147,6 +5301,8 @@ fn describeError(name_error: NameError) []const u8 {
         error.AmbiguousMethod => "method is found in more than one place",
         error.DuplicateTypeclass => "typeclass is already defined",
         error.DuplicateImport => "name is already defined",
+        error.PublicImportNamedLikeModule => "a public import has the name of a module or directory beside its module that it does not name",
+        error.PublicImportCycle => "a public import leads back to itself through other public imports",
         error.NamedLikeModule => "name is already used by a module or directory",
         error.ImportNotMember => "an import is not a member of its module",
         error.ModuleUsedAsValue => "a module cannot be used here",
@@ -5199,6 +5355,7 @@ fn describeError(name_error: NameError) []const u8 {
         error.GenericParameterDefault => "a parameter whose type depends on a type parameter cannot have a default, since the default would need a type for every instance",
         error.DependencyLoop => "value depends on itself at compile time",
         error.PrivateDeclaration => "the declaration is private to its module",
+        error.PrivatePublicImport => "a private declaration cannot be publicly imported",
         error.PrivateExternalField => "a field of an external struct cannot be private",
         error.PrivateInSignature => "a private type cannot appear in a declaration that is not private",
         error.NeedlessPrivate => "private at a use crosses into a private declaration or field of another module, and is written nowhere else",
@@ -5206,23 +5363,44 @@ fn describeError(name_error: NameError) []const u8 {
 }
 
 fn isExternalFieldType(value_type: types.Type) bool {
+    if (types.findUnwrappedField(value_type)) |field| return isExternalFieldType(field.type);
     return switch (value_type) {
         .number, .boolean, .pointer => true,
-        .optional => |optional| optional.child == .pointer,
+        .optional => types.isPointerOptional(value_type),
         .array => |array| isExternalFieldType(array.element),
         .@"struct" => |struct_type| struct_type.external,
         .void, .type, .@"enum", .slice, .result, .tuple, .function, .variable, .application => false,
     };
 }
 
+fn findRefusedFieldInline(value_type: types.Type) ?types.Struct {
+    if (types.findUnwrappedField(value_type) != null) return value_type.@"struct";
+    return switch (value_type) {
+        .array => |array| findRefusedFieldInline(array.element),
+        .number, .boolean, .void, .type, .@"struct", .@"enum", .slice, .pointer, .optional, .result, .tuple, .function, .variable, .application => null,
+    };
+}
+
 fn containsInternalStruct(value_type: types.Type) bool {
+    if (types.findUnwrappedField(value_type)) |field| return containsInternalStruct(field.type);
     return switch (value_type) {
         .@"struct" => |struct_type| !struct_type.external,
         .pointer => |pointer| containsInternalStruct(pointer.target),
         .array => |array| containsInternalStruct(array.element),
         .slice => |slice| containsInternalStruct(slice.element),
-        .optional => |optional| optional.child == .pointer and containsInternalStruct(optional.child),
+        .optional => |optional| types.isPointerOptional(value_type) and containsInternalStruct(optional.child),
         .number, .boolean, .void, .type, .@"enum", .result, .tuple, .function, .variable, .application => false,
+    };
+}
+
+fn findInternalStructInline(value_type: types.Type) ?types.Struct {
+    if (types.findUnwrappedField(value_type) != null) return value_type.@"struct";
+    return switch (value_type) {
+        .pointer => |pointer| findInternalStructInline(pointer.target),
+        .array => |array| findInternalStructInline(array.element),
+        .slice => |slice| findInternalStructInline(slice.element),
+        .optional => |optional| findInternalStructInline(optional.child),
+        .number, .boolean, .void, .type, .@"struct", .@"enum", .result, .tuple, .function, .variable, .application => null,
     };
 }
 
@@ -5399,6 +5577,18 @@ fn findDeclaration(module: ast.Module, name: []const u8) ?usize {
     return null;
 }
 
+fn isPublicImport(declaration: ast.Declaration) bool {
+    return declaration.kind == .import and declaration.kind.import.public;
+}
+
+fn isSubmodulePath(path: ast.Path, module_path: ast.Path, name: []const u8) bool {
+    if (path.len != module_path.len + 1 or !std.mem.eql(u8, path[path.len - 1], name)) return false;
+    for (path[0..module_path.len], module_path) |own_name, module_name| {
+        if (!std.mem.eql(u8, own_name, module_name)) return false;
+    }
+    return true;
+}
+
 fn findNestedDeclaration(module: ast.Module, owner: usize, name: []const u8) ?usize {
     for (module.declarations, 0..) |declaration, index| {
         if (declaration.owner != owner or isMethod(declaration)) continue;
@@ -5424,11 +5614,6 @@ fn renderCrossing(allocator: std.mem.Allocator, name: []const u8, crossing: Cros
         try text.appendSlice(allocator, if (std.mem.eql(u8, segment, ast.module_root)) "module" else segment);
     }
     return text.items;
-}
-
-fn findMember(module: ast.Module, name: []const u8) ?usize {
-    if (isImported(module, name)) return null;
-    return findDeclaration(module, name);
 }
 
 fn isImported(module: ast.Module, name: []const u8) bool {
@@ -5511,6 +5696,7 @@ fn dropDependent(
                 .@"defer",
                 .@"break",
                 .@"continue",
+                .@"unreachable",
                 .value,
                 .replacement,
                 => {},
@@ -5542,7 +5728,7 @@ fn dropDependent(
             .variable_declaration => |variable| {
                 if (mentionsAny(dependency.values.items, variable.value)) try dependency.values.append(allocator, variable.name);
             },
-            .noop, .@"return", .discard, .call, .tuple_declaration, .assignment, .@"defer", .@"break", .@"continue", .value, .replacement => {},
+            .noop, .@"return", .discard, .call, .tuple_declaration, .assignment, .@"defer", .@"break", .@"continue", .@"unreachable", .value, .replacement => {},
         }
         try kept.append(allocator, copy);
     }
@@ -5551,7 +5737,7 @@ fn dropDependent(
 
 fn isDependentStatement(names: Names, statement: ast.Statement) bool {
     return switch (statement.kind) {
-        .noop, .@"break", .@"continue", .replacement => false,
+        .noop, .@"break", .@"continue", .@"unreachable", .replacement => false,
         .@"return" => |value| if (value) |returned| names.returns or isDependentExpression(names, returned, false) else false,
         .discard, .call, .value => |expression| isDependentExpression(names, expression, false),
         .constant_declaration => |constant| isDependentDeclaration(names, constant.type, constant.value),
@@ -5622,7 +5808,8 @@ fn isDependentExpression(names: Names, expression: ast.Expression, in_type: bool
         .method_call => |call| isDependentExpression(names, call.receiver.*, in_type) or
             (if (call.with_value) |value| isDependentExpression(names, value.*, true) else false) or
             areDependentArguments(names, call.arguments, true),
-        .negation, .address_of, .dereference, .unwrap, .@"try" => |operand| isDependentExpression(names, operand.*, in_type),
+        .negation, .address_of, .dereference, .@"try" => |operand| isDependentExpression(names, operand.*, in_type),
+        .unwrap => unreachable,
         .range => |range| isDependentExpression(names, range.start, in_type) or
             (if (range.end) |end| isDependentExpression(names, end, in_type) else false),
         .unary => |unary| isDependentExpression(names, unary.operand.*, in_type),
@@ -5783,7 +5970,7 @@ fn collectStatementNames(
     statement: ast.Statement,
 ) std.mem.Allocator.Error!void {
     switch (statement.kind) {
-        .noop, .@"break", .@"continue", .replacement => {},
+        .noop, .@"break", .@"continue", .@"unreachable", .replacement => {},
         .@"defer" => |deferred| try collectStatementNames(allocator, names, deferred.statement.*),
         .@"return" => |value| if (value) |returned| try collectExpressionNames(allocator, names, returned),
         .discard, .call, .value => |expression| try collectExpressionNames(allocator, names, expression),
@@ -5858,7 +6045,8 @@ fn collectExpressionNames(
             for (call.arguments) |argument| try collectExpressionNames(allocator, names, argument.value);
             if (call.with_value) |value| try collectExpressionNames(allocator, names, value.*);
         },
-        .negation, .address_of, .dereference, .unwrap, .@"try" => |operand| try collectExpressionNames(allocator, names, operand.*),
+        .negation, .address_of, .dereference, .@"try" => |operand| try collectExpressionNames(allocator, names, operand.*),
+        .unwrap => unreachable,
         .range => |range| {
             try collectExpressionNames(allocator, names, range.start);
             if (range.end) |end| try collectExpressionNames(allocator, names, end);
@@ -6845,6 +7033,29 @@ test "expectVisibleSignatures: allows a private type in the private members of a
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
 
     _ = try analyzer.analyze();
+}
+
+test "isImportedTypeFunction: follows a public import to a function that gives a type, for a private type in a constant that is not private" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "fn Make(type T) -> type\n    return struct\n        value: T\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "gallery.mn", .data = "public import things::Make\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import gallery::Make\n\nprivate struct Slot\n    value: u8\n\n\nconst Alias = Make(Slot)\n\nfn main = noop\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.PrivateInSignature, analyzer.analyze());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"main"}), analyzer.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 7, .column = 1 }, analyzer.failure.?.location.?);
+    try std.testing.expectEqualStrings("`Slot` is private to this module and cannot appear in `Alias`, which is not", analyzer.failure.?.message);
 }
 
 test "resolveModule: rejects a duplicate function" {
@@ -9113,7 +9324,7 @@ test "resolveInstanceFunction: names each of two instances for one type that dif
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\nstruct Random\n    state: u32\ninstance Iterator(Random, u32)\n\n    fn next(random: *Random) -> ?u32\n        random.state += 1\n        return random.state\ninstance Iterator(Random, f64)\n\n    fn next(random: *Random) -> ?f64\n        random.state += 2\n        return 0.5\nfn run() -> u32\n    var random = Random{ state = 0 }\n    const half = Iterator(Random, f64)::next(&random).?\n    const whole = Iterator(Random, u32)::next(&random).?\n    if (half == 0.5) return whole\n    return 0\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::iterator::Iterator\nstruct Random\n    state: u32\ninstance Iterator(Random, u32)\n\n    fn next(random: *Random) -> ?u32\n        random.state += 1\n        return random.state\ninstance Iterator(Random, f64)\n\n    fn next(random: *Random) -> ?f64\n        random.state += 2\n        return 0.5\nfn run() -> u32\n    var random = Random{ state = 0 }\n    const half = Iterator(Random, f64)::next(&random) orelse unreachable\n    const whole = Iterator(Random, u32)::next(&random) orelse unreachable\n    if (half == 0.5) return whole\n    return 0\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -9135,7 +9346,7 @@ test "resolveInstanceFunction: names an instance whose header gives a type by a 
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, "library");
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Iterator\nimport mn::iterator::Zip\nfn run() -> u8\n    const names: const(*[]const(*[]u8)) = { \"Anna\", \"Ben\" }\n    const ages: const(*[]u8) = { 31, 25 }\n    var pairs = Zip::zip({ names, ages })\n    return Iterator(mn::iterator::Zipped([const(*[]const(*[]u8)), const(*[]u8)]), [const(*const(*[]u8)), const(*u8)])::next(&pairs).?[1].*\nconst RESULT = run()\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::iterator::Iterator\nimport mn::iterator::Zip\nfn run() -> u8\n    const names: const(*[]const(*[]u8)) = { \"Anna\", \"Ben\" }\n    const ages: const(*[]u8) = { 31, 25 }\n    var pairs = Zip::zip({ names, ages })\n    return (Iterator(mn::iterator::Zipped([const(*[]const(*[]u8)), const(*[]u8)]), [const(*const(*[]u8)), const(*u8)])::next(&pairs) orelse unreachable)[1].*\nconst RESULT = run()\n" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
@@ -13062,7 +13273,7 @@ test "resolveNamesInExpression: resolves the operands of an address and a derefe
     try std.testing.expectEqual(ast.Resolution{ .parameter = 0 }, value.resolution.?);
 }
 
-test "resolveNamesInExpression: resolves the operand of an unwrap" {
+test "resolveNamesInExpression: resolves the operand of orelse before unreachable" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var program_directory = std.testing.tmpDir(.{});
@@ -13072,14 +13283,14 @@ test "resolveNamesInExpression: resolves the operand of an unwrap" {
         &.{ ".zig-cache", "tmp", &program_directory.sub_path },
     );
     var loader = @import("loader.zig").Loader.init(program_path, program_path);
-    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(value: ?i32) -> i32 = return value.?" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn read(value: ?i32) -> i32 = return value orelse unreachable" });
     try loader.loadMainModule(&arena, std.testing.io, "main");
     var type_registry: types.Registry = .{};
     var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
     try name_resolver.resolve();
 
     const value = loader.modules.items[0].declarations[0].kind.function_definition.body[0].kind.@"return".?;
-    try std.testing.expectEqual(ast.Resolution{ .parameter = 0 }, value.kind.unwrap.kind.identifier.resolution.?);
+    try std.testing.expectEqual(ast.Resolution{ .parameter = 0 }, value.kind.binary.left.kind.identifier.resolution.?);
 }
 
 test "resolveNamesInExpression: resolves the names in the operands of operators" {
@@ -15683,6 +15894,55 @@ test "resolveModule: accepts an import of a reserved name under another name" {
     try std.testing.expectEqualStrings("compile", loader.modules.items[0].declarations[0].kind.import.name);
 }
 
+test "expectNamedSubmodule: rejects a public import named like a module of the directory of its module that it does not name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.createDirPath(std.testing.io, "shapes");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "geometry.mn", .data = "fn circle() = noop\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes/module.mn", .data = "public import geometry::circle\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes/circle.mn", .data = "fn area() = noop\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import shapes\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.PublicImportNamedLikeModule, name_resolver.resolve());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"shapes"}), name_resolver.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqualStrings("the public import of `geometry::circle` as `circle` clashes with the module or directory `shapes::circle`, which it does not name", name_resolver.failure.?.message);
+}
+
+test "expectNamedSubmodule: accepts a public import of a module of the directory of its module under the module's name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.createDirPath(std.testing.io, "window");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "window/descriptor.mn", .data = "struct Descriptor\n    width: u32\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "window/module.mn", .data = "public import window::descriptor\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import window\n\nfn take(descriptor: window::descriptor::Descriptor) = _ = descriptor\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const signature = loader.modules.items[0].declarations[1].kind.function_definition.signature;
+    const struct_type = ast.extractType(signature.parameters[0].type).@"struct";
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{ "window", "descriptor" }), loader.modules.items[struct_type.module].path);
+}
+
 test "findBareDeclaration: reaches declarations named void and Self only through a path" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -16138,6 +16398,29 @@ test "resolveMember: rejects a name the module does not declare" {
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 13 }, name_resolver.failure.?.location.?);
 }
 
+test "findMember: leaves a public import out of the members of its own module, as an import" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.createDirPath(std.testing.io, "window");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "window/descriptor.mn", .data = "struct Descriptor\n    width: u32\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "window/module.mn", .data = "public import window::descriptor::Descriptor\n\nfn make() -> module::Descriptor = { width = 1 }\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import window\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ImportNotMember, name_resolver.resolve());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"window"}), name_resolver.failure.?.module.?);
+    try std.testing.expectEqual(3, name_resolver.failure.?.location.?.row);
+}
+
 test "resolveMember: rejects an import of another module" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -16482,6 +16765,276 @@ test "resolveImport: rejects an import of an import" {
     try std.testing.expectError(error.ImportNotMember, name_resolver.resolve());
     try std.testing.expectEqual(loader.modules.items[0].path, name_resolver.failure.?.module.?);
     try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, name_resolver.failure.?.location.?);
+}
+
+test "resolveImport: passes on the name of each form of public import, a group included, as the declaration it names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Circle\n    radius: u32\n\nstruct Square\n    side: u32\n\nstruct Triangle\n    base: u32\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "gallery.mn", .data = "public import shapes::Circle\npublic import shapes::Square as Box\npublic import shapes::{ self as figures, Triangle }\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import gallery\nimport gallery::{ Circle, Box }\nimport shapes\n\nfn main()\n    const circle: Circle = { radius = 1 }\n    const box: Box = { side = 2 }\n    const triangle: gallery::figures::Triangle = { base = 3 }\n    const same: gallery::Triangle = triangle\n    const original: shapes::Triangle = same\n    _ = circle\n    _ = box\n    _ = original\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[4].kind.function_definition.body;
+    for (body[0..5], [_][]const u8{ "Circle", "Square", "Triangle", "Triangle", "Triangle" }) |statement, name| {
+        const value_type = statement.kind.constant_declaration.value.type.?.@"struct";
+        try std.testing.expectEqualStrings(name, value_type.name);
+        try std.testing.expectEqualDeep(@as(ast.Path, &.{"shapes"}), loader.modules.items[value_type.module].path);
+    }
+}
+
+test "resolveImport: passes on a function, a constant, a typeclass and a nested type through a public import" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "typeclass Show(type T)\n\n    fn show(value: T) -> u32\n\nstruct Outer\n    struct Inner\n        value: u32\n\nconst LIMIT: u32 = 7\n\nfn double(value: u32) -> u32 = value * 2\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "gallery.mn", .data = "public import things::{ Show, LIMIT, double }\npublic import things::Outer::Inner\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import gallery::{ Show, Inner, LIMIT, double }\n\ninstance Show(Inner)\n\n    fn show(value: Inner) -> u32 = value.value\n\nfn main()\n    const inner: Inner = { value = double(LIMIT) }\n    _ = Show::show(inner)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    const typeclass = declarations[4].kind.instance_declaration.resolved.?;
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"things"}), loader.modules.items[typeclass.module].path);
+    const body = for (declarations) |declaration| {
+        if (declaration.kind == .function_definition and std.mem.eql(u8, declaration.kind.function_definition.signature.name, "main")) break declaration.kind.function_definition.body;
+    } else unreachable;
+    const value = body[0].kind.constant_declaration.value;
+    try std.testing.expectEqualStrings("Outer::Inner", value.type.?.@"struct".name);
+    const call = value.kind.composite_literal.elements[0].value.kind.call;
+    const function = call.callee.identifier.resolution.?.function;
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"things"}), loader.modules.items[function.module].path);
+    const constant = call.arguments[0].value.kind.identifier.resolution.?.constant;
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"things"}), loader.modules.items[constant.module].path);
+}
+
+test "resolveImport: makes the name of a public import usable inside the module that writes it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.createDirPath(std.testing.io, "window");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "window/descriptor.mn", .data = "struct Descriptor\n    width: u32\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "window/module.mn", .data = "public import window::descriptor::Descriptor\n\nfn make() -> Descriptor = { width = 1 }\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import window\nimport window::Descriptor\n\nfn main()\n    const made: Descriptor = window::make()\n    _ = made\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const window = for (loader.modules.items) |module| {
+        if (module.path.len == 1 and std.mem.eql(u8, module.path[0], "window")) break module;
+    } else unreachable;
+    const return_type = ast.extractType(window.declarations[1].kind.function_definition.signature.return_type).@"struct";
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{ "window", "descriptor" }), loader.modules.items[return_type.module].path);
+    const value_type = loader.modules.items[0].declarations[2].kind.function_definition.body[0].kind.constant_declaration.value.type.?.@"struct";
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{ "window", "descriptor" }), loader.modules.items[value_type.module].path);
+}
+
+test "resolveImport: gives the same type through a public import and through the module that declares it, with its instance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.createDirPath(std.testing.io, "window");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "show.mn", .data = "typeclass Show(type T)\n\n    fn show(value: T) -> u32\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "window/descriptor.mn", .data = "import show::Show\n\nstruct Descriptor\n    width: u32\n\ninstance Show(Descriptor)\n\n    fn show(value: Descriptor) -> u32 = value.width\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "window/module.mn", .data = "public import window::descriptor::Descriptor\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import show::Show\nimport window\nimport window::descriptor\n\nfn measure(value: descriptor::Descriptor) -> u32 = value.show()\n\nfn main()\n    const value: window::Descriptor = { width = 3 }\n    _ = measure(value)\n    _ = Show::show(value)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const declarations = loader.modules.items[0].declarations;
+    const parameter_type = ast.extractType(declarations[3].kind.function_definition.signature.parameters[0].type);
+    const value_type = declarations[4].kind.function_definition.body[0].kind.constant_declaration.value.type.?;
+    try std.testing.expect(std.meta.eql(parameter_type, value_type));
+}
+
+test "resolveImport: reaches a module passed on by a public import through further names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.createDirPath(std.testing.io, "window");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "shapes.mn", .data = "struct Circle\n    radius: u32\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "window/module.mn", .data = "public import shapes\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import window\nimport window::shapes::Circle as Round\n\nfn main()\n    const circle: window::shapes::Circle = { radius = 1 }\n    const round: Round = circle\n    _ = round\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const body = loader.modules.items[0].declarations[2].kind.function_definition.body;
+    for (body[0..2]) |statement| {
+        const value_type = statement.kind.constant_declaration.value.type.?.@"struct";
+        try std.testing.expectEqualDeep(@as(ast.Path, &.{"shapes"}), loader.modules.items[value_type.module].path);
+    }
+}
+
+test "resolveImport: follows a public import of a public import to the declaration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "one.mn", .data = "struct Thing\n    value: u8\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "two.mn", .data = "public import one::Thing\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "three.mn", .data = "public import two::Thing as Item\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import three::Item\n\nfn take(item: Item) = _ = item\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const signature = loader.modules.items[0].declarations[1].kind.function_definition.signature;
+    const struct_type = ast.extractType(signature.parameters[0].type).@"struct";
+    try std.testing.expectEqualStrings("Thing", struct_type.name);
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"one"}), loader.modules.items[struct_type.module].path);
+}
+
+test "resolveImport: refuses a public import of a private declaration with or without private in its path, also of its own module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { source: []const u8, row: usize, message: []const u8 }{
+        .{ .source = "public import things::helper\n", .row = 1, .message = "`helper` is private to `things` and cannot be publicly imported" },
+        .{ .source = "public import things::private::helper\n", .row = 1, .message = "`helper` is private to `things` and cannot be publicly imported" },
+        .{ .source = "private fn hidden() -> u8 = 1\n\nfn open() -> u8 = hidden()\n\npublic import gallery::hidden as visible\n", .row = 5, .message = "`hidden` is private to `gallery` and cannot be publicly imported" },
+    };
+    for (cases) |case| {
+        var program_directory = std.testing.tmpDir(.{});
+        defer program_directory.cleanup();
+        const program_path = try std.fs.path.join(
+            arena.allocator(),
+            &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+        );
+        var loader = @import("loader.zig").Loader.init(program_path, program_path);
+        try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "private fn helper() -> u8 = 1\n\nfn open() -> u8 = helper()\n" });
+        try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "gallery.mn", .data = case.source });
+        try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import gallery\nimport things\n" });
+        try loader.loadMainModule(&arena, std.testing.io, "main");
+        var type_registry: types.Registry = .{};
+        var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+        try std.testing.expectError(error.PrivatePublicImport, name_resolver.resolve());
+        try std.testing.expectEqualDeep(@as(ast.Path, &.{"gallery"}), name_resolver.failure.?.module.?);
+        try std.testing.expectEqual(token.Location{ .row = case.row, .column = 1 }, name_resolver.failure.?.location.?);
+        try std.testing.expectEqualStrings(case.message, name_resolver.failure.?.message);
+    }
+}
+
+test "resolveImport: rejects a public import of something that does not exist with the error an import of it gives" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var failures: [2]Failure = undefined;
+    var errors: [2]ResolveError = undefined;
+    for ([_][]const u8{ "import things::missing\n", "public import things::missing\n" }, &failures, &errors) |source, *failure, *resolve_error| {
+        var program_directory = std.testing.tmpDir(.{});
+        defer program_directory.cleanup();
+        const program_path = try std.fs.path.join(
+            arena.allocator(),
+            &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+        );
+        var loader = @import("loader.zig").Loader.init(program_path, program_path);
+        try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "things.mn", .data = "fn open() = noop\n" });
+        try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "gallery.mn", .data = source });
+        try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import gallery\n" });
+        try loader.loadMainModule(&arena, std.testing.io, "main");
+        var type_registry: types.Registry = .{};
+        var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+        if (name_resolver.resolve()) |_| return error.TestUnexpectedResult else |found| resolve_error.* = found;
+        failure.* = name_resolver.failure.?;
+    }
+
+    try std.testing.expectEqual(error.UnknownName, errors[0]);
+    try std.testing.expectEqual(errors[0], errors[1]);
+    try std.testing.expectEqualStrings(failures[0].message, failures[1].message);
+    try std.testing.expectEqual(failures[0].location.?, failures[1].location.?);
+}
+
+test "beginPublicImport: rejects a public import that leads back to itself through another module's public import, naming the cycle" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "one.mn", .data = "public import two::Thing\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "two.mn", .data = "public import one::Thing\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import one::Thing\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.PublicImportCycle, name_resolver.resolve());
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"one"}), name_resolver.failure.?.module.?);
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqualStrings("the public import `one::Thing` leads back to itself: `one::Thing` -> `two::Thing` -> `one::Thing`", name_resolver.failure.?.message);
+}
+
+test "beginPublicImport: accepts a struct whose field reaches it through a public import of it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.createDirPath(std.testing.io, "window");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "window/node.mn", .data = "import window\n\nstruct Node\n    next: ?*window::Node\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "window/module.mn", .data = "public import window::node::Node\n" });
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import window::Node\n\nfn take(node: Node) = _ = node\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const signature = loader.modules.items[0].declarations[1].kind.function_definition.signature;
+    const struct_type = ast.extractType(signature.parameters[0].type).@"struct";
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{ "window", "node" }), loader.modules.items[struct_type.module].path);
 }
 
 test "resolveConstant: rejects constants that refer to each other" {
@@ -16985,6 +17538,46 @@ test "resolveExternalSignature: accepts external structs and other types" {
     try std.testing.expect(loader.modules.items[0].declarations[0].kind.struct_definition.value.?.@"struct".external);
 }
 
+test "expectExternalSignatureType: rejects an inline struct over a struct that is not external and names both" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Point\n    x: i32\ninline struct Wrapped\n    point: Point\nexternal fn take(wrapped: *Wrapped)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InternalStructInExternalFunction, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 5, .column = 27 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqualStrings("`Wrapped` is an inline struct over `Point`, and a struct in an external function's parameters or return type must be an external struct", name_resolver.failure.?.message);
+}
+
+test "expectExternalSignatureType: accepts inline structs over a number, a pointer and a slice, nested, through pointers, arrays and optionals, and given by a function that returns a type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external struct Point\n    x: i32\ninline struct Count\n    value: u32\ninline struct Handle\n    point: *Point\ninline struct Text\n    bytes: const(*[]u8)\ninline struct Outer\n    count: Count\nfn Wrapped(type T) -> type\n    return inline struct\n        value: T\nexternal fn take(count: Count, handle: ?Handle, text: Text, outer: *Outer, counts: [2]Count, wrapped: Wrapped(Handle)) -> Outer" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    _ = try analyzer.analyze();
+
+    const parameters = loader.modules.items[0].declarations[6].kind.function_declaration.parameters;
+    try std.testing.expect(ast.extractType(parameters[5].type).@"struct".@"inline");
+}
+
 test "resolveStruct: resolves a struct used as a type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -17141,6 +17734,166 @@ test "expectExternalFields: rejects an optional value that is not a pointer" {
 
     try std.testing.expectError(error.NotExternalField, name_resolver.resolve());
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 12 }, name_resolver.failure.?.location.?);
+}
+
+test "expectExternalFields: accepts inline structs over numbers and pointers, nested, in arrays, through pointers, an optional of one over a pointer and one with a private field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline struct Count\n    value: u32\ninline struct Handle\n    private pointer: *u8\ninline struct Outer\n    count: Count\nexternal struct Record\n    count: Count\n    handle: ?Handle\n    outer: Outer\n    counts: [2]Count\n    pointer: *Count\nfn use(record: Record) = _ = record" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const record = loader.modules.items[0].declarations[3].kind.struct_definition.value.?.@"struct";
+    try std.testing.expect(record.external);
+    try std.testing.expect(record.fields[1].type.optional.child.@"struct".@"inline");
+}
+
+test "expectDeferredExternalFields: accepts an inline struct resolved first whose field points to the external struct that holds it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline struct Link\n    record: *Record\nexternal struct Record\n    link: Link\n    value: i32\nfn use(link: Link) = _ = link" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const record = loader.modules.items[0].declarations[1].kind.struct_definition.value.?.@"struct";
+    try std.testing.expect(record.fields[0].type.@"struct".@"inline");
+}
+
+test "failExternalField: rejects an inline struct over a slice and names it with its field's type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline struct Text\n    bytes: const(*[]u8)\nexternal struct Record\n    texts: [2]Text\nfn use(record: Record) = _ = record" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.NotExternalField, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 4, .column = 12 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqualStrings("`Text` is an inline struct over `const(*[]u8)`, and an external struct's fields must be numbers, bool, pointers, optional pointers, function pointers, arrays of these or external structs", name_resolver.failure.?.message);
+}
+
+test "expectNotHeldByItself: rejects an inline struct that points to itself through an optional" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline struct Node\n    next: ?*Node\nfn take(node: Node) = _ = node" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InlineStructHoldsItself, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqualStrings("`Node` is an inline struct that holds itself, and an inline struct only wraps another type, so it cannot hold itself; declare it as an ordinary `struct`", name_resolver.failure.?.message);
+}
+
+test "expectNotHeldByItself: rejects an inline struct that points to itself through an array of pointers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline struct Node\n    children: [2]*Node\nfn take(node: Node) = _ = node" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InlineStructHoldsItself, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqualStrings("`Node` is an inline struct that holds itself, and an inline struct only wraps another type, so it cannot hold itself; declare it as an ordinary `struct`", name_resolver.failure.?.message);
+}
+
+test "expectNotHeldByItself: rejects an inline struct that reaches itself through another inline struct and a slice" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "inline struct Tree\n    children: Children\ninline struct Children\n    items: *[]Tree\nfn take(tree: Tree) = _ = tree" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InlineStructHoldsItself, name_resolver.resolve());
+    try std.testing.expectEqual(token.Location{ .row = 1, .column = 1 }, name_resolver.failure.?.location.?);
+    try std.testing.expectEqualStrings("`Tree` is an inline struct that holds itself, and an inline struct only wraps another type, so it cannot hold itself; declare it as an ordinary `struct`", name_resolver.failure.?.message);
+}
+
+test "expectNotHeldByItself: rejects an inline struct given by a function that returns a type and holds itself" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn Wrapped(type T) -> type\n    return inline struct\n        pair: [T, *Self]\nfn take(wrapped: Wrapped(u32)) = _ = wrapped" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.InlineStructHoldsItself, analyzer.analyze());
+    try std.testing.expectEqualStrings("`Wrapped` is an inline struct that holds itself, and an inline struct only wraps another type, so it cannot hold itself; declare it as an ordinary `struct`", analyzer.failure.?.message);
+}
+
+test "expectNotHeldByItself: accepts an inline struct that points to an ordinary struct holding it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Node\n    next: ?*Node\n    link: Link\ninline struct Link\n    node: ?*Node\nfn take(node: Node) = _ = node" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var name_resolver = NameResolver.init(&arena, std.testing.io, &loader, &type_registry);
+    try name_resolver.resolve();
+
+    const node = loader.modules.items[0].declarations[0].kind.struct_definition.value.?.@"struct";
+    try std.testing.expect(node.fields[1].type.@"struct".@"inline");
 }
 
 test "expectNoPrivateFields: rejects a private field of an external struct" {

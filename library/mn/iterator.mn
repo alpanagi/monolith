@@ -108,5 +108,5 @@ private fn fill_zipped(type C, comptime index: usize, cursors: *C, element: *Cur
     else
         const item = Iterator::next(&cursors.*[index])
         if (item == null) return false
-        element.*[index] = item.?
+        element.*[index] = item orelse unreachable
         return fill_zipped(C, index + 1, cursors, element)

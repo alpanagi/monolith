@@ -922,6 +922,17 @@ test "lexWord: recognizes the import and as keywords" {
     try std.testing.expectEqualStrings("ask", lexer.tokens.items[3].kind.identifier);
 }
 
+test "lexWord: recognizes the public keyword and reads export as a name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("public publicly export");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_public);
+    try std.testing.expectEqualStrings("publicly", lexer.tokens.items[2].kind.identifier);
+    try std.testing.expectEqualStrings("export", lexer.tokens.items[3].kind.identifier);
+}
+
 test "lexWord: recognizes return and boolean keywords" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -962,6 +973,16 @@ test "lexWord: recognizes the control flow keywords" {
     try std.testing.expect(lexer.tokens.items[4].kind == .keyword_break);
     try std.testing.expect(lexer.tokens.items[5].kind == .keyword_continue);
     try std.testing.expectEqualStrings("iffy", lexer.tokens.items[6].kind.identifier);
+}
+
+test "lexWord: recognizes the unreachable keyword and reads a longer word as a name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lexer = Lexer.init("unreachable unreachably");
+    try lexer.lex(&arena);
+
+    try std.testing.expect(lexer.tokens.items[1].kind == .keyword_unreachable);
+    try std.testing.expectEqualStrings("unreachably", lexer.tokens.items[2].kind.identifier);
 }
 
 test "lexWord: recognizes the for and in keywords" {
