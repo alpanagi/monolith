@@ -2446,14 +2446,24 @@ pub const TypeChecker = struct {
     }
 
     fn decideCondition(self: *TypeChecker, condition: *const ast.Expression) TypeError!?bool {
-        if (!self.evaluator.isKnown(condition.*)) return null;
-        const value = self.evaluateValue(condition) catch |evaluate_error| {
-            if (evaluate_error != error.CannotEvaluate and evaluate_error != error.ExternalCall) return evaluate_error;
+        const computed = self.evaluateIfComputable(condition) catch |evaluate_error| {
+            if (evaluate_error != error.CannotEvaluate) return evaluate_error;
             self.failure = null;
             self.failed_function = null;
             return null;
         };
+        const value = computed orelse return null;
         return value.boolean;
+    }
+
+    fn evaluateIfComputable(self: *TypeChecker, expression: *const ast.Expression) TypeError!?Value {
+        if (!self.evaluator.isKnown(expression.*)) return null;
+        return self.evaluateValue(expression) catch |evaluate_error| {
+            if (evaluate_error != error.ExternalCall) return evaluate_error;
+            self.failure = null;
+            self.failed_function = null;
+            return null;
+        };
     }
 
     fn chooseBlock(self: *TypeChecker, conditional: *ast.If, chosen: bool) void {
@@ -2650,7 +2660,7 @@ pub const TypeChecker = struct {
         defer self.exact_numbers = exact;
         recordExpectedType(expression, expected);
         if (expression.kind == .case_literal) try self.resolveCaseLiteral(expression, findLiteralType(expected));
-        if (expected == .optional and takesExpectedType(expression.*)) {
+        if (expected == .optional and (takesExpectedType(expression.*) or expression.kind == .string_literal)) {
             try self.checkExpression(parameters, expression, expected.optional.child);
             if (!isConvertible(expression.type.?, expected)) return self.fail(expression.location, error.TypeMismatch);
             return;
@@ -3729,7 +3739,7 @@ pub const TypeChecker = struct {
                     if (!isInteger(value_type)) return self.fail(value.location, error.ExpectedInteger);
                 }
                 expression.type = target;
-                if (self.evaluator.isKnown(expression.*)) _ = try self.evaluateValue(expression);
+                _ = try self.evaluateIfComputable(expression);
                 return target;
             },
             .cast => {
@@ -16456,6 +16466,60 @@ test "evaluateCaseInteger: rejects a case that is not known at compile time" {
 
     try std.testing.expectError(error.CannotEvaluate, analyzer.analyze());
     try std.testing.expectEqual(token.Location{ .row = 3, .column = 15 }, analyzer.failure.?.location.?);
+}
+
+test "evaluateIfComputable: leaves the conversion of a value from a call that reaches an external function to run time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::process\n\nfn main\n    const arguments = process::arguments()\n    _ = mn::convert(f64, arguments.length)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "evaluateIfComputable: leaves a local constant from a function that reaches an external function through another function to run time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::process\n\nfn count -> usize = process::arguments().length\n\nfn main\n    const total = count()\n    const ratio = mn::convert(f64, total)\n    _ = ratio\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "evaluateIfComputable: keeps evaluating a local constant from a function that reaches no external function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\n\nfn large -> u32 = 300\n\nfn main\n    const value = large()\n    _ = mn::convert(u8, value)\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ConversionOutOfRange, analyzer.analyze());
 }
 
 test "chooseBlock: checks only the block that a type comparison chooses" {

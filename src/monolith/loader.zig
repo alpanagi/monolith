@@ -14,10 +14,14 @@ const isName = @import("name.zig").isName;
 const isWordCharacter = @import("name.zig").isWordCharacter;
 const isWordStart = @import("name.zig").isWordStart;
 
+const runner_module_name = "runner";
+const script_module_name = "build";
+
 pub const Loader = struct {
     program_path: []const u8,
     compiler_path: []const u8,
     test_directory: ?TestDirectory = null,
+    runner_file: ?[]const u8 = null,
     modules: std.ArrayList(ast.Module) = .empty,
     namespaces: std.ArrayList(Namespace) = .empty,
     failure: ?Failure = null,
@@ -66,12 +70,25 @@ pub const Loader = struct {
         return modules;
     }
 
+    pub fn loadBuildScript(
+        self: *Loader,
+        arena: *std.heap.ArenaAllocator,
+        io: std.Io,
+        runner_file: []const u8,
+    ) LoadError!void {
+        self.runner_file = runner_file;
+        const path = try arena.allocator().dupe([]const u8, &.{runner_module_name});
+        _ = try self.loadModule(arena, io, path, runner_file);
+        try self.loadReferencedModules(arena, io);
+    }
+
     pub fn buildModuleFileName(
         self: *Loader,
         allocator: std.mem.Allocator,
         io: std.Io,
         path: ast.Path,
     ) LoadError![]const u8 {
+        if (self.isRunnerPath(path)) return self.runner_file.?;
         const outer_file = try self.buildOuterFileName(allocator, path);
         if (try isFile(io, outer_file)) return outer_file;
         const inner_file = try self.buildInnerFileName(allocator, path);
@@ -95,6 +112,7 @@ pub const Loader = struct {
         name: []const u8,
     ) LoadError!bool {
         if (isDirectoryModuleName(name)) return false;
+        if (self.isScriptPath(path)) return false;
         const member = try std.mem.concat(allocator, []const u8, &.{ path, &.{name} });
         const file = try self.buildOuterFileName(allocator, member);
         if (try isFile(io, file)) return true;
@@ -251,6 +269,7 @@ pub const Loader = struct {
     ) LoadError!?Namespace {
         if (self.findNamespace(path[0 .. path.len - 1], path[path.len - 1])) |namespace| return namespace;
         if (isDirectoryModuleName(path[path.len - 1])) return null;
+        if (self.isScriptPath(path)) return self.loadScriptNamespace(arena, io, path);
         const allocator = arena.allocator();
         const outer_file = try self.buildOuterFileName(allocator, path);
         const inner_file = try self.buildInnerFileName(allocator, path);
@@ -273,6 +292,28 @@ pub const Loader = struct {
             module = try self.loadModule(arena, io, path, inner_file);
         }
         const namespace: Namespace = .{ .path = path, .module = module, .directory = is_directory };
+        try self.namespaces.append(allocator, namespace);
+        return namespace;
+    }
+
+    fn isScriptPath(self: *const Loader, path: ast.Path) bool {
+        return self.runner_file != null and !isLanguageModule(path[0]);
+    }
+
+    fn isRunnerPath(self: *const Loader, path: ast.Path) bool {
+        return self.runner_file != null and path.len == 1 and std.mem.eql(u8, path[0], runner_module_name);
+    }
+
+    fn loadScriptNamespace(
+        self: *Loader,
+        arena: *std.heap.ArenaAllocator,
+        io: std.Io,
+        path: ast.Path,
+    ) LoadError!?Namespace {
+        if (path.len != 1 or !std.mem.eql(u8, path[0], script_module_name)) return null;
+        const allocator = arena.allocator();
+        const module = try self.loadModule(arena, io, path, try self.buildOuterFileName(allocator, path));
+        const namespace: Namespace = .{ .path = path, .module = module, .directory = false };
         try self.namespaces.append(allocator, namespace);
         return namespace;
     }
@@ -837,6 +878,58 @@ test "loadTestModules: rejects a test directory whose name cannot be the name of
     try std.testing.expectEqualStrings(expected, loader.failure.?.message);
 }
 
+test "loadBuildScript: loads the runner first and build.mn as the module build without the directory build beside it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const allocator = arena.allocator();
+    var project_directory = std.testing.tmpDir(.{});
+    defer project_directory.cleanup();
+    var compiler_directory = std.testing.tmpDir(.{});
+    defer compiler_directory.cleanup();
+    const project_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &project_directory.sub_path });
+    const compiler_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &compiler_directory.sub_path });
+    try project_directory.dir.createDirPath(io, "build/script");
+    try project_directory.dir.writeFile(io, .{ .sub_path = "build/module.mn", .data = "not a module" });
+    try project_directory.dir.writeFile(io, .{ .sub_path = "build/script.mn", .data = "not a module" });
+    try project_directory.dir.writeFile(io, .{ .sub_path = "build.mn", .data = "fn build() = noop" });
+    try compiler_directory.dir.writeFile(io, .{ .sub_path = "runner.mn", .data = "import build\nfn main() = build::build()\nfn other() = build::script::run()" });
+    const runner_file = try std.fs.path.join(allocator, &.{ compiler_path, "runner.mn" });
+    var loader = Loader.init(project_path, compiler_path);
+    try loader.loadBuildScript(&arena, io, runner_file);
+
+    try std.testing.expectEqual(2, loader.modules.items.len);
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"runner"}), loader.modules.items[0].path);
+    try std.testing.expectEqualDeep(@as(ast.Path, &.{"build"}), loader.modules.items[1].path);
+    const script = loader.findRoot("build").?;
+    try std.testing.expectEqual(1, script.module.?);
+    try std.testing.expect(!script.directory);
+    try std.testing.expectEqual(null, loader.findMember(script, "script"));
+}
+
+test "loadBuildScript: loads no other module of the project" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const allocator = arena.allocator();
+    var project_directory = std.testing.tmpDir(.{});
+    defer project_directory.cleanup();
+    const project_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &project_directory.sub_path });
+    try project_directory.dir.createDirPath(io, "source");
+    try project_directory.dir.writeFile(io, .{ .sub_path = "source/main.mn", .data = "fn main() = noop" });
+    try project_directory.dir.writeFile(io, .{ .sub_path = "helper.mn", .data = "fn help() = noop" });
+    try project_directory.dir.writeFile(io, .{ .sub_path = "build.mn", .data = "import helper\nimport runner\nimport source::main\nfn build() = helper::help()" });
+    try project_directory.dir.writeFile(io, .{ .sub_path = "runner.mn", .data = "fn main() = noop" });
+    try project_directory.dir.writeFile(io, .{ .sub_path = "compiler.mn", .data = "import build\nfn main() = build::build()" });
+    var loader = Loader.init(project_path, project_path);
+    try loader.loadBuildScript(&arena, io, try std.fs.path.join(allocator, &.{ project_path, "compiler.mn" }));
+
+    try std.testing.expectEqual(2, loader.modules.items.len);
+    try std.testing.expectEqual(null, loader.findRoot("helper"));
+    try std.testing.expectEqual(null, loader.findRoot("source"));
+    try std.testing.expectEqual(null, loader.findRoot("runner"));
+}
+
 test "buildModuleFileName: gives the module in the directory when there is no file next to it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -888,6 +981,27 @@ test "buildModuleFileName: gives the file next to the directory when neither exi
 
     const expected = try std.fs.path.join(arena.allocator(), &.{ program_path, "missing.mn" });
     try std.testing.expectEqualStrings(expected, try loader.buildModuleFileName(arena.allocator(), io, &.{"missing"}));
+}
+
+test "buildModuleFileName: gives the runner's own file for the runner of a build script" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const allocator = arena.allocator();
+    var project_directory = std.testing.tmpDir(.{});
+    defer project_directory.cleanup();
+    const project_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &project_directory.sub_path });
+    try project_directory.dir.createDirPath(io, "compiler");
+    try project_directory.dir.writeFile(io, .{ .sub_path = "runner.mn", .data = "" });
+    try project_directory.dir.writeFile(io, .{ .sub_path = "build.mn", .data = "" });
+    try project_directory.dir.writeFile(io, .{ .sub_path = "compiler/runner.mn", .data = "import build\nfn main() = noop" });
+    const runner_file = try std.fs.path.join(allocator, &.{ project_path, "compiler/runner.mn" });
+    var loader = Loader.init(project_path, project_path);
+    try loader.loadBuildScript(&arena, io, runner_file);
+
+    try std.testing.expectEqualStrings(runner_file, try loader.buildModuleFileName(allocator, io, &.{"runner"}));
+    const script_file = try std.fs.path.join(allocator, &.{ project_path, "build.mn" });
+    try std.testing.expectEqualStrings(script_file, try loader.buildModuleFileName(allocator, io, &.{"build"}));
 }
 
 test "findMember: finds nothing for a module that no path names" {
@@ -958,6 +1072,26 @@ test "hasMember: finds nothing for the name module" {
     try program_directory.dir.writeFile(io, .{ .sub_path = "shapes/module.mn", .data = "" });
 
     try std.testing.expect(!try loader.hasMember(arena.allocator(), io, &.{"shapes"}, "module"));
+}
+
+test "hasMember: finds nothing in the directory beside build.mn for a build script" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    const allocator = arena.allocator();
+    var project_directory = std.testing.tmpDir(.{});
+    defer project_directory.cleanup();
+    const project_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &project_directory.sub_path });
+    try project_directory.dir.createDirPath(io, "build/build");
+    try project_directory.dir.writeFile(io, .{ .sub_path = "build/tests.mn", .data = "" });
+    try project_directory.dir.writeFile(io, .{ .sub_path = "build.mn", .data = "fn build() = noop" });
+    try project_directory.dir.writeFile(io, .{ .sub_path = "runner.mn", .data = "import build\nfn main() = build::build()" });
+    var loader = Loader.init(project_path, project_path);
+
+    try std.testing.expect(try loader.hasMember(allocator, io, &.{"build"}, "tests"));
+    try loader.loadBuildScript(&arena, io, try std.fs.path.join(allocator, &.{ project_path, "runner.mn" }));
+    try std.testing.expect(!try loader.hasMember(allocator, io, &.{"build"}, "build"));
+    try std.testing.expect(!try loader.hasMember(allocator, io, &.{"build"}, "tests"));
 }
 
 test "loadReferencedModules: loads a module named only by a path in a function body" {

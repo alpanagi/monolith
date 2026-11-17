@@ -47,7 +47,8 @@ pub const Generator = struct {
     in_main: bool = false,
     tests: ?[]const TestModule = null,
     executable_path: ?[]const u8 = null,
-    kept_directory: ?[]const u8 = null,
+    kept_directories: []const []const u8 = &.{},
+    libraries: []const []const u8 = &.{},
     failure: ?Failure = null,
 
     pub fn init(program: ast.Program) Generator {
@@ -92,7 +93,7 @@ pub const Generator = struct {
         io: std.Io,
         output_path: []const u8,
     ) GenerateError!void {
-        const kept_directory = self.kept_directory orelse return std.Io.Dir.cwd().deleteTree(io, output_path);
+        if (self.kept_directories.len == 0) return std.Io.Dir.cwd().deleteTree(io, output_path);
         var directory = std.Io.Dir.cwd().openDir(io, output_path, .{ .iterate = true }) catch |open_error| switch (open_error) {
             error.FileNotFound => return,
             else => return open_error,
@@ -105,7 +106,7 @@ pub const Generator = struct {
             const next = walker.next(io) catch |walk_error| return self.failClear(allocator, output_path, walk_error);
             const entry = next orelse break;
             if (std.mem.findScalar(u8, entry.path, '/') != null) continue;
-            if (std.mem.eql(u8, entry.path, kept_directory)) continue;
+            if (containsName(self.kept_directories, entry.path)) continue;
             try names.append(allocator, try allocator.dupe(u8, entry.path));
         }
         for (names.items) |name| try directory.deleteTree(io, name);
@@ -293,6 +294,7 @@ pub const Generator = struct {
         for (runtime_files) |path| {
             if (std.mem.endsWith(u8, path, ".c")) try arguments.append(allocator, try std.fs.path.join(allocator, &.{ source_path, path }));
         }
+        for (self.libraries) |library| try arguments.append(allocator, try std.mem.concat(allocator, u8, &.{ "-l", library }));
         const executable_path = self.executable_path orelse try std.fs.path.join(allocator, &.{ output_path, self.program.modules[0].path[0] });
         try arguments.appendSlice(allocator, &.{ "-o", executable_path });
 
@@ -7850,7 +7852,7 @@ test "Generator.generate: keeps the files of a test build in a program build of 
             generator.executable_path = try std.fs.path.join(allocator, &.{ test_output_path, "test" });
             try generator.generate(allocator, std.testing.io, "generators/c", test_output_path);
         } else {
-            generator.kept_directory = "tests";
+            generator.kept_directories = &.{"tests"};
             try generator.generate(allocator, std.testing.io, "generators/c", output_path);
         }
         if (step == 0) continue;
@@ -8014,6 +8016,37 @@ test "Generator.generate: builds an executable that reads its arguments" {
 
     const without_arguments = try std.process.run(allocator, std.testing.io, .{ .argv = &.{"./main"}, .cwd = .{ .dir = build_directory } });
     try std.testing.expectEqualStrings("0\ntrue\n", without_arguments.stdout);
+    try std.testing.expectEqual(0, without_arguments.term.exited);
+}
+
+test "Generator.generate: builds an executable that converts the number of its arguments at run time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn\nimport mn::process\nimport mn::process::stdout\nimport mn::stream::Writer\nimport mn::text\n\nfn main -> !void\n    const arguments = process::arguments()\n    const count = mn::convert(f64, arguments.length)\n    try text::print(&stdout, \"{}\\n\", { mn::convert(u64, count + count + count) })\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    const program = try analyzer.analyze();
+    var generator = Generator.init(program);
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
+    defer build_directory.close(std.testing.io);
+
+    const with_arguments = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "./main", "one", "two" }, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqualStrings("6\n", with_arguments.stdout);
+    try std.testing.expectEqual(0, with_arguments.term.exited);
+
+    const without_arguments = try std.process.run(allocator, std.testing.io, .{ .argv = &.{"./main"}, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqualStrings("0\n", without_arguments.stdout);
     try std.testing.expectEqual(0, without_arguments.term.exited);
 }
 
@@ -21588,6 +21621,174 @@ test "generateExpression: adds a decimal point to a float written without one" {
     );
 }
 
+test "generateString: generates a string literal that becomes an optional slice as a field of a struct literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Data\n    name: ?const(*[]u8)\nfn make() -> Data = Data{ name = \"engine\" }" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    var generator = Generator.init(try analyzer.analyze());
+    const files = try generator.generateFiles(arena.allocator());
+
+    var source: []const u8 = "";
+    for (files) |file| {
+        if (std.mem.eql(u8, file.path, "main.c")) source = file.contents;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, source, ".length = 6 }") != null);
+}
+
+test "generateString: generates a string literal that becomes an optional slice as a field default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "struct Data\n    name: ?const(*[]u8) = \"engine\"\nfn make() -> Data = Data{}" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    var generator = Generator.init(try analyzer.analyze());
+    const files = try generator.generateFiles(arena.allocator());
+
+    var source: []const u8 = "";
+    for (files) |file| {
+        if (std.mem.eql(u8, file.path, "main.c")) source = file.contents;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, source, ".length = 6 }") != null);
+}
+
+test "generateString: generates a string literal that becomes an optional slice as a declaration with that annotation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: ?const(*[]u8)) = _ = value\nfn make()\n    const name: ?const(*[]u8) = \"engine\"\n    take(name)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    var generator = Generator.init(try analyzer.analyze());
+    const files = try generator.generateFiles(arena.allocator());
+
+    var source: []const u8 = "";
+    for (files) |file| {
+        if (std.mem.eql(u8, file.path, "main.c")) source = file.contents;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, source, ".length = 6 }") != null);
+}
+
+test "generateString: generates a string literal that becomes an optional slice as an argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: ?const(*[]u8)) = _ = value\nfn make() = take(\"engine\")" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    var generator = Generator.init(try analyzer.analyze());
+    const files = try generator.generateFiles(arena.allocator());
+
+    var source: []const u8 = "";
+    for (files) |file| {
+        if (std.mem.eql(u8, file.path, "main.c")) source = file.contents;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, source, ".length = 6 }") != null);
+}
+
+test "generateString: generates a string literal that becomes an optional slice as a return value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn make() -> ?const(*[]u8) = return \"engine\"" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    var generator = Generator.init(try analyzer.analyze());
+    const files = try generator.generateFiles(arena.allocator());
+
+    var source: []const u8 = "";
+    for (files) |file| {
+        if (std.mem.eql(u8, file.path, "main.c")) source = file.contents;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, source, ".length = 6 }") != null);
+}
+
+test "generateString: generates a string literal that becomes an optional slice as an assignment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(value: ?const(*[]u8)) = _ = value\nfn make()\n    var name: ?const(*[]u8) = null\n    name = \"engine\"\n    take(name)" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    var generator = Generator.init(try analyzer.analyze());
+    const files = try generator.generateFiles(arena.allocator());
+
+    var source: []const u8 = "";
+    for (files) |file| {
+        if (std.mem.eql(u8, file.path, "main.c")) source = file.contents;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, source, ".length = 6 }") != null);
+}
+
+test "generateString: generates a string literal that becomes an optional slice as an element of an array literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(values: [2]?const(*[]u8)) = _ = values\nfn make() = take({ \"engine\", null })" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    var generator = Generator.init(try analyzer.analyze());
+    const files = try generator.generateFiles(arena.allocator());
+
+    var source: []const u8 = "";
+    for (files) |file| {
+        if (std.mem.eql(u8, file.path, "main.c")) source = file.contents;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, source, ".length = 6 }") != null);
+}
+
+test "generateString: generates a string literal that becomes an optional slice as an element of a tuple literal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    var loader = @import("monolith").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "fn take(pair: [?const(*[]u8), u8]) = _ = pair\nfn make() = take({ \"engine\", 1 })" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    var generator = Generator.init(try analyzer.analyze());
+    const files = try generator.generateFiles(arena.allocator());
+
+    var source: []const u8 = "";
+    for (files) |file| {
+        if (std.mem.eql(u8, file.path, "main.c")) source = file.contents;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, source, ".length = 6 }") != null);
+}
+
 test "generateLiteralElements: points an empty slice at the shared zero-sized object" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -27437,4 +27638,168 @@ test "integration: builds the program that init writes" {
 
     const executable = try output_directory.dir.statFile(std.testing.io, "build/main", .{});
     try std.testing.expectEqual(.file, executable.kind);
+}
+
+test "integration: creates, fills and ends an Executable, a TestSuite and a Build in tests, leaving nothing allocated" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    const source =
+        \\import mn
+        \\import mn::build::{ Build, Command, Executable, TestSuite }
+        \\import mn::convert::View
+        \\import mn::memory::{ self, Allocator, Deinit }
+        \\import mn::test::expect
+        \\
+        \\
+        \\struct Counting
+        \\    live: usize
+        \\
+        \\
+        \\instance Allocator(Counting)
+        \\
+        \\    fn allocate(counting: *Counting, type T, count: usize) -> memory::Error!*[]T
+        \\        counting.live += mn::size(T) * count
+        \\        return memory::allocate(T, count) with memory::Heap
+        \\
+        \\
+        \\    fn(type T) resize(_: *Counting, _: *[]T, _: usize) -> bool = false
+        \\
+        \\
+        \\    fn(type T) free(counting: *Counting, items: const(*[]T))
+        \\        counting.live -= mn::size(T) * items.length
+        \\        memory::free(items) with memory::Heap
+        \\
+        \\
+        \\test "Executable: holds its libraries in order until it is ended"
+        \\    var counting: Counting = { live = 0 }
+        \\    with &counting
+        \\    var engine = Executable::init({ name = "engine", main = "source/main.mn" })
+        \\    try engine.link_system_library("SDL3")
+        \\    try engine.link_system_library("vulkan")
+        \\    const libraries = engine.libraries.view_as(const(*[]const(*[]u8)))
+        \\    try expect(memory::equal(engine.name, "engine") and memory::equal(engine.main, "source/main.mn"))
+        \\    try expect(libraries.length == 2 and memory::equal(libraries[0], "SDL3") and memory::equal(libraries[1], "vulkan"))
+        \\    try expect(counting.live > 0)
+        \\    engine.deinit()
+        \\    try expect(counting.live == 0)
+        \\
+        \\
+        \\test "Executable::init: builds source/main.mn by default and names the executable after its main module unless it is given a name"
+        \\    const plain = Executable::init()
+        \\    try expect(memory::equal(plain.name, "main") and memory::equal(plain.main, "source/main.mn"))
+        \\    const engine = Executable::init({ name = "engine" })
+        \\    try expect(memory::equal(engine.name, "engine") and memory::equal(engine.main, "source/main.mn"))
+        \\    const start = Executable::init({ main = "tools/editor/start.mn" })
+        \\    try expect(memory::equal(start.name, "start") and memory::equal(start.main, "tools/editor/start.mn"))
+        \\
+        \\
+        \\test "TestSuite::init: takes the source and tests directories by default and holds its libraries until it is ended"
+        \\    var counting: Counting = { live = 0 }
+        \\    with &counting
+        \\    var suite = TestSuite::init()
+        \\    try suite.link_system_library("m")
+        \\    try expect(memory::equal(suite.source_directory, "source") and memory::equal(suite.tests_directory, "tests"))
+        \\    const libraries = suite.libraries.view_as(const(*[]const(*[]u8)))
+        \\    try expect(libraries.length == 1 and memory::equal(libraries[0], "m"))
+        \\    suite.deinit()
+        \\    try expect(counting.live == 0)
+        \\
+        \\
+        \\test "Build: holds what is added and ends it when it is ended"
+        \\    var counting: Counting = { live = 0 }
+        \\    with &counting
+        \\    var build = Build::init()
+        \\    for _ in 0..20
+        \\        var editor = Executable::init({ name = "editor", main = "source/editor.mn" })
+        \\        try editor.link_system_library("m")
+        \\        try build.add_executable(editor)
+        \\    var suite = TestSuite::init({ source_directory = "program", tests_directory = "checks" })
+        \\    try suite.link_system_library("m")
+        \\    try build.add_test_suite(suite)
+        \\    try build.add_command("shaders", "glslc", { "-o", "triangle.spv" })
+        \\    try build.add_command("clean", "true", {})
+        \\    const suites = build.test_suites.view_as(const(*[]TestSuite))
+        \\    try expect(build.executables.length() == 20 and suites.length == 1 and memory::equal(suites[0].tests_directory, "checks"))
+        \\    const commands = build.commands.view_as(const(*[]Command))
+        \\    const arguments = commands[0].arguments.view_as(const(*[]const(*[]u8)))
+        \\    try expect(memory::equal(commands[0].name, "shaders") and memory::equal(commands[0].program, "glslc"))
+        \\    try expect(arguments.length == 2 and memory::equal(arguments[1], "triangle.spv"))
+        \\    try expect(commands.length == 2 and memory::equal(commands[1].program, "true") and commands[1].arguments.length() == 0)
+        \\    build.deinit()
+        \\    try expect(counting.live == 0)
+        \\
+    ;
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "building.mn", .data = source });
+    var loader = @import("monolith").Loader.init(program_path, "library");
+    const modules = try loader.loadTestModules(&arena, std.testing.io, program_path, false);
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    var generator = Generator.init(try analyzer.analyze());
+    const file = try loader.buildModuleFileName(allocator, std.testing.io, loader.modules.items[modules[0]].path);
+    generator.tests = &.{.{ .module = modules[0], .file = file }};
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build", "tests" });
+    generator.executable_path = try std.fs.path.join(allocator, &.{ output_path, "test" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build/tests", .{});
+    defer build_directory.close(std.testing.io);
+    const capture = "printf '%s\\n' '#!/bin/sh' 'cd \"$(dirname \"$0\")\" && exec ./test >stdout 2>stderr' > capture && chmod +x capture";
+    const created = try std.process.run(allocator, std.testing.io, .{ .argv = &.{ "sh", "-c", capture }, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqual(0, created.term.exited);
+    var runner: @import("monolith").TestRunner = .{};
+    const status = try runner.run(allocator, std.testing.io, try std.fs.path.join(allocator, &.{ output_path, "capture" }));
+
+    try std.testing.expectEqualStrings("4 passed, 0 failed\n", try build_directory.readFileAlloc(std.testing.io, "stderr", allocator, .unlimited));
+    try std.testing.expectEqual(0, status);
+}
+
+test "integration: passes string literals into an optional slice field and argument and reads their text back" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    var output_directory = std.testing.tmpDir(.{});
+    defer output_directory.cleanup();
+    const allocator = arena.allocator();
+    const program_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &program_directory.sub_path });
+    const source =
+        \\import mn::process::stdout
+        \\
+        \\
+        \\struct Data
+        \\    name: ?const(*[]u8)
+        \\
+        \\
+        \\fn show(name: ?const(*[]u8)) -> !void
+        \\    if name as text
+        \\        try stdout.println("{s}", { text })
+        \\
+        \\
+        \\fn main -> !void
+        \\    const data = Data{ name = "engine" }
+        \\    try show(data.name)
+        \\    try show("editor")
+        \\    try show(null)
+        \\
+    ;
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = source });
+    var loader = @import("monolith").Loader.init(program_path, "library");
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("monolith").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+    var generator = Generator.init(try analyzer.analyze());
+    const output_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &output_directory.sub_path, "build" });
+    try generator.generate(allocator, std.testing.io, "generators/c", output_path);
+
+    const build_directory = try output_directory.dir.openDir(std.testing.io, "build", .{});
+    defer build_directory.close(std.testing.io);
+    const result = try std.process.run(allocator, std.testing.io, .{ .argv = &.{"./main"}, .cwd = .{ .dir = build_directory } });
+    try std.testing.expectEqualStrings("engine\neditor\n", result.stdout);
+    try std.testing.expectEqual(0, result.term.exited);
 }

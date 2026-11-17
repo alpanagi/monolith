@@ -46,6 +46,12 @@ pub fn build(b: *std.Build) void {
     });
 
     b.installDirectory(.{
+        .source_dir = b.path("library/script"),
+        .install_dir = .bin,
+        .install_subdir = "script",
+    });
+
+    b.installDirectory(.{
         .source_dir = b.path("generators/c/runtime"),
         .install_dir = .bin,
         .install_subdir = "generators/c/runtime",
@@ -71,6 +77,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     addTestRun(b, test_step, c_generator_tests, input_marker);
+
+    const main_tests = b.addTest(.{ .root_module = exe.root_module });
+    addTestRun(b, test_step, main_tests, input_marker);
 }
 
 fn addInputMarker(b: *std.Build) std.Build.LazyPath {

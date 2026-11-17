@@ -1,0 +1,52 @@
+import mn::build::{ Build, Command, Executable, TestSuite }
+import mn::container::ArrayList
+import mn::convert::View
+import mn::filesystem::{ self, Path }
+import mn::memory::{ self, Deinit }
+import mn::process
+import mn::stream::Writer
+import mn::text
+
+import build
+
+
+fn main -> !void
+    var arena = memory::Arena(memory::Heap)::init(memory::Heap::init())
+    defer arena.deinit()
+    with &arena
+    var description = Build::init()
+    try build::build(&description)
+    var output = ArrayList(u8)::init()
+    try write_description(&output, &description)
+    const arguments = process::arguments()
+    try filesystem::write(arguments[0].view_as(Path), output.view_as(const(*[]u8)))
+
+
+fn write_description(output: *ArrayList(u8), description: const(*Build)) -> !void
+    for *executable in description.executables.view_as(const(*[]Executable))
+        try output.write("executable\n")
+        try write_bytes(output, executable.name)
+        try write_bytes(output, executable.main)
+        try write_list(output, &executable.libraries)
+    for *suite in description.test_suites.view_as(const(*[]TestSuite))
+        try output.write("test_suite\n")
+        try write_bytes(output, suite.source_directory)
+        try write_bytes(output, suite.tests_directory)
+        try write_list(output, &suite.libraries)
+    for *command in description.commands.view_as(const(*[]Command))
+        try output.write("command\n")
+        try write_bytes(output, command.name)
+        try write_bytes(output, command.program)
+        try write_list(output, &command.arguments)
+
+
+fn write_bytes(output: *ArrayList(u8), bytes: const(*[]u8)) -> !void
+    try text::print(output, "{}:", { bytes.length })
+    try output.write(bytes)
+    try output.write("\n")
+
+
+fn write_list(output: *ArrayList(u8), list: const(*ArrayList(const(*[]u8)))) -> !void
+    try text::print(output, "{}\n", { list.length() })
+    for bytes in list.view_as(const(*[]const(*[]u8)))
+        try write_bytes(output, bytes)

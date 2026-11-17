@@ -1,0 +1,99 @@
+import mn::container::ArrayList
+import mn::memory::{ self, Deinit }
+
+
+struct Build
+    executables: ArrayList(Executable)
+    test_suites: ArrayList(TestSuite)
+    commands: ArrayList(Command)
+
+    fn init -> Self = { executables = ::init(), test_suites = ::init(), commands = ::init() }
+
+
+    fn add_executable(self: *Self, executable: Executable) -> memory::Error!void = self.executables.append(executable)
+
+    fn add_test_suite(self: *Self, suite: TestSuite) -> memory::Error!void = self.test_suites.append(suite)
+
+
+    fn add_command(self: *Self, name: const(*[]u8), program: const(*[]u8), arguments: const(*[]const(*[]u8))) -> memory::Error!void
+        var command: Command = { name = name, program = program, arguments = ::init() }
+        errdefer command.deinit()
+        for argument in arguments
+            try command.arguments.append(argument)
+        try self.commands.append(command)
+
+
+instance Deinit(Build)
+
+    fn deinit(build: *Self)
+        while build.executables.pop() as var executable
+            executable.deinit()
+        build.executables.deinit()
+        while build.test_suites.pop() as var suite
+            suite.deinit()
+        build.test_suites.deinit()
+        while build.commands.pop() as var command
+            command.deinit()
+        build.commands.deinit()
+
+
+struct Executable
+    name: const(*[]u8)
+    main: const(*[]u8)
+    libraries: ArrayList(const(*[]u8))
+
+    fn init(options: Options = {}) -> Self = { name = options.name orelse find_module_name(options.main), main = options.main, libraries = ::init() }
+
+
+    fn link_system_library(self: *Self, name: const(*[]u8)) -> memory::Error!void = self.libraries.append(name)
+
+    struct Options
+        name: ?const(*[]u8) = null
+        main: const(*[]u8) = "source/main.mn"
+
+
+instance Deinit(Executable)
+
+    fn deinit(executable: *Self) = executable.libraries.deinit()
+
+
+private fn find_module_name(path: const(*[]u8)) -> const(*[]u8)
+    var start = path.length
+    while (start > 0 and path[start - 1] != '/') start -= 1
+    const file_name = path[start..]
+    const extension = ".mn"
+    if (file_name.length <= extension.length) return file_name
+    const stem_length = file_name.length - extension.length
+    if (memory::equal(file_name[stem_length..], extension)) return file_name[..stem_length]
+    return file_name
+
+
+struct TestSuite
+    source_directory: const(*[]u8)
+    tests_directory: const(*[]u8)
+    libraries: ArrayList(const(*[]u8))
+
+    fn init(options: Options = {}) -> Self = { source_directory = options.source_directory, tests_directory = options.tests_directory, libraries = ::init() }
+
+
+    fn link_system_library(self: *Self, name: const(*[]u8)) -> memory::Error!void = self.libraries.append(name)
+
+    struct Options
+        source_directory: const(*[]u8) = "source"
+        tests_directory: const(*[]u8) = "tests"
+
+
+instance Deinit(TestSuite)
+
+    fn deinit(suite: *Self) = suite.libraries.deinit()
+
+
+struct Command
+    name: const(*[]u8)
+    program: const(*[]u8)
+    arguments: ArrayList(const(*[]u8))
+
+
+instance Deinit(Command)
+
+    fn deinit(command: *Self) = command.arguments.deinit()

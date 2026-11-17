@@ -13837,6 +13837,78 @@ test "expectLength: rejects a length that calls an external function" {
     try std.testing.expectEqual(token.Location{ .row = 2, .column = 18 }, analyzer.failure.?.location.?);
 }
 
+test "expectLength: computes a length from a function whose call to an external function is on a branch not taken" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn size() -> usize\nfn choose(outside: bool) -> usize\n    if (outside) return size()\n    return 4\nfn show(values: [choose(false)]i32) = _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
+test "expectLength: rejects a length from a function whose branch taken calls an external function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, program_path);
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "external fn size() -> usize\nfn choose(outside: bool) -> usize\n    if (outside) return size()\n    return 4\nfn show(values: [choose(true)]i32) = _ = values" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ExternalCall, analyzer.analyze());
+}
+
+test "expectLength: rejects a length from a local constant whose call reaches an external function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::process\n\nfn main\n    const arguments = process::arguments()\n    var buffer: [arguments.length]u8 = undefined\n    buffer[0] = 1\n    _ = buffer\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    try std.testing.expectError(error.ExternalCall, analyzer.analyze());
+}
+
+test "expectLength: takes the length of an array that comes from a call that reaches an external function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var program_directory = std.testing.tmpDir(.{});
+    defer program_directory.cleanup();
+    const program_path = try std.fs.path.join(
+        arena.allocator(),
+        &.{ ".zig-cache", "tmp", &program_directory.sub_path },
+    );
+    var loader = @import("loader.zig").Loader.init(program_path, "library");
+    try program_directory.dir.writeFile(std.testing.io, .{ .sub_path = "main.mn", .data = "import mn::process\n\nfn read -> [4]u8\n    const name = process::invoked_as()\n    return { name[0], name[0], name[0], name[0] }\n\nfn main\n    const contents = read()\n    const copy: [contents.length]u8 = contents\n    const length = contents.length\n    const other: [length]u8 = copy\n    _ = other\n" });
+    try loader.loadMainModule(&arena, std.testing.io, "main");
+    var type_registry: types.Registry = .{};
+    var analyzer = @import("analyzer.zig").Analyzer.init(&arena, std.testing.io, &loader, &type_registry);
+
+    _ = try analyzer.analyze();
+}
+
 test "resolveSliceType: resolves a slice type through a constant" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
